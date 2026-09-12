@@ -134,15 +134,19 @@ function storedEmbedding(value, key) {
 async function readConceptEmbedding(root, key) {
   try {
     return storedEmbedding(JSON.parse(await readFile(cachePath(root, key), "utf8")), key);
-  } catch {
-    return;
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === "ENOENT" || error instanceof SyntaxError)
+      return;
+    throw error;
   }
 }
-async function writeConceptEmbedding(root, embedding) {
+async function writeConceptEmbedding(root, embedding, stagingRoot = root) {
   const directory = join2(root, embedding.key.slice(0, 2));
+  await mkdir(stagingRoot, { recursive: true });
   await mkdir(directory, { recursive: true });
   const destination = cachePath(root, embedding.key);
-  const temporary = join2(directory, `.${embedding.key}.${randomUUID()}.tmp`);
+  const temporary = join2(stagingRoot, `.${embedding.key}.${randomUUID()}.tmp`);
   const stored = {
     version: CONCEPT_CACHE_VERSION,
     key: embedding.key,
@@ -152,26 +156,25 @@ async function writeConceptEmbedding(root, embedding) {
       vector: encodeVector(window.vector)
     }))
   };
-  await writeFile(temporary, JSON.stringify(stored), { flag: "wx", mode: 384 });
   try {
-    await rename(temporary, destination);
-  } catch (error) {
-    if (errorCode(error) !== "EEXIST") {
-      await rm(temporary, { force: true });
-      throw error;
-    }
-    if (await readConceptEmbedding(root, embedding.key)) {
-      await rm(temporary, { force: true });
-      return;
-    }
-    await rm(destination, { force: true });
+    await writeFile(temporary, JSON.stringify(stored), { flag: "wx", mode: 384 });
     try {
       await rename(temporary, destination);
-    } catch (replacementError) {
-      await rm(temporary, { force: true });
-      if (errorCode(replacementError) !== "EEXIST")
-        throw replacementError;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST")
+        throw error;
+      if (await readConceptEmbedding(root, embedding.key))
+        return;
+      await rm(destination, { force: true });
+      try {
+        await rename(temporary, destination);
+      } catch (replacementError) {
+        if (errorCode(replacementError) !== "EEXIST")
+          throw replacementError;
+      }
     }
+  } finally {
+    await rm(temporary, { force: true });
   }
 }
 async function enforceConceptCacheLimit(root, maximumBytes = CONCEPT_CACHE_MAX_BYTES) {
@@ -188,12 +191,26 @@ async function enforceConceptCacheLimit(root, maximumBytes = CONCEPT_CACHE_MAX_B
     if (!shard.isDirectory() || !/^[0-9a-f]{2}$/u.test(shard.name))
       continue;
     const directory = join2(root, shard.name);
-    const files = await readdir(directory, { withFileTypes: true });
+    let files;
+    try {
+      files = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (errorCode(error) === "ENOENT")
+        continue;
+      throw error;
+    }
     for (const file of files) {
       if (!file.isFile() || !file.name.endsWith(".json"))
         continue;
       const path = join2(directory, file.name);
-      const metadata = await stat(path);
+      let metadata;
+      try {
+        metadata = await stat(path);
+      } catch (error) {
+        if (errorCode(error) === "ENOENT")
+          continue;
+        throw error;
+      }
       entries.push({ path, bytes: metadata.size, modified: metadata.mtimeMs });
     }
   }
@@ -297,10 +314,17 @@ function tokenSafeWindows(extractor, pending) {
   }
   return windows;
 }
-async function embedConceptInputs(extractor, pending) {
+async function embedConceptInputs(extractor, pending, callbacks = {}) {
   const layouts = pending.map((item) => tokenSafeWindows(extractor, item));
   const inputs = layouts.flatMap((windows) => windows.map((window) => window.input));
   const vectors = [];
+  const layoutEnds = [];
+  let layoutEnd = 0;
+  for (const windows of layouts) {
+    layoutEnd += windows.length;
+    layoutEnds.push(layoutEnd);
+  }
+  let completedEmbedding = 0;
   for (let offset = 0;offset < inputs.length; offset += INFERENCE_BATCH_SIZE) {
     const batch = inputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
     const tensor = await extractor(batch, { pooling: "mean", normalize: true });
@@ -310,6 +334,23 @@ async function embedConceptInputs(extractor, pending) {
       const start = index * CONCEPT_EMBEDDING_DIMENSIONS;
       vectors.push(Array.from(tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS), Number));
     }
+    const completedWindows = Math.min(offset + batch.length, inputs.length);
+    while (layoutEnds[completedEmbedding] !== undefined && layoutEnds[completedEmbedding] <= completedWindows) {
+      const start = completedEmbedding === 0 ? 0 : layoutEnds[completedEmbedding - 1];
+      const item = pending[completedEmbedding];
+      if (!item)
+        throw new Error("Missing completed concept embedding input");
+      await callbacks.onCompletedEmbedding?.({
+        key: item.key,
+        windows: (layouts[completedEmbedding] ?? []).map((window, index) => ({
+          start: window.start,
+          end: window.end,
+          vector: vectors[start + index] ?? []
+        }))
+      }, completedEmbedding + 1, pending.length);
+      completedEmbedding += 1;
+    }
+    callbacks.onBatch?.(completedWindows, inputs.length);
   }
   let vectorIndex = 0;
   return pending.map((item, index) => ({
@@ -399,21 +440,18 @@ async function installConceptModel() {
 
 // src/concept-worker.ts
 var CACHE_IO_CONCURRENCY = 64;
-async function readCachedEmbeddings(root, requested) {
+function emitProgress(progress) {
+  process.stdout.write(`${JSON.stringify({ type: "progress", ...progress })}
+`);
+}
+async function readCachedEmbeddings(root, requested, onProgress) {
   const cached = [];
   for (let offset = 0;offset < requested.length; offset += CACHE_IO_CONCURRENCY) {
     const batch = await Promise.all(requested.slice(offset, offset + CACHE_IO_CONCURRENCY).map((item) => readConceptEmbedding(root, item.key)));
     cached.push(...batch);
+    onProgress?.(Math.min(offset + batch.length, requested.length), requested.length);
   }
   return cached;
-}
-async function writeCachedEmbeddings(root, created) {
-  let failed = false;
-  for (let offset = 0;offset < created.length; offset += CACHE_IO_CONCURRENCY) {
-    const batch = await Promise.allSettled(created.slice(offset, offset + CACHE_IO_CONCURRENCY).map((item) => writeConceptEmbedding(root, item)));
-    failed ||= batch.some((item) => item.status === "rejected");
-  }
-  return failed;
 }
 async function requestFromStdin() {
   const chunks = [];
@@ -441,6 +479,7 @@ async function search() {
   const request = await requestFromStdin();
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
+  const stagingRoot = process.env.SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
   await verifyConceptModel(directory);
   const requested = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
@@ -450,15 +489,22 @@ async function search() {
       text
     }))
   ];
-  const cached = await readCachedEmbeddings(cacheRoot, requested);
-  const missing = requested.filter((_item, index) => !cached[index]);
+  const uniqueRequested = [...new Map(requested.map((item) => [item.key, item])).values()];
+  const progressContext = {
+    uniqueEmbeddings: uniqueRequested.length,
+    passages: request.passages.length
+  };
+  const cached = await readCachedEmbeddings(cacheRoot, uniqueRequested, (completed, total) => emitProgress({ phase: "cache-read", completed, total, ...progressContext }));
+  const missing = uniqueRequested.filter((_item, index) => !cached[index]);
   const warnings = [];
   let created = [];
+  let cacheWriteFailed = false;
   if (missing.length) {
     env.allowRemoteModels = false;
     env.useFSCache = false;
     env.useBrowserCache = false;
     env.localModelPath = "/";
+    emitProgress({ phase: "model-loading", ...progressContext });
     const extractor = await pipeline("feature-extraction", directory, {
       local_files_only: true,
       dtype: "q8",
@@ -466,15 +512,26 @@ async function search() {
       session_options: { intraOpNumThreads: 2, interOpNumThreads: 1 }
     });
     try {
-      created = await embedConceptInputs(extractor, missing);
+      created = await embedConceptInputs(extractor, missing, {
+        onCompletedEmbedding: async (embedding, completed, total) => {
+          try {
+            await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
+          } catch {
+            cacheWriteFailed = true;
+          }
+          emitProgress({ phase: "cache-write", completed, total, ...progressContext });
+        },
+        onBatch: (completed, total) => emitProgress({ phase: "embedding", completed, total, ...progressContext })
+      });
     } finally {
       await extractor.dispose();
     }
-    if (await writeCachedEmbeddings(cacheRoot, created))
+    if (cacheWriteFailed)
       warnings.push("Concept embedding cache write failed; ranking completed but some work may repeat");
   }
   const createdByKey = new Map(created.map((item) => [item.key, item]));
-  const embeddings = requested.map((item, index) => cached[index] ?? createdByKey.get(item.key));
+  const embeddingsByKey = new Map(uniqueRequested.map((item, index) => [item.key, cached[index] ?? createdByKey.get(item.key)]));
+  const embeddings = requested.map((item) => embeddingsByKey.get(item.key));
   if (embeddings.some((item) => !item))
     throw new Error("Missing concept embedding result");
   const queryWindows = embeddings[0]?.windows;
@@ -489,11 +546,13 @@ async function search() {
   });
   let cacheBytes;
   try {
+    emitProgress({ phase: "cache-cleanup", ...progressContext });
     cacheBytes = await enforceConceptCacheLimit(cacheRoot);
   } catch {
     warnings.push("Concept embedding cache cleanup failed; the configured 512 MiB bound was not verified");
   }
   process.stdout.write(JSON.stringify({
+    type: "result",
     scores,
     cacheHits: cached.filter(Boolean).length,
     cacheMisses: missing.length,

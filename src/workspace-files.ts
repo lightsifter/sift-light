@@ -26,6 +26,7 @@ export interface WorkspaceFileList {
   paths: string[];
   partial: boolean;
   reasons: string[];
+  coverageIssue?: "unreadable" | "invalid-path" | "enumeration-limit";
 }
 
 class EnumerationLimit extends Error {}
@@ -59,6 +60,7 @@ export async function listWorkspaceFiles(
     throw new SignalGrepError("Candidate file limit must be a positive integer");
   const paths = new Set<string>();
   const reasons = new Set<string>();
+  let coverageIssue: WorkspaceFileList["coverageIssue"];
   let bytes = 0;
   try {
     const result = await runOwnedProcess(
@@ -96,9 +98,10 @@ export async function listWorkspaceFiles(
           while (delimiter >= 0) {
             const raw = pending.subarray(0, delimiter);
             const decoded = raw.toString("utf8");
-            if (!Buffer.from(decoded).equals(raw))
+            if (!Buffer.from(decoded).equals(raw)) {
               reasons.add("Some candidate paths are not valid UTF-8");
-            else {
+              coverageIssue ??= "invalid-path";
+            } else {
               const local = workspaceRelativePath(cwd, decoded, policy);
               if (!paths.has(local) && paths.size >= maxFiles)
                 throw new EnumerationLimit(
@@ -117,8 +120,10 @@ export async function listWorkspaceFiles(
     const diagnostics = classifyRipgrepDiagnostics(result.stderr);
     if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
       throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
-    if (diagnostics.unreadable.length > 0)
+    if (diagnostics.unreadable.length > 0) {
       reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
+      coverageIssue = "unreadable";
+    }
     if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
       throw new SignalGrepError(
         result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`,
@@ -126,6 +131,12 @@ export async function listWorkspaceFiles(
   } catch (error) {
     if (!(error instanceof EnumerationLimit)) throw error;
     reasons.add(error.message);
+    coverageIssue = "enumeration-limit";
   }
-  return { paths: [...paths].toSorted(), partial: reasons.size > 0, reasons: [...reasons] };
+  return {
+    paths: [...paths].toSorted(),
+    partial: reasons.size > 0,
+    reasons: [...reasons],
+    ...(coverageIssue ? { coverageIssue } : {}),
+  };
 }

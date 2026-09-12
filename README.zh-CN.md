@@ -26,7 +26,7 @@
 
 Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段落，不再固定抽取范围开头的一小部分。超过模型 token 窗口的段落会拆成带重叠、且保证不截断的窗口参与排名，后半段内容不会被静默丢弃。离线 embedding 按内容、模型版本和分段版本缓存在本地，缓存上限为 512 MiB；重复内容直接复用，内容变化自然失效，缓存写入或清理失败会在结果中明确显示。
 
-如果 Concept 推理失败或超时，hybrid 仍会返回已完成的精确字面结果，并把 `coverage.conceptCandidates` 标为 `skipped`，同时写明原因；不会丢掉已经算完的字面搜索。交互场景可用 `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` 限制 Concept 时限（整数毫秒，1000–3600000，默认 600000）。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`）会出现在结果里，便于在下一次请求前用 `path` 或 `glob` 收窄大库。空文件属于正常跳过，不会把结果标成 partial。
+Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: "waiting"` 或 `"running"`、`operationId`、进度和精确的 `nextRequest`，例如 `{ "mode": "await", "operationId": "..." }`。请原样复制这个请求：它会续接同一个计算，不会重启查询，也不会降级成只有字面的结果。最终结果可稳定复取十分钟；每个服务会话最多保留 32 个终态结果。`mode: "cancel"` 会停止自有任务并等待清理完成。每个服务会话最多同时接纳八个 pending operation；单个 operation 使用 `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` 指定一个总执行时限（整数毫秒，1000–3600000，默认 600000），另有 120 秒无人续接租期。真实模型、来源或资源故障会以明确失败返回。发布结果前会重新枚举并校验同一来源 generation；源文件变化会刷新 operation，混合版本不会被标成 complete。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`）会出现在结果里，便于在下一次请求前用 `path` 或 `glob` 收窄大库。空文件属于正常跳过，不会把结果标成 partial。
 
 ### 几个条件，可以一起交代
 
@@ -39,6 +39,12 @@ Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段�
 ### 看到了多少，说得清楚
 
 一页装不下的内容会分批展示，并提供继续查看的入口。原文发生变化时，也会提醒重新确认。像一位认真整理资料的助手，会把“已经看到的”和“还需要往后翻的”交代清楚。
+
+### 在有界证据内追踪调用关系
+
+使用 `mode: "trace"`，并传入 `relation: "callers"` 或 `"callees"`、源码 `path`、从 1 开始的 `line`，以及可选的 `symbol` 或 UTF-16 `column`。提供方会在有界的广度优先遍历中追踪 TypeScript 或 Go 的静态关系。`glob`、`exclude` 和 `hidden` 会在提供方接纳源码清单时实际生效，并保留在返回的 scope 中。`depth`、`maxNodes`、`maxEdges` 和 `maxExpansions` 都是跨续探请求累计的限制；如果触及限制或遇到无法解析的关系，partial 结果会写明原因。编译器或语法证据说明源码关系，不证明运行时分发。
+
+追踪页面使用不可变的 `cursor`。如果前沿还有工作，响应还会给出独立的 `exploreCursor`；请复制完整返回的 `nextRequest` 来扩展追踪。续探会创建新的分析版本，不会改写之前的页面。结构化关系详情会保留请求的 scope 和 comparison target，并把覆盖状态（`complete` 或 `partial`）与源码新鲜度（`current`、`stale` 或 `unknown`）分开记录。使用 `mode: "validate"` 加上保存的 trace 或 analysis cursor，可以把保留的源码、配置、清单和其他证据依赖与当前工作区比较。校验会独立报告 `current`、`stale` 或 `unknown`，同时保留原始的 complete 或 partial 覆盖状态；partial 快照通过新鲜校验也不会被宣称为完整搜索。文件系统变更提示只是尽力而为的通知，最终新鲜度由权威校验决定。
 
 ### 按文件时间缩小范围，也可以看代码结构
 
@@ -63,6 +69,7 @@ Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段�
 - “按这个 Unix 毫秒时间戳之后修改过的文件搜索。”
 - “这句话我可能记得不准确，把精确和语义证据一起找出来。”
 - “列出这个 Python 文件里的类和函数，再打开需要看的方法。”
+- “追踪这个函数两跳以内的调用方；我改完配置后再校验已保存的证据。”
 
 插件提供文件位置和实际文本，帮助 Agent 根据原文回答，也方便你回到资料中核对。
 

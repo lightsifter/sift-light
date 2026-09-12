@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { EvidenceService, isEvidenceRequest } from "./evidence-service.js";
+import { ConceptSourceChangedError } from "./concept-source-generation.js";
 import type { GitChangeRequest } from "./git-source.js";
 import type { SyntaxRoleName } from "./syntax.js";
 import { resolve } from "node:path";
@@ -17,10 +18,21 @@ import {
 import { redactSignalGrepResult } from "./redaction.js";
 import type { RipgrepRunner } from "./rg.js";
 import type { CodeStructureProvider } from "./structure.js";
-import type { ConceptSearchRunner } from "./concept-search.js";
+import { ConceptWorkerExitError, type ConceptSearchRunner } from "./concept-search.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { SnapshotStore } from "./snapshot-store.js";
+import {
+  OPERATION_INITIAL_WAIT_MS,
+  OperationLifecycle,
+  type OperationProgress,
+} from "./operation-lifecycle.js";
+import {
+  completeOperationResult,
+  operationOutcome,
+  operationStateResult,
+} from "./operation-output.js";
 import { modificationTimeBoundsText } from "./source.js";
+import { resolveConceptTimeoutMs } from "./concept-model.js";
 import {
   DEFAULT_SUMMARY_FILE_LIMIT,
   MAX_INSPECT_TARGETS,
@@ -39,6 +51,7 @@ export interface SignalGrepInput extends RawSearchInput {
   column?: number;
   mode?: SearchMode;
   cursor?: string;
+  exploreCursor?: string;
   paths?: string[];
   matchIndex?: number;
   matchIndices?: number[];
@@ -53,6 +66,12 @@ export interface SignalGrepInput extends RawSearchInput {
   symbol?: string;
   maxFilesToParse?: number;
   conceptLimit?: number;
+  relation?: "callers" | "callees";
+  depth?: number;
+  maxNodes?: number;
+  maxEdges?: number;
+  maxExpansions?: number;
+  operationId?: string;
 }
 
 export interface SignalGrepServiceOptions {
@@ -65,6 +84,7 @@ export interface SignalGrepServiceOptions {
 
 export interface SignalGrepSearchOptions {
   contextBudget?: ContextBudget;
+  onProgress?: (progress: OperationProgress) => void;
 }
 interface PathSelection {
   labels: string[];
@@ -247,6 +267,23 @@ function rejectCursorOnlyOptions(input: SignalGrepInput): void {
   }
 }
 
+async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promise<void> {
+  if (signal.aborted)
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  await new Promise<void>((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolveDelay();
+    }, delayMs);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      rejectDelay(signal.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export class SignalGrepService {
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
@@ -254,12 +291,14 @@ export class SignalGrepService {
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
   readonly #active = new Set<Promise<SignalGrepResult>>();
+  #operations: OperationLifecycle<SignalGrepResult>;
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
   constructor(options: SignalGrepServiceOptions) {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(
       this.#runRipgrep,
       this.#snapshots,
@@ -275,15 +314,24 @@ export class SignalGrepService {
     options: SignalGrepSearchOptions = {},
   ): Promise<SignalGrepResult> {
     validateRawSearchInput(input);
-    for (const path of input.paths ?? []) validateSearchPath(path, "paths");
-    for (const target of input.targets ?? []) {
-      if (target && typeof target.path === "string")
-        validateSearchPath(target.path, "targets.path");
+    let request: Promise<SignalGrepResult>;
+    if (input.mode === "await" || input.mode === "cancel") {
+      request = this.#operationCommand(input, cwd, signal);
+    } else {
+      if (input.operationId !== undefined)
+        throw new SignalGrepError("operationId is only valid with mode=await or mode=cancel");
+      for (const path of input.paths ?? []) validateSearchPath(path, "paths");
+      for (const target of input.targets ?? []) {
+        if (target && typeof target.path === "string")
+          validateSearchPath(target.path, "targets.path");
+      }
+      const combined = signal
+        ? AbortSignal.any([signal, this.#lifecycle.signal])
+        : this.#lifecycle.signal;
+      request = this.#isLongRunningQuery(input)
+        ? this.#searchOperation(input, cwd, signal, options)
+        : this.#search(input, cwd, combined, options);
     }
-    const combined = signal
-      ? AbortSignal.any([signal, this.#lifecycle.signal])
-      : this.#lifecycle.signal;
-    const request = this.#search(input, cwd, combined, options);
     this.#active.add(request);
     try {
       const result = await request;
@@ -293,6 +341,104 @@ export class SignalGrepService {
     } finally {
       this.#active.delete(request);
     }
+  }
+
+  #isLongRunningQuery(input: SignalGrepInput): input is SignalGrepInput & {
+    mode: "concept" | "hybrid";
+  } {
+    return (
+      (input.mode === "concept" || input.mode === "hybrid") &&
+      input.operationId === undefined &&
+      input.cursor === undefined
+    );
+  }
+
+  async #searchOperation(
+    input: SignalGrepInput & { mode: "concept" | "hybrid" },
+    cwd: string,
+    signal: AbortSignal | undefined,
+    options: SignalGrepSearchOptions,
+  ): Promise<SignalGrepResult> {
+    const started = this.#operations.start(
+      async (operationSignal, operationId) => {
+        const combined = AbortSignal.any([operationSignal, this.#lifecycle.signal]);
+        const deadlineAt = this.#operations.get(operationId).deadlineAt;
+        this.#operations.updateProgress(operationId, { phase: "queued" });
+        let refreshAttempt = 0;
+        let workerRestarted = false;
+        while (true) {
+          try {
+            this.#operations.updateProgress(operationId, { phase: "running" });
+            // oxlint-disable-next-line no-await-in-loop -- retries share one operation deadline and signal.
+            return await this.#search(input, cwd, combined, {
+              ...options,
+              onProgress: (progress) => this.#operations.updateProgress(operationId, progress),
+            });
+          } catch (error) {
+            if (error instanceof ConceptWorkerExitError) {
+              if (workerRestarted || combined.aborted) throw error;
+              const remaining = deadlineAt - Date.now();
+              if (remaining <= 0) throw error;
+              workerRestarted = true;
+              this.#operations.updateProgress(operationId, {
+                phase: "refreshing",
+                detail:
+                  "worker restart 1 after unexpected worker termination; completed cache entries are reusable",
+              });
+              // oxlint-disable-next-line no-await-in-loop -- bounded retry backoff preserves one deadline.
+              await waitForSourceRefresh(combined, Math.min(100, remaining));
+              continue;
+            }
+            if (!(error instanceof ConceptSourceChangedError)) throw error;
+            if (combined.aborted) throw error;
+            const remaining = deadlineAt - Date.now();
+            if (remaining <= 0)
+              throw new SignalGrepError("Source did not stabilize before the operation deadline", {
+                cause: error,
+              });
+            this.#operations.updateProgress(operationId, {
+              phase: "refreshing",
+              detail: `generation retry ${String(++refreshAttempt)}: ${error.message}`,
+            });
+            // oxlint-disable-next-line no-await-in-loop -- bounded retry backoff preserves one deadline.
+            await waitForSourceRefresh(combined, Math.min(100, remaining));
+          }
+        }
+      },
+      { mode: input.mode, redact: input.redact ?? false, cwd },
+    );
+    const outcome = await this.#operations.wait(started.id, OPERATION_INITIAL_WAIT_MS, signal);
+    return operationOutcome(outcome, input.mode);
+  }
+
+  async #operationCommand(
+    input: SignalGrepInput,
+    cwd: string,
+    signal: AbortSignal | undefined,
+  ): Promise<SignalGrepResult> {
+    if (!input.operationId || typeof input.operationId !== "string")
+      throw new SignalGrepError("mode=await and mode=cancel require operationId");
+    const existing = this.#operations.get(input.operationId);
+    const mode = existing.metadata.mode;
+    if (resolve(cwd) !== resolve(existing.metadata.cwd))
+      throw new SignalGrepError("Operation belongs to a different working directory");
+    const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
+    if (forbidden.length > 0)
+      throw new SignalGrepError(
+        `${input.mode} accepts only operationId; remove ${forbidden.join(", ")} and copy the returned nextRequest exactly`,
+      );
+    if (input.mode === "cancel") {
+      const cancelled = await this.#operations.cancelAndWait(input.operationId);
+      if (cancelled.state === "complete" && cancelled.result !== undefined)
+        return completeOperationResult(cancelled.result, cancelled);
+      return operationStateResult(cancelled, mode);
+    }
+    const outcome = await this.#operations.wait(
+      input.operationId,
+      OPERATION_INITIAL_WAIT_MS,
+      signal,
+    );
+    return operationOutcome(outcome, mode);
   }
 
   async #search(
@@ -309,7 +455,7 @@ export class SignalGrepService {
     }
     const mode = input.mode ?? "auto";
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
-    if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal);
+    if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal, options);
     if (input.column !== undefined)
       throw new SignalGrepError("column requires semantic navigation");
     if (input.query !== undefined) throw new SignalGrepError(DISCOVERY_MODE_REQUIRED_ERROR);
@@ -385,14 +531,19 @@ export class SignalGrepService {
   clear(): void {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController();
+    this.#operations.reset();
     this.#snapshots.clear();
     this.#evidence.clear();
   }
 
   async shutdown(): Promise<void> {
-    this.clear();
+    this.#lifecycle.abort();
+    this.#operations.clear();
     const pending = [...this.#active];
     await Promise.allSettled(pending);
+    await this.#operations.shutdown();
+    this.#snapshots.clear();
+    this.#evidence.clear();
     await this.#evidence.shutdown();
   }
 

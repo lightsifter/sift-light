@@ -367,6 +367,7 @@ export class AnalysisStore {
           ...(result.chunks !== undefined ? { chunks: result.chunks } : {}),
           ...(result.coverage ? { coverage: result.coverage } : {}),
           ...(result.stats ? { stats: result.stats } : {}),
+          ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
         },
         ...(result.scope ? { scope: result.scope } : {}),

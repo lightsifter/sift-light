@@ -1,5 +1,5 @@
 import type { Writable } from "node:stream";
-import { SignalGrepError } from "./errors.js";
+import { abortError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 
 const MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
@@ -88,6 +88,7 @@ export class JsonRpcChannel {
   }
 
   endInput(): void {
+    if (this.#inputEnded) return;
     if (this.#pending.size) throw new Error("Cannot end JSON-RPC input with pending requests");
     this.#inputEnded = true;
     this.#stdin.end();
@@ -99,6 +100,14 @@ export class JsonRpcChannel {
       pending.reject(new SignalGrepError("Language service closed before responding"));
     this.#pending.clear();
   }
+}
+
+export interface OwnedJsonRpcSession {
+  readonly channel: JsonRpcChannel;
+  /** Resolves after the owned process and protocol reader have closed. */
+  readonly completion: Promise<{ code: number | null; stderr: string }>;
+  /** Terminates the owned process; callers must await completion afterward. */
+  abort(): void;
 }
 
 async function readMessages(
@@ -144,6 +153,59 @@ async function readMessages(
   }
 }
 
+/**
+ * Start one interactive JSON-RPC process and keep it alive for a caller-owned
+ * analysis view. The caller must perform the protocol shutdown and then call
+ * `channel.endInput()`; process cleanup remains owned by this helper.
+ */
+export async function openOwnedJsonRpc(
+  options: {
+    executable: string;
+    args: string[];
+    cwd: string;
+    signal: AbortSignal;
+    env?: NodeJS.ProcessEnv;
+  },
+  onRequest: (method: string, params: unknown) => unknown,
+): Promise<OwnedJsonRpcSession> {
+  const ready = Promise.withResolvers<JsonRpcChannel>();
+  const termination = new AbortController();
+  let settled = false;
+  const signal = AbortSignal.any([options.signal, termination.signal]);
+  const completion = runOwnedProcess(
+    { ...options, signal, interactive: true },
+    async (stdout, stdin) => {
+      if (!stdin) {
+        const error = new SignalGrepError("Missing interactive language-service stdin");
+        if (!settled) ready.reject(error);
+        throw error;
+      }
+      const channel = new JsonRpcChannel(stdin, onRequest);
+      if (!settled) {
+        settled = true;
+        ready.resolve(channel);
+      }
+      await readMessages(stdout, channel);
+    },
+  );
+  // A process that fails before emitting a channel must reject the open call,
+  // while later failures remain observable through completion.
+  void completion.catch((error: unknown) => {
+    if (!settled) {
+      settled = true;
+      ready.reject(error);
+    }
+  });
+  let channel: JsonRpcChannel;
+  try {
+    channel = await ready.promise;
+  } catch (error) {
+    await completion.catch(() => undefined);
+    throw error;
+  }
+  return { channel, completion, abort: () => termination.abort() };
+}
+
 export async function runOwnedJsonRpc<T>(
   options: {
     executable: string;
@@ -155,26 +217,25 @@ export async function runOwnedJsonRpc<T>(
   operation: (channel: JsonRpcChannel) => Promise<T>,
   onRequest: (method: string, params: unknown) => unknown,
 ): Promise<T> {
-  let completed: { value: T } | undefined;
-  const result = await runOwnedProcess({ ...options, interactive: true }, async (stdout, stdin) => {
-    if (!stdin) throw new Error("Missing interactive language-service stdin");
-    const channel = new JsonRpcChannel(stdin, onRequest);
-    try {
-      await Promise.all([
-        readMessages(stdout, channel),
-        operation(channel).then((value) => {
-          completed = { value };
-          return undefined;
-        }),
-      ]);
-    } finally {
-      channel.close();
-    }
-  });
-  if (result.code !== 0)
-    throw new SignalGrepError(
-      `Language-service process failed (${String(result.code)}): ${result.stderr}`,
+  const session = await openOwnedJsonRpc(options, onRequest);
+  try {
+    const value = await operation(session.channel);
+    session.channel.endInput();
+    const result = await session.completion;
+    if (result.code !== 0)
+      throw new SignalGrepError(
+        `Language-service process failed (${String(result.code)}): ${result.stderr}`,
+      );
+    return value;
+  } catch (error) {
+    session.channel.close();
+    session.abort();
+    const completionFailure = await session.completion.catch(
+      (completionError: unknown) => completionError,
     );
-  if (!completed) throw new Error("Language-service operation did not complete");
-  return completed.value;
+    if (options.signal.aborted) throw abortError();
+    if (completionFailure instanceof Error && completionFailure.name !== "AbortError")
+      throw completionFailure;
+    throw error;
+  }
 }

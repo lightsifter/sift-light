@@ -46,8 +46,8 @@ var init_lib = __esm(() => {
 });
 
 // src/omp-index.ts
-import { homedir as homedir2 } from "os";
-import { join as join4 } from "path";
+import { homedir as homedir3 } from "os";
+import { join as join6 } from "path";
 
 // src/config-reader.ts
 import { readFile } from "fs/promises";
@@ -1545,7 +1545,7 @@ class SignalGrepRuntime {
 }
 
 // src/service.ts
-import { createHash as createHash3 } from "crypto";
+import { createHash as createHash6 } from "crypto";
 
 // src/analysis-evidence.ts
 function sourceEvidence(document2, range) {
@@ -1705,6 +1705,8 @@ class JsonRpcChannel {
       throw new SignalGrepError("Language-service response omitted its result");
   }
   endInput() {
+    if (this.#inputEnded)
+      return;
     if (this.#pending.size)
       throw new Error("Cannot end JSON-RPC input with pending requests");
     this.#inputEnded = true;
@@ -1759,29 +1761,41 @@ async function readMessages(stdout, channel) {
     channel.close();
   }
 }
-async function runOwnedJsonRpc(options, operation, onRequest) {
-  let completed;
-  const result = await runOwnedProcess({ ...options, interactive: true }, async (stdout, stdin) => {
-    if (!stdin)
-      throw new Error("Missing interactive language-service stdin");
+async function openOwnedJsonRpc(options, onRequest) {
+  const ready = Promise.withResolvers();
+  const termination = new AbortController;
+  let settled = false;
+  const signal = AbortSignal.any([options.signal, termination.signal]);
+  const completion = runOwnedProcess({ ...options, signal, interactive: true }, async (stdout, stdin) => {
+    if (!stdin) {
+      const error = new SignalGrepError("Missing interactive language-service stdin");
+      if (!settled)
+        ready.reject(error);
+      throw error;
+    }
     const channel = new JsonRpcChannel(stdin, onRequest);
-    try {
-      await Promise.all([
-        readMessages(stdout, channel),
-        operation(channel).then((value) => {
-          completed = { value };
-          return;
-        })
-      ]);
-    } finally {
-      channel.close();
+    if (!settled) {
+      settled = true;
+      ready.resolve(channel);
+    }
+    await readMessages(stdout, channel);
+  });
+  completion.catch((error) => {
+    if (!settled) {
+      settled = true;
+      ready.reject(error);
     }
   });
-  if (result.code !== 0)
-    throw new SignalGrepError(`Language-service process failed (${String(result.code)}): ${result.stderr}`);
-  if (!completed)
-    throw new Error("Language-service operation did not complete");
-  return completed.value;
+  let channel;
+  try {
+    channel = await ready.promise;
+  } catch (error) {
+    await completion.catch(() => {
+      return;
+    });
+    throw error;
+  }
+  return { channel, completion, abort: () => termination.abort() };
 }
 
 // src/semantic-protocol.ts
@@ -1845,7 +1859,7 @@ function lspPosition(document2, character) {
 // src/owned-task-queue.ts
 class OwnedTaskQueue {
   #tail = Promise.resolve();
-  async run(operation, signal) {
+  async acquire(signal) {
     if (signal?.aborted)
       throw abortError();
     const previous = this.#tail;
@@ -1860,10 +1874,25 @@ class OwnedTaskQueue {
       await Promise.race([previous, cancelled.promise]);
       if (signal?.aborted)
         throw abortError();
-      return await operation();
+      let released = false;
+      return () => {
+        if (released)
+          return;
+        released = true;
+        completed.resolve();
+      };
     } finally {
       signal?.removeEventListener("abort", abort2);
-      completed.resolve();
+      if (signal?.aborted)
+        completed.resolve();
+    }
+  }
+  async run(operation, signal) {
+    const release = await this.acquire(signal);
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 }
@@ -1900,70 +1929,150 @@ function executablePath() {
     throw new SignalGrepError(`TypeScript semantic provider is unavailable for ${process.platform}/${process.arch}; reinstall with optional dependencies enabled`, { cause: error });
   }
 }
-async function runTypeScript(cwd, documents, operation, parent, sourceCwd = cwd) {
-  const executable = executablePath();
+function languageId(path) {
+  if (/\.tsx$/i.test(path))
+    return "typescriptreact";
+  if (/\.jsx$/i.test(path))
+    return "javascriptreact";
+  return /\.[cm]?ts$/i.test(path) ? "typescript" : "javascript";
+}
+async function initializeTypeScriptSession(cwd, sourceCwd, documents, channel, signal) {
+  if (signal.aborted)
+    throw abortError();
+  const initialized = await channel.request("initialize", {
+    processId: process.pid,
+    rootUri: await semanticUri(cwd, "."),
+    capabilities: {
+      workspace: {
+        configuration: true,
+        didChangeWatchedFiles: { dynamicRegistration: true }
+      },
+      textDocument: {
+        definition: { linkSupport: true },
+        implementation: { linkSupport: true },
+        callHierarchy: {}
+      },
+      general: { positionEncodings: ["utf-16"] }
+    },
+    initializationOptions: { runExternalCode: false, disablePushDiagnostics: true }
+  });
+  if (!rpcRecord(initialized) || !rpcRecord(initialized.capabilities))
+    throw new SignalGrepError("Language service omitted its capabilities");
+  await channel.notify("initialized", {});
+  await channel.notify("workspace/didChangeConfiguration", {
+    settings: { "js/ts": preferences, typescript: preferences, javascript: preferences }
+  });
+  for (const document2 of documents) {
+    if (signal.aborted)
+      throw abortError();
+    const uri = await semanticUri(sourceCwd, document2.path);
+    await channel.notify("textDocument/didOpen", {
+      textDocument: {
+        uri,
+        languageId: languageId(document2.path),
+        version: 1,
+        text: document2.text
+      }
+    });
+  }
+  return initialized.capabilities;
+}
+async function withTypeScript(cwd, documents, operation, parent, sourceCwd = cwd) {
+  const session = await openTypeScriptSession(cwd, documents, parent, sourceCwd);
+  try {
+    return await operation(session.channel, session.capabilities);
+  } finally {
+    await session.close();
+  }
+}
+async function openTypeScriptSession(cwd, documents, parent, sourceCwd = cwd) {
+  const release = await compilerQueue.acquire(parent);
+  let released = false;
+  const releaseOnce = () => {
+    if (released)
+      return;
+    released = true;
+    release();
+  };
   const deadline = new AbortController;
   const signal = parent ? AbortSignal.any([parent, deadline.signal]) : deadline.signal;
-  const timer = setTimeout(() => deadline.abort(), TYPESCRIPT_QUERY_TIMEOUT_MS);
+  let deadlineTriggered = false;
+  const timer = setTimeout(() => {
+    deadlineTriggered = true;
+    deadline.abort();
+  }, TYPESCRIPT_QUERY_TIMEOUT_MS);
+  let handedOff = false;
   try {
-    return await runOwnedJsonRpc({
+    const executable = executablePath();
+    const session = await openOwnedJsonRpc({
       executable,
       args: ["--lsp", "--stdio"],
       cwd,
       signal,
       env: { ...process.env, PATH: dirname(executable), GOMEMLIMIT: "256MiB" }
-    }, async (channel) => {
-      const initialized = await channel.request("initialize", {
-        processId: process.pid,
-        rootUri: await semanticUri(cwd, "."),
-        capabilities: {
-          workspace: {
-            configuration: true,
-            didChangeWatchedFiles: { dynamicRegistration: true }
-          },
-          textDocument: {
-            definition: { linkSupport: true },
-            implementation: { linkSupport: true },
-            callHierarchy: {}
-          },
-          general: { positionEncodings: ["utf-16"] }
-        },
-        initializationOptions: { runExternalCode: false, disablePushDiagnostics: true }
-      });
-      if (!rpcRecord(initialized) || !rpcRecord(initialized.capabilities))
-        throw new SignalGrepError("Language service omitted its capabilities");
-      await channel.notify("initialized", {});
-      await channel.notify("workspace/didChangeConfiguration", {
-        settings: { "js/ts": preferences, typescript: preferences, javascript: preferences }
-      });
-      for (const document2 of documents) {
-        const uri = await semanticUri(sourceCwd, document2.path);
-        await channel.notify("textDocument/didOpen", {
-          textDocument: {
-            uri,
-            languageId: /\.tsx$/i.test(document2.path) ? "typescriptreact" : /\.jsx$/i.test(document2.path) ? "javascriptreact" : /\.[cm]?ts$/i.test(document2.path) ? "typescript" : "javascript",
-            version: 1,
-            text: document2.text
-          }
-        });
-      }
-      const result = await operation(channel, initialized.capabilities);
-      await channel.request("shutdown", undefined);
-      channel.endInput();
-      return result;
     }, serverRequest);
+    let capabilities;
+    try {
+      capabilities = await initializeTypeScriptSession(cwd, sourceCwd, documents, session.channel, signal);
+    } catch (error) {
+      deadline.abort();
+      clearTimeout(timer);
+      session.channel.close();
+      await session.completion.catch(() => {
+        return;
+      });
+      releaseOnce();
+      throw error;
+    }
+    let closePromise;
+    session.completion.finally(() => {
+      clearTimeout(timer);
+      releaseOnce();
+    }).catch(() => {
+      return;
+    });
+    handedOff = true;
+    return {
+      channel: session.channel,
+      capabilities,
+      completion: session.completion,
+      close() {
+        if (!closePromise)
+          closePromise = closeSession();
+        return closePromise;
+      }
+    };
+    async function closeSession() {
+      let shutdownAcknowledged = false;
+      try {
+        await session.channel.request("shutdown", undefined);
+        shutdownAcknowledged = true;
+        session.channel.endInput();
+        const result = await session.completion;
+        if (result.code !== 0 && !(shutdownAcknowledged && result.code === 1))
+          throw new SignalGrepError(`TypeScript language service failed (${String(result.code)}): ${result.stderr}`);
+      } catch (error) {
+        deadline.abort();
+        session.channel.close();
+        await session.completion.catch(() => {
+          return;
+        });
+        throw error;
+      } finally {
+        clearTimeout(timer);
+        releaseOnce();
+      }
+    }
   } catch (error) {
+    if (!handedOff)
+      clearTimeout(timer);
+    releaseOnce();
     if (parent?.aborted)
       throw abortError();
-    if (deadline.signal.aborted)
-      throw new SignalGrepError(`TypeScript semantic query exceeded the ${String(TYPESCRIPT_QUERY_TIMEOUT_MS)} ms deadline`);
+    if (deadlineTriggered)
+      throw new SignalGrepError(`TypeScript semantic view exceeded the ${String(TYPESCRIPT_QUERY_TIMEOUT_MS)} ms deadline`);
     throw error;
-  } finally {
-    clearTimeout(timer);
   }
-}
-function withTypeScript(cwd, documents, operation, parent, sourceCwd = cwd) {
-  return compilerQueue.run(() => runTypeScript(cwd, documents, operation, parent, sourceCwd), parent);
 }
 
 // src/syntax.ts
@@ -2663,13 +2772,21 @@ var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: 
 
 // src/concept-search.ts
 import { dirname as dirname4 } from "path";
+import { join as join5 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
+import { StringDecoder } from "string_decoder";
+import { mkdir as mkdir2 } from "fs/promises";
+import { rm as rm2 } from "fs/promises";
+import { randomUUID } from "crypto";
 
 // src/concept-model.ts
+import { homedir as homedir2 } from "os";
+import { join as join3, resolve as resolve8 } from "path";
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
 var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
+var CONCEPT_CACHE_VERSION = 1;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MIN_CONCEPT_TIMEOUT_MS = 1000;
@@ -2677,6 +2794,9 @@ var MAX_CONCEPT_TIMEOUT_MS = 60 * 60000;
 var CONCEPT_TIMEOUT_ENV = "BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS";
 var MAX_CONCEPT_WORKER_INPUT_BYTES = 64 * 1024 * 1024;
 var MAX_CONCEPT_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024;
+function conceptCacheDirectory() {
+  return resolve8(process.env.SIGNAL_GREP_MODEL_DIR ?? join3(homedir2(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+}
 function resolveConceptTimeoutMs(environment = process.env) {
   const raw = environment[CONCEPT_TIMEOUT_ENV];
   if (raw === undefined || raw === "")
@@ -2762,29 +2882,32 @@ function normalizeRequest(input) {
   };
 }
 
+// src/concept-source-generation.ts
+import { createHash as createHash3 } from "crypto";
+
 // src/source-access.ts
-import { extname as extname2, resolve as resolve12 } from "path";
+import { extname as extname2, resolve as resolve13 } from "path";
 
 // src/historical-paths.ts
 import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "fs/promises";
 import { constants as constants2 } from "fs";
 import { tmpdir } from "os";
-import { dirname as dirname3, join as join3, parse, relative as relative4, resolve as resolve9 } from "path";
+import { dirname as dirname3, join as join4, parse, relative as relative4, resolve as resolve10 } from "path";
 
 // src/workspace-files.ts
-import { relative as relative3, resolve as resolve8, sep as sep2 } from "path";
+import { relative as relative3, resolve as resolve9, sep as sep2 } from "path";
 class EnumerationLimit extends Error {
 }
 function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
-  const absolute = resolve8(cwd, path);
+  const absolute = resolve9(cwd, path);
   policy.assertPath(absolute);
-  const local = relative3(resolve8(cwd), absolute);
+  const local = relative3(resolve9(cwd), absolute);
   if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
     throw new SignalGrepError("Git internals are excluded from source candidates");
   return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
 }
 async function listWorkspaceFiles(cwd, signal, options = {}) {
-  const absolutePath = resolve8(cwd, options.path ?? ".");
+  const absolutePath = resolve9(cwd, options.path ?? ".");
   const policy = new SearchPathPolicy(cwd);
   const searchPath = await policy.resolveSearchTarget(absolutePath);
   const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
@@ -2792,6 +2915,7 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
     throw new SignalGrepError("Candidate file limit must be a positive integer");
   const paths = new Set;
   const reasons = new Set;
+  let coverageIssue;
   let bytes = 0;
   try {
     const result = await runOwnedProcess({
@@ -2826,9 +2950,10 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
         while (delimiter >= 0) {
           const raw = pending.subarray(0, delimiter);
           const decoded = raw.toString("utf8");
-          if (!Buffer.from(decoded).equals(raw))
+          if (!Buffer.from(decoded).equals(raw)) {
             reasons.add("Some candidate paths are not valid UTF-8");
-          else {
+            coverageIssue ??= "invalid-path";
+          } else {
             const local = workspaceRelativePath(cwd, decoded, policy);
             if (!paths.has(local) && paths.size >= maxFiles)
               throw new EnumerationLimit(`Candidate enumeration reached the ${String(maxFiles)} file limit`);
@@ -2844,16 +2969,24 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
     const diagnostics = classifyRipgrepDiagnostics(result.stderr);
     if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
       throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
-    if (diagnostics.unreadable.length > 0)
+    if (diagnostics.unreadable.length > 0) {
       reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
+      coverageIssue = "unreadable";
+    }
     if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
       throw new SignalGrepError(result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`);
   } catch (error) {
     if (!(error instanceof EnumerationLimit))
       throw error;
     reasons.add(error.message);
+    coverageIssue = "enumeration-limit";
   }
-  return { paths: [...paths].toSorted(), partial: reasons.size > 0, reasons: [...reasons] };
+  return {
+    paths: [...paths].toSorted(),
+    partial: reasons.size > 0,
+    reasons: [...reasons],
+    ...coverageIssue ? { coverageIssue } : {}
+  };
 }
 
 // src/historical-paths.ts
@@ -2870,7 +3003,7 @@ function partitionPaths(paths) {
 }
 function relevantDirectories(cwd, paths) {
   const directories = new Set;
-  for (const path of [cwd, ...paths.map((sourcePath) => dirname3(resolve9(cwd, sourcePath)))]) {
+  for (const path of [cwd, ...paths.map((sourcePath) => dirname3(resolve10(cwd, sourcePath)))]) {
     let current = path;
     for (;; ) {
       directories.add(current);
@@ -2883,7 +3016,7 @@ function relevantDirectories(cwd, paths) {
   return [...directories];
 }
 async function filterHistoricalPaths(cwd, paths, request, signal) {
-  if (!isPathInsideCwd(resolve9(cwd, request.path ?? "."), cwd)) {
+  if (!isPathInsideCwd(resolve10(cwd, request.path ?? "."), cwd)) {
     throw new SignalGrepError("Historical path filtering requires a path inside cwd");
   }
   const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
@@ -2894,8 +3027,8 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
   const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
   if (bounded.length === 0)
     return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
-  const root = await mkdtemp(join3(tmpdir(), "baoer_signal_grep-paths-"));
-  const absoluteCwd = resolve9(cwd);
+  const root = await mkdtemp(join4(tmpdir(), "baoer_signal_grep-paths-"));
+  const absoluteCwd = resolve10(cwd);
   const volumeRoot = parse(absoluteCwd).root;
   const ignoreFiles = [];
   let ignoreBytesRead = 0;
@@ -2906,7 +3039,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       for (const name2 of [".ignore", ".rgignore"]) {
         if (signal?.aborted)
           throw abortError();
-        const path = join3(directory, name2);
+        const path = join4(directory, name2);
         let discovered = false;
         try {
           const before = await lstat(path);
@@ -2952,17 +3085,17 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
     }
     const visible = new Set;
     for (const [index, group] of partitionPaths(bounded).entries()) {
-      const tree = join3(root, String(index));
-      const target = join3(tree, relative4(volumeRoot, absoluteCwd));
+      const tree = join4(root, String(index));
+      const target = join4(tree, relative4(volumeRoot, absoluteCwd));
       await mkdir(target, { recursive: true });
       for (const path of group) {
         const safe = workspaceRelativePath(absoluteCwd, path);
-        const placeholder = resolve9(target, safe);
+        const placeholder = resolve10(target, safe);
         await mkdir(dirname3(placeholder), { recursive: true });
         await writeFile(placeholder, "");
       }
       for (const ignore of ignoreFiles) {
-        const destination = join3(tree, ignore.local);
+        const destination = join4(tree, ignore.local);
         await mkdir(dirname3(destination), { recursive: true });
         await writeFile(destination, ignore.bytes);
       }
@@ -3155,7 +3288,7 @@ async function sourceSimilarity(oldContent, newContent, budget) {
 import { createHash } from "crypto";
 import { constants as constants3 } from "fs";
 import { lstat as lstat2, open as open2 } from "fs/promises";
-import { isAbsolute as isAbsolute5, relative as relative5, resolve as resolve10, sep as sep3 } from "path";
+import { isAbsolute as isAbsolute5, relative as relative5, resolve as resolve11, sep as sep3 } from "path";
 
 // src/git-process.ts
 var GIT_READ_ARGUMENTS = [
@@ -3299,8 +3432,8 @@ function splitGitRecords(output) {
 // src/git-repository.ts
 async function verifyWorktreeRevision(cwd, path, expected) {
   try {
-    const current = await lstat2(resolve10(cwd, path));
-    await assertExistingPathInsideCwd(resolve10(cwd, path), cwd);
+    const current = await lstat2(resolve11(cwd, path));
+    await assertExistingPathInsideCwd(resolve11(cwd, path), cwd);
     if (current.isFile() && sameSourceRevision(sourceRevisionFromStats(current), expected))
       return;
   } catch (error) {
@@ -3312,8 +3445,8 @@ async function verifyWorktreeRevision(cwd, path, expected) {
 function gitPath(cwd, path) {
   if (path.length === 0 || path.includes("\x00"))
     throw new SignalGrepError("Git source path is invalid");
-  const absolute = resolve10(cwd, path);
-  const local = relative5(resolve10(cwd), absolute).split(sep3).join("/");
+  const absolute = resolve11(cwd, path);
+  const local = relative5(resolve11(cwd), absolute).split(sep3).join("/");
   if (!isPathInsideCwd(absolute, cwd) || local.split("/").some((part) => part.toLowerCase() === ".git")) {
     throw new SignalGrepError("Git source path must stay within the working directory and outside .git");
   }
@@ -3337,7 +3470,7 @@ async function resolveGitRepository(cwd, signal) {
   const root = decodeGitPath(output).replace(/\r?\n$/, "");
   if (!isAbsolute5(root))
     throw new SignalGrepError("Git returned an invalid repository root");
-  return resolve10(root);
+  return resolve11(root);
 }
 async function findGitRepository(cwd, signal) {
   try {
@@ -3435,7 +3568,7 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
   };
 }
 async function readWorktreeSource(cwd, path, budget, signal) {
-  const absolute = resolve10(cwd, path);
+  const absolute = resolve11(cwd, path);
   if (signal?.aborted)
     throw abortError();
   let discovered = false;
@@ -3740,7 +3873,7 @@ async function readGitSource(cwd, identity, signal, options = {}) {
 import { isUtf8 } from "buffer";
 import { createHash as createHash2 } from "crypto";
 import { open as open3, realpath as realpath4 } from "fs/promises";
-import { relative as relative6, resolve as resolve11 } from "path";
+import { relative as relative6, resolve as resolve12 } from "path";
 class SourceDocumentError extends SignalGrepError {
   reason;
   constructor(reason, message) {
@@ -3886,7 +4019,7 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
   if (expected?.kind === "git") {
     throw new SignalGrepError("A Git source reference cannot be read from the worktree");
   }
-  const absolute = resolve11(cwd, path);
+  const absolute = resolve12(cwd, path);
   const [canonical, canonicalCwd] = await Promise.all([
     new SearchPathPolicy(cwd).resolveExistingPath(absolute),
     realpath4(cwd)
@@ -4021,7 +4154,9 @@ class SourceAccess {
   #maxFiles;
   #documents = new Map;
   #syntax = new Map;
+  #maxVerificationBytes;
   #bytes = 0;
+  #verificationBytes = 0;
   #syntaxParses = 0;
   #syntaxCacheHits = 0;
   #readTail = Promise.resolve();
@@ -4030,6 +4165,7 @@ class SourceAccess {
     this.#queue = queue;
     this.signal = signal;
     this.#maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
+    this.#maxVerificationBytes = options.maxVerificationBytes ?? MAX_STRUCTURE_BYTES;
   }
   get filesRead() {
     return this.#documents.size;
@@ -4047,26 +4183,29 @@ class SourceAccess {
     return this.#syntaxCacheHits;
   }
   withSignal(signal) {
-    return new SourceAccess(this.cwd, this.#queue, signal, { maxFiles: this.#maxFiles });
+    return new SourceAccess(this.cwd, this.#queue, signal, {
+      maxFiles: this.#maxFiles,
+      maxVerificationBytes: this.#maxVerificationBytes
+    });
   }
   async load(path, expected) {
     if (this.signal?.aborted)
       throw abortError();
-    if (expected && resolve12(this.cwd, expected.path) !== resolve12(this.cwd, path)) {
+    if (expected && resolve13(this.cwd, expected.path) !== resolve13(this.cwd, path)) {
       throw new SignalGrepError("Source reference path does not match the requested file");
     }
-    const key = JSON.stringify([resolve12(this.cwd, path), expected?.origin]);
+    const key = JSON.stringify([resolve13(this.cwd, path), expected?.origin]);
     const existing = this.#documents.get(key);
     if (existing)
       return existing;
     if (this.#documents.size >= this.#maxFiles) {
       throw new SourceBudgetError(`Structural scan reached the ${String(this.#maxFiles)}-file limit`);
     }
-    const pending = this.#read(path, expected);
+    const pending = this.#read(path, expected, false);
     this.#documents.set(key, pending);
     return pending;
   }
-  async#read(path, expected) {
+  async#read(path, expected, verification) {
     const predecessor = this.#readTail;
     let release = noop;
     this.#readTail = new Promise((done) => {
@@ -4074,18 +4213,20 @@ class SourceAccess {
     });
     try {
       await predecessor;
-      return await this.#readOnce(path, expected);
+      return await this.#readOnce(path, expected, verification);
     } finally {
       release();
     }
   }
-  async#readOnce(path, expected) {
+  async#readOnce(path, expected, verification) {
     let document2;
-    const remaining = MAX_STRUCTURE_BYTES - this.#bytes;
+    const consumed = verification ? this.#verificationBytes : this.#bytes - this.#verificationBytes;
+    const budget = verification ? this.#maxVerificationBytes : MAX_STRUCTURE_BYTES;
+    const remaining = budget - consumed;
     if (remaining <= 0)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     if (expected?.origin.kind !== "git") {
-      const metadata2 = await getSourceRevision(resolve12(this.cwd, path));
+      const metadata2 = await getSourceRevision(resolve13(this.cwd, path));
       if (metadata2 && metadata2.size > remaining)
         throw new SourceBudgetError("Next source exceeds the remaining 32 MiB structural read budget");
     }
@@ -4100,7 +4241,9 @@ class SourceAccess {
       document2 = await readWorkspaceDocument(path, this.cwd, this.signal, expected?.origin, remaining);
     }
     this.#bytes += document2.bytes.length;
-    if (this.#bytes > MAX_STRUCTURE_BYTES)
+    if (verification)
+      this.#verificationBytes += document2.bytes.length;
+    else if (this.#bytes - this.#verificationBytes > MAX_STRUCTURE_BYTES)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     return document2;
   }
@@ -4125,8 +4268,147 @@ class SourceAccess {
     this.#syntax.delete(document2);
   }
   refresh(path, expected) {
-    return this.#read(path, expected);
+    return this.#read(path, expected, true);
   }
+}
+
+// src/concept-source-generation.ts
+class ConceptSourceChangedError extends SignalGrepError {
+  constructor(message = "Concept source changed while evidence was being computed") {
+    super(message);
+    this.name = "ConceptSourceChangedError";
+  }
+}
+function isSourceMissing(error) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+function options(filters) {
+  return {
+    ...filters.path ? { path: filters.path } : {},
+    glob: filters.glob,
+    exclude: filters.exclude,
+    hidden: filters.hidden
+  };
+}
+async function createConceptSourceGeneration(access, filters) {
+  const files = await listWorkspaceFiles(access.cwd, access.signal, options(filters));
+  const startedAt = Date.now();
+  const inventory = [];
+  const documents = [];
+  const reasons = [...files.reasons];
+  let filesSkippedEmpty = 0;
+  let filesUnavailable = 0;
+  let budgetError;
+  for (const path of files.paths) {
+    if (budgetError) {
+      inventory.push({ path, status: "unavailable", reason: budgetError.message });
+      filesUnavailable += 1;
+      continue;
+    }
+    try {
+      const document2 = await access.load(path);
+      if (!document2.utf8)
+        throw new SourceDocumentError("encoding", "Not lossless UTF-8");
+      if (!document2.text.trim()) {
+        inventory.push({
+          path,
+          status: "empty",
+          reference: document2.reference,
+          ...document2.reference.origin.kind === "worktree" ? { contentHash: document2.reference.origin.contentHash } : {}
+        });
+        filesSkippedEmpty += 1;
+        continue;
+      }
+      inventory.push({
+        path,
+        status: "admitted",
+        reference: document2.reference,
+        ...document2.reference.origin.kind === "worktree" ? { contentHash: document2.reference.origin.contentHash } : {}
+      });
+      documents.push(document2);
+    } catch (error) {
+      if (isSourceMissing(error))
+        throw new ConceptSourceChangedError(`${path}: source disappeared while reading`);
+      if (error instanceof SourceBudgetError) {
+        budgetError = error;
+        reasons.push(error.message);
+        inventory.push({ path, status: "unavailable", reason: error.message });
+        filesUnavailable += 1;
+        continue;
+      }
+      if (!(error instanceof SourceDocumentError))
+        throw error;
+      if (error.reason === "source-changed")
+        throw new ConceptSourceChangedError(`${path}: ${error.message}`);
+      inventory.push({ path, status: "unavailable", reason: error.message });
+      filesUnavailable += 1;
+      reasons.push(`${path}: ${error.message}`);
+    }
+  }
+  const inventoryHash = createHash3("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32);
+  return {
+    cwd: access.cwd,
+    filters: {
+      ...filters.path ? { path: filters.path } : {},
+      glob: [...filters.glob],
+      exclude: [...filters.exclude],
+      hidden: filters.hidden
+    },
+    files,
+    inventory,
+    documents,
+    partial: files.partial || filesUnavailable > 0,
+    reasons,
+    filesSkippedEmpty,
+    filesUnavailable,
+    startedAt,
+    inventoryHash
+  };
+}
+function conceptSourceSummary(generation) {
+  return {
+    inventoryHash: generation.inventoryHash,
+    verification: generation.verifiedAt === undefined ? "unverified" : "verified-during-interval",
+    startedAt: generation.startedAt,
+    ...generation.verifiedAt === undefined ? {} : { verifiedAt: generation.verifiedAt },
+    filesEnumerated: generation.files.paths.length,
+    filesAdmitted: generation.documents.length,
+    filesSkippedEmpty: generation.filesSkippedEmpty,
+    filesUnavailable: generation.filesUnavailable
+  };
+}
+function samePathSet(left, right) {
+  if (left.length !== right.length)
+    return false;
+  return left.every((path, index) => path === right[index]);
+}
+async function verifyConceptSourceGeneration(generation, access) {
+  const current = await listWorkspaceFiles(access.cwd, access.signal, options(generation.filters));
+  if (current.coverageIssue !== undefined && current.coverageIssue !== generation.files.coverageIssue) {
+    throw new SignalGrepError(current.reasons.join("; "));
+  }
+  if (current.partial !== generation.files.partial || !samePathSet(current.paths, generation.files.paths)) {
+    throw new ConceptSourceChangedError("Concept source inventory changed while evidence was being computed");
+  }
+  for (const entry of generation.inventory) {
+    if (!entry.reference)
+      continue;
+    try {
+      const document2 = await access.refresh(entry.path, entry.reference);
+      const hash = document2.reference.origin.kind === "worktree" ? document2.reference.origin.contentHash : undefined;
+      if (entry.contentHash !== hash)
+        throw new ConceptSourceChangedError(`${entry.path}: source content changed`);
+    } catch (error) {
+      if (error instanceof ConceptSourceChangedError)
+        throw error;
+      if (isSourceMissing(error))
+        throw new ConceptSourceChangedError(`${entry.path}: source disappeared during verification`);
+      if (error instanceof SourceDocumentError)
+        throw new ConceptSourceChangedError(`${entry.path}: ${error.message}`);
+      throw error;
+    }
+  }
+  generation.verifiedAt = Date.now();
 }
 
 // src/concept-search.ts
@@ -4140,6 +4422,15 @@ function conciseWorkerError(stderr) {
   if (diagnostic)
     return diagnostic.slice(0, 512);
   return "worker returned no concise diagnostic";
+}
+
+class ConceptWorkerExitError extends SignalGrepError {
+  exitCode;
+  constructor(exitCode, diagnostic) {
+    super(`Local concept worker exited unexpectedly (${String(exitCode)}): ${diagnostic}`);
+    this.name = "ConceptWorkerExitError";
+    this.exitCode = exitCode;
+  }
 }
 function scoreProfile(scores) {
   const ordered = scores.toSorted((a, b) => b - a);
@@ -4189,13 +4480,18 @@ function passage(document2, start2) {
     next
   };
 }
-async function similarities(query, passages, parent) {
+async function similarities(query, passages, parent, onProgress) {
   const worker = fileURLToPath3(new URL("./concept-worker.mjs", import.meta.url));
   const config = fileURLToPath3(new URL("./syntax-worker.toml", import.meta.url));
   const env = { ...process.env };
   delete env.NODE_OPTIONS;
-  const buffers = [];
+  const stagingRoot = join5(conceptCacheDirectory(), ".staging", randomUUID());
+  await mkdir2(stagingRoot, { recursive: true });
   let bytes = 0;
+  let lineBuffer = "";
+  let finalValue;
+  let sawFinal = false;
+  const decoder = new StringDecoder("utf8");
   try {
     const processResult = await runOwnedProcess({
       executable: process.execPath,
@@ -4208,7 +4504,7 @@ async function similarities(query, passages, parent) {
         "--infer"
       ] : [worker, "--infer"],
       cwd: dirname4(worker),
-      env,
+      env: { ...env, SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
       ...parent ? { signal: parent } : {},
       input: Buffer.from(JSON.stringify({
         query,
@@ -4219,12 +4515,58 @@ async function similarities(query, passages, parent) {
         bytes += chunk.byteLength;
         if (bytes > MAX_CONCEPT_WORKER_OUTPUT_BYTES)
           throw new SignalGrepError("Concept worker exceeded its 4 MiB response budget");
-        buffers.push(Buffer.from(chunk));
+        lineBuffer += decoder.write(Buffer.from(chunk));
+        let newline = lineBuffer.indexOf(`
+`);
+        while (newline >= 0) {
+          const line = lineBuffer.slice(0, newline).trim();
+          lineBuffer = lineBuffer.slice(newline + 1);
+          newline = lineBuffer.indexOf(`
+`);
+          if (!line)
+            continue;
+          const parsed = JSON.parse(line);
+          if (!rpcRecord(parsed) || typeof parsed.type !== "string")
+            throw new SignalGrepError("Invalid concept worker progress response");
+          if (parsed.type === "progress") {
+            if (sawFinal)
+              throw new SignalGrepError("Concept worker emitted progress after its result");
+            if (typeof parsed.phase !== "string" || parsed.completed !== undefined && (typeof parsed.completed !== "number" || !Number.isSafeInteger(parsed.completed) || parsed.completed < 0) || parsed.total !== undefined && (typeof parsed.total !== "number" || !Number.isSafeInteger(parsed.total) || parsed.total < 0))
+              throw new SignalGrepError("Invalid concept worker progress response");
+            const progress = { phase: parsed.phase };
+            if (typeof parsed.completed === "number")
+              progress.completed = parsed.completed;
+            if (typeof parsed.total === "number")
+              progress.total = parsed.total;
+            if (typeof parsed.uniqueEmbeddings === "number" && typeof parsed.passages === "number")
+              progress.detail = `unique embeddings ${String(parsed.uniqueEmbeddings)}, passages ${String(parsed.passages)}`;
+            onProgress?.(progress);
+          } else if (parsed.type === "result") {
+            if (sawFinal)
+              throw new SignalGrepError("Concept worker emitted more than one result");
+            sawFinal = true;
+            finalValue = parsed;
+          } else {
+            throw new SignalGrepError("Invalid concept worker response type");
+          }
+        }
       }
     });
+    if (processResult.code === null)
+      throw new ConceptWorkerExitError(processResult.code, conciseWorkerError(processResult.stderr));
     if (processResult.code !== 0)
       throw new ConceptUnavailableError(`Local concept inference failed (${String(processResult.code)}): ${conciseWorkerError(processResult.stderr)}`);
-    const value = JSON.parse(Buffer.concat(buffers).toString("utf8"));
+    lineBuffer += decoder.end();
+    if (lineBuffer.trim()) {
+      const parsed = JSON.parse(lineBuffer.trim());
+      if (!rpcRecord(parsed) || parsed.type !== "result")
+        throw new SignalGrepError("Concept worker did not return a result record");
+      if (sawFinal)
+        throw new SignalGrepError("Concept worker emitted more than one result");
+      finalValue = parsed;
+      sawFinal = true;
+    }
+    const value = finalValue;
     if (!rpcRecord(value) || !Array.isArray(value.scores) || value.scores.length !== passages.length || value.scores.some((score) => typeof score !== "number" || !Number.isFinite(score)) || typeof value.cacheHits !== "number" || !Number.isSafeInteger(value.cacheHits) || value.cacheHits < 0 || typeof value.cacheMisses !== "number" || !Number.isSafeInteger(value.cacheMisses) || value.cacheMisses < 0 || typeof value.cacheMaxBytes !== "number" || !Number.isSafeInteger(value.cacheMaxBytes) || value.cacheMaxBytes <= 0 || value.cacheBytes !== undefined && (typeof value.cacheBytes !== "number" || !Number.isSafeInteger(value.cacheBytes) || value.cacheBytes < 0) || typeof value.windowsRanked !== "number" || !Number.isSafeInteger(value.windowsRanked) || value.windowsRanked < passages.length || !Array.isArray(value.warnings) || value.warnings.some((warning) => typeof warning !== "string") || typeof value.peakRssBytes !== "number" || !Number.isFinite(value.peakRssBytes) || value.peakRssBytes < 0)
       throw new SignalGrepError("Invalid concept inference response");
     return {
@@ -4240,12 +4582,22 @@ async function similarities(query, passages, parent) {
   } catch (error) {
     if (parent?.aborted)
       throw abortError();
+    if (error instanceof ConceptWorkerExitError)
+      throw error;
     if (error instanceof ConceptUnavailableError)
       throw error;
     const message = error instanceof Error ? error.message : "unknown provider failure";
     throw new ConceptUnavailableError(`Local concept inference failed: ${message}`, {
       cause: error
     });
+  } finally {
+    try {
+      await rm2(stagingRoot, { recursive: true, force: true });
+    } catch (error) {
+      throw new ConceptUnavailableError("Unable to clean up concept worker staging files", {
+        cause: error
+      });
+    }
   }
 }
 function validateConceptQuery(query) {
@@ -4253,51 +4605,34 @@ function validateConceptQuery(query) {
     throw new SignalGrepError("Concept query requires nonempty, single-line well-formed text of at most 256 characters");
   return query;
 }
-async function runConceptSearch(input, access, infer) {
+async function runConceptSearch(input, access, infer, onProgress) {
   const query = validateConceptQuery(input.query);
   const started = performance.now();
   const request = normalizeRequest({ ...input, pattern: "" });
-  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+  const sourceGeneration = await createConceptSourceGeneration(access, {
     ...request.path ? { path: request.path } : {},
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden
   });
+  onProgress?.({
+    phase: "source-generation",
+    completed: sourceGeneration.files.paths.length,
+    total: sourceGeneration.files.paths.length,
+    detail: `generation ${sourceGeneration.inventoryHash}; admitted ${String(sourceGeneration.documents.length)}, unavailable ${String(sourceGeneration.filesUnavailable)}`
+  });
+  const files = sourceGeneration.files;
   const result = {
     kind: "concept",
     unit: "evidence-items",
     items: [],
-    partial: files.partial,
-    reasons: [...files.reasons],
+    partial: sourceGeneration.partial,
+    reasons: [...sourceGeneration.reasons],
     redact: input.redact ?? false
   };
   const documents = [];
-  let filesSkippedEmpty = 0;
-  let filesUnavailable = 0;
-  for (const path of files.paths) {
-    try {
-      const document2 = await access.load(path);
-      if (!document2.utf8)
-        throw new SourceDocumentError("encoding", "Not lossless UTF-8");
-      if (!document2.text.trim()) {
-        filesSkippedEmpty += 1;
-        continue;
-      }
-      documents.push({ document: document2, next: 0 });
-    } catch (error) {
-      if (error instanceof SourceBudgetError) {
-        result.partial = true;
-        result.reasons.push(error.message);
-        filesUnavailable += 1;
-        break;
-      }
-      if (!(error instanceof SourceDocumentError))
-        throw error;
-      result.partial = true;
-      filesUnavailable += 1;
-      result.reasons.push(`${path}: ${error.message}`);
-    }
-  }
+  for (const document2 of sourceGeneration.documents)
+    documents.push({ document: document2, next: 0 });
   const passages = [];
   while (documents.some((item) => item.next < item.document.text.length)) {
     for (const item of documents) {
@@ -4308,9 +4643,10 @@ async function runConceptSearch(input, access, infer) {
       item.next = chunk.next;
     }
   }
+  onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
   const filesAdmitted = documents.length;
-  const filesProcessed = filesAdmitted + filesSkippedEmpty + filesUnavailable;
-  const filesNotProcessed = Math.max(0, files.paths.length - filesProcessed);
+  const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
+  const filesUnavailable = sourceGeneration.filesUnavailable;
   if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
     result.reasons.push(`Concept enumerated ${String(files.paths.length)} files; narrow path or glob for faster interactive retrieval`);
   }
@@ -4318,11 +4654,11 @@ async function runConceptSearch(input, access, infer) {
     filesEnumerated: files.paths.length,
     filesAdmitted,
     filesSkippedEmpty,
-    filesUnavailable: filesUnavailable + filesNotProcessed,
+    filesUnavailable,
     passagesQueued: passages.length
   };
   if (passages.length) {
-    const inferred = await infer(query, passages, access.signal);
+    const inferred = await infer(query, passages, access.signal, onProgress);
     result.reasons.push(...inferred.warnings);
     result.items = passages.map((item, index) => {
       const similarity = inferred.scores[index];
@@ -4382,29 +4718,19 @@ async function runConceptSearch(input, access, infer) {
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide"
   };
-  return result;
+  await verifyConceptSourceGeneration(sourceGeneration, access);
+  result.sourceGeneration = conceptSourceSummary(sourceGeneration);
+  return { analysis: result, sourceGeneration };
 }
-function conceptSearch(input, access) {
-  return runConceptSearchWithDeadline(input, access, similarities);
+function conceptSearch(input, access, onProgress) {
+  return runConceptSearchQueued(input, access, similarities, onProgress);
 }
-async function runConceptSearchWithDeadline(input, access, infer, timeout = resolveConceptTimeoutMs) {
-  const timeoutMs = timeout();
-  const controller = new AbortController;
-  const signal = access.signal ? AbortSignal.any([access.signal, controller.signal]) : controller.signal;
-  const scopedAccess = access.withSignal(signal);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await inferenceQueue.run(() => runConceptSearch(input, scopedAccess, infer), scopedAccess.signal);
-  } catch (error) {
+async function runConceptSearchQueued(input, access, infer, onProgress) {
+  return inferenceQueue.run(() => runConceptSearch(input, access, infer, onProgress), access.signal).catch((error) => {
     if (access.signal?.aborted)
       throw abortError();
-    if (controller.signal.aborted) {
-      throw new ConceptUnavailableError(`Concept request exceeded the ${String(timeoutMs)} ms deadline`, { cause: error });
-    }
     throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 // src/structural-search.ts
@@ -4544,14 +4870,15 @@ function rankEvidence(items, priority) {
 }
 
 // src/semantic-navigation.ts
-import { resolve as resolve15 } from "path";
+import { resolve as resolve16 } from "path";
 
 // src/semantic-project.ts
-import { resolve as resolve14 } from "path";
+import { resolve as resolve15 } from "path";
+import { stat as stat3 } from "fs/promises";
 
 // src/project-root.ts
 import { readdir, realpath as realpath5 } from "fs/promises";
-import { dirname as dirname5, relative as relative7, resolve as resolve13 } from "path";
+import { dirname as dirname5, relative as relative7, resolve as resolve14 } from "path";
 var TYPESCRIPT_CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/i;
 function isMissingPath(error) {
   return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
@@ -4574,18 +4901,18 @@ async function projectConfig(directory, signal) {
   }
 }
 async function gitRootWithinCwd(cwd, gitRoot) {
-  const absoluteCwd = resolve13(cwd);
+  const absoluteCwd = resolve14(cwd);
   const [canonicalCwd, canonicalRoot] = await Promise.all([
     realpath5(absoluteCwd),
     realpath5(gitRoot)
   ]);
   if (!isPathInsideCwd(canonicalRoot, canonicalCwd))
     return;
-  return resolve13(absoluteCwd, relative7(canonicalCwd, canonicalRoot));
+  return resolve14(absoluteCwd, relative7(canonicalCwd, canonicalRoot));
 }
 async function resolveSemanticProjectRoot(cwd, targetPath, signal) {
-  const absoluteCwd = resolve13(cwd);
-  const absoluteTarget = resolve13(absoluteCwd, targetPath);
+  const absoluteCwd = resolve14(cwd);
+  const absoluteTarget = resolve14(absoluteCwd, targetPath);
   if (!isPathInsideCwd(absoluteTarget, absoluteCwd))
     return absoluteCwd;
   const targetDirectory = dirname5(absoluteTarget);
@@ -4621,19 +4948,43 @@ function semanticWorkspacePaths(files) {
     return language !== undefined && language !== "go" || semanticMetadataPath.test(path);
   }).toSorted((left, right) => left.localeCompare(right));
 }
-async function semanticProject(access, targetPath) {
-  const root = await resolveSemanticProjectRoot(access.cwd, targetPath, access.signal);
-  const files = await listWorkspaceFiles(access.cwd, access.signal, { path: root });
+async function semanticProject(access, targetPath, allowDirectoryTarget = false, filters = {}) {
+  let requestedTarget = targetPath;
+  if (allowDirectoryTarget) {
+    try {
+      if ((await stat3(resolve15(access.cwd, targetPath))).isDirectory())
+        requestedTarget = resolve15(targetPath, "__relationship_target__.ts");
+    } catch {}
+  }
+  const root = await resolveSemanticProjectRoot(access.cwd, requestedTarget, access.signal);
+  const workspaceFilters = {
+    ...filters.glob === undefined ? {} : { glob: [...filters.glob] },
+    ...filters.exclude === undefined ? {} : { exclude: [...filters.exclude] },
+    ...filters.hidden === undefined ? {} : { hidden: filters.hidden }
+  };
+  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+    path: root,
+    ...workspaceFilters
+  });
   const trackedPaths = semanticWorkspacePaths(files);
   const paths = files.paths.filter((path) => {
     const language = syntaxLanguage(path);
     return language && language !== "go";
   });
   const metadataPaths = files.paths.filter((path) => semanticMetadataPath.test(path));
-  const target = resolve14(access.cwd, targetPath);
-  if (!paths.some((path) => resolve14(access.cwd, path) === target))
+  let target = resolve15(access.cwd, targetPath);
+  if (allowDirectoryTarget) {
+    try {
+      if ((await stat3(target)).isDirectory()) {
+        const first = paths.find((path) => resolve15(access.cwd, path).startsWith(`${target}/`));
+        if (first)
+          target = resolve15(access.cwd, first);
+      }
+    } catch {}
+  }
+  if (!paths.some((path) => resolve15(access.cwd, path) === target))
     throw new SignalGrepError("Semantic target must be an admitted JS/TS workspace file under current ignore rules");
-  paths.sort((a, b) => Number(resolve14(access.cwd, b) === target) - Number(resolve14(access.cwd, a) === target) || a.localeCompare(b));
+  paths.sort((a, b) => Number(resolve15(access.cwd, b) === target) - Number(resolve15(access.cwd, a) === target) || a.localeCompare(b));
   const documents = new Map;
   const reasons = [...files.reasons];
   const metadata2 = [];
@@ -4643,7 +4994,7 @@ async function semanticProject(access, targetPath) {
       if (!document2.utf8)
         throw new SourceDocumentError("encoding", `Non-UTF-8 semantic source: ${path}`);
       if (paths.includes(path))
-        documents.set(resolve14(access.cwd, path), document2);
+        documents.set(resolve15(access.cwd, path), document2);
       else
         metadata2.push(document2);
     } catch (error) {
@@ -4659,15 +5010,21 @@ async function semanticProject(access, targetPath) {
   const primary = documents.get(target);
   if (!primary)
     throw new SignalGrepError("Semantic target could not be read within the source budget");
+  const recheckInventory = async () => {
+    const after = await listWorkspaceFiles(access.cwd, access.signal, {
+      path: root,
+      ...workspaceFilters
+    });
+    if (JSON.stringify(semanticWorkspacePaths(after)) !== JSON.stringify(trackedPaths))
+      throw new SignalGrepError("Workspace file set changed during semantic query; retry");
+  };
   const recheck = async () => {
     for (const document2 of [...documents.values(), ...metadata2]) {
       if (document2.reference.origin.kind !== "worktree")
         throw new Error("Expected worktree semantic source");
       await access.refresh(document2.path, document2.reference);
     }
-    const after = await listWorkspaceFiles(access.cwd, access.signal, { path: root });
-    if (JSON.stringify(semanticWorkspacePaths(after)) !== JSON.stringify(trackedPaths))
-      throw new SignalGrepError("Workspace file set changed during semantic query; retry");
+    await recheckInventory();
   };
   const result = {
     kind: "references",
@@ -4683,7 +5040,7 @@ async function semanticProject(access, targetPath) {
     },
     stats: { filesEnumerated: paths.length, filesSkipped: paths.length - documents.size }
   };
-  return { documents, primary, result, recheck, root };
+  return { documents, metadata: metadata2, primary, result, recheck, recheckInventory, root, trackedPaths };
 }
 
 // src/semantic-navigation.ts
@@ -4837,7 +5194,7 @@ async function runSemanticNavigation(input, access) {
             await add(target, "dependency");
           } else if (targetDocument === primary) {
             await add({
-              path: resolve15(access.cwd, document2.path),
+              path: resolve16(access.cwd, document2.path),
               range: {
                 start: lspPosition(document2, specifier.start),
                 end: lspPosition(document2, specifier.end)
@@ -4870,10 +5227,10 @@ function navigateSemantics(input, access) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname6, resolve as resolve21 } from "path";
+import { dirname as dirname8, resolve as resolve28 } from "path";
 
 // src/analysis-store.ts
-import { randomUUID } from "crypto";
+import { randomUUID as randomUUID2 } from "crypto";
 
 // src/analysis-term-pages.ts
 var MAX_INLINE_TERM_COUNT_BYTES = 4 * 1024;
@@ -5057,7 +5414,7 @@ class AnalysisStore {
       this.#items.delete(oldest.id);
       this.#rememberExpired(oldest.id);
     }
-    const id = randomUUID();
+    const id = randomUUID2();
     this.#items.set(id, { id, result: bounded, bytes, touched: this.#now() });
     return `${id}.${result.kind === "hybrid" ? "analysis-hybrid" : "analysis"}.0`;
   }
@@ -5215,6 +5572,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...result.chunks !== undefined ? { chunks: result.chunks } : {},
           ...result.coverage ? { coverage: result.coverage } : {},
           ...result.stats ? { stats: result.stats } : {},
+          ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
           ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}
         },
         ...result.scope ? { scope: result.scope } : {},
@@ -5247,7 +5605,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
 }
 
 // src/inspect.ts
-import { resolve as resolve16 } from "path";
+import { resolve as resolve17 } from "path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -5274,7 +5632,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SignalGrepError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve16(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve17(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -5296,7 +5654,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve17 } from "path";
+import { resolve as resolve18 } from "path";
 class CandidateLimit extends SignalGrepError {
 }
 function record(value) {
@@ -5461,7 +5819,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve17(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve18(options.cwd, options.request.path), options.cwd)) {
     throw new SignalGrepError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -7215,10 +7573,10 @@ async function runOwnedParallel(start2, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve19, sep as sep4 } from "path";
+import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve20, sep as sep4 } from "path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve18 } from "path";
+import { resolve as resolve19 } from "path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -7229,7 +7587,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve18(cwd, path));
+      const revision = await getSourceRevision(resolve19(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -7286,8 +7644,8 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve19(cwd, root);
-  const absolutePath = resolve19(cwd, path);
+  const absoluteRoot = resolve20(cwd, root);
+  const absolutePath = resolve20(cwd, path);
   const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
@@ -7348,7 +7706,7 @@ async function discoverFiles(input, cwd, signal) {
 }
 
 // src/source-continuations.ts
-import { randomUUID as randomUUID2 } from "crypto";
+import { randomUUID as randomUUID3 } from "crypto";
 
 // src/source-pages.ts
 function mergeByteRanges(ranges) {
@@ -7452,7 +7810,7 @@ class SourceContinuations {
   create(source, target, gaps, boundary) {
     this.#sweep();
     const item = {
-      id: randomUUID2(),
+      id: randomUUID3(),
       source: structuredClone(source),
       target: mergeByteRanges(target),
       gaps: mergeByteRanges(gaps),
@@ -7545,7 +7903,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve20 } from "path";
+import { resolve as resolve21 } from "path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -7614,7 +7972,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document2.utf8 && structure && document2.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document2.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve20(access.cwd, target.path),
+      absolutePath: resolve21(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document2.reference.origin.revision
@@ -7832,7 +8190,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve20(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve21(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -7922,6 +8280,377 @@ async function continueSource(cursor, access, continuations) {
       sourceBlocks: [{ path: document2.path, source }],
       ...source.nextRequest ? { nextRequest: source.nextRequest } : {}
     }
+  };
+}
+
+// src/evidence-validation.ts
+import { realpath as realpath6, stat as stat4 } from "fs/promises";
+import { resolve as resolve22 } from "path";
+
+// src/evidence-validity.ts
+function aggregateRelationshipValidity(sources) {
+  if (sources.some((source) => source.status === "stale"))
+    return "stale";
+  if (sources.length === 0 || sources.some((source) => source.status === "unknown"))
+    return "unknown";
+  return "current";
+}
+function relationshipCoverage(sources, reasons = [], status = sources.length > 0 ? "complete" : "not-applicable") {
+  return {
+    status,
+    freshness: aggregateRelationshipValidity(sources),
+    sources: [...sources],
+    reasons: [...new Set(reasons)]
+  };
+}
+function relationshipRecheck(sources, affectedNodeKeys = [], affectedEdgeKeys = [], reasons = [], coverage = sources.length > 0 ? "complete" : "not-applicable") {
+  return {
+    validity: aggregateRelationshipValidity(sources),
+    coverage,
+    sources: [...sources],
+    affectedNodeKeys: [...new Set(affectedNodeKeys)],
+    affectedEdgeKeys: [...new Set(affectedEdgeKeys)],
+    reasons: [...new Set(reasons)]
+  };
+}
+
+// src/evidence-validation.ts
+function isAbort(error, signal) {
+  return signal?.aborted === true || error instanceof Error && error.name === "AbortError";
+}
+function systemErrorCode(error) {
+  if (typeof error !== "object" || error === null || !("code" in error))
+    return;
+  const code = error.code;
+  return typeof code === "string" ? code : undefined;
+}
+function policyFailure(error) {
+  return error instanceof SignalGrepError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
+}
+async function confirmWorktreeState(path, cwd, signal) {
+  const absolute = resolve22(cwd, path);
+  const policy = new SearchPathPolicy(cwd);
+  try {
+    policy.assertPath(absolute);
+    const before = await stat4(absolute);
+    const beforeCanonical = await realpath6(absolute);
+    const after = await stat4(absolute);
+    const afterCanonical = await realpath6(absolute);
+    if (!before.isFile() || !after.isFile()) {
+      return { status: "stale", reason: "Source is no longer a regular file" };
+    }
+    if (beforeCanonical !== afterCanonical || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after))) {
+      return { status: "stale", reason: "Source changed while checking its availability" };
+    }
+    return { status: "unknown", reason: "Source could not be read despite a stable path" };
+  } catch (error) {
+    if (isAbort(error, signal))
+      throw error;
+    const code = systemErrorCode(error);
+    if (code === "ENOENT")
+      return { status: "stale", reason: "Source is unavailable" };
+    if (code && ["EACCES", "EPERM", "ELOOP", "ENOTDIR"].includes(code)) {
+      return { status: "unknown", reason: `Source could not be checked (${code})` };
+    }
+    if (policyFailure(error)) {
+      return {
+        status: "unknown",
+        reason: error instanceof Error ? error.message : "Path policy denied source"
+      };
+    }
+    throw error;
+  }
+}
+async function failure(error, expected, path, cwd, signal) {
+  if (error instanceof SourceDocumentError) {
+    if (error.reason === "source-changed") {
+      return { status: "stale", reason: error.message };
+    }
+    if (error.reason === "source-unavailable" && expected?.origin.kind === "worktree") {
+      return confirmWorktreeState(path, cwd, signal);
+    }
+    return { status: "unknown", reason: error.message };
+  }
+  if (error instanceof SourceBudgetError)
+    return { status: "unknown", reason: error.message, budgetReached: true };
+  const code = systemErrorCode(error);
+  if (code === "ENOENT" && expected?.origin.kind === "worktree") {
+    return confirmWorktreeState(path, cwd, signal);
+  }
+  if (code && ["EACCES", "EPERM", "ELOOP", "ENOTDIR"].includes(code)) {
+    return { status: "unknown", reason: `Source could not be checked (${code})` };
+  }
+  if (policyFailure(error)) {
+    return {
+      status: "unknown",
+      reason: error instanceof Error ? error.message : "Path policy denied source"
+    };
+  }
+  throw error;
+}
+function sourceKey(reference) {
+  return JSON.stringify([reference.path, reference.origin]);
+}
+function revisionKey(path, revision) {
+  return JSON.stringify([path, revision]);
+}
+function selectedIndex(index, count, label) {
+  if (index === undefined)
+    return;
+  if (!Number.isSafeInteger(index) || index < 1 || index > count) {
+    throw new CursorError(`matchIndex must select a retained ${label} from 1 through ${String(count)}`, "E_CURSOR_OFFSET_INVALID");
+  }
+  return index;
+}
+function addUniqueTarget(targets, seen, target) {
+  if (seen.has(target.key))
+    return;
+  seen.add(target.key);
+  targets.push(target);
+}
+function analysisTargets(items, matchIndex) {
+  const selected = selectedIndex(matchIndex, items.length, "analysis item");
+  const selectedItems = selected === undefined ? items : [items[selected - 1]];
+  const targets = [];
+  const missing = [];
+  const seen = new Set;
+  for (const item of selectedItems) {
+    const reference = item.source;
+    if (!reference) {
+      const key = JSON.stringify(["missing", item.path]);
+      if (!seen.has(key)) {
+        seen.add(key);
+        missing.push({
+          path: item.path,
+          role: "source",
+          status: "unknown",
+          reason: "Saved analysis item has no source reference"
+        });
+      }
+      continue;
+    }
+    addUniqueTarget(targets, seen, {
+      key: sourceKey(reference),
+      path: reference.path,
+      expected: reference
+    });
+  }
+  return { targets, missing };
+}
+function snapshotTargets(snapshot, matchIndex) {
+  const selected = selectedIndex(matchIndex, snapshot.matches.length, "search match");
+  const selectedPaths = selected === undefined ? [...snapshot.sourceRevisions.keys()] : [snapshot.matches[selected - 1].absolutePath];
+  const targets = [];
+  const missing = [];
+  const seen = new Set;
+  for (const path of selectedPaths) {
+    const revision = snapshot.sourceRevisions.get(path);
+    if (!revision) {
+      const key = JSON.stringify(["missing", path]);
+      if (!seen.has(key)) {
+        seen.add(key);
+        missing.push({
+          path,
+          role: "source",
+          status: "unknown",
+          reason: "Saved search has no source revision"
+        });
+      }
+      continue;
+    }
+    addUniqueTarget(targets, seen, {
+      key: revisionKey(path, revision),
+      path,
+      revision
+    });
+  }
+  return { targets, missing };
+}
+async function validateSnapshotTarget(target, cwd, policy, signal) {
+  if (!target.revision)
+    throw new Error("Snapshot validation target omitted its revision");
+  try {
+    const absolute = resolve22(cwd, target.path);
+    const canonical = await policy.resolveExistingPath(absolute);
+    if (!canonical) {
+      const result = await confirmWorktreeState(target.path, cwd, signal);
+      return { path: target.path, role: "source", ...result };
+    }
+    const before = await stat4(absolute);
+    const beforeCanonical = canonical;
+    const after = await stat4(absolute);
+    const afterCanonical = await realpath6(absolute);
+    if (!before.isFile() || !after.isFile()) {
+      return {
+        path: target.path,
+        role: "source",
+        status: "stale",
+        reason: "Source is no longer a regular file"
+      };
+    }
+    if (beforeCanonical !== afterCanonical || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after))) {
+      return {
+        path: target.path,
+        role: "source",
+        status: "stale",
+        reason: "Source changed while checking its revision"
+      };
+    }
+    const current = sourceRevisionFromStats(after);
+    const unchanged = sameSourceRevision(target.revision, current);
+    return {
+      path: target.path,
+      role: "source",
+      status: unchanged ? "current" : "stale",
+      ...unchanged ? {} : { reason: "Source revision changed" }
+    };
+  } catch (error) {
+    if (isAbort(error, signal))
+      throw error;
+    const code = systemErrorCode(error);
+    if (code === "ENOENT") {
+      const classified = await confirmWorktreeState(target.path, cwd, signal);
+      return { path: target.path, role: "source", ...classified };
+    }
+    const classified = await failure(error, undefined, target.path, cwd, signal);
+    return {
+      path: target.path,
+      role: "source",
+      status: classified.status,
+      reason: classified.reason
+    };
+  }
+}
+async function validateAnalysisTarget(target, access, cwd, signal) {
+  if (!target.expected)
+    throw new Error("Analysis validation target omitted its source reference");
+  try {
+    const current = await access.refresh(target.path, target.expected);
+    return {
+      path: target.path,
+      role: "source",
+      status: "current",
+      ...target.expected ? { expected: target.expected } : {},
+      current: current.reference
+    };
+  } catch (error) {
+    if (isAbort(error, signal))
+      throw error;
+    const classified = await failure(error, target.expected, target.path, cwd, signal);
+    return {
+      path: target.path,
+      role: "source",
+      status: classified.status,
+      ...target.expected ? { expected: target.expected } : {},
+      reason: classified.reason,
+      ...classified.budgetReached ? { budgetReached: true } : {}
+    };
+  }
+}
+function comparisonTarget(sources, hasUnscopedUnknown) {
+  const hasGit = sources.some((source) => source.expected?.origin.kind === "git");
+  const hasWorktree = sources.some((source) => source.expected?.origin.kind === "worktree");
+  if (hasGit && hasWorktree || hasGit && hasUnscopedUnknown)
+    return "mixed";
+  if (hasGit)
+    return "recorded-git";
+  return "current-worktree";
+}
+function evidenceScope(cwd, scope, request) {
+  const path = scope?.path ?? request?.expandedFromPath ?? request?.path ?? ".";
+  const include = scope?.glob ?? request?.glob;
+  const exclude = scope?.exclude ?? request?.exclude;
+  const hidden = scope?.hidden ?? request?.hidden;
+  return {
+    root: resolve22(cwd, path),
+    ...include && include.length > 0 ? { include: [...include] } : {},
+    ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
+    ...hidden === undefined ? {} : { hidden }
+  };
+}
+async function validateSavedEvidence(options) {
+  let scope = { root: resolve22(options.cwd) };
+  const reasons = [];
+  let storedPartial = false;
+  let targets;
+  let sources;
+  const missing = [];
+  const isAnalysis = options.cursor.includes(".analysis.");
+  if (isAnalysis) {
+    const { stored } = options.analyses.resolve(options.cursor);
+    scope = evidenceScope(options.cwd, stored.result.scope, undefined);
+    storedPartial = stored.result.partial;
+    reasons.push(...stored.result.reasons);
+    const selected = analysisTargets(stored.result.items, options.matchIndex);
+    targets = selected.targets;
+    missing.push(...selected.missing);
+    const access = new SourceAccess(options.cwd, options.queue, options.signal, {
+      maxFiles: options.maxFiles ?? MAX_STRUCTURE_FILES
+    });
+    sources = [...missing];
+    let budgetExhausted = false;
+    let admittedTargets = 0;
+    for (const target of targets) {
+      if (options.signal?.aborted)
+        throw abortError();
+      if (budgetExhausted || admittedTargets >= access.maxFiles) {
+        sources.push({
+          path: target.path,
+          role: "source",
+          status: "unknown",
+          ...target.expected ? { expected: target.expected } : {},
+          reason: "Saved evidence validation source budget is exhausted"
+        });
+        continue;
+      }
+      admittedTargets += 1;
+      const status = await validateAnalysisTarget(target, access, options.cwd, options.signal);
+      const { budgetReached, ...sourceStatus } = status;
+      sources.push(sourceStatus);
+      if (budgetReached)
+        budgetExhausted = true;
+    }
+  } else {
+    const { snapshot } = options.snapshots.resolve(options.cursor);
+    scope = evidenceScope(options.cwd, undefined, snapshot.request);
+    storedPartial = !snapshot.snapshotComplete;
+    reasons.push(...snapshot.retention?.reasons ?? []);
+    const selected = snapshotTargets(snapshot, options.matchIndex);
+    targets = selected.targets;
+    missing.push(...selected.missing);
+    const policy = new SearchPathPolicy(options.cwd);
+    sources = [...missing];
+    let checked = 0;
+    const maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
+    for (const target of targets) {
+      if (options.signal?.aborted)
+        throw abortError();
+      if (checked >= maxFiles) {
+        sources.push({
+          path: target.path,
+          role: "source",
+          status: "unknown",
+          reason: "Saved evidence validation source budget is exhausted"
+        });
+        continue;
+      }
+      checked += 1;
+      sources.push(await validateSnapshotTarget(target, options.cwd, policy, options.signal));
+    }
+  }
+  if (sources.length === 0)
+    reasons.push("No retained source evidence could be validated");
+  const uniqueReasons = [...new Set(reasons)];
+  const coverage = storedPartial || sources.length === 0 || sources.some((source) => source.status === "unknown") ? "partial" : "complete";
+  const recheck = relationshipRecheck(sources, [], [], uniqueReasons, coverage);
+  return {
+    scope,
+    sources,
+    coverage,
+    storedPartial,
+    reasons: uniqueReasons,
+    comparisonTarget: comparisonTarget(sources, missing.length > 0),
+    recheck
   };
 }
 
@@ -8405,6 +9134,46 @@ function parsePythonOutline(document2) {
 }
 
 // src/hybrid-search.ts
+import { resolve as resolve23 } from "path";
+class HybridSourceChangedError extends ConceptSourceChangedError {
+  constructor(message = "Hybrid source changed while exact and concept evidence were being merged") {
+    super(message);
+    this.name = "HybridSourceChangedError";
+  }
+}
+function sameHybridLiteralScan(left, right) {
+  if (left.totalMatches !== right.totalMatches || left.snapshotComplete !== right.snapshotComplete || left.fileCounts.size !== right.fileCounts.size)
+    return false;
+  const leftMatchesByDisplayPath = new Map;
+  for (const match of left.matches) {
+    if (!leftMatchesByDisplayPath.has(match.displayPath)) {
+      leftMatchesByDisplayPath.set(match.displayPath, match);
+    }
+  }
+  const rightMatchesByDisplayPath = new Map;
+  for (const match of right.matches) {
+    if (!rightMatchesByDisplayPath.has(match.displayPath)) {
+      rightMatchesByDisplayPath.set(match.displayPath, match);
+    }
+  }
+  for (const [path, count] of left.fileCounts) {
+    if (right.fileCounts.get(path) !== count)
+      return false;
+    const leftMatch = leftMatchesByDisplayPath.get(path);
+    const rightMatch = rightMatchesByDisplayPath.get(path);
+    if (leftMatch?.absolutePath !== rightMatch?.absolutePath)
+      return false;
+    if (!leftMatch || !rightMatch)
+      continue;
+    const leftRevision = left.sourceRevisions.get(leftMatch.absolutePath);
+    const rightRevision = right.sourceRevisions.get(rightMatch.absolutePath);
+    if (leftRevision === undefined || rightRevision === undefined)
+      continue;
+    if (!sameSourceRevision(leftRevision, rightRevision))
+      return false;
+  }
+  return true;
+}
 function rangesOverlap(left, right) {
   return left.start < right.end && right.start < left.end;
 }
@@ -8422,21 +9191,32 @@ function absoluteOccurrenceRanges(document2, line, match) {
     end: lineRange.start + occurrence.byteEnd
   }));
 }
-async function literalEvidence(scan, access) {
+async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
+  const generatedDocuments = new Map(generation.documents.map((document2) => [resolve23(access.cwd, document2.path), document2]));
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const document2 = await access.load(match.absolutePath);
+      const generated = generatedDocuments.get(resolve23(access.cwd, match.absolutePath));
+      const document2 = generated ?? await access.load(match.absolutePath);
       const expected = scan.sourceRevisions.get(match.absolutePath);
-      if (!expected || document2.reference.origin.kind !== "worktree" || !sameSourceRevision(expected, document2.reference.origin.revision)) {
-        unavailable.set(match.absolutePath, "source revision was not stable across hybrid search");
+      if (!expected) {
+        unavailable.set(match.absolutePath, "source revision metadata was unavailable");
         continue;
+      }
+      if (document2.reference.origin.kind !== "worktree") {
+        unavailable.set(match.absolutePath, "source revision origin was unavailable");
+        continue;
+      }
+      if (!sameSourceRevision(expected, document2.reference.origin.revision)) {
+        throw new HybridSourceChangedError(`${match.displayPath}: source revision changed while preparing hybrid evidence`);
       }
       documents.set(match.absolutePath, document2);
     } catch (error) {
+      if (error instanceof SourceDocumentError && error.reason === "source-changed")
+        throw new HybridSourceChangedError(`${match.displayPath}: ${error.message}`);
       if (error instanceof SourceBudgetError || error instanceof SourceDocumentError) {
         unavailable.set(match.absolutePath, error.message);
         continue;
@@ -8486,10 +9266,12 @@ function isLiteralOverlap(item, rangesByPath) {
     return false;
   return (rangesByPath.get(item.path) ?? []).some((range) => rangesOverlap(range, itemRange));
 }
-async function combineHybridSearch(scan, concept, access, conceptLimit) {
+async function combineHybridSearch(scan, execution, access, conceptLimit) {
+  const concept = execution.analysis;
   if (concept.kind !== "concept")
     throw new Error("Hybrid search requires concept evidence");
-  const literal = await literalEvidence(scan, access);
+  await verifyConceptSourceGeneration(execution.sourceGeneration, access);
+  const literal = await literalEvidence(scan, access, execution.sourceGeneration);
   const eligibleConcept = concept.items.filter((item) => !isLiteralOverlap(item, literal.rangesByPath));
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
   const selectedConcept = [];
@@ -8503,8 +9285,9 @@ async function combineHybridSearch(scan, concept, access, conceptLimit) {
   const literalOccurrencesRetained = scan.matches.reduce((total, match) => total + match.occurrences.length, 0);
   const literalCoverage = scan.snapshotComplete ? "complete" : "partial";
   const conceptCoverage = concept.coverage?.conceptCandidates ?? (concept.partial ? "partial" : "complete");
-  const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" ? "complete" : "partial";
-  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial";
+  const conceptSourceCoverage = execution.sourceGeneration.partial ? "partial" : "complete";
+  const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
+  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
   return {
     kind: "hybrid",
@@ -8515,6 +9298,7 @@ async function combineHybridSearch(scan, concept, access, conceptLimit) {
       ...scan.retention?.reasons ?? [],
       ...concept.reasons,
       ...literal.reasons,
+      ...execution.sourceGeneration.reasons,
       ...selectionReason ? [selectionReason] : []
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
@@ -8538,10 +9322,12 @@ async function combineHybridSearch(scan, concept, access, conceptLimit) {
       conceptCandidates: conceptCoverage,
       crossSourceDeduplication: deduplicationCoverage,
       sourceInspection: literal.sourceCoverage,
+      conceptSourceInspection: conceptSourceCoverage,
       retention: "complete"
     },
     ...concept.stats ? { stats: concept.stats } : {},
-    ...concept.redact !== undefined ? { redact: concept.redact } : {}
+    ...concept.redact !== undefined ? { redact: concept.redact } : {},
+    ...concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {}
   };
 }
 function retainedHybridCounts(original, items) {
@@ -8556,11 +9342,2568 @@ function retainedHybridCounts(original, items) {
   return { ...original, literalItemsRetained, conceptItemsRetained };
 }
 
+// src/relationship-output.ts
+import { createHash as createHash4 } from "crypto";
+function sourceItem(status, index) {
+  return {
+    path: status.path,
+    line: index + 1,
+    label: `${status.role} source ${status.status}`,
+    details: {
+      role: status.role,
+      status: status.status,
+      ...status.reason ? { reason: status.reason } : {},
+      index
+    }
+  };
+}
+function publicSourceStatus(status) {
+  const reference = status.current ?? status.expected;
+  const actualTarget = status.actualTarget ?? (reference === undefined ? undefined : reference.origin.kind === "git" ? "recorded-git" : "current-worktree");
+  return {
+    path: status.path,
+    role: status.role,
+    status: status.status,
+    ...actualTarget ? { actualTarget } : {},
+    ...status.reason ? { reason: status.reason } : {}
+  };
+}
+function sourceStatusRank(status) {
+  return status === "stale" ? 0 : status === "unknown" ? 1 : 2;
+}
+function dependencyKey(dependency) {
+  return JSON.stringify([
+    dependency.path,
+    dependency.role,
+    dependency.fingerprint ?? null,
+    dependency.exists ?? null,
+    dependency.reason ?? null
+  ]);
+}
+function publicEdgeKey(edge) {
+  return createHash4("sha256").update(edge.edgeKey).digest("hex").slice(0, 20);
+}
+function publicNodeKey(node) {
+  return createHash4("sha256").update(JSON.stringify(node.identity)).digest("hex").slice(0, 20);
+}
+function displayName(value) {
+  const limit = 96;
+  if (value.length <= limit)
+    return { value, truncated: false };
+  return { value: `${value.slice(0, limit - 1)}\u2026`, truncated: true };
+}
+function dependencyTable(edges) {
+  const ids = new Map;
+  const table = [];
+  for (const dependency of edges.flatMap((edge) => edge.dependencies).filter((item) => item.role !== "source")) {
+    const key = dependencyKey(dependency);
+    if (ids.has(key))
+      continue;
+    const id = table.length;
+    ids.set(key, id);
+    table.push({
+      id,
+      path: dependency.path,
+      role: dependency.role,
+      ...dependency.fingerprint ? { fingerprint: dependency.fingerprint } : {},
+      ...dependency.exists === undefined ? {} : { exists: dependency.exists },
+      ...dependency.reason ? { reason: dependency.reason } : {}
+    });
+  }
+  return { table, ids };
+}
+function evidenceKey(evidence) {
+  return JSON.stringify([
+    evidence.reason,
+    evidence.level,
+    evidence.basis,
+    evidence.providerBasis ?? null
+  ]);
+}
+function evidenceTable(edges) {
+  const ids = new Map;
+  const table = [];
+  for (const evidence of edges.flatMap((edge) => edge.evidence)) {
+    const key = evidenceKey(evidence);
+    if (ids.has(key))
+      continue;
+    const id = table.length;
+    ids.set(key, id);
+    table.push({
+      id,
+      reason: evidence.reason,
+      level: evidence.level,
+      basis: evidence.basis,
+      ...evidence.providerBasis ? { providerBasis: evidence.providerBasis } : {}
+    });
+  }
+  return { table, ids };
+}
+function edgeItem(edge, index, dependencyIds, evidenceIds) {
+  const nodeSummary = (node) => ({
+    key: publicNodeKey(node),
+    name: displayName(node.name).value,
+    ...displayName(node.name).truncated ? { nameTruncated: true } : {}
+  });
+  const fromName = displayName(edge.from.name);
+  const toName = displayName(edge.to.name);
+  return {
+    path: edge.to.path,
+    line: edge.to.start.line,
+    label: `${edge.operation}: ${fromName.value} \u2192 ${toName.value}`,
+    range: edge.to.range,
+    index,
+    details: {
+      edgeKey: publicEdgeKey(edge),
+      operation: edge.operation,
+      from: nodeSummary(edge.from),
+      to: nodeSummary(edge.to),
+      ...edge.callSite ? {
+        callSite: {
+          path: edge.callSite.path,
+          line: edge.callSite.start.line
+        }
+      } : {},
+      evidence: edge.evidence.map((evidence) => evidenceIds.get(evidenceKey(evidence)) ?? -1),
+      confidence: edge.confidence,
+      dependencies: edge.dependencies.filter((dependency) => dependency.role !== "source").map((dependency) => dependencyIds.get(dependencyKey(dependency)) ?? -1),
+      index
+    }
+  };
+}
+function publicDetails(scope, sources, values) {
+  const ordered = [...sources].toSorted((left, right) => {
+    return sourceStatusRank(left.status) - sourceStatusRank(right.status) || left.path.localeCompare(right.path);
+  });
+  const visible = [];
+  let sourceBytes = 0;
+  for (const source of ordered) {
+    const compact = publicSourceStatus(source);
+    const rowBytes = Buffer.byteLength(JSON.stringify(compact));
+    if (visible.length > 0 && sourceBytes + rowBytes > 4096)
+      break;
+    visible.push(compact);
+    sourceBytes += rowBytes;
+  }
+  const omitted = sources.length - visible.length;
+  return {
+    scope,
+    checked: visible.filter((source) => source.status !== "unknown"),
+    unchecked: visible.filter((source) => source.status === "unknown"),
+    ...omitted > 0 ? { sourceOmitted: omitted } : {},
+    ...values
+  };
+}
+function publicChangeHints(hints) {
+  if (hints.length === 0)
+    return;
+  return hints.toSorted((left, right) => left.observedAt - right.observedAt).slice(-32).map((hint) => {
+    const value = {
+      path: hint.path,
+      role: hint.role,
+      observedAt: hint.observedAt
+    };
+    if (hint.reason)
+      value.reason = hint.reason;
+    return value;
+  });
+}
+function changeHintText(hints) {
+  if (hints.length === 0)
+    return "";
+  const visible = hints.slice(-4).map((hint) => `${hint.role} ${displayName(hint.path).value}`).join(", ");
+  const suffix = hints.length > 4 ? `; ${String(hints.length - 4)} more retained` : "";
+  return ` Change hints: ${visible}${suffix}.`;
+}
+function watchHealthText(health) {
+  if (!health)
+    return "";
+  const reasons = health.reasons.length ? ` ${health.reasons.slice(0, 2).join(" ")}` : "";
+  return ` Watch health: ${health.status}; ${String(health.retainedHints)} hint(s) retained, ${String(health.droppedHints)} dropped.${reasons}`;
+}
+function base(mode, status, total, files, returned = total) {
+  return {
+    version: 1,
+    mode,
+    status,
+    totalMatches: total,
+    storedMatches: total,
+    totalFiles: files,
+    returnedMatches: returned,
+    snapshotComplete: status === "complete"
+  };
+}
+function traceResult(stored, page, scope, input, changeHints = [], watchHealth) {
+  const state = stored.state;
+  const paths = new Set(state.edges.flatMap((edge) => [edge.from.path, edge.to.path]));
+  const dependencies = dependencyTable(state.edges);
+  const evidence = evidenceTable(state.edges);
+  const hints = publicChangeHints(changeHints);
+  const relationship = publicDetails(scope, state.coverage.sources, {
+    operation: state.operation,
+    ...state.nodes[0] ? {
+      providerId: state.nodes[0].identity.providerId,
+      analysisViewId: state.nodes[0].identity.analysisViewId
+    } : {},
+    freshness: state.coverage.freshness,
+    coverage: state.coverage.status,
+    comparisonTarget: "current-worktree",
+    truncation: { truncated: state.truncated, reasons: state.reasons },
+    depth: state.budget.maxDepth,
+    depthReached: state.depthReached,
+    expansions: state.expansions,
+    dependencyTable: dependencies.table,
+    evidenceTable: evidence.table,
+    ...hints ? { changeHints: hints } : {},
+    ...watchHealth ? { watchHealth } : {}
+  });
+  const status = state.status === "complete" && state.coverage.freshness === "current" ? "complete" : "partial";
+  const details = base("trace", status, page.totalItems, paths.size, page.items.length);
+  const analysis = {
+    kind: "trace",
+    unit: "relationships",
+    totalItems: page.totalItems,
+    returnedItems: page.items.length,
+    items: page.items.map((edge, index) => edgeItem(edge, page.offset + index + 1, dependencies.ids, evidence.ids)),
+    reasons: [...state.reasons],
+    relationship
+  };
+  const pageRequest = page.nextCursor ? { mode: "trace", cursor: page.nextCursor } : undefined;
+  const exploreRequest = stored.exploreCursor ? { mode: "trace", exploreCursor: stored.exploreCursor } : undefined;
+  const nextRequest = pageRequest ?? (page.totalItems <= page.items.length ? exploreRequest : undefined);
+  const visibleSources = [...relationship.checked, ...relationship.unchecked];
+  const sourceText = visibleSources.length ? ` Sources: ${visibleSources.map((source) => `${source.status} ${source.path}`).join(", ")}${relationship.sourceOmitted ? `; ${String(relationship.sourceOmitted)} source(s) omitted from this page` : ""}.` : " Sources: none recorded (freshness is unknown until evidence is checked).";
+  const edgeText = page.items.length ? ` Edges: ${page.items.map((edge, index) => `${String(page.offset + index + 1)}. ${displayName(edge.from.name).value} \u2192 ${displayName(edge.to.name).value} (${edge.to.path}:${String(edge.to.start.line)})`).join("; ")}.` : " Edges: none retained on this page.";
+  const reasonText = state.reasons.length ? ` ${state.reasons.join(" ")}` : "";
+  const requestText = nextRequest ? ` Next request: ${JSON.stringify(nextRequest)}` : exploreRequest ? ` Explore request: ${JSON.stringify(exploreRequest)}` : "";
+  const text = `Static ${state.operation} trace retained ${String(page.totalItems)} relationship(s); returned ${String(page.items.length)} on this page; depth ${String(state.depthReached)}/${String(state.budget.maxDepth)}.${edgeText}${sourceText}${reasonText}${changeHintText(changeHints)}${watchHealthText(watchHealth)}${requestText}`;
+  return {
+    text,
+    details: {
+      ...details,
+      cursor: stored.cursor,
+      ...nextRequest ? { nextRequest } : {},
+      ...exploreRequest ? { exploreRequest } : {},
+      analysis,
+      relationship,
+      ...stored.exploreCursor ? { exploreCursor: stored.exploreCursor } : {}
+    }
+  };
+}
+function validationResult(state, cursor, recheck, checkInterval, comparisonTarget, changeHints = [], watchHealth) {
+  const status = state.status === "partial" || recheck.validity !== "current" ? "partial" : "complete";
+  const coverage = state.coverage.status === "partial" || recheck.coverage === "partial" ? "partial" : recheck.coverage;
+  const reasons = [...new Set([...state.reasons ?? [], ...recheck.reasons])];
+  const hints = publicChangeHints(changeHints);
+  const relationship = publicDetails(state.scope, recheck.sources, {
+    comparisonTarget,
+    freshness: recheck.validity,
+    coverage,
+    truncation: { truncated: state.truncated ?? false, reasons },
+    affectedNodeKeys: recheck.affectedNodeKeys,
+    affectedEdgeKeys: (state.edges ?? []).filter((edge) => recheck.affectedEdgeKeys.includes(edge.edgeKey)).map(publicEdgeKey),
+    checkInterval,
+    ...hints ? { changeHints: hints } : {},
+    ...watchHealth ? { watchHealth } : {}
+  });
+  const analysis = {
+    kind: "validate",
+    unit: "evidence-items",
+    totalItems: recheck.sources.length,
+    returnedItems: relationship.checked.length + relationship.unchecked.length,
+    items: [...relationship.checked, ...relationship.unchecked].map((source, index) => Object.assign(sourceItem(source, index), { index })),
+    reasons,
+    relationship
+  };
+  const details = {
+    ...base("validate", status, relationship.checked.length + relationship.unchecked.length, new Set(recheck.sources.map((source) => source.path)).size, recheck.sources.length),
+    cursor,
+    analysis,
+    relationship
+  };
+  return {
+    text: `Relationship validation is ${recheck.validity}; checked ${String(relationship.checked.length)} source(s), ${String(relationship.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}.${relationship.sourceOmitted ? ` ${String(relationship.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${changeHintText(changeHints)}${watchHealthText(watchHealth)}`,
+    details
+  };
+}
+
+// src/relationship-service.ts
+import { resolve as resolve27 } from "path";
+
+// src/change-awareness.ts
+import { statSync, watch } from "fs";
+import { dirname as dirname6, relative as relative9, resolve as resolve24 } from "path";
+var DEFAULT_MAX_SOURCES = 1024;
+var DEFAULT_MAX_HINTS = 1024;
+var MAX_HEALTH_REASONS = 32;
+function errorCode(error) {
+  if (error === null || typeof error !== "object" || !("code" in error))
+    return;
+  const code = error.code;
+  return typeof code === "string" ? code : undefined;
+}
+function watcherFailureReason(error, recursive) {
+  const code = errorCode(error);
+  return `${recursive ? "recursive " : ""}filesystem watcher failed${code === undefined ? "" : ` (${code})`}`;
+}
+function sourceUnavailableReason(error) {
+  const code = errorCode(error);
+  return `relationship watcher source is unavailable${code === undefined ? "" : ` (${code})`}`;
+}
+function isInsideOrEqual(root, candidate) {
+  const value = relative9(root, candidate);
+  const separator = process.platform === "win32" ? "\\" : "/";
+  return value === "" || value !== ".." && !value.startsWith(`..${separator}`);
+}
+function isRecursiveUnsupported(error) {
+  return errorCode(error) === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+}
+
+class RelationshipChangeAwareness {
+  #dirty = new Map;
+  #listeners = new Set;
+  #groups = new Map;
+  #subscriptions = new Map;
+  #healthReasons = new Set;
+  #maxSources = DEFAULT_MAX_SOURCES;
+  #maxHints = DEFAULT_MAX_HINTS;
+  #nextToken = 0;
+  #droppedHints = 0;
+  #watcherErrors = 0;
+  #partialStarts = 0;
+  #closed = false;
+  markDirty(path, role = "source", reason, observedAt = Date.now()) {
+    const hint = {
+      path,
+      role,
+      observedAt,
+      ...reason === undefined ? {} : { reason }
+    };
+    this.#dirty.set(resolve24(path), { ...hint, path: resolve24(path) });
+    this.#trimHints();
+    for (const listener of this.#listeners) {
+      try {
+        listener(hint);
+      } catch {
+        this.#rememberHealthReason("change listener failed");
+      }
+    }
+    return hint;
+  }
+  start(paths, options = {}) {
+    if (this.#closed)
+      throw new Error("Relationship watcher is closed");
+    const requestedMaxSources = options.maxSources ?? this.#maxSources;
+    if (!Number.isSafeInteger(requestedMaxSources) || requestedMaxSources < 1)
+      throw new Error("Relationship watcher source limit must be a positive integer");
+    const requestedMaxHints = options.maxHints ?? this.#maxHints;
+    if (!Number.isSafeInteger(requestedMaxHints) || requestedMaxHints < 1)
+      throw new Error("Relationship watcher hint limit must be a positive integer");
+    if (requestedMaxSources < this.#subscriptions.size)
+      throw new Error(`Relationship watcher source limit is below active subscriptions (${String(this.#subscriptions.size)})`);
+    this.#maxSources = Math.min(this.#maxSources, requestedMaxSources);
+    const uniquePaths = new Set(paths.map((path) => resolve24(path)));
+    if (this.#subscriptions.size + uniquePaths.size > this.#maxSources)
+      throw new Error(`Relationship watcher source limit exceeded (${String(this.#maxSources)})`);
+    this.#maxHints = Math.min(this.#maxHints, requestedMaxHints);
+    this.#trimHints();
+    const recursive = options.recursive ?? false;
+    const role = options.role ?? "source";
+    const tokens = [];
+    try {
+      for (const path of uniquePaths)
+        tokens.push(this.#addSubscription(path, role, recursive));
+    } catch (error) {
+      this.#partialStarts += 1;
+      this.#rememberHealthReason("watcher start was rolled back after a resource failure");
+      const cleanupErrors = [];
+      for (const token of tokens.toReversed()) {
+        try {
+          this.#releaseToken(token);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (cleanupErrors.length)
+        throw new AggregateError([error, ...cleanupErrors], "Relationship watcher start failed and cleanup was incomplete", { cause: error });
+      throw error;
+    }
+    let stopped = false;
+    return () => {
+      if (stopped)
+        return;
+      stopped = true;
+      const errors = [];
+      for (const token of tokens) {
+        try {
+          this.#releaseToken(token);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length)
+        throw new AggregateError(errors, "Relationship watcher stop failed");
+    };
+  }
+  stop(path) {
+    const tokenList = path === undefined ? [...this.#subscriptions.keys()] : (() => {
+      const token = [...this.#subscriptions.values()].find((subscription) => subscription.path === resolve24(path))?.token;
+      return token === undefined ? [] : [token];
+    })();
+    const errors = [];
+    for (const token of tokenList) {
+      try {
+        this.#releaseToken(token);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "Relationship watcher stop failed");
+  }
+  close() {
+    let failure;
+    try {
+      this.stop();
+    } catch (error) {
+      failure = error;
+    } finally {
+      this.#listeners.clear();
+      this.#dirty.clear();
+      this.#closed = true;
+    }
+    if (failure)
+      throw failure;
+  }
+  subscribe(listener) {
+    if (this.#closed)
+      throw new Error("Relationship watcher is closed");
+    this.#listeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed)
+        return;
+      subscribed = false;
+      this.#listeners.delete(listener);
+    };
+  }
+  dirty(path) {
+    if (path !== undefined) {
+      const hint = this.#dirty.get(resolve24(path));
+      return hint === undefined ? [] : [hint];
+    }
+    return [...this.#dirty.values()];
+  }
+  clear(path) {
+    if (path === undefined)
+      this.#dirty.clear();
+    else
+      this.#dirty.delete(resolve24(path));
+  }
+  clearAll() {
+    this.#dirty.clear();
+  }
+  health() {
+    const reasons = [...this.#healthReasons];
+    const status = this.#closed ? "closed" : reasons.length ? "degraded" : this.#subscriptions.size ? "healthy" : "unknown";
+    return {
+      status,
+      activeSources: this.#subscriptions.size,
+      activeWatchers: [...this.#groups.values()].filter((group) => group.watcher !== undefined).length,
+      maxSources: this.#maxSources,
+      retainedHints: this.#dirty.size,
+      maxHints: this.#maxHints,
+      overflowed: this.#droppedHints > 0,
+      droppedHints: this.#droppedHints,
+      watcherErrors: this.#watcherErrors,
+      partialStarts: this.#partialStarts,
+      reasons
+    };
+  }
+  #rememberHealthReason(reason) {
+    if (this.#healthReasons.size < MAX_HEALTH_REASONS)
+      this.#healthReasons.add(reason);
+    else
+      this.#healthReasons.add("additional watcher health issues occurred");
+  }
+  #trimHints() {
+    while (this.#dirty.size > this.#maxHints) {
+      const oldest = this.#dirty.keys().next().value;
+      if (oldest === undefined)
+        break;
+      this.#dirty.delete(oldest);
+      this.#droppedHints += 1;
+      this.#rememberHealthReason("dirty hint retention overflow");
+    }
+  }
+  #addSubscription(path, role, recursive) {
+    let sourceStats;
+    try {
+      sourceStats = statSync(path, { throwIfNoEntry: false });
+    } catch (error) {
+      throw new Error(sourceUnavailableReason(error), { cause: error });
+    }
+    const parent = dirname6(path);
+    let parentStats;
+    try {
+      parentStats = statSync(parent, { throwIfNoEntry: false });
+    } catch (error) {
+      throw new Error(sourceUnavailableReason(error), { cause: error });
+    }
+    if (!parentStats?.isDirectory())
+      throw new Error(sourceUnavailableReason(new Error("parent directory is unavailable")));
+    if (!sourceStats && recursive)
+      this.#rememberHealthReason("recursive source is absent; only parent replacement events are watched");
+    const specs = sourceStats?.isDirectory() && recursive ? [{ root: path, recursive: true }] : [{ root: parent, recursive: false }];
+    const groupKeys = [];
+    const createdGroups = [];
+    try {
+      for (const spec of specs) {
+        const key = `${spec.root}\x00${spec.recursive ? "recursive" : "direct"}`;
+        let group = this.#groups.get(key);
+        if (!group) {
+          group = {
+            key,
+            root: spec.root,
+            recursive: spec.recursive,
+            subscriptions: new Map,
+            watchRecursive: spec.recursive,
+            watcher: undefined
+          };
+          this.#groups.set(key, group);
+          createdGroups.push(group);
+        }
+        if (!group.watcher)
+          group.watcher = this.#openWatcher(group);
+        groupKeys.push(key);
+      }
+    } catch (error) {
+      for (const group of createdGroups) {
+        if (group.subscriptions.size !== 0)
+          continue;
+        this.#groups.delete(group.key);
+        group.watcher?.close();
+        group.watcher = undefined;
+      }
+      throw new Error(sourceUnavailableReason(error), { cause: error });
+    }
+    const token = ++this.#nextToken;
+    const subscription = {
+      token,
+      path,
+      role,
+      directory: sourceStats?.isDirectory() ?? recursive,
+      recursive,
+      groupKeys
+    };
+    for (const key of groupKeys) {
+      const group = this.#groups.get(key);
+      if (!group)
+        throw new Error("Relationship watcher group was not created");
+      group.subscriptions.set(token, subscription);
+    }
+    this.#subscriptions.set(token, subscription);
+    return token;
+  }
+  #openWatcher(group) {
+    const onChange = (_event, name2) => {
+      const changed = name2 === null ? undefined : resolve24(group.root, typeof name2 === "string" ? name2 : name2.toString());
+      for (const subscription of group.subscriptions.values()) {
+        if (changed === undefined) {
+          this.markDirty(subscription.path, subscription.role, "filesystem change");
+        } else if (changed === subscription.path || group.watchRecursive && subscription.directory && subscription.recursive && isInsideOrEqual(subscription.path, changed)) {
+          this.markDirty(changed, subscription.role, "filesystem change");
+          if (changed === subscription.path && subscription.directory && subscription.recursive)
+            this.#refreshDirectoryGroup(subscription);
+        }
+      }
+    };
+    let watcher;
+    try {
+      watcher = watch(group.root, { recursive: group.recursive }, onChange);
+      group.watchRecursive = group.recursive;
+    } catch (error) {
+      if (!group.recursive || !isRecursiveUnsupported(error))
+        throw error;
+      this.#rememberHealthReason(watcherFailureReason(error, true));
+      watcher = watch(group.root, { recursive: false }, onChange);
+      group.watchRecursive = false;
+    }
+    watcher.on("error", (error) => {
+      this.#watcherErrors += 1;
+      this.#rememberHealthReason(watcherFailureReason(error, group.recursive));
+      if (group.watcher !== watcher)
+        return;
+      group.watcher = undefined;
+      try {
+        watcher.close();
+      } catch {
+        this.#rememberHealthReason("filesystem watcher close failed");
+      }
+    });
+    watcher.on("close", () => {
+      if (group.watcher !== watcher)
+        return;
+      group.watcher = undefined;
+      if (group.subscriptions.size)
+        this.#rememberHealthReason("filesystem watcher closed while subscriptions remained");
+    });
+    return watcher;
+  }
+  #refreshDirectoryGroup(subscription) {
+    const key = subscription.groupKeys.find((groupKey) => this.#groups.get(groupKey)?.recursive);
+    if (key === undefined)
+      return;
+    const group = this.#groups.get(key);
+    if (!group || group.watcher)
+      return;
+    let stats;
+    try {
+      stats = statSync(subscription.path, { throwIfNoEntry: false });
+    } catch {
+      this.#rememberHealthReason("directory watcher refresh could not inspect the source");
+      return;
+    }
+    if (!stats?.isDirectory())
+      return;
+    try {
+      group.watcher = this.#openWatcher(group);
+    } catch (error) {
+      this.#rememberHealthReason(watcherFailureReason(error, true));
+    }
+  }
+  #releaseToken(token) {
+    const subscription = this.#subscriptions.get(token);
+    if (!subscription)
+      return;
+    this.#subscriptions.delete(token);
+    for (const groupKey of subscription.groupKeys) {
+      const group = this.#groups.get(groupKey);
+      if (!group)
+        continue;
+      group.subscriptions.delete(token);
+      if (group.subscriptions.size !== 0)
+        continue;
+      this.#groups.delete(group.key);
+      const watcher = group.watcher;
+      group.watcher = undefined;
+      watcher?.close();
+    }
+  }
+}
+
+// src/go-semantic-provider.ts
+import { createHash as createHash5, randomUUID as randomUUID4 } from "crypto";
+import { delimiter, dirname as dirname7, isAbsolute as isAbsolute6, resolve as resolve25 } from "path";
+import { fileURLToPath as fileURLToPath4 } from "url";
+var GO_SEMANTIC_QUERY_TIMEOUT_MS = 20000;
+var GO_SEMANTIC_PROVIDER_ID = "gopls";
+var goSource = /\.go$/i;
+var goManifest = /(?:^|\/)(?:go\.mod|go\.work|go\.sum)$/i;
+var goTextDocument = /(?:\.go|(?:^|\/)(?:go\.mod|go\.work))$/i;
+var GO_ENVIRONMENT_PATH = "go:environment";
+var GO_INVENTORY_PATH = "go:inventory";
+var GO_ENVIRONMENT_KEYS = [
+  "GO111MODULE",
+  "GOOS",
+  "GOARCH",
+  "GOARM",
+  "GO386",
+  "GOEXPERIMENT",
+  "CGO_ENABLED",
+  "GOFLAGS",
+  "GOMOD",
+  "GOWORK",
+  "GOWASM",
+  "GOMODCACHE",
+  "GOPRIVATE",
+  "GONOPROXY",
+  "GONOSUMDB",
+  "PATH"
+];
+var providerQueue = new OwnedTaskQueue;
+function executablePath2() {
+  const configured = process.env.BAOER_SIGNAL_GREP_GOPLS_PATH?.trim();
+  if (!configured)
+    return "gopls";
+  if (!isAbsolute6(configured))
+    throw new SignalGrepError("BAOER_SIGNAL_GREP_GOPLS_PATH must be an absolute executable path");
+  return configured;
+}
+function environment(executable) {
+  const path = process.env.PATH ?? "";
+  const executableDirectory = isAbsolute6(executable) ? dirname7(executable) : undefined;
+  const configuredFlags = process.env.GOFLAGS?.trim() ?? "";
+  const modFlag = configuredFlags.match(/(?:^|\s)-mod=(\S+)/)?.[1];
+  if (modFlag !== undefined && modFlag !== "readonly")
+    throw new SignalGrepError(`GOFLAGS requests -mod=${modFlag}; Go relationship search requires -mod=readonly`);
+  return {
+    ...process.env,
+    ...executableDirectory ? { PATH: `${executableDirectory}${delimiter}${path}` } : {},
+    GOTOOLCHAIN: "local",
+    GOPROXY: "off",
+    GOSUMDB: "off",
+    GOFLAGS: configuredFlags ? `${configuredFlags} -mod=readonly` : "-mod=readonly"
+  };
+}
+function configurationFingerprint(executable) {
+  const values = {
+    executable,
+    GOTOOLCHAIN: "local",
+    GOPROXY: "off",
+    GOSUMDB: "off"
+  };
+  for (const key of GO_ENVIRONMENT_KEYS)
+    values[key] = process.env[key] ?? "";
+  return createHash5("sha256").update(JSON.stringify(values)).digest("hex");
+}
+function isAdmittedGoFile(path) {
+  return goSource.test(path) || goManifest.test(path);
+}
+function documentRole(path) {
+  return goManifest.test(path) ? "manifest" : "source";
+}
+function languageId2(path) {
+  return goSource.test(path) ? "go" : "go.mod";
+}
+function fileUri(value) {
+  if (typeof value !== "string" || !value.startsWith("file:"))
+    throw new SignalGrepError("gopls returned a non-file URI");
+  return value;
+}
+function uriPath(uri) {
+  try {
+    return fileURLToPath4(uri);
+  } catch (error) {
+    throw new SignalGrepError("gopls returned an invalid file URI", { cause: error });
+  }
+}
+function readNode2(value) {
+  if (!rpcRecord(value))
+    throw new SignalGrepError("gopls returned an invalid navigation item");
+  const record = value;
+  const uri = fileUri(record.uri ?? record.targetUri);
+  const range = lspRange(record.range ?? record.targetRange ?? record.selectionRange);
+  const selectionRange = lspRange(record.selectionRange ?? record.targetSelectionRange ?? range);
+  return {
+    id: `${uri}:${String(selectionRange.start.line)}:${String(selectionRange.start.character)}:${String(selectionRange.end.line)}:${String(selectionRange.end.character)}`,
+    path: uriPath(uri),
+    uri,
+    range,
+    selectionRange,
+    ...typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {},
+    ...typeof record.kind === "number" && Number.isSafeInteger(record.kind) ? { kind: record.kind } : {}
+  };
+}
+function readLocations(value) {
+  if (value === null)
+    return [];
+  return (Array.isArray(value) ? value : [value]).map((item) => readNode2(item));
+}
+function readCallRanges(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.map((range) => lspRange(range));
+}
+function positionOf(node) {
+  return node.selectionRange.start;
+}
+function sourceLocation(document2, range) {
+  return {
+    path: document2.path,
+    range: byteRange(document2, range),
+    start: { line: range.start.line + 1, column: range.start.character + 1 },
+    end: { line: range.end.line + 1, column: range.end.character + 1 },
+    source: document2.reference
+  };
+}
+function symbolPosition(document2, value, name2) {
+  if (value.selectionRange !== undefined)
+    return lspRange(value.selectionRange).start;
+  const location = rpcRecord(value.location) ? value.location : undefined;
+  if (!location || location.range === undefined)
+    return;
+  const range = lspRange(location.range);
+  const bytes = byteRange(document2, range);
+  const offset = document2.slice(bytes).indexOf(name2);
+  if (offset < 0)
+    return;
+  return lspPosition(document2, document2.toCharacterOffset(bytes.start) + offset);
+}
+function documentDependency(document2) {
+  return {
+    path: document2.path,
+    role: documentRole(document2.path),
+    reference: document2.reference,
+    exists: true
+  };
+}
+function environmentDependency(fingerprint) {
+  return { path: GO_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
+}
+function evidence(reason) {
+  return { reason, level: "compiler", basis: "semantic", providerBasis: GO_SEMANTIC_PROVIDER_ID };
+}
+function operationMethod(operation) {
+  switch (operation) {
+    case "definitions":
+      return "textDocument/definition";
+    case "references":
+      return "textDocument/references";
+    case "implementations":
+      return "textDocument/implementation";
+    case "callers":
+    case "callees":
+      return "textDocument/prepareCallHierarchy";
+    default:
+      throw new SignalGrepError("Unsupported Go relationship operation");
+  }
+}
+function relationReason(operation) {
+  if (operation === "callers" || operation === "callees")
+    return "gopls static call hierarchy; dynamic calls are excluded and runtime dispatch is unproven";
+  return "gopls compiler-bound navigation in the active Go build configuration";
+}
+function operationUnresolved(operation, reason) {
+  return { operation, reason, confidence: "unknown" };
+}
+
+class GoRelationshipView {
+  providerId = GO_SEMANTIC_PROVIDER_ID;
+  analysisViewId;
+  sourceScope;
+  #channel;
+  #completion;
+  #cwd;
+  #source;
+  #signal;
+  #configurationFingerprint;
+  #inventory;
+  #documents;
+  #openReasons;
+  #initialCoveragePartial;
+  #nodePaths = new Map;
+  #edgePaths = new Map;
+  #closed = false;
+  #closePromise;
+  constructor(options, channel, completion, documents, openReasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, clearTimeout2) {
+    this.analysisViewId = options.analysisViewId ?? randomUUID4();
+    this.sourceScope = options.scope;
+    this.#cwd = options.cwd;
+    this.#source = options.source;
+    this.#signal = signal;
+    this.#configurationFingerprint = configurationFingerprint(executable);
+    this.#inventory = inventory;
+    this.#channel = channel;
+    this.#completion = completion;
+    this.#documents = documents;
+    this.#openReasons = [...openReasons, `gopls executable: ${executable}`];
+    this.#initialCoveragePartial = initialCoveragePartial;
+    this.#releaseQueue = releaseQueue;
+    this.#clearTimeout = clearTimeout2;
+  }
+  #releaseQueue;
+  #clearTimeout;
+  async resolveNode(input, signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const document2 = this.#documents.get(resolve25(this.#cwd, input.path));
+    if (!document2)
+      return {
+        status: "unsupported",
+        reasons: ["Go target is outside admitted provider source"],
+        dependencies: []
+      };
+    const position = await this.position(document2, input);
+    const params = { textDocument: { uri: await semanticUri(this.#cwd, document2.path) }, position };
+    const prepared = await this.#channel.request("textDocument/prepareCallHierarchy", params);
+    const candidates = Array.isArray(prepared) ? prepared.map(readNode2) : [];
+    if (candidates.length > 1 && input.column === undefined)
+      return {
+        status: "ambiguous",
+        candidates: candidates.map((candidate) => this.node(candidate, document2)),
+        reasons: ["gopls returned multiple call hierarchy items; include a column"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    let selected = candidates[0];
+    if (!selected) {
+      const definitions = readLocations(await this.#channel.request("textDocument/definition", params));
+      selected = definitions[0];
+    }
+    if (!selected)
+      return {
+        status: "unknown",
+        reasons: ["gopls returned no definition or call hierarchy item"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    const target = this.#documents.get(resolve25(this.#cwd, selected.path));
+    if (!target)
+      return {
+        status: "unknown",
+        reasons: ["gopls resolved outside admitted provider source"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    return {
+      status: "resolved",
+      node: this.node(selected, target),
+      reasons: [],
+      dependencies: [
+        documentDependency(document2),
+        documentDependency(target),
+        environmentDependency(this.#configurationFingerprint)
+      ]
+    };
+  }
+  async expand(node, operation, signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const internal = this.internalNode(node);
+    const document2 = this.#documents.get(resolve25(this.#cwd, internal.path));
+    if (!document2)
+      return {
+        edges: [],
+        nodes: [],
+        unresolved: [
+          operationUnresolved(operation, "Node source is outside admitted provider source")
+        ],
+        dependencies: [],
+        coverage: {
+          status: "partial",
+          freshness: "unknown",
+          sources: [],
+          reasons: ["Node source is outside admitted provider source"]
+        }
+      };
+    const params = {
+      textDocument: { uri: await semanticUri(this.#cwd, document2.path) },
+      position: positionOf(internal)
+    };
+    const goEdges = [];
+    const unresolved = [];
+    if (operation === "callers" || operation === "callees") {
+      const prepared = await this.#channel.request(operationMethod(operation), params);
+      if (!Array.isArray(prepared))
+        unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
+      else {
+        for (const item of prepared) {
+          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+          const calls = await this.#channel.request(method, { item });
+          if (!Array.isArray(calls)) {
+            unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
+            continue;
+          }
+          for (const call of calls) {
+            if (!rpcRecord(call)) {
+              unresolved.push(operationUnresolved(operation, "gopls returned an invalid call edge"));
+              continue;
+            }
+            const record = call;
+            try {
+              const endpoint = readNode2(operation === "callers" ? record.from : record.to);
+              const callRanges = readCallRanges(record.fromRanges);
+              goEdges.push({
+                operation,
+                from: operation === "callers" ? endpoint : internal,
+                to: operation === "callers" ? internal : endpoint,
+                ...callRanges ? { callRanges } : {}
+              });
+            } catch (error) {
+              unresolved.push(operationUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
+            }
+          }
+        }
+      }
+    } else {
+      const value = await this.#channel.request(operationMethod(operation), {
+        ...params,
+        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
+      });
+      const candidates = readLocations(value);
+      for (const candidate of candidates)
+        goEdges.push({ operation, from: internal, to: candidate });
+    }
+    const nodes = [];
+    const edges = [];
+    for (const edge of goEdges) {
+      const from = this.convertNode(edge.from, unresolved, operation);
+      const to = this.convertNode(edge.to, unresolved, operation);
+      if (!from || !to)
+        continue;
+      nodes.push(from, to);
+      const callRanges = edge.callRanges?.length ? edge.callRanges : [undefined];
+      for (const [index, range] of callRanges.entries()) {
+        const callSite = range ? this.callSite(edge, range) : undefined;
+        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
+        const edgePaths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
+        this.#edgePaths.set(edgeKey, edgePaths);
+        edges.push({
+          edgeKey,
+          operation,
+          from,
+          to,
+          ...callSite ? { callSite } : {},
+          evidence: [evidence(relationReason(operation))],
+          confidence: "verified-static",
+          dependencies: [...edgePaths].map((path) => documentDependency(this.#documents.get(resolve25(this.#cwd, path)) ?? document2)).concat(environmentDependency(this.#configurationFingerprint))
+        });
+      }
+    }
+    const uniqueNodes = [...new Map(nodes.map((item) => [item.identity.localKey, item])).values()];
+    const reasons = [...this.#openReasons, relationReason(operation)];
+    return {
+      edges,
+      nodes: uniqueNodes,
+      unresolved,
+      dependencies: [
+        documentDependency(document2),
+        environmentDependency(this.#configurationFingerprint)
+      ],
+      coverage: {
+        status: this.#initialCoveragePartial || unresolved.length ? "partial" : "complete",
+        freshness: "current",
+        sources: this.currentSourceStatuses(),
+        reasons: [...new Set(reasons)]
+      }
+    };
+  }
+  async recheck(signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const sources = [];
+    const reasons = [];
+    for (const document2 of this.#documents.values()) {
+      try {
+        await this.#source.refresh(document2.path, document2.reference);
+        sources.push(this.sourceStatus(document2, "current"));
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "source recheck failed";
+        sources.push(this.sourceStatus(document2, "stale", reason));
+        reasons.push(`${document2.path}: ${reason}`);
+      }
+    }
+    let configurationReason;
+    let currentConfigurationFingerprint;
+    try {
+      const executable = executablePath2();
+      environment(executable);
+      currentConfigurationFingerprint = configurationFingerprint(executable);
+    } catch (error) {
+      configurationReason = error instanceof Error ? error.message : "Go build configuration is invalid";
+    }
+    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.#configurationFingerprint;
+    sources.push({
+      path: GO_ENVIRONMENT_PATH,
+      role: "config",
+      status: configurationChanged ? "stale" : "current",
+      ...configurationReason ? { reason: configurationReason } : configurationChanged ? { reason: "Go build environment or gopls executable changed during relationship query" } : {}
+    });
+    if (configurationChanged)
+      reasons.push(configurationReason ?? "Go build environment or gopls executable changed during relationship query");
+    const inventory = await listWorkspaceFiles(this.#cwd, this.#signal, {
+      path: this.sourceScope.root,
+      glob: [...this.sourceScope.include ?? []],
+      exclude: [...this.sourceScope.exclude ?? []],
+      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden }
+    });
+    const currentInventory = new Set(inventory.paths.filter(isAdmittedGoFile));
+    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
+    if (inventoryChanged || inventory.partial) {
+      reasons.push(inventoryChanged ? "Go source/config inventory changed during relationship query; retry" : inventory.reasons.join("; "));
+      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
+        sources.push({
+          path,
+          role: documentRole(path),
+          status: "stale",
+          reason: "source removed during query"
+        });
+      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
+        sources.push({
+          path,
+          role: documentRole(path),
+          status: "stale",
+          reason: "source added during query; retry"
+        });
+      if (inventory.partial)
+        sources.push({
+          path: GO_INVENTORY_PATH,
+          role: "metadata",
+          status: "unknown",
+          reason: inventory.reasons.join("; ") || "Go source/config inventory is incomplete"
+        });
+    }
+    const stalePaths = new Set(sources.filter((source) => source.status === "stale").map((source) => source.path));
+    const inventoryUnknown = sources.some((source) => source.path === GO_INVENTORY_PATH && source.status === "unknown");
+    const sourceUnknown = sources.some((source) => source.status === "unknown");
+    const configurationStale = sources.some((source) => source.path === GO_ENVIRONMENT_PATH && source.status !== "current");
+    return {
+      validity: stalePaths.size ? "stale" : sourceUnknown ? "unknown" : "current",
+      coverage: this.#initialCoveragePartial || stalePaths.size || sourceUnknown ? "partial" : "complete",
+      sources,
+      affectedNodeKeys: configurationStale || inventoryUnknown ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => sources.some((source) => source.path === path && source.status !== "current")).map(([key]) => key),
+      affectedEdgeKeys: configurationStale || inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([key]) => key),
+      reasons: [...new Set(reasons)]
+    };
+  }
+  close() {
+    if (!this.#closePromise)
+      this.#closePromise = this.closeOnce();
+    return this.#closePromise;
+  }
+  async closeOnce() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    try {
+      await this.#channel.request("shutdown", undefined);
+      this.#channel.endInput();
+      const result = await this.#completion;
+      if (result.code !== 0)
+        throw new SignalGrepError(`gopls process failed (${String(result.code)}): ${result.stderr}`);
+    } catch (error) {
+      this.#channel.close();
+      await this.#completion.catch(() => {
+        return;
+      });
+      throw error;
+    } finally {
+      this.#clearTimeout();
+      this.#releaseQueue();
+    }
+  }
+  async position(document2, input) {
+    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
+      throw new SignalGrepError("Go semantic target line must be one-based");
+    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
+      throw new SignalGrepError("Go semantic target column must be one-based");
+    if (input.column !== undefined) {
+      if (input.line === undefined)
+        throw new SignalGrepError("Go semantic column requires a line");
+      return { line: input.line - 1, character: input.column - 1 };
+    }
+    if (!input.symbol)
+      throw new SignalGrepError("Go semantic target requires a column or symbol");
+    const symbolName = input.symbol;
+    const symbols = await this.#channel.request("textDocument/documentSymbol", {
+      textDocument: { uri: await semanticUri(this.#cwd, document2.path) }
+    });
+    const found = [];
+    const visit = (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        return;
+      if (!rpcRecord(value))
+        return;
+      const record = value;
+      const position = symbolPosition(document2, record, symbolName);
+      if (record.name === symbolName && position) {
+        if (input.line === undefined || position.line + 1 === input.line)
+          found.push(position);
+      }
+      if (Array.isArray(record.children))
+        for (const child of record.children)
+          visit(child);
+    };
+    if (Array.isArray(symbols))
+      for (const symbol of symbols)
+        visit(symbol);
+    if (found.length !== 1)
+      throw new SignalGrepError(found.length ? "Go semantic target symbol is ambiguous" : "Go semantic target symbol is absent");
+    const position = found[0];
+    if (!position)
+      throw new SignalGrepError("Go semantic target symbol is absent");
+    return position;
+  }
+  node(internal, document2) {
+    const range = byteRange(document2, internal.range);
+    const selection = byteRange(document2, internal.selectionRange);
+    const localKey = `${document2.path}:${String(selection.start)}:${String(selection.end)}`;
+    this.#nodePaths.set(localKey, document2.path);
+    return {
+      identity: {
+        providerId: GO_SEMANTIC_PROVIDER_ID,
+        analysisViewId: this.analysisViewId,
+        sourceScope: this.sourceScope.root,
+        localKey
+      },
+      path: document2.path,
+      name: internal.name ?? document2.path,
+      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
+      range,
+      start: {
+        line: internal.selectionRange.start.line + 1,
+        column: internal.selectionRange.start.character + 1
+      },
+      end: {
+        line: internal.selectionRange.end.line + 1,
+        column: internal.selectionRange.end.character + 1
+      },
+      source: document2.reference,
+      evidence: [evidence("gopls compiler-bound Go navigation result")]
+    };
+  }
+  convertNode(internal, unresolved, operation) {
+    const document2 = this.#documents.get(resolve25(this.#cwd, internal.path));
+    if (!document2) {
+      unresolved.push(operationUnresolved(operation, "gopls result is outside admitted Go source"));
+      return;
+    }
+    return this.node(internal, document2);
+  }
+  callSite(edge, range) {
+    const document2 = this.#documents.get(resolve25(this.#cwd, edge.from.path));
+    return document2 ? sourceLocation(document2, range) : undefined;
+  }
+  sourceStatus(document2, status, reason) {
+    return {
+      path: document2.path,
+      role: documentRole(document2.path),
+      status,
+      expected: document2.reference,
+      ...reason ? { reason } : {}
+    };
+  }
+  currentSourceStatuses() {
+    return [
+      ...[...this.#documents.values()].map((document2) => this.sourceStatus(document2, "current")),
+      { path: GO_ENVIRONMENT_PATH, role: "config", status: "current" }
+    ];
+  }
+  internalNode(node) {
+    const document2 = this.#documents.get(resolve25(this.#cwd, node.path));
+    if (!document2)
+      throw new SignalGrepError("Relationship node is outside this Go view");
+    const start2 = { line: node.start.line - 1, character: node.start.column - 1 };
+    const end = {
+      line: (node.end?.line ?? node.start.line) - 1,
+      character: (node.end?.column ?? node.start.column) - 1
+    };
+    return {
+      id: node.identity.localKey,
+      path: document2.path,
+      uri: "",
+      range: { start: start2, end },
+      selectionRange: { start: start2, end },
+      name: node.name
+    };
+  }
+  assertOpen() {
+    if (this.#closed)
+      throw new SignalGrepError("Go relationship view is closed");
+  }
+}
+var goSemanticProvider = {
+  providerId: GO_SEMANTIC_PROVIDER_ID,
+  async open(options) {
+    const releaseQueue = await providerQueue.acquire(options.signal);
+    try {
+      const files = await listWorkspaceFiles(options.cwd, options.signal, {
+        path: options.scope.root,
+        glob: [...options.scope.include ?? []],
+        exclude: [...options.scope.exclude ?? []],
+        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
+        ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
+      });
+      const documents = new Map;
+      const reasons = [...files.reasons];
+      let initialCoveragePartial = files.partial;
+      for (const path of files.paths.filter(isAdmittedGoFile)) {
+        if (options.signal.aborted)
+          throw abortError();
+        try {
+          const document2 = await options.source.load(path);
+          if (!document2.utf8) {
+            reasons.push(`${path}: source is not lossless UTF-8`);
+            initialCoveragePartial = true;
+            continue;
+          }
+          documents.set(resolve25(options.cwd, path), document2);
+        } catch (error) {
+          reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
+          initialCoveragePartial = true;
+        }
+      }
+      if (documents.size === 0)
+        throw new SignalGrepError("Go semantic provider found no admitted Go source");
+      const executable = executablePath2();
+      const deadline = new AbortController;
+      const signal = AbortSignal.any([options.signal, deadline.signal]);
+      const timer = setTimeout(() => deadline.abort(), GO_SEMANTIC_QUERY_TIMEOUT_MS);
+      let owned;
+      try {
+        owned = await openOwnedJsonRpc({
+          executable,
+          args: ["serve"],
+          cwd: resolve25(options.cwd, options.scope.root),
+          signal,
+          env: environment(executable)
+        }, (method, params) => {
+          if (method === "workspace/configuration") {
+            if (!rpcRecord(params) || !Array.isArray(params.items))
+              throw new SignalGrepError("Invalid gopls configuration request");
+            return params.items.map(() => ({}));
+          }
+          if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
+            return null;
+          if (method === "workspace/applyEdit")
+            return { applied: false, failureReason: "Relationship search is read-only" };
+          throw new SignalGrepError(`Unsupported gopls client request: ${method}`);
+        });
+        const initialize = await owned.channel.request("initialize", {
+          processId: process.pid,
+          rootUri: await semanticUri(options.cwd, options.scope.root),
+          workspaceFolders: [
+            { uri: await semanticUri(options.cwd, options.scope.root), name: options.scope.root }
+          ],
+          capabilities: {
+            workspace: { workspaceFolders: true, configuration: true },
+            textDocument: {
+              definition: { linkSupport: true },
+              references: {},
+              implementation: { linkSupport: true },
+              callHierarchy: {}
+            },
+            general: { positionEncodings: ["utf-16"] }
+          },
+          initializationOptions: {}
+        });
+        if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || !("capabilities" in initialize))
+          throw new SignalGrepError("gopls initialize omitted capabilities");
+        await owned.channel.notify("initialized", {});
+        for (const document2 of documents.values()) {
+          if (!goTextDocument.test(document2.path))
+            continue;
+          const uri = await semanticUri(options.cwd, document2.path);
+          await owned.channel.notify("textDocument/didOpen", {
+            textDocument: {
+              uri,
+              languageId: languageId2(document2.path),
+              version: 1,
+              text: document2.text
+            }
+          });
+        }
+        const inventory = new Set(files.paths.filter(isAdmittedGoFile));
+        return new GoRelationshipView(options, owned.channel, owned.completion, documents, reasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, () => clearTimeout(timer));
+      } catch (error) {
+        deadline.abort();
+        clearTimeout(timer);
+        releaseQueue();
+        if (owned) {
+          owned.channel.close();
+          await owned.completion.catch(() => {
+            return;
+          });
+        }
+        throw error;
+      }
+    } catch (error) {
+      releaseQueue();
+      throw error;
+    }
+  }
+};
+
+// src/relationship-types.ts
+function relationshipNodeKey(node) {
+  const identity = node.identity;
+  return JSON.stringify([
+    identity.providerId,
+    identity.analysisViewId,
+    identity.sourceScope,
+    identity.localKey
+  ]);
+}
+function relationshipEdgeKey(edge) {
+  return edge.edgeKey;
+}
+
+// src/relationship-explorer.ts
+var DEFAULT_RELATIONSHIP_TRACE_BUDGET = {
+  maxDepth: 3,
+  maxNodes: 200,
+  maxEdges: 400,
+  maxExpansions: 200
+};
+function validateBudget(budget) {
+  for (const [name2, value] of Object.entries(budget)) {
+    if (!Number.isSafeInteger(value) || value < 1)
+      throw new SignalGrepError(`Relationship ${name2} must be a positive integer`);
+  }
+}
+function resolvedRoot(root) {
+  if (!root)
+    throw new SignalGrepError("Relationship trace root was not resolved");
+  if ("identity" in root)
+    return root;
+  if (root.status !== "resolved" || !root.node)
+    throw new SignalGrepError(`Relationship target could not be resolved: ${root.reasons.join("; ")}`);
+  return root.node;
+}
+function mergeDependencies(expansions) {
+  const status = expansions.flatMap((expansion) => expansion.coverage.sources);
+  return [...new Map(status.map((item) => [`${item.role}:${item.path}`, item])).values()];
+}
+
+class RelationshipExplorer {
+  async start(view, request) {
+    validateBudget(request.budget);
+    if (request.signal?.aborted)
+      throw abortError();
+    const root = resolvedRoot(request.root);
+    const state = {
+      scope: request.scope ?? view.sourceScope,
+      operation: request.operation,
+      budget: { ...request.budget },
+      nodes: [root],
+      edges: [],
+      unresolved: [],
+      frontier: [{ node: root, depth: 0 }],
+      expanded: [],
+      reasons: [],
+      coverage: relationshipCoverage([], [], "not-applicable"),
+      depthReached: 0,
+      expansions: 0,
+      truncated: false
+    };
+    return this.continue(view, state, request.signal);
+  }
+  async continue(view, previous, signal, options = {}) {
+    const budget = {
+      ...previous.budget,
+      maxDepth: previous.budget.maxDepth + (options.extendDepth ?? 0)
+    };
+    validateBudget(budget);
+    if (signal?.aborted)
+      throw abortError();
+    const nodes = new Map(previous.nodes.map((node) => [relationshipNodeKey(node), node]));
+    const edges = new Map(previous.edges.map((edge) => [relationshipEdgeKey(edge), edge]));
+    const expanded = new Set(previous.expanded);
+    const frontier = previous.frontier.map((item) => ({ ...item }));
+    const unresolved = [...previous.unresolved];
+    const reasons = [...previous.reasons];
+    const expansions = previous.expansions;
+    let usedExpansions = expansions;
+    let depthReached = previous.depthReached;
+    let truncated = false;
+    const expansionFacts = [];
+    while (frontier.length > 0) {
+      if (signal?.aborted)
+        throw abortError();
+      const current = frontier.shift();
+      if (!current)
+        break;
+      if (current.depth >= budget.maxDepth) {
+        frontier.unshift(current);
+        truncated = true;
+        break;
+      }
+      const key = `${relationshipNodeKey(current.node)}\x00${previous.operation}`;
+      if (expanded.has(key))
+        continue;
+      if (usedExpansions >= budget.maxExpansions) {
+        frontier.unshift(current);
+        truncated = true;
+        break;
+      }
+      usedExpansions += 1;
+      expanded.add(key);
+      const expansion = await view.expand(current.node, previous.operation, signal);
+      expansionFacts.push(expansion);
+      depthReached = Math.max(depthReached, current.depth + 1);
+      for (const item of expansion.unresolved)
+        unresolved.push(item);
+      for (const edge of expansion.edges) {
+        if (edges.has(edge.edgeKey))
+          continue;
+        const missingNodeKeys = [edge.from, edge.to].map(relationshipNodeKey).filter((missingKey) => !nodes.has(missingKey));
+        if (edges.size >= budget.maxEdges || nodes.size + new Set(missingNodeKeys).size > budget.maxNodes) {
+          truncated = true;
+          reasons.push(edges.size >= budget.maxEdges ? "Relationship edge budget reached; remaining edges were not retained and cannot be continued" : "Relationship node budget reached; remaining edges were not retained and cannot be continued");
+          frontier.length = 0;
+          break;
+        }
+        edges.set(edge.edgeKey, edge);
+        for (const node of [edge.from, edge.to]) {
+          const nodeKey = relationshipNodeKey(node);
+          if (!nodes.has(nodeKey)) {
+            nodes.set(nodeKey, node);
+          }
+          if (!expanded.has(`${nodeKey}\x00${previous.operation}`))
+            frontier.push({ node, depth: current.depth + 1 });
+        }
+      }
+      if (nodes.size >= budget.maxNodes || edges.size >= budget.maxEdges) {
+        truncated = true;
+        frontier.length = 0;
+        reasons.push("Relationship traversal reached its retained node/edge budget");
+        break;
+      }
+    }
+    const previousSources = previous.coverage.sources;
+    const sources = [
+      ...new Map([...previousSources, ...mergeDependencies(expansionFacts)].map((source) => [
+        `${source.role}:${source.path}`,
+        source
+      ])).values()
+    ];
+    const allReasons = [...new Set([...previous.coverage.reasons, ...reasons])];
+    const freshness = expansionFacts.length === 0 ? "unknown" : aggregateRelationshipValidity(sources);
+    const coverage = relationshipCoverage(sources, allReasons, truncated || unresolved.length > 0 ? "partial" : "complete");
+    coverage.freshness = freshness;
+    return {
+      scope: previous.scope,
+      operation: previous.operation,
+      budget,
+      nodes: [...nodes.values()],
+      edges: [...edges.values()],
+      unresolved,
+      frontier,
+      expanded: [...expanded],
+      reasons: allReasons,
+      coverage,
+      depthReached,
+      expansions: usedExpansions,
+      truncated,
+      status: truncated || unresolved.length > 0 ? "partial" : "complete"
+    };
+  }
+}
+
+// src/relationship-store.ts
+import { randomUUID as randomUUID5 } from "crypto";
+var PAGE_SIZE = 30;
+var DEFAULT_TTL_MS = 60000;
+var DEFAULT_MAX_ENTRIES = 32;
+var DEFAULT_MAX_STATES = 128;
+var DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
+
+class RelationshipChangedError extends SignalGrepError {
+  validity;
+  constructor(validity, message) {
+    super(message);
+    this.name = "RelationshipChangedError";
+    this.validity = validity;
+  }
+}
+function cursorParts(cursor) {
+  const match = /^relationship\.([a-f0-9-]+)\.(page|explore)\.([0-9a-z]+)\.([0-9a-z]+)$/.exec(cursor);
+  if (!match)
+    throw new SignalGrepError("Invalid relationship cursor");
+  const version = Number.parseInt(match[3] ?? "", 36);
+  const offset = Number.parseInt(match[4] ?? "", 36);
+  if (!Number.isSafeInteger(version) || version < 0 || version.toString(36) !== match[3] || !Number.isSafeInteger(offset) || offset < 0 || offset.toString(36) !== match[4])
+    throw new SignalGrepError("Invalid relationship cursor offset");
+  const kind = match[2];
+  if (kind !== "page" && kind !== "explore")
+    throw new SignalGrepError("Invalid relationship cursor kind");
+  return { id: match[1] ?? "", kind, version, offset };
+}
+function pageCursor(id, version, offset) {
+  return `relationship.${id}.page.${version.toString(36)}.${offset.toString(36)}`;
+}
+function exploreCursor(id, version) {
+  return `relationship.${id}.explore.${version.toString(36)}.0`;
+}
+function referenceKey(value) {
+  return JSON.stringify(value);
+}
+function compareCaptured(captured, current) {
+  const actual = new Map(current.sources.map((source) => [`${source.role}:${source.path}`, source]));
+  const statuses = [...captured.coverage.sources].map((expected) => {
+    const found = actual.get(`${expected.role}:${expected.path}`);
+    if (!found) {
+      const wasPresent = expected.expected !== undefined || expected.current !== undefined;
+      return Object.assign({}, expected, {
+        status: wasPresent ? "stale" : "unknown",
+        reason: wasPresent ? "Captured dependency is no longer present" : "Dependency could not be rechecked"
+      });
+    }
+    const expectedReference = expected.expected ?? expected.current;
+    const currentReference = found.current ?? found.expected;
+    if (expectedReference && currentReference && referenceKey(expectedReference) !== referenceKey(currentReference))
+      return Object.assign({}, found, {
+        status: "stale",
+        expected: expectedReference,
+        reason: "Captured dependency revision changed"
+      });
+    return found;
+  });
+  const reasons = [
+    ...new Set([
+      ...current.reasons,
+      ...statuses.filter((source) => source.reason).map((source) => `${source.path}: ${source.reason}`)
+    ])
+  ];
+  return relationshipRecheck(statuses, current.affectedNodeKeys, current.affectedEdgeKeys, reasons, aggregateRelationshipValidity(statuses) === "current" ? current.coverage : "partial");
+}
+function rootViewId(request) {
+  const root = request.root ? "identity" in request.root ? request.root : request.root.node : undefined;
+  return root?.identity.analysisViewId;
+}
+
+class RelationshipStore {
+  #entries = new Map;
+  #locks = new Map;
+  #active = new Set;
+  #explorer;
+  #pageSize;
+  #ttlMs;
+  #maxEntries;
+  #maxStates;
+  #maxBytes;
+  #stateCount = 0;
+  #bytes = 0;
+  #generation = 0;
+  #closed = false;
+  constructor(explorer = new RelationshipExplorer, pageSize = PAGE_SIZE, options = {}) {
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1)
+      throw new SignalGrepError("Relationship page size must be positive");
+    this.#explorer = explorer;
+    this.#pageSize = pageSize;
+    this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.#maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    this.#maxStates = options.maxStates ?? DEFAULT_MAX_STATES;
+    this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    if (![this.#ttlMs, this.#maxEntries, this.#maxStates, this.#maxBytes].every((value) => Number.isSafeInteger(value) && value >= 1))
+      throw new SignalGrepError("Invalid relationship store bounds");
+  }
+  async create(factory, request, prepare) {
+    this.assertOpen();
+    const generation = this.#generation;
+    let effectiveRequest = request;
+    const state = await this.#withView(factory, request.signal, rootViewId(request), async (view) => {
+      const before = await view.recheck(request.signal);
+      this.assertCurrent(before);
+      effectiveRequest = prepare ? await prepare(view) : request;
+      const explored = await this.#explorer.start(view, effectiveRequest);
+      const after = await view.recheck(request.signal);
+      this.assertCurrent(after);
+      return explored;
+    });
+    if (generation !== this.#generation)
+      throw new SignalGrepError("Relationship store was cleared during the operation");
+    const bytes = Buffer.byteLength(JSON.stringify(state));
+    if (bytes > this.#maxBytes)
+      throw new SignalGrepError("Relationship snapshot exceeds the storage byte limit");
+    this.#expire();
+    const id = randomUUID5();
+    const entry = {
+      id,
+      factory,
+      request: effectiveRequest,
+      currentVersion: 0,
+      states: new Map([[0, state]]),
+      touched: Date.now(),
+      bytes,
+      active: 0
+    };
+    this.#entries.set(id, entry);
+    this.#stateCount += 1;
+    this.#bytes += bytes;
+    this.#evict(id);
+    if (!this.#entries.has(id))
+      throw new SignalGrepError("Relationship snapshot was evicted before it could be returned");
+    return this.#stored(entry, state, 0);
+  }
+  page(cursor, limit = this.#pageSize) {
+    this.assertOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new SignalGrepError("Relationship page limit must be positive");
+    this.#expire();
+    const parts2 = cursorParts(cursor);
+    if (parts2.kind !== "page")
+      throw new SignalGrepError("Relationship exploration cursor cannot page results");
+    const entry = this.#entry(parts2.id);
+    const state = entry.states.get(parts2.version);
+    if (!state)
+      throw new SignalGrepError("Relationship page was evicted; start the trace again");
+    if (parts2.offset > state.edges.length)
+      throw new SignalGrepError("Relationship page offset is beyond the snapshot");
+    entry.touched = Date.now();
+    const items = state.edges.slice(parts2.offset, parts2.offset + limit);
+    const nextOffset = parts2.offset + items.length;
+    const nextCursor = nextOffset < state.edges.length ? pageCursor(entry.id, parts2.version, nextOffset) : undefined;
+    const continuation = this.#continuation(entry, parts2.version);
+    return {
+      items,
+      offset: parts2.offset,
+      totalItems: state.edges.length,
+      cursor,
+      ...nextCursor ? { nextCursor } : {},
+      ...continuation ? { exploreCursor: continuation } : {}
+    };
+  }
+  snapshot(cursor) {
+    this.assertOpen();
+    this.#expire();
+    const parts2 = cursorParts(cursor);
+    const entry = this.#entry(parts2.id);
+    const state = entry.states.get(parts2.version);
+    if (!state)
+      throw new SignalGrepError("Relationship snapshot was evicted");
+    entry.touched = Date.now();
+    return state;
+  }
+  async continue(exploreCursorValue, signal) {
+    this.assertOpen();
+    const parts2 = cursorParts(exploreCursorValue);
+    if (parts2.kind !== "explore")
+      throw new SignalGrepError("Relationship page cursor cannot explore");
+    const generation = this.#generation;
+    return this.#locked(parts2.id, async (entry) => {
+      const previous = entry.states.get(parts2.version);
+      if (!previous)
+        throw new SignalGrepError("Relationship exploration snapshot was evicted");
+      if (parts2.version !== entry.currentVersion)
+        throw new SignalGrepError("Relationship exploration cursor is superseded by a newer snapshot");
+      if (previous.frontier.length === 0)
+        return this.#stored(entry, previous, entry.currentVersion);
+      const state = await this.#withView(entry.factory, signal, rootViewId(entry.request), async (view) => {
+        const before = compareCaptured(previous, await view.recheck(signal));
+        this.assertCurrent(before);
+        const next = await this.#explorer.continue(view, previous, signal, { extendDepth: 1 });
+        const after = compareCaptured(previous, await view.recheck(signal));
+        this.assertCurrent(after);
+        return next;
+      });
+      if (this.#generation !== generation)
+        throw new SignalGrepError("Relationship store was cleared during the operation");
+      const bytes = Buffer.byteLength(JSON.stringify(state));
+      if (bytes > this.#maxBytes)
+        throw new SignalGrepError("Relationship continuation exceeds the storage byte limit");
+      const version = entry.currentVersion + 1;
+      entry.currentVersion = version;
+      entry.states.set(version, state);
+      entry.bytes += bytes;
+      this.#stateCount += 1;
+      this.#bytes += bytes;
+      entry.touched = Date.now();
+      this.#evict(entry.id);
+      if (!this.#entries.has(entry.id))
+        throw new SignalGrepError("Relationship continuation was evicted before it could be returned");
+      return this.#stored(entry, state, version);
+    });
+  }
+  async validate(cursor, signal) {
+    this.assertOpen();
+    const parts2 = cursorParts(cursor);
+    const entry = this.#entry(parts2.id);
+    if (!entry.states.has(parts2.version))
+      throw new SignalGrepError("Relationship evidence snapshot was evicted");
+    entry.touched = Date.now();
+    const state = entry.states.get(parts2.version);
+    if (!state)
+      throw new SignalGrepError("Relationship evidence snapshot was evicted");
+    const generation = this.#generation;
+    const result = await this.#withView(entry.factory, signal, rootViewId(entry.request), async (view) => compareCaptured(state, await view.recheck(signal)));
+    if (generation !== this.#generation)
+      throw new SignalGrepError("Relationship store was cleared during the operation");
+    return result;
+  }
+  clear() {
+    this.#generation += 1;
+    this.#entries.clear();
+    this.#stateCount = 0;
+    this.#bytes = 0;
+  }
+  async close() {
+    this.#closed = true;
+    this.#generation += 1;
+    await Promise.allSettled(this.#active);
+    this.#entries.clear();
+    this.#locks.clear();
+    this.#stateCount = 0;
+    this.#bytes = 0;
+  }
+  async#locked(id, operation) {
+    const previous = this.#locks.get(id) ?? Promise.resolve();
+    const done = Promise.withResolvers();
+    const chain = previous.then(() => done.promise);
+    this.#locks.set(id, chain);
+    await previous;
+    const entry = this.#entries.get(id);
+    if (!entry)
+      throw new SignalGrepError("Relationship exploration was not found or has expired");
+    entry.active += 1;
+    const marker = Promise.withResolvers();
+    this.#active.add(marker.promise);
+    try {
+      return await operation(entry);
+    } finally {
+      entry.active -= 1;
+      done.resolve();
+      marker.resolve();
+      this.#active.delete(marker.promise);
+      if (this.#locks.get(id) === chain)
+        this.#locks.delete(id);
+    }
+  }
+  async#withView(factory, signal, analysisViewId, operation) {
+    const marker = Promise.withResolvers();
+    this.#active.add(marker.promise);
+    let view;
+    try {
+      view = await factory.open(signal, analysisViewId);
+      return await operation(view);
+    } finally {
+      try {
+        if (view)
+          await view.close();
+      } finally {
+        marker.resolve();
+        this.#active.delete(marker.promise);
+      }
+    }
+  }
+  #stored(entry, state, version) {
+    const continuation = this.#continuation(entry, version);
+    return {
+      state,
+      cursor: pageCursor(entry.id, version, 0),
+      ...continuation ? { exploreCursor: continuation } : {}
+    };
+  }
+  #continuation(entry, version) {
+    const state = entry.states.get(version);
+    return state && state.frontier.length > 0 && state.coverage.freshness === "current" ? exploreCursor(entry.id, version) : undefined;
+  }
+  #entry(id) {
+    const entry = this.#entries.get(id);
+    if (!entry)
+      throw new SignalGrepError("Relationship result was not found or has expired");
+    return entry;
+  }
+  #expire() {
+    const cutoff = Date.now() - this.#ttlMs;
+    for (const [id, entry] of this.#entries)
+      if (entry.active === 0 && entry.touched < cutoff)
+        this.#drop(id, entry);
+  }
+  #evict(preserveId) {
+    while (this.#entries.size > this.#maxEntries || this.#stateCount > this.#maxStates || this.#bytes > this.#maxBytes) {
+      const oldest = [...this.#entries.values()].filter((entry) => entry.active === 0 && entry.id !== preserveId).toSorted((left, right) => left.touched - right.touched)[0];
+      if (!oldest)
+        break;
+      this.#drop(oldest.id, oldest);
+    }
+  }
+  #drop(id, entry) {
+    if (!this.#entries.delete(id))
+      return;
+    this.#stateCount -= entry.states.size;
+    this.#bytes -= entry.bytes;
+  }
+  assertCurrent(recheck) {
+    if (recheck.validity !== "current")
+      throw new RelationshipChangedError(recheck.validity, `Relationship evidence is ${recheck.validity}; the operation was not published`);
+  }
+  assertOpen() {
+    if (this.#closed)
+      throw new SignalGrepError("Relationship store is closed");
+  }
+}
+
+// src/typescript-relationship-provider.ts
+import { randomUUID as randomUUID6 } from "crypto";
+import { resolve as resolve26 } from "path";
+import { pathToFileURL as pathToFileURL2 } from "url";
+var TYPESCRIPT_PROVIDER_ID = "typescript";
+function record2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : undefined;
+}
+function callItem(value) {
+  const item = record2(value);
+  if (!item || typeof item.name !== "string" || typeof item.kind !== "string" && typeof item.kind !== "number")
+    return;
+  const uri = typeof item.uri === "string" ? item.uri : undefined;
+  const rangeValue = item.range;
+  const selectionValue = item.selectionRange ?? rangeValue;
+  if (!uri || !rangeValue || !selectionValue)
+    return;
+  return {
+    ...item,
+    name: item.name,
+    kind: item.kind,
+    uri,
+    range: lspRange(rangeValue),
+    selectionRange: lspRange(selectionValue)
+  };
+}
+function sourceRange(document2, range) {
+  const bytes = byteRange(document2, range);
+  return {
+    path: document2.path,
+    range: bytes,
+    start: document2.positionAt(bytes.start),
+    end: document2.positionAt(bytes.end),
+    source: document2.reference
+  };
+}
+function symbolAt(document2, symbol) {
+  return sourceRange(document2, {
+    start: lspPosition(document2, symbol.start),
+    end: lspPosition(document2, symbol.end)
+  });
+}
+function lspAtByte(document2, byte) {
+  const position = document2.positionAt(byte);
+  return { line: position.line - 1, character: position.column - 1 };
+}
+function operationMethod2(operation) {
+  return operation === "definitions" ? "textDocument/definition" : operation === "implementations" ? "textDocument/implementation" : "textDocument/references";
+}
+function operationEvidence(operation) {
+  return {
+    level: "compiler",
+    basis: "semantic",
+    providerBasis: "typescript-language-service",
+    reason: `TypeScript language service ${operation} result; static binding does not prove runtime dispatch`
+  };
+}
+function dependencies(documents, metadata2) {
+  return [
+    ...documents.map((document2) => ({
+      path: document2.path,
+      role: "source",
+      reference: document2.reference
+    })),
+    ...metadata2.map((document2) => ({
+      path: document2.path,
+      role: /(?:^|\/)package\.json$/iu.test(document2.path) ? "manifest" : "config",
+      reference: document2.reference
+    }))
+  ];
+}
+function currentStatuses(dependenciesList, status, reason) {
+  return dependenciesList.map((dependency) => ({
+    path: dependency.path,
+    role: dependency.role,
+    status,
+    ...dependency.reference ? { expected: dependency.reference } : {},
+    ...reason === undefined ? {} : { reason }
+  }));
+}
+function inputPosition(document2, input) {
+  if (!Number.isSafeInteger(input.line) || input.line < 1)
+    throw new SignalGrepError("Semantic line must be a positive integer");
+  const line = document2.lineRange(input.line);
+  if (input.column === undefined)
+    return document2.toCharacterOffset(line.start);
+  if (!Number.isSafeInteger(input.column) || input.column < 1)
+    throw new SignalGrepError("Semantic column must be a positive integer");
+  const position = document2.toCharacterOffset(line.start) + input.column - 1;
+  document2.toByteOffset(position);
+  return position;
+}
+function candidatesFor(document2, syntax, input) {
+  const character = inputPosition(document2, input);
+  return syntax.symbols.filter((candidate) => {
+    const line = document2.lineAt(document2.toByteOffset(candidate.start));
+    const bySymbol = input.symbol === undefined || candidate.name === input.symbol;
+    const byLine = input.line === undefined || line === input.line;
+    const byCharacter = input.column === undefined || candidate.start <= character && character <= candidate.end;
+    return bySymbol && byLine && byCharacter && candidate.hasBody;
+  });
+}
+
+class TypeScriptRelationshipView {
+  providerId = TYPESCRIPT_PROVIDER_ID;
+  analysisViewId;
+  sourceScope;
+  #access;
+  #documents;
+  #cwd;
+  #projectRecheck;
+  #sourceAt;
+  #dependencies;
+  #nodes = new Map;
+  #edges = new Map;
+  #closed = false;
+  constructor(options, access, documents, metadata2, projectRecheck, sourceAt) {
+    this.analysisViewId = options.analysisViewId ?? randomUUID6();
+    this.sourceScope = options.scope;
+    this.#cwd = options.cwd;
+    this.#access = access;
+    this.#documents = documents;
+    this.#projectRecheck = projectRecheck;
+    this.#sourceAt = sourceAt;
+    this.#dependencies = dependencies(documents, metadata2);
+  }
+  #query(operation) {
+    return withTypeScript(this.#cwd, this.#documents, async (channel) => operation(channel), this.#access.signal, this.#cwd);
+  }
+  #assertOpen(signal) {
+    if (this.#closed)
+      throw new SignalGrepError("Relationship analysis view is closed");
+    if (signal?.aborted || this.#access.signal?.aborted)
+      throw abortError();
+  }
+  #node(document2, location, name2) {
+    const node = {
+      identity: {
+        providerId: this.providerId,
+        analysisViewId: this.analysisViewId,
+        sourceScope: JSON.stringify(this.sourceScope),
+        localKey: `${document2.path}:${location.range.start}:${location.range.end}:${name2}`
+      },
+      path: document2.path,
+      name: name2,
+      kind: "function",
+      range: location.range,
+      start: location.start,
+      ...location.end ? { end: location.end } : {},
+      source: document2.reference,
+      evidence: [operationEvidence("references")]
+    };
+    this.#nodes.set(relationshipNodeKey(node), node);
+    return node;
+  }
+  async resolveNode(input, signal) {
+    this.#assertOpen(signal);
+    const document2 = await this.#sourceAt(input.path);
+    if (!document2) {
+      return {
+        status: "unknown",
+        reasons: [`Semantic source is outside the admitted TypeScript project: ${input.path}`],
+        dependencies: [{ path: input.path, role: "source", reason: "source-not-admitted" }]
+      };
+    }
+    const syntax = await this.#access.syntax(document2);
+    if (syntax.status !== "ok") {
+      return {
+        status: "unsupported",
+        reasons: [`Cannot resolve a TypeScript symbol because syntax is ${syntax.status}`],
+        dependencies: this.#dependencies
+      };
+    }
+    const candidates = candidatesFor(document2, syntax, input);
+    if (candidates.length !== 1) {
+      return {
+        status: candidates.length === 0 ? "unknown" : "ambiguous",
+        ...candidates.length ? {
+          candidates: candidates.map((candidate) => this.#node(document2, symbolAt(document2, candidate), candidate.name))
+        } : {},
+        reasons: [
+          `Semantic target is ${candidates.length === 0 ? "absent" : "ambiguous"}; supply an exact line and UTF-16 column`
+        ],
+        dependencies: this.#dependencies
+      };
+    }
+    const candidate = candidates[0];
+    if (!candidate)
+      throw new Error("Missing semantic candidate");
+    let location = symbolAt(document2, candidate);
+    let nodeDocument = document2;
+    let name2 = candidate.name;
+    try {
+      const prepared = await this.#query((channel) => channel.request("textDocument/prepareCallHierarchy", {
+        textDocument: { uri: pathToFileURL2(resolve26(this.#cwd, document2.path)).href },
+        position: lspPosition(document2, candidate.start)
+      }));
+      if (Array.isArray(prepared)) {
+        const preparedItems = prepared.map(callItem).filter((item) => item !== undefined);
+        const selected = preparedItems.find((item) => item.selectionRange.start.line <= document2.lineAt(candidate.start) - 1 && item.selectionRange.end.line >= document2.lineAt(candidate.start) - 1) ?? preparedItems[0];
+        if (selected) {
+          const selectedLocation = semanticLocation({
+            targetUri: selected.uri,
+            targetSelectionRange: selected.selectionRange
+          });
+          const selectedDocument = await this.#sourceAt(selectedLocation.path);
+          if (selectedDocument) {
+            location = sourceRange(selectedDocument, selectedLocation.range);
+            nodeDocument = selectedDocument;
+            name2 = selected.name;
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof SignalGrepError && error.message.includes("Invalid TypeScript"))
+        throw error;
+    }
+    return {
+      status: "resolved",
+      node: this.#node(nodeDocument, location, name2),
+      reasons: [],
+      dependencies: this.#dependencies
+    };
+  }
+  async expand(node, operation, signal) {
+    this.#assertOpen(signal);
+    const document2 = await this.#sourceAt(node.path);
+    if (!document2)
+      return {
+        edges: [],
+        nodes: [],
+        unresolved: [
+          {
+            operation,
+            reason: `Source is no longer admitted: ${node.path}`,
+            confidence: "unknown"
+          }
+        ],
+        dependencies: this.#dependencies,
+        coverage: {
+          status: "partial",
+          freshness: "unknown",
+          sources: currentStatuses(this.#dependencies, "unknown", "source-not-admitted"),
+          reasons: [`Source is no longer admitted: ${node.path}`]
+        }
+      };
+    const textDocument = {
+      uri: await this.#uri(document2),
+      position: lspAtByte(document2, node.range.start)
+    };
+    const edges = [];
+    const nodes = [];
+    const unresolved = [];
+    if (operation === "callers" || operation === "callees") {
+      const prepared = await this.#query((channel) => channel.request("textDocument/prepareCallHierarchy", {
+        textDocument,
+        position: textDocument.position
+      }));
+      if (prepared === null) {
+        unresolved.push({
+          operation,
+          reason: "Compiler did not provide call hierarchy for this symbol",
+          confidence: "unknown"
+        });
+      } else if (!Array.isArray(prepared)) {
+        throw new SignalGrepError("Invalid TypeScript call hierarchy response");
+      } else {
+        for (const value of prepared) {
+          const item = callItem(value);
+          if (!item)
+            throw new SignalGrepError("Invalid TypeScript call hierarchy item");
+          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+          const response = await this.#query((channel) => channel.request(method, { item }));
+          if (response === null)
+            continue;
+          if (!Array.isArray(response))
+            throw new SignalGrepError("Invalid TypeScript call relationship response");
+          for (const raw of response) {
+            const call = record2(raw);
+            if (!call)
+              throw new SignalGrepError("Invalid TypeScript call relationship");
+            const from = record2(call.from);
+            const to = record2(call.to);
+            const sourceValue = operation === "callers" ? from : to;
+            if (!sourceValue)
+              continue;
+            const location = semanticLocation(sourceValue);
+            const targetDocument = await this.#sourceAt(location.path);
+            if (!targetDocument) {
+              unresolved.push({
+                operation,
+                reason: `Compiler location is outside admitted sources: ${location.path}`,
+                confidence: "unknown"
+              });
+              continue;
+            }
+            const targetLocation = sourceRange(targetDocument, location.range);
+            const related = this.#node(targetDocument, targetLocation, targetDocument.slice(targetLocation.range));
+            nodes.push(related);
+            const fromNode = operation === "callers" ? related : node;
+            const toNode = operation === "callers" ? node : related;
+            const callerDocument = await this.#sourceAt(from?.uri ? semanticLocation(from).path : document2.path);
+            const ranges = Array.isArray(call.fromRanges) ? call.fromRanges : [];
+            for (const rawRange of ranges.length ? ranges : [undefined]) {
+              const callSite = rawRange === undefined || !callerDocument ? undefined : sourceRange(callerDocument, lspRange(rawRange));
+              edges.push({
+                edgeKey: JSON.stringify([
+                  operation,
+                  relationshipNodeKey(fromNode),
+                  relationshipNodeKey(toNode),
+                  callSite?.range ?? targetLocation.range
+                ]),
+                operation,
+                from: fromNode,
+                to: toNode,
+                ...callSite ? { callSite } : {},
+                evidence: [operationEvidence(operation)],
+                confidence: "verified-static",
+                dependencies: this.#dependencies
+              });
+            }
+          }
+        }
+      }
+    } else {
+      const response = await this.#query((channel) => channel.request(operationMethod2(operation), {
+        textDocument,
+        position: textDocument.position,
+        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
+      }));
+      for (const location of locations(response)) {
+        const targetDocument = await this.#sourceAt(location.path);
+        if (!targetDocument) {
+          unresolved.push({
+            operation,
+            source: {
+              path: location.path,
+              range: { start: 0, end: 0 },
+              start: { line: 1, column: 1 }
+            },
+            reason: `Compiler location is outside admitted sources: ${location.path}`,
+            confidence: "unknown"
+          });
+          continue;
+        }
+        const targetLocation = sourceRange(targetDocument, location.range);
+        const related = this.#node(targetDocument, targetLocation, targetDocument.slice(targetLocation.range));
+        nodes.push(related);
+        edges.push({
+          edgeKey: JSON.stringify([
+            operation,
+            relationshipNodeKey(node),
+            relationshipNodeKey(related),
+            targetLocation.range
+          ]),
+          operation,
+          from: operation === "definitions" || operation === "implementations" ? node : related,
+          to: operation === "definitions" || operation === "implementations" ? related : node,
+          evidence: [operationEvidence(operation)],
+          confidence: "verified-static",
+          dependencies: this.#dependencies
+        });
+      }
+    }
+    const uniqueEdges = [...new Map(edges.map((edge) => [edge.edgeKey, edge])).values()];
+    const uniqueNodes = [
+      ...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()
+    ];
+    for (const edge of uniqueEdges)
+      this.#edges.set(edge.edgeKey, edge);
+    const reasons = unresolved.map((item) => item.reason);
+    const freshness = uniqueEdges.length || unresolved.length ? "current" : "unknown";
+    return {
+      edges: uniqueEdges,
+      nodes: uniqueNodes,
+      unresolved,
+      dependencies: this.#dependencies,
+      coverage: {
+        status: unresolved.length ? "partial" : "complete",
+        freshness,
+        sources: currentStatuses(this.#dependencies, freshness),
+        reasons
+      }
+    };
+  }
+  async recheck(signal) {
+    this.#assertOpen(signal);
+    const statuses = [];
+    const affectedPaths = new Set;
+    for (const dependency of this.#dependencies) {
+      this.#assertOpen(signal);
+      if (!dependency.reference) {
+        statuses.push({
+          path: dependency.path,
+          role: dependency.role,
+          status: "unknown",
+          reason: "Missing captured source reference"
+        });
+        continue;
+      }
+      try {
+        const refreshed = await this.#access.refresh(dependency.path, dependency.reference);
+        statuses.push({
+          path: dependency.path,
+          role: dependency.role,
+          status: "current",
+          expected: dependency.reference,
+          current: refreshed.reference
+        });
+      } catch (error) {
+        if (error instanceof SourceDocumentError) {
+          const status = error.reason === "source-changed" ? "stale" : "unknown";
+          statuses.push({
+            path: dependency.path,
+            role: dependency.role,
+            status,
+            expected: dependency.reference,
+            reason: error.message
+          });
+          if (status === "stale")
+            affectedPaths.add(dependency.path);
+          continue;
+        }
+        throw error;
+      }
+    }
+    try {
+      await this.#projectRecheck();
+    } catch (error) {
+      if (error instanceof SignalGrepError && error.message.includes("Workspace file set changed")) {
+        for (const dependency of this.#dependencies) {
+          const current = statuses.find((status) => status.path === dependency.path);
+          if (current?.status === "current") {
+            current.status = "stale";
+            current.reason = "Workspace file inventory changed during recheck";
+            affectedPaths.add(current.path);
+          }
+        }
+      } else
+        throw error;
+    }
+    const affectedNodeKeys = [...this.#nodes.values()].filter((node) => affectedPaths.has(node.path)).map(relationshipNodeKey);
+    const affectedEdgeKeys = [...this.#edges.values()].filter((edge) => affectedPaths.has(edge.from.path) || affectedPaths.has(edge.to.path)).map((edge) => edge.edgeKey);
+    const reasons = statuses.filter((status) => status.reason).map((status) => `${status.path}: ${status.reason}`);
+    return relationshipRecheck(statuses, affectedNodeKeys, affectedEdgeKeys, reasons, statuses.some((status) => status.status !== "current") ? "partial" : "complete");
+  }
+  async close() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+  }
+  async#uri(document2) {
+    const path = resolve26(this.#cwd, document2.path);
+    return pathToFileURL2(path).href;
+  }
+}
+function createTypeScriptRelationshipProvider(access) {
+  return {
+    providerId: TYPESCRIPT_PROVIDER_ID,
+    async open(options) {
+      if (options.cwd !== access.cwd)
+        throw new SignalGrepError("TypeScript provider cwd does not match SourceAccess");
+      const project = await semanticProject(access, options.scope.root, true, {
+        ...options.scope.include ? { glob: [...options.scope.include] } : {},
+        ...options.scope.exclude ? { exclude: [...options.scope.exclude] } : {},
+        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden }
+      });
+      const documents = [...project.documents.values()];
+      const sourceAt = await semanticSources(options.cwd, documents);
+      return new TypeScriptRelationshipView(options, access, documents, project.metadata, project.recheckInventory, sourceAt);
+    }
+  };
+}
+
+// src/relationship-service.ts
+class RelationshipService {
+  #queue;
+  #resolveScope;
+  #maxFilesToParse;
+  #relationships = new RelationshipStore;
+  #changeAwareness = new RelationshipChangeAwareness;
+  #relationshipWatchStops = new Set;
+  #watchedRelationshipRoots = new Set;
+  constructor(options) {
+    this.#queue = options.queue;
+    this.#resolveScope = options.resolveScope;
+    this.#maxFilesToParse = options.maxFilesToParse;
+  }
+  clear() {
+    this.#relationships.clear();
+  }
+  async shutdown() {
+    await this.#relationships.close();
+    for (const stop2 of this.#relationshipWatchStops)
+      stop2();
+    this.#relationshipWatchStops.clear();
+    this.#watchedRelationshipRoots.clear();
+    this.#changeAwareness.close();
+  }
+  async trace(input, cwd, signal) {
+    if (input.cursor?.startsWith("relationship.") && input.exploreCursor !== undefined)
+      throw new CursorError("Use cursor for immutable pages or exploreCursor for continuation, not both", "E_CURSOR_OPTIONS_CONFLICT");
+    if (input.exploreCursor !== undefined) {
+      rejectFields(input, [
+        "path",
+        "line",
+        "column",
+        "symbol",
+        "relation",
+        "depth",
+        "maxNodes",
+        "maxEdges",
+        "maxExpansions",
+        "cursor"
+      ], "Trace continuation", true);
+      const stored = await this.#relationships.continue(input.exploreCursor, signal);
+      return this.#pageResult(stored, stored.state.scope, input, this.#relationshipHints(stored.state.scope), this.#relationshipWatchHealth());
+    }
+    if (input.cursor?.startsWith("relationship.")) {
+      rejectFields(input, [
+        "path",
+        "line",
+        "column",
+        "symbol",
+        "relation",
+        "depth",
+        "maxNodes",
+        "maxEdges",
+        "maxExpansions"
+      ], "Trace continuation", true);
+      if (input.cursor.includes(".explore."))
+        throw new SignalGrepError("Use exploreCursor for relationship continuation; cursor is reserved for immutable pages");
+      const state = this.#relationships.snapshot(input.cursor);
+      const page = this.#relationships.page(input.cursor);
+      return this.#pageResult({
+        state,
+        cursor: input.cursor,
+        ...page.exploreCursor ? { exploreCursor: page.exploreCursor } : {}
+      }, state.scope, input, this.#relationshipHints(state.scope), this.#relationshipWatchHealth());
+    }
+    rejectFields(input, [
+      "query",
+      "pattern",
+      "context",
+      "wholeWord",
+      "literal",
+      "ignoreCase",
+      "changes",
+      "modifiedAfter",
+      "modifiedBefore",
+      "anyOf",
+      "allOf",
+      "within",
+      "roles",
+      "paths",
+      "matchIndices",
+      "targets",
+      "sourceCursor",
+      "conceptLimit"
+    ], "mode=trace");
+    const operation = input.relation;
+    if (operation !== "callers" && operation !== "callees")
+      throw new SignalGrepError("mode=trace requires relation=callers or relation=callees");
+    if (!input.path || input.line === undefined)
+      throw new SignalGrepError("mode=trace requires path and line; add column or symbol to identify the root");
+    const maxDepth = input.depth ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxDepth;
+    const budget = {
+      maxDepth,
+      maxNodes: input.maxNodes ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxNodes,
+      maxEdges: input.maxEdges ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxEdges,
+      maxExpansions: input.maxExpansions ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxExpansions
+    };
+    const maxFiles = this.#maxFilesToParse(input.maxFilesToParse);
+    const { factory, scope } = await this.#factory(input, cwd, signal, maxFiles);
+    const request = {
+      operation,
+      budget,
+      scope,
+      ...signal ? { signal } : {}
+    };
+    const stored = await this.#relationships.create(factory, request, async (view) => ({
+      ...request,
+      root: await view.resolveNode({
+        path: input.path.replace(/^@/, ""),
+        line: input.line,
+        ...input.column !== undefined ? { column: input.column } : {},
+        ...input.symbol ? { symbol: input.symbol } : {}
+      }, signal)
+    }));
+    return this.#pageResult(stored, scope, input, this.#relationshipHints(scope), this.#relationshipWatchHealth());
+  }
+  async validate(input, signal) {
+    const cursor = input.cursor;
+    if (!cursor)
+      throw new SignalGrepError("mode=validate requires a saved evidence cursor");
+    rejectFields(input, [
+      "path",
+      "line",
+      "column",
+      "symbol",
+      "relation",
+      "depth",
+      "maxNodes",
+      "maxEdges",
+      "maxExpansions",
+      "exploreCursor"
+    ], "Evidence validation", true);
+    const state = this.#relationships.snapshot(cursor);
+    const startedAt = Date.now();
+    const recheck = await this.#relationships.validate(cursor, signal);
+    const finishedAt = Date.now();
+    return validationResult(state, cursor, recheck, {
+      start: startedAt,
+      end: finishedAt,
+      ...input.matchIndex !== undefined ? { selected: input.matchIndex } : {}
+    }, "current-worktree", this.#relationshipHints(state.scope), this.#relationshipWatchHealth());
+  }
+  async#factory(input, cwd, signal, maxFiles) {
+    const target = input.path?.replace(/^@/, "");
+    if (!target)
+      throw new SignalGrepError("mode=trace requires a workspace path");
+    const resolved = await this.#resolveScope(cwd, target, input, signal);
+    const scope = {
+      root: resolved.root,
+      ...resolved.filters.glob.length ? { include: resolved.filters.glob } : {},
+      ...resolved.filters.exclude.length ? { exclude: resolved.filters.exclude } : {},
+      hidden: resolved.filters.hidden
+    };
+    if (!this.#watchedRelationshipRoots.has(scope.root)) {
+      const stop2 = this.#changeAwareness.start([scope.root], {
+        recursive: true,
+        maxSources: 64
+      });
+      this.#relationshipWatchStops.add(stop2);
+      this.#watchedRelationshipRoots.add(scope.root);
+    }
+    const go = /\.go$/iu.test(target);
+    const providerId = go ? goSemanticProvider.providerId : "typescript";
+    const factory = {
+      providerId,
+      open: async (operationSignal = new AbortController().signal, analysisViewId) => {
+        const access = new SourceAccess(cwd, this.#queue, operationSignal, { maxFiles });
+        const implementation = go ? goSemanticProvider : createTypeScriptRelationshipProvider(access);
+        return implementation.open({
+          cwd,
+          scope,
+          source: access,
+          signal: operationSignal,
+          ...analysisViewId ? { analysisViewId } : {},
+          limits: { maxFiles }
+        });
+      }
+    };
+    return { factory, scope };
+  }
+  #relationshipHints(scope) {
+    return this.#changeAwareness.dirty().filter((hint) => isPathInsideCwd(resolve27(hint.path), scope.root));
+  }
+  #relationshipWatchHealth() {
+    return this.#changeAwareness.health();
+  }
+  #pageResult(stored, scope, input, changeHints, watchHealth) {
+    let limit;
+    for (;; ) {
+      const page = this.#relationships.page(stored.cursor, limit);
+      const result = traceResult(stored, page, scope, input, changeHints, watchHealth);
+      const bytes = Buffer.byteLength(JSON.stringify({ text: result.text, details: result.details }));
+      if (bytes <= MAX_RESULT_BYTES)
+        return result;
+      if (page.items.length <= 1)
+        throw new SignalGrepError("Relationship evidence cannot fit the shared result byte budget");
+      limit = Math.max(1, Math.floor(page.items.length / 2));
+    }
+  }
+}
+function rejectFields(input, fields, operation, cursor = false) {
+  const present = fields.filter((field) => input[field] !== undefined);
+  if (!present.length)
+    return;
+  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: copy the complete returned request unchanged. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
+  if (cursor)
+    throw new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT");
+  throw new SignalGrepError(message);
+}
+
 // src/evidence-service.ts
 function isEvidenceRequest(input) {
-  return isSemanticMode(input.mode) || input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "impact" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
+  return isSemanticMode(input.mode) || input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "impact" || input.mode === "trace" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
-function rejectFields(input, fields, operation, cursor = false, repair = "copy the complete returned request unchanged") {
+function rejectFields2(input, fields, operation, cursor = false, repair = "copy the complete returned request unchanged") {
   const present = fields.filter((field) => input[field] !== undefined);
   const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: ${repair}. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
   if (present.length)
@@ -8665,11 +12008,11 @@ function searchScope(request) {
   };
 }
 async function navigationRoot(cwd, path, signal) {
-  const absolute = resolve21(cwd, path);
-  const repository = await findGitRepository(dirname6(absolute), signal);
+  const absolute = resolve28(cwd, path);
+  const repository = await findGitRepository(dirname8(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve21(cwd) : dirname6(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve28(cwd) : dirname8(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -8681,7 +12024,7 @@ function navigationFilters(input) {
   return { glob: request.glob, exclude: request.exclude, hidden: request.hidden };
 }
 function navigationScope(cwd, root, requestedPath, filters) {
-  const projectRoot = resolve21(cwd);
+  const projectRoot = resolve28(cwd);
   return {
     path: root === projectRoot ? "." : root,
     requestedPath,
@@ -8701,20 +12044,79 @@ class EvidenceService {
   #queue = new SyntaxQueue;
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
+  #relationshipService;
   constructor(runner, snapshots, structure, runConceptSearch = conceptSearch) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    this.#relationshipService = new RelationshipService({
+      queue: this.#queue,
+      resolveScope: async (cwd, target, input, signal) => ({
+        root: await navigationRoot(cwd, target, signal),
+        filters: navigationFilters(input)
+      }),
+      maxFilesToParse
+    });
   }
   clear() {
     this.#analyses.clear();
     this.#continuations.clear();
     this.#queue.clear();
+    this.#relationshipService.clear();
   }
   async shutdown() {
     this.clear();
+    await this.#relationshipService.shutdown();
     await this.#queue.shutdown();
+  }
+  async#relationshipValidate(input, cwd, signal) {
+    const cursor = input.cursor;
+    if (!cursor)
+      throw new SignalGrepError("mode=validate requires a saved evidence cursor");
+    rejectFields2(input, [
+      "path",
+      "line",
+      "column",
+      "symbol",
+      "relation",
+      "depth",
+      "maxNodes",
+      "maxEdges",
+      "maxExpansions",
+      "exploreCursor"
+    ], "Evidence validation", true);
+    if (cursor.startsWith("relationship.")) {
+      return this.#relationshipService.validate(input, signal);
+    }
+    return this.#validateSavedEvidence(input, cwd, signal);
+  }
+  async#validateSavedEvidence(input, cwd, signal) {
+    const cursor = input.cursor;
+    if (!cursor)
+      throw new SignalGrepError("A saved evidence cursor is required");
+    const startedAt = Date.now();
+    const validated = await validateSavedEvidence({
+      cursor,
+      cwd,
+      ...signal ? { signal } : {},
+      ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {},
+      analyses: this.#analyses,
+      snapshots: this.#snapshots,
+      queue: this.#queue,
+      maxFiles: MAX_STRUCTURE_FILES
+    });
+    const finishedAt = Date.now();
+    return validationResult({
+      scope: validated.scope,
+      coverage: { sources: validated.sources, status: validated.coverage },
+      status: validated.storedPartial || validated.coverage === "partial" ? "partial" : "complete",
+      reasons: validated.reasons
+    }, cursor, validated.recheck, {
+      start: startedAt,
+      end: finishedAt,
+      ...input.matchIndex !== undefined ? { selected: input.matchIndex } : {}
+    }, validated.comparisonTarget, []);
   }
   async#testEntryPaths(root, files, cwd, filters, signal) {
     const sourceGlobs = ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"];
@@ -8748,7 +12150,7 @@ class EvidenceService {
     const expandedRequest = { ...projectRequest, expandedFromPath: requestedPath };
     return { candidates: await collect(expandedRequest), request: expandedRequest };
   }
-  async search(input, cwd, signal) {
+  async search(input, cwd, signal, options = {}) {
     if (signal?.aborted)
       throw abortError();
     if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
@@ -8756,8 +12158,10 @@ class EvidenceService {
     const analysisStarted = performance.now();
     const fileLimit = maxFilesToParse(input.maxFilesToParse);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
+    if (input.mode === "trace" || input.mode === "validate")
+      return input.mode === "trace" ? this.#relationshipService.trace(input, cwd, signal) : this.#relationshipValidate(input, cwd, signal);
     if (isSemanticMode(input.mode)) {
-      rejectFields(input, [...searchFields, ...inspectFields, "cursor", "matchIndex"], `mode=${input.mode}`);
+      rejectFields2(input, [...searchFields, ...inspectFields, "cursor", "matchIndex"], `mode=${input.mode}`);
       return this.#analyses.page(this.#analyses.create(await navigateSemantics(input, access)));
     }
     if (input.column !== undefined)
@@ -8767,7 +12171,7 @@ class EvidenceService {
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect")
         throw new SignalGrepError("sourceCursor requires mode=inspect");
-      rejectFields(input, [
+      rejectFields2(input, [
         ...searchFields,
         "cursor",
         "path",
@@ -8782,12 +12186,12 @@ class EvidenceService {
       return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
-      rejectFields(input, [...searchFields, "paths", "symbol", "maxFilesToParse"], "mode=inspect");
+      rejectFields2(input, [...searchFields, "paths", "symbol", "maxFilesToParse"], "mode=inspect");
       const targets = this.#inspectionTargets(input, cwd);
       return inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
-      rejectFields(input, [
+      rejectFields2(input, [
         ...searchFields.filter((field) => !["query", "glob", "exclude", "hidden"].includes(field)),
         ...inspectFields,
         "cursor",
@@ -8795,10 +12199,11 @@ class EvidenceService {
         "symbol",
         "matchIndex"
       ], "mode=concept", false, "use only mode, query, path, glob, exclude, hidden and redact");
-      return this.#analyses.page(this.#analyses.create(await this.#conceptSearch(input, access)));
+      const execution = await this.#conceptSearch(input, access, options.onProgress);
+      return this.#analyses.page(this.#analyses.create(execution.analysis));
     }
     if (input.mode === "hybrid") {
-      rejectFields(input, [
+      rejectFields2(input, [
         ...searchFields.filter((field) => !["query", "glob", "exclude", "hidden", "conceptLimit"].includes(field)),
         ...inspectFields,
         "cursor",
@@ -8823,6 +12228,7 @@ class EvidenceService {
       let conceptResult;
       let conceptAccess;
       let conceptFailure;
+      options.onProgress?.({ phase: "literal-search" });
       await runOwnedParallel((groupSignal) => {
         conceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
         return [
@@ -8830,7 +12236,7 @@ class EvidenceService {
             literalResult = result;
             return;
           }),
-          this.#conceptSearch(input, conceptAccess).then((result) => {
+          this.#conceptSearch(input, conceptAccess, options.onProgress).then((result) => {
             conceptResult = result;
             return;
           }).catch((error) => {
@@ -8844,18 +12250,17 @@ class EvidenceService {
       if (!literalResult || !conceptAccess)
         throw new Error("Hybrid search did not settle its owned literal operation");
       if (!conceptResult) {
-        const message = conceptFailure instanceof Error ? conceptFailure.message : "concept search failed without a diagnostic";
-        conceptResult = {
-          kind: "concept",
-          unit: "evidence-items",
-          items: [],
-          partial: true,
-          reasons: [`Semantic candidates unavailable: ${message}`],
-          coverage: { conceptCandidates: "skipped" }
-        };
+        if (conceptFailure instanceof Error)
+          throw conceptFailure;
+        throw new SignalGrepError("Concept search failed without a diagnostic");
+      }
+      const firstLiteralResult = literalResult;
+      const verifiedLiteralResult = await this.#runner(literalRequest, cwd, signal);
+      if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
+        throw new HybridSourceChangedError("Literal source evidence changed while concept evidence was being computed");
       }
       const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-      const hybrid = await combineHybridSearch(literalResult, conceptResult, literalAccess, limit);
+      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, literalAccess, limit);
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
@@ -8863,7 +12268,7 @@ class EvidenceService {
       return this.#analyses.page(cursor);
     }
     if (input.mode === "structure") {
-      rejectFields(input, [
+      rejectFields2(input, [
         ...searchFields.filter((field) => !["pattern", "glob", "exclude", "hidden"].includes(field)),
         ...inspectFields,
         "cursor",
@@ -8874,7 +12279,7 @@ class EvidenceService {
       return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
     }
     if (input.mode === "files") {
-      rejectFields(input, [
+      rejectFields2(input, [
         "pattern",
         "cursor",
         "line",
@@ -8901,7 +12306,7 @@ class EvidenceService {
       return this.#impact(input, access);
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
-      rejectFields(input, [
+      rejectFields2(input, [
         ...searchFields,
         ...inspectFields,
         "path",
@@ -8916,7 +12321,7 @@ class EvidenceService {
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access);
-    rejectFields(input, [...inspectFields, "query", "line", "matchIndex", "symbol", "cursor", "conceptLimit"], "Evidence search", false, "a new search accepts one path; split multiple paths into separate requests without widening their scope");
+    rejectFields2(input, [...inspectFields, "query", "line", "matchIndex", "symbol", "cursor", "conceptLimit"], "Evidence search", false, "a new search accepts one path; split multiple paths into separate requests without widening their scope");
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (input.pattern !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
@@ -9115,7 +12520,7 @@ class EvidenceService {
     if (input.targets !== undefined && input.matchIndices !== undefined)
       throw new SignalGrepError("Use targets or matchIndices, not both");
     if (input.targets !== undefined || input.matchIndices !== undefined) {
-      rejectFields(input, ["path", "line", "matchIndex"], "Batch inspection");
+      rejectFields2(input, ["path", "line", "matchIndex"], "Batch inspection");
       const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
       if (size < 1 || size > MAX_INSPECT_TARGETS)
         throw new SignalGrepError("Batch inspection requires 1-5 targets");
@@ -9153,7 +12558,7 @@ class EvidenceService {
   }
   async#impact(input, access) {
     const impactStarted = performance.now();
-    rejectFields(input, [...searchFields.filter((field) => !navigationFilterFields.has(field)), ...inspectFields], "mode=impact");
+    rejectFields2(input, [...searchFields.filter((field) => !navigationFilterFields.has(field)), ...inspectFields], "mode=impact");
     const filters = navigationFilters(input);
     let path;
     let line = input.line;
@@ -9230,15 +12635,15 @@ class EvidenceService {
         exclude: filters.exclude,
         hidden: filters.hidden
       });
-      const allowed = new Set(files.paths.map((file) => resolve21(access.cwd, file)));
-      const primaryPath = resolve21(access.cwd, document2.path);
+      const allowed = new Set(files.paths.map((file) => resolve28(access.cwd, file)));
+      const primaryPath = resolve28(access.cwd, document2.path);
       allowed.add(primaryPath);
       const host = {
         cwd: access.cwd,
         ...access.signal ? { signal: access.signal } : {},
         normalizePath: (file) => workspaceRelativePath(access.cwd, file),
         load: async (file, expected) => {
-          const absolutePath = resolve21(access.cwd, file);
+          const absolutePath = resolve28(access.cwd, file);
           if (!allowed.has(absolutePath))
             throw new SignalGrepError("Navigation source is excluded by current ignore rules");
           if (absolutePath === primaryPath && expected === undefined)
@@ -9297,7 +12702,7 @@ class EvidenceService {
   async#navigate(input, access) {
     const navigationStarted = performance.now();
     const allowsFilters = input.mode === "imports" || input.mode === "tests";
-    rejectFields(input, [
+    rejectFields2(input, [
       ...allowsFilters ? searchFields.filter((field) => !navigationFilterFields.has(field)) : searchFields,
       ...inspectFields
     ], `mode=${input.mode}`);
@@ -9439,15 +12844,15 @@ class EvidenceService {
       exclude: filters.exclude,
       hidden: filters.hidden
     });
-    const allowed = new Set(files.paths.map((file) => resolve21(access.cwd, file)));
-    const primaryPath = resolve21(access.cwd, document2.path);
+    const allowed = new Set(files.paths.map((file) => resolve28(access.cwd, file)));
+    const primaryPath = resolve28(access.cwd, document2.path);
     allowed.add(primaryPath);
     const host = {
       cwd: access.cwd,
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = resolve21(access.cwd, file);
+        const absolutePath = resolve28(access.cwd, file);
         if (!allowed.has(absolutePath))
           throw new SignalGrepError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -9489,7 +12894,7 @@ class EvidenceService {
 }
 
 // src/service.ts
-import { resolve as resolve22 } from "path";
+import { resolve as resolve29 } from "path";
 
 // src/format.ts
 import { readFile as readFile3 } from "fs/promises";
@@ -9932,7 +13337,7 @@ function redactSignalGrepResult(result) {
 }
 
 // src/snapshot-store.ts
-import { randomUUID as randomUUID3 } from "crypto";
+import { randomUUID as randomUUID7 } from "crypto";
 class SnapshotStore {
   #snapshots = new Map;
   #expired = new Set;
@@ -9957,7 +13362,7 @@ class SnapshotStore {
     const now = this.#now();
     const snapshot = {
       ...scan,
-      id: randomUUID3(),
+      id: randomUUID7(),
       createdAt: now,
       lastAccessedAt: now
     };
@@ -10061,6 +13466,419 @@ class SnapshotStore {
   }
 }
 
+// src/operation-lifecycle.ts
+import { randomUUID as randomUUID8 } from "crypto";
+var OPERATION_INITIAL_WAIT_MS = 5000;
+var OPERATION_DEFAULT_DEADLINE_MS = 10 * 60000;
+var OPERATION_DEFAULT_LEASE_MS = 2 * 60000;
+var OPERATION_RESULT_TTL_MS = 10 * 60000;
+var MAX_ACTIVE_OPERATIONS = 8;
+var MAX_RETAINED_OPERATIONS = 32;
+function abortReason(signal) {
+  return signal?.reason instanceof Error ? signal.reason : new Error("Operation was cancelled");
+}
+function snapshot(entry) {
+  return {
+    id: entry.id,
+    state: entry.state,
+    startedAt: entry.startedAt,
+    deadlineAt: entry.deadlineAt,
+    leaseExpiresAt: entry.leaseExpiresAt,
+    metadata: entry.metadata,
+    ...entry.progress ? { progress: { ...entry.progress } } : {},
+    ...entry.result === undefined ? {} : { result: entry.result },
+    ...entry.error === undefined ? {} : { error: entry.error }
+  };
+}
+
+class OperationLifecycle {
+  #operations = new Map;
+  #pending = new Set;
+  #now;
+  #maxOperations;
+  #deadlineMs;
+  #leaseMs;
+  #resultTtlMs;
+  #maxRetainedOperations;
+  #closed = false;
+  constructor(options = {}) {
+    this.#now = options.now ?? Date.now;
+    this.#maxOperations = options.maxOperations ?? MAX_ACTIVE_OPERATIONS;
+    this.#deadlineMs = options.deadlineMs ?? OPERATION_DEFAULT_DEADLINE_MS;
+    this.#leaseMs = options.leaseMs ?? OPERATION_DEFAULT_LEASE_MS;
+    this.#resultTtlMs = options.resultTtlMs ?? OPERATION_RESULT_TTL_MS;
+    this.#maxRetainedOperations = options.maxRetainedOperations ?? MAX_RETAINED_OPERATIONS;
+    if (!Number.isSafeInteger(this.#maxOperations) || this.#maxOperations < 1)
+      throw new Error("maxOperations must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#deadlineMs) || this.#deadlineMs < 1)
+      throw new Error("deadlineMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#leaseMs) || this.#leaseMs < 1)
+      throw new Error("leaseMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#resultTtlMs) || this.#resultTtlMs < 1)
+      throw new Error("resultTtlMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#maxRetainedOperations) || this.#maxRetainedOperations < 1)
+      throw new Error("maxRetainedOperations must be a positive safe integer");
+  }
+  get size() {
+    this.#expireRetained();
+    return this.#operations.size;
+  }
+  start(run2, metadata2) {
+    this.#expireRetained();
+    if (this.#closed)
+      throw new Error("Operation lifecycle is closed");
+    if (this.#pending.size >= this.#maxOperations)
+      throw new Error(`Operation resource limit reached (${String(this.#maxOperations)} pending operations)`);
+    const id = randomUUID8();
+    const startedAt = this.#now();
+    const controller = new AbortController;
+    const promise = Promise.resolve().then(() => run2(controller.signal, id));
+    const entry = {
+      id,
+      startedAt,
+      deadlineAt: startedAt + this.#deadlineMs,
+      leaseExpiresAt: startedAt + this.#leaseMs,
+      metadata: metadata2,
+      controller,
+      promise,
+      state: "running",
+      settled: false,
+      retainedAt: undefined,
+      waiters: new Set,
+      timer: undefined,
+      leaseTimer: undefined
+    };
+    this.#operations.set(id, entry);
+    this.#pending.add(promise);
+    promise.finally(() => this.#pending.delete(promise)).catch(() => {
+      return;
+    });
+    entry.timer = setTimeout(() => {
+      this.#finishFailure(entry, "Operation deadline exceeded");
+      controller.abort(new Error("Operation deadline exceeded"));
+    }, this.#deadlineMs);
+    entry.timer.unref?.();
+    this.#armLease(entry);
+    entry.promise.then((result) => {
+      entry.settled = true;
+      if (entry.timer)
+        clearTimeout(entry.timer);
+      entry.timer = undefined;
+      if (entry.state === "running") {
+        entry.state = "complete";
+        entry.result = result;
+        this.#retainResult(entry);
+        this.#notify(entry);
+      }
+      return;
+    }, (error) => {
+      entry.settled = true;
+      if (entry.timer)
+        clearTimeout(entry.timer);
+      entry.timer = undefined;
+      if (entry.state === "running") {
+        entry.state = controller.signal.aborted ? "cancelled" : "failed";
+        entry.error = error;
+        this.#retainResult(entry);
+        this.#notify(entry);
+      }
+      return;
+    });
+    return { ...snapshot(entry), promise: entry.promise };
+  }
+  get(operationId) {
+    this.#expireRetained();
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    return snapshot(entry);
+  }
+  updateProgress(operationId, progress) {
+    const entry = this.#operations.get(operationId);
+    if (!entry || entry.state !== "running")
+      return;
+    entry.progress = { ...progress };
+  }
+  touch(operationId) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state === "running")
+      this.#touch(entry);
+    return snapshot(entry);
+  }
+  async wait(operationId, timeoutMs = OPERATION_INITIAL_WAIT_MS, signal) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
+      throw new Error("timeoutMs must be a non-negative safe integer");
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state !== "running")
+      return this.#settled(entry);
+    this.#touch(entry);
+    return new Promise((resolve, reject) => {
+      let timer;
+      let finished = false;
+      let aborting = false;
+      const onSettled = () => finish(this.#settled(entry));
+      const finish = (result) => {
+        if (finished || aborting)
+          return;
+        finished = true;
+        if (timer)
+          clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        entry.waiters.delete(onSettled);
+        resolve(result);
+      };
+      const onAbort = () => {
+        if (finished || aborting)
+          return;
+        aborting = true;
+        if (timer)
+          clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        entry.waiters.delete(onSettled);
+        const reason = abortReason(signal);
+        this.cancelAndWait(operationId, reason).then(() => {
+          if (!finished) {
+            finished = true;
+            reject(reason);
+          }
+          return;
+        }, (error) => {
+          if (!finished) {
+            finished = true;
+            reject(error);
+          }
+          return;
+        });
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => finish({ state: "running", operation: snapshot(entry) }), timeoutMs);
+      timer.unref?.();
+      entry.waiters.add(onSettled);
+    });
+  }
+  cancel(operationId, reason = new Error("Operation cancelled")) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state === "running") {
+      entry.state = "cancelled";
+      entry.error = reason;
+      entry.controller.abort(reason);
+      this.#retainResult(entry);
+      this.#notify(entry);
+    }
+    return snapshot(entry);
+  }
+  async cancelAndWait(operationId, reason = new Error("Operation cancelled")) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    this.cancel(operationId, reason);
+    await Promise.allSettled([entry.promise]);
+    return snapshot(entry);
+  }
+  clear(reason = new Error("Operation session closed")) {
+    this.#closed = true;
+    for (const entry of this.#operations.values()) {
+      if (entry.state === "running")
+        this.cancel(entry.id, reason);
+      this.#clearTimers(entry);
+    }
+    this.#operations.clear();
+  }
+  reset(reason = new Error("Operation session reset")) {
+    this.clear(reason);
+    this.#closed = false;
+  }
+  async shutdown(reason = new Error("Operation session closed")) {
+    this.clear(reason);
+    await Promise.allSettled(this.#pending);
+  }
+  #settled(entry) {
+    const current = snapshot(entry);
+    if (entry.state === "complete" && entry.result !== undefined)
+      return { state: "complete", operation: current, result: entry.result };
+    if (entry.state === "failed")
+      return { state: "failed", operation: current, error: entry.error };
+    if (entry.state === "cancelled" || entry.state === "expired")
+      return { state: entry.state, operation: current, error: entry.error };
+    return { state: "running", operation: current };
+  }
+  #finishFailure(entry, message) {
+    if (entry.state !== "running")
+      return;
+    entry.state = "failed";
+    entry.error = new Error(message);
+    this.#retainResult(entry);
+    this.#notify(entry);
+  }
+  #retainResult(entry) {
+    if (entry.settled && entry.timer)
+      clearTimeout(entry.timer);
+    if (entry.settled)
+      entry.timer = undefined;
+    if (entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.leaseTimer = undefined;
+    entry.retainedAt = this.#now();
+    entry.leaseExpiresAt = this.#now() + this.#resultTtlMs;
+    entry.leaseTimer = setTimeout(() => this.#evict(entry), this.#resultTtlMs);
+    entry.leaseTimer.unref?.();
+    this.#evictRetainedOverflow();
+  }
+  #notify(entry) {
+    const waiters = [...entry.waiters];
+    entry.waiters.clear();
+    for (const waiter of waiters)
+      waiter();
+  }
+  #touch(entry) {
+    entry.leaseExpiresAt = this.#now() + this.#leaseMs;
+    this.#armLease(entry);
+  }
+  #armLease(entry) {
+    if (entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.leaseTimer = setTimeout(() => {
+      if (entry.state === "running") {
+        entry.state = "expired";
+        entry.error = new Error("Operation lease expired without a continuation");
+        entry.controller.abort(entry.error);
+      }
+      this.#evict(entry);
+    }, Math.max(1, entry.leaseExpiresAt - this.#now()));
+    entry.leaseTimer.unref?.();
+  }
+  #evict(entry) {
+    if (this.#operations.get(entry.id) !== entry)
+      return;
+    if (entry.state === "running") {
+      entry.state = "expired";
+      entry.error = new Error("Operation lease expired without a continuation");
+      entry.controller.abort(entry.error);
+    }
+    this.#notify(entry);
+    this.#clearTimers(entry);
+    this.#operations.delete(entry.id);
+  }
+  #evictRetainedOverflow() {
+    const retained = [...this.#operations.values()].filter((entry) => entry.state !== "running" && entry.retainedAt !== undefined).toSorted((left, right) => (left.retainedAt ?? left.startedAt) - (right.retainedAt ?? right.startedAt));
+    while (retained.length > this.#maxRetainedOperations) {
+      const candidate = retained.shift();
+      if (!candidate || candidate.waiters.size > 0)
+        continue;
+      this.#evict(candidate);
+    }
+  }
+  #clearTimers(entry, includeLease = true) {
+    if (entry.timer)
+      clearTimeout(entry.timer);
+    if (includeLease && entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.timer = undefined;
+    if (includeLease)
+      entry.leaseTimer = undefined;
+  }
+  #expireRetained() {
+    const now = this.#now();
+    for (const entry of this.#operations.values()) {
+      if (entry.leaseExpiresAt <= now)
+        this.#evict(entry);
+    }
+  }
+}
+
+// src/operation-output.ts
+function operationRequest(operationId) {
+  return { mode: "await", operationId };
+}
+function operationDetails(operation, nextRequest) {
+  return {
+    id: operation.id,
+    mode: operation.metadata.mode,
+    state: operation.state,
+    startedAt: operation.startedAt,
+    deadlineAt: operation.deadlineAt,
+    leaseExpiresAt: operation.leaseExpiresAt,
+    ...operation.progress ? { progress: operation.progress } : {},
+    ...nextRequest ? { nextRequest } : {},
+    ...operation.error instanceof Error ? { error: operation.error.message } : {}
+  };
+}
+function waitingResult(operation, mode) {
+  const nextRequest = operationRequest(operation.id);
+  const progress = operation.progress ? ` Progress: ${JSON.stringify(operation.progress)}.` : "";
+  const details = {
+    version: 1,
+    mode,
+    status: "waiting",
+    totalMatches: 0,
+    storedMatches: 0,
+    totalFiles: 0,
+    returnedMatches: 0,
+    snapshotComplete: false,
+    nextRequest,
+    ...operation.metadata.redact ? { redactionRequested: true } : {},
+    operation: operationDetails(operation, nextRequest)
+  };
+  return {
+    text: `Operation ${operation.id} is still running; no evidence page is available yet.${progress}
+
+Next request: ${JSON.stringify(nextRequest)}. Copy it exactly to continue waiting; the original query will not be started again.`,
+    details
+  };
+}
+function operationStateResult(operation, mode) {
+  if (operation.state === "complete" && operation.result !== undefined)
+    return completeOperationResult(operation.result, operation);
+  const details = {
+    version: 1,
+    mode,
+    status: operation.state,
+    totalMatches: 0,
+    storedMatches: 0,
+    totalFiles: 0,
+    returnedMatches: 0,
+    snapshotComplete: false,
+    ...operation.metadata.redact ? { redactionRequested: true } : {},
+    operation: operationDetails(operation)
+  };
+  const message = operation.error instanceof Error ? ` ${operation.error.message}.` : "";
+  return {
+    text: `Operation ${operation.id} ${operation.state}.${message}`,
+    details
+  };
+}
+function completeOperationResult(result, operation) {
+  const stable = structuredClone(result);
+  return {
+    ...stable,
+    text: `${stable.text}
+
+Operation ${operation.id} complete; final result is retained for stable await re-fetch.`,
+    details: {
+      ...stable.details,
+      ...operation.metadata.redact ? { redactionRequested: true } : {},
+      operation: operationDetails(operation)
+    }
+  };
+}
+function operationOutcome(outcome, mode) {
+  if (outcome.state === "running")
+    return waitingResult(outcome.operation, mode);
+  if (outcome.state === "complete")
+    return completeOperationResult(outcome.result, outcome.operation);
+  throw outcome.error;
+}
+
 // src/service.ts
 function cursorPathSelection(input, cwd) {
   if (input.path !== undefined && input.paths !== undefined) {
@@ -10083,14 +13901,14 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SignalGrepError("Cursor paths cannot be empty");
-    const absolutePath = resolve22(cwd, label);
+    const absolutePath = resolve29(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash3("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash6("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails(snapshot, mode) {
@@ -10221,6 +14039,22 @@ function rejectCursorOnlyOptions(input) {
     throw new CursorError(`The following options cannot be used with cursor: ${ignored.join(", ")}`, "E_CURSOR_OPTIONS_CONFLICT");
   }
 }
+async function waitForSourceRefresh(signal, delayMs) {
+  if (signal.aborted)
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  await new Promise((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolveDelay();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      rejectDelay(signal.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 class SignalGrepService {
   #runRipgrep;
@@ -10229,23 +14063,32 @@ class SignalGrepService {
   #evidence;
   #lifecycle = new AbortController;
   #active = new Set;
+  #operations;
   #reusableSummarySnapshots = new WeakSet;
   constructor(options) {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
-    for (const path of input.paths ?? [])
-      validateSearchPath(path, "paths");
-    for (const target of input.targets ?? []) {
-      if (target && typeof target.path === "string")
-        validateSearchPath(target.path, "targets.path");
+    let request;
+    if (input.mode === "await" || input.mode === "cancel") {
+      request = this.#operationCommand(input, cwd, signal);
+    } else {
+      if (input.operationId !== undefined)
+        throw new SignalGrepError("operationId is only valid with mode=await or mode=cancel");
+      for (const path of input.paths ?? [])
+        validateSearchPath(path, "paths");
+      for (const target of input.targets ?? []) {
+        if (target && typeof target.path === "string")
+          validateSearchPath(target.path, "targets.path");
+      }
+      const combined = signal ? AbortSignal.any([signal, this.#lifecycle.signal]) : this.#lifecycle.signal;
+      request = this.#isLongRunningQuery(input) ? this.#searchOperation(input, cwd, signal, options) : this.#search(input, cwd, combined, options);
     }
-    const combined = signal ? AbortSignal.any([signal, this.#lifecycle.signal]) : this.#lifecycle.signal;
-    const request = this.#search(input, cwd, combined, options);
     this.#active.add(request);
     try {
       const result = await request;
@@ -10254,6 +14097,77 @@ class SignalGrepService {
       this.#active.delete(request);
     }
   }
+  #isLongRunningQuery(input) {
+    return (input.mode === "concept" || input.mode === "hybrid") && input.operationId === undefined && input.cursor === undefined;
+  }
+  async#searchOperation(input, cwd, signal, options) {
+    const started = this.#operations.start(async (operationSignal, operationId) => {
+      const combined = AbortSignal.any([operationSignal, this.#lifecycle.signal]);
+      const deadlineAt = this.#operations.get(operationId).deadlineAt;
+      this.#operations.updateProgress(operationId, { phase: "queued" });
+      let refreshAttempt = 0;
+      let workerRestarted = false;
+      while (true) {
+        try {
+          this.#operations.updateProgress(operationId, { phase: "running" });
+          return await this.#search(input, cwd, combined, {
+            ...options,
+            onProgress: (progress) => this.#operations.updateProgress(operationId, progress)
+          });
+        } catch (error) {
+          if (error instanceof ConceptWorkerExitError) {
+            if (workerRestarted || combined.aborted)
+              throw error;
+            const remaining = deadlineAt - Date.now();
+            if (remaining <= 0)
+              throw error;
+            workerRestarted = true;
+            this.#operations.updateProgress(operationId, {
+              phase: "refreshing",
+              detail: "worker restart 1 after unexpected worker termination; completed cache entries are reusable"
+            });
+            await waitForSourceRefresh(combined, Math.min(100, remaining));
+            continue;
+          }
+          if (!(error instanceof ConceptSourceChangedError))
+            throw error;
+          if (combined.aborted)
+            throw error;
+          const remaining = deadlineAt - Date.now();
+          if (remaining <= 0)
+            throw new SignalGrepError("Source did not stabilize before the operation deadline", {
+              cause: error
+            });
+          this.#operations.updateProgress(operationId, {
+            phase: "refreshing",
+            detail: `generation retry ${String(++refreshAttempt)}: ${error.message}`
+          });
+          await waitForSourceRefresh(combined, Math.min(100, remaining));
+        }
+      }
+    }, { mode: input.mode, redact: input.redact ?? false, cwd });
+    const outcome = await this.#operations.wait(started.id, OPERATION_INITIAL_WAIT_MS, signal);
+    return operationOutcome(outcome, input.mode);
+  }
+  async#operationCommand(input, cwd, signal) {
+    if (!input.operationId || typeof input.operationId !== "string")
+      throw new SignalGrepError("mode=await and mode=cancel require operationId");
+    const existing = this.#operations.get(input.operationId);
+    const mode = existing.metadata.mode;
+    if (resolve29(cwd) !== resolve29(existing.metadata.cwd))
+      throw new SignalGrepError("Operation belongs to a different working directory");
+    const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
+    if (forbidden.length > 0)
+      throw new SignalGrepError(`${input.mode} accepts only operationId; remove ${forbidden.join(", ")} and copy the returned nextRequest exactly`);
+    if (input.mode === "cancel") {
+      const cancelled = await this.#operations.cancelAndWait(input.operationId);
+      if (cancelled.state === "complete" && cancelled.result !== undefined)
+        return completeOperationResult(cancelled.result, cancelled);
+      return operationStateResult(cancelled, mode);
+    }
+    const outcome = await this.#operations.wait(input.operationId, OPERATION_INITIAL_WAIT_MS, signal);
+    return operationOutcome(outcome, mode);
+  }
   async#search(input, cwd, signal, options = {}) {
     if (input.cursor !== undefined && (typeof input.cursor !== "string" || input.cursor.trim().length === 0)) {
       throw new CursorError("Invalid cursor. Copy a nonempty cursor from a previous result.");
@@ -10261,7 +14175,7 @@ class SignalGrepService {
     const mode = input.mode ?? "auto";
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input))
-      return this.#evidence.search(input, cwd, signal);
+      return this.#evidence.search(input, cwd, signal, options);
     if (input.column !== undefined)
       throw new SignalGrepError("column requires semantic navigation");
     if (input.query !== undefined)
@@ -10327,13 +14241,18 @@ class SignalGrepService {
   clear() {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController;
+    this.#operations.reset();
     this.#snapshots.clear();
     this.#evidence.clear();
   }
   async shutdown() {
-    this.clear();
+    this.#lifecycle.abort();
+    this.#operations.clear();
     const pending = [...this.#active];
     await Promise.allSettled(pending);
+    await this.#operations.shutdown();
+    this.#snapshots.clear();
+    this.#evidence.clear();
     await this.#evidence.shutdown();
   }
   get snapshotCount() {
@@ -13946,6 +17865,9 @@ function renderSignalGrepResult(result, options, locale, theme) {
   const text = resultText(result);
   if (text === undefined)
     return new Text("", 0, 0);
+  if (result.details?.operation && result.details.operation.state !== "complete") {
+    return new Text(theme.fg("warning", text), 0, 0);
+  }
   if (options.isPartial) {
     return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
   }
@@ -13971,7 +17893,7 @@ function renderSignalGrepResult(result, options, locale, theme) {
 }
 
 // src/search-policy-recovery.ts
-import { isAbsolute as isAbsolute6, relative as relative9, resolve as resolve23, sep as sep5 } from "path";
+import { isAbsolute as isAbsolute7, relative as relative10, resolve as resolve30, sep as sep5 } from "path";
 var MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
 function manual() {
   return { kind: "manual", reason: MANUAL_REASON };
@@ -14177,7 +18099,7 @@ function hasNormalizationSensitivePath(path) {
   if (process.platform === "win32" && /^[A-Za-z]:(?![\\/])/u.test(path))
     return true;
   const segments = path.split(process.platform === "win32" ? /[\\/]/u : "/");
-  let namedSegmentSeen = isAbsolute6(path);
+  let namedSegmentSeen = isAbsolute7(path);
   for (const segment of segments) {
     if (segment === "..")
       return true;
@@ -14218,10 +18140,10 @@ function recoverShellSearch(command, match, workingDirectory) {
     return manual();
   if (hasNormalizationSensitivePath(parsed.path))
     return manual();
-  const base = resolve23(workingDirectory);
-  const path = resolve23(base, parsed.path);
-  const localPath = relative9(base, path);
-  if (isAbsolute6(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
+  const base = resolve30(workingDirectory);
+  const path = resolve30(base, parsed.path);
+  const localPath = relative10(base, path);
+  if (isAbsolute7(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
     return manual();
   if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git"))
     return manual();
@@ -14249,7 +18171,7 @@ function recoverShellSearch(command, match, workingDirectory) {
 }
 
 // src/search-policy-shell.ts
-import { fileURLToPath as fileURLToPath4 } from "url";
+import { fileURLToPath as fileURLToPath5 } from "url";
 
 // node_modules/web-tree-sitter/tree-sitter.js
 var __defProp2 = Object.defineProperty;
@@ -17749,12 +21671,12 @@ class ShellSearchPolicy {
     if (Buffer.byteLength(command, "utf8") > MAX_POLICY_COMMAND_BYTES)
       throw new Error("Search policy command exceeds 64 KiB; split the shell request");
     this.#initialization ??= Parser.init({
-      locateFile: () => fileURLToPath4(new URL("tree-sitter.wasm", this.#assets))
+      locateFile: () => fileURLToPath5(new URL("tree-sitter.wasm", this.#assets))
     });
     await this.#initialization;
     for (const shell of ["bash", "powershell"]) {
       if (!this.#languages.has(shell))
-        this.#languages.set(shell, Language.load(fileURLToPath4(new URL(`tree-sitter-${shell}.wasm`, this.#assets))));
+        this.#languages.set(shell, Language.load(fileURLToPath5(new URL(`tree-sitter-${shell}.wasm`, this.#assets))));
     }
     const [bash, powershell] = await Promise.all([
       this.#languages.get("bash"),
@@ -18343,9 +22265,36 @@ var signalGrepSchema = _Object_({
     "callers",
     "callees",
     "dependencies",
-    "dependents"
+    "dependents",
+    "trace",
+    "validate",
+    "await",
+    "cancel"
   ], {
-    description: "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. inspect/outline/imports/tests/impact retain their documented location selectors. tests supports JS/TS/TSX sources; Python supports outline, not related-test navigation. Compiler results are static evidence; concept and related-test results remain candidates."
+    description: "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates."
+  })),
+  relation: Optional(stringEnum(["callers", "callees"], {
+    description: "mode=trace relationship direction; required for a new trace and ignored only when paging a trace cursor."
+  })),
+  depth: Optional(Integer({
+    minimum: 1,
+    maximum: 8,
+    description: "mode=trace maximum BFS depth; continuation increases the cumulative depth by one."
+  })),
+  maxNodes: Optional(Integer({
+    minimum: 1,
+    maximum: 2000,
+    description: "mode=trace retained node budget across all continuation pages."
+  })),
+  maxEdges: Optional(Integer({
+    minimum: 1,
+    maximum: 4000,
+    description: "mode=trace retained edge budget across all continuation pages."
+  })),
+  maxExpansions: Optional(Integer({
+    minimum: 1,
+    maximum: 2000,
+    description: "mode=trace provider expansion budget across all continuation pages."
   })),
   line: Optional(Number2({
     description: "1-indexed source line for path inspection/navigation/impact. Omit with matchIndex, matchIndices or targets."
@@ -18366,7 +22315,15 @@ var signalGrepSchema = _Object_({
     maxItems: MAX_INSPECT_TARGETS,
     description: "Inspect known path/line locations together without a cursor. The complete batch shares one 16 KiB response budget."
   })),
-  cursor: Optional(String2({ description: "Opaque cursor from a previous stable search snapshot." }))
+  cursor: Optional(String2({ description: "Opaque cursor from a previous stable search snapshot." })),
+  operationId: Optional(String2({
+    minLength: 1,
+    maxLength: 128,
+    description: "Operation handle returned by a waiting concept/hybrid result. Required with mode=await or mode=cancel; copy it exactly and do not start a new query."
+  })),
+  exploreCursor: Optional(String2({
+    description: "Independent relationship exploration handle returned by mode=trace; use it to extend depth without changing immutable result page cursors."
+  }))
 });
 
 // src/model-error.ts
@@ -18422,9 +22379,9 @@ var SIGNAL_GREP_LABEL = "baoer_signal_grep";
 var OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
 function expandTilde(path) {
   if (path === "~")
-    return homedir2();
+    return homedir3();
   if (path.startsWith("~/"))
-    return join4(homedir2(), path.slice(2));
+    return join6(homedir3(), path.slice(2));
   return path;
 }
 function ompProfile() {
@@ -18444,7 +22401,7 @@ function ompAgentDir() {
     return expandTilde(configured);
   const configDir = process.env.PI_CONFIG_DIR || ".omp";
   const profile = ompProfile();
-  return profile ? join4(homedir2(), configDir, "profiles", profile, "agent") : join4(homedir2(), configDir, "agent");
+  return profile ? join6(homedir3(), configDir, "profiles", profile, "agent") : join6(homedir3(), configDir, "agent");
 }
 function selectSearchTools(pi, replaceAlternatives) {
   const current = pi.getActiveTools();
@@ -18465,7 +22422,7 @@ async function registerOmpSignalGrepExtension(pi, searchPolicyAssets = new URL("
     structure: createCtagsStructureProvider()
   }));
   const policy = new SearchPolicy(searchPolicyAssets);
-  const resolvedConfig = config ?? await readSignalGrepConfigFile(join4(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE));
+  const resolvedConfig = config ?? await readSignalGrepConfigFile(join6(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE));
   const { locale } = resolvedConfig;
   const enforcement = normalizeSearchEnforcement(resolvedConfig.enforceSearch, "OMP extension config");
   let selection = Promise.resolve();

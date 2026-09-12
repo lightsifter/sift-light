@@ -90,19 +90,23 @@ export async function readConceptEmbedding(
 ): Promise<CachedConceptEmbedding | undefined> {
   try {
     return storedEmbedding(JSON.parse(await readFile(cachePath(root, key), "utf8")), key);
-  } catch {
-    return undefined;
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === "ENOENT" || error instanceof SyntaxError) return undefined;
+    throw error;
   }
 }
 
 export async function writeConceptEmbedding(
   root: string,
   embedding: CachedConceptEmbedding,
+  stagingRoot = root,
 ): Promise<void> {
   const directory = join(root, embedding.key.slice(0, 2));
+  await mkdir(stagingRoot, { recursive: true });
   await mkdir(directory, { recursive: true });
   const destination = cachePath(root, embedding.key);
-  const temporary = join(directory, `.${embedding.key}.${randomUUID()}.tmp`);
+  const temporary = join(stagingRoot, `.${embedding.key}.${randomUUID()}.tmp`);
   const stored: StoredEmbedding = {
     version: CONCEPT_CACHE_VERSION,
     key: embedding.key,
@@ -112,25 +116,22 @@ export async function writeConceptEmbedding(
       vector: encodeVector(window.vector),
     })),
   };
-  await writeFile(temporary, JSON.stringify(stored), { flag: "wx", mode: 0o600 });
   try {
-    await rename(temporary, destination);
-  } catch (error) {
-    if (errorCode(error) !== "EEXIST") {
-      await rm(temporary, { force: true });
-      throw error;
-    }
-    if (await readConceptEmbedding(root, embedding.key)) {
-      await rm(temporary, { force: true });
-      return;
-    }
-    await rm(destination, { force: true });
+    await writeFile(temporary, JSON.stringify(stored), { flag: "wx", mode: 0o600 });
     try {
       await rename(temporary, destination);
-    } catch (replacementError) {
-      await rm(temporary, { force: true });
-      if (errorCode(replacementError) !== "EEXIST") throw replacementError;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+      if (await readConceptEmbedding(root, embedding.key)) return;
+      await rm(destination, { force: true });
+      try {
+        await rename(temporary, destination);
+      } catch (replacementError) {
+        if (errorCode(replacementError) !== "EEXIST") throw replacementError;
+      }
     }
+  } finally {
+    await rm(temporary, { force: true });
   }
 }
 
@@ -149,13 +150,25 @@ export async function enforceConceptCacheLimit(
   for (const shard of shards) {
     if (!shard.isDirectory() || !/^[0-9a-f]{2}$/u.test(shard.name)) continue;
     const directory = join(root, shard.name);
-    // oxlint-disable-next-line no-await-in-loop -- bounded 256-shard cache inventory.
-    const files = await readdir(directory, { withFileTypes: true });
+    let files: Dirent[];
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- bounded 256-shard cache inventory.
+      files = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") continue;
+      throw error;
+    }
     for (const file of files) {
       if (!file.isFile() || !file.name.endsWith(".json")) continue;
       const path = join(directory, file.name);
-      // oxlint-disable-next-line no-await-in-loop -- eviction needs authoritative file sizes and mtimes.
-      const metadata = await stat(path);
+      let metadata;
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- eviction needs authoritative file sizes and mtimes.
+        metadata = await stat(path);
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") continue;
+        throw error;
+      }
       entries.push({ path, bytes: metadata.size, modified: metadata.mtimeMs });
     }
   }

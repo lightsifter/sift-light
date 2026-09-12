@@ -92,6 +92,9 @@ export function renderSignalGrepResult(
   const text = resultText(result);
   if (text === undefined) return new Text("", 0, 0);
 
+  if (result.details?.operation && result.details.operation.state !== "complete") {
+    return new Text(theme.fg("warning", text), 0, 0);
+  }
   if (options.isPartial) {
     return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
   }

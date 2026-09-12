@@ -26,7 +26,7 @@ Use `mode: "hybrid"` with one natural-language `query` when a sentence may have 
 
 Concept ranking covers every UTF-8 passage admitted by the request's documented source budget; it no longer samples a fixed prefix of the scope. Passages that exceed the model token window are ranked through overlapping token-safe windows, so later text is not silently discarded. Offline embeddings are cached by content, model revision and chunking revision in a bounded 512 MiB local cache. Repeated content is reused, changed content misses naturally, and cache write or cleanup failures remain visible in the result.
 
-If Concept inference fails or times out, hybrid still returns the exact literal page with `coverage.conceptCandidates` set to `skipped` and an explicit reason; it does not discard a completed literal search. Bound interactive Concept latency with `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` (integer milliseconds from 1000 through 3600000; default 600000). Admission planning counts (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`) stay visible so large libraries can be narrowed with `path` or `glob` before another attempt. Empty files are a normal skip and do not mark the result partial.
+Slow Concept and hybrid requests return within the default five-second wait window with `status: "waiting"` or `"running"`, an `operationId`, progress and an exact `nextRequest` such as `{ "mode": "await", "operationId": "..." }`. Copy that request unchanged: it resumes the same computation and never restarts the query or downgrades to a literal-only result. A final result remains available for stable re-fetch for 10 minutes, with up to 32 terminal results retained per service session, and `mode: "cancel"` stops the owned work and waits for cleanup. Each service session admits at most eight pending operations; an operation has one total deadline controlled by `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` (integer milliseconds from 1000 through 3600000; default 600000) and a 120-second idle continuation lease. A real model, source or resource failure is returned as a failure with its diagnostic. Source generation is re-enumerated and re-verified before publication, so changes refresh the operation and mixed versions are never marked complete. Admission planning counts (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`) stay visible so large libraries can be narrowed with `path` or `glob` before another attempt. Empty files are a normal skip and do not mark the result partial.
 
 ### Give several search conditions together
 
@@ -39,6 +39,12 @@ Ask the agent to restrict a search to one folder when that is the scope you need
 ### Know what has been shown
 
 Long results arrive in pages with a way to continue. When the original material changes, the plugin asks for a fresh check. Like a careful research assistant, it distinguishes the passages already shown from the pages still to come.
+
+### Follow static callers and callees with bounded evidence
+
+Use `mode: "trace"` with `relation: "callers"` or `"callees"`, a source `path`, and a 1-based `line` plus an optional `symbol` or UTF-16 `column`. The provider follows static TypeScript or Go relationships through a bounded breadth-first traversal. `glob`, `exclude`, and `hidden` are applied when the provider admits its source inventory and are retained in the reported scope. `depth`, `maxNodes`, `maxEdges`, and `maxExpansions` are cumulative limits; a partial result names the limit or unresolved relationship that stopped expansion. Static compiler or syntax evidence describes a source relationship and does not prove runtime dispatch.
+
+Trace pages use an immutable `cursor`. When the result has more frontier work, the response also includes an independent `exploreCursor`; copy the complete returned `nextRequest` to extend the trace. Continuing exploration creates a new retained analysis version and never rewrites an earlier page. Structured relationship details retain the requested scope and comparison target, with coverage (`complete` or `partial`) separate from source freshness (`current`, `stale`, or `unknown`). Use `mode: "validate"` with a saved trace or analysis cursor to compare its retained source, configuration, manifest, and other evidence dependencies with the current worktree. Validation reports `current`, `stale`, or `unknown` separately from the original complete or partial coverage, so a fresh check of a partial snapshot does not claim a complete search. Filesystem change hints are best-effort notifications; authoritative recheck results decide freshness.
 
 ### Narrow by file age or inspect code structure
 
@@ -63,6 +69,7 @@ Tell your agent what you need, for example:
 - “Search files modified since this Unix millisecond timestamp.”
 - “I may remember this sentence incorrectly; search exact and semantic evidence together.”
 - “Show the Python classes and functions in this file, then inspect the method that matters.”
+- “Trace the callers of this function for two hops, then validate the saved evidence after I change the configuration.”
 
 The plugin provides file locations and actual text so the agent can answer from the material and you can check the original yourself.
 

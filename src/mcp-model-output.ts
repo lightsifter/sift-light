@@ -16,6 +16,10 @@ function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails):
     analysis.chunks ? `Chunks: ${JSON.stringify(analysis.chunks)}` : undefined,
     analysis.coverage ? `Coverage: ${JSON.stringify(analysis.coverage)}` : undefined,
     analysis.stats ? `Stats: ${JSON.stringify(analysis.stats)}` : undefined,
+    analysis.sourceGeneration
+      ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}`
+      : undefined,
+    details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline"
       ? "[Outline signatures are deferred; inspect item #N for version-checked source.]"
       : undefined,

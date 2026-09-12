@@ -1,7 +1,9 @@
 import type { AnalysisDetails } from "./analysis-types.js";
+import type { RelationshipPublicDetails } from "./relationship-types.js";
 import type { SourceFragment } from "./source-pages.js";
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
 
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_PAGE_SIZE = 100;
@@ -53,7 +55,27 @@ export type SearchMode =
   | "outline"
   | "imports"
   | "tests"
-  | "impact";
+  | "impact"
+  | "trace"
+  | "validate"
+  | "await"
+  | "cancel";
+
+export type OperationResultState = "running" | "complete" | "failed" | "cancelled" | "expired";
+
+export type OperationProgressDetails = OperationProgress;
+
+export interface OperationDetails {
+  id: string;
+  mode: "concept" | "hybrid";
+  state: OperationResultState;
+  startedAt: number;
+  deadlineAt: number;
+  leaseExpiresAt: number;
+  progress?: OperationProgressDetails;
+  nextRequest?: SignalGrepInput;
+  error?: string;
+}
 
 export type ContextBudgetTier = keyof typeof CONTEXT_BUDGET_POLICY.resultTokenBudgets;
 
@@ -142,6 +164,8 @@ export interface SourceExcerptDetails {
 export interface InspectRetry {
   mode: "inspect";
   cursor?: string;
+  exploreCursor?: string;
+  exploreRequest?: SignalGrepInput;
   matchIndex?: number;
   path?: string;
   line?: number;
@@ -227,7 +251,7 @@ export interface SearchSnapshot extends SearchScan {
 export interface SignalGrepDetails {
   version: 1;
   mode: SearchMode;
-  status: "complete" | "partial";
+  status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";
   totalMatches: number;
   storedMatches: number;
   totalFiles: number;
@@ -235,8 +259,11 @@ export interface SignalGrepDetails {
   snapshotComplete: boolean;
   retention?: SearchRetentionDetails;
   cursor?: string;
+  exploreCursor?: string;
   nextRequest?: SignalGrepInput;
+  exploreRequest?: SignalGrepInput;
   analysis?: AnalysisDetails;
+  relationship?: RelationshipPublicDetails;
   sourceBlocks?: { path: string; source: SourceExcerptDetails }[];
   summaryFilesShown?: number;
   summaryOffset?: number;
@@ -261,6 +288,7 @@ export interface SignalGrepDetails {
   redactedCount?: number;
   redactionRequested?: boolean;
   redactionApplied?: boolean;
+  operation?: OperationDetails;
 }
 
 export interface SignalGrepResult {

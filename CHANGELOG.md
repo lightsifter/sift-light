@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+## [2.0.0] - 2026-09-13
+
+- Add one owned lifecycle for long-running Concept and hybrid requests: the initial wait returns an exact `mode="await"` continuation with an operation id and progress, continuation resumes the same computation, final results are stably retained, and explicit cancellation waits for owned cleanup. Pending operations are bounded per service session, idle leases expire abandoned work, and real failures remain diagnostic instead of degrading to literal-only evidence.
+- Re-enumerate and verify a complete Concept source generation before publishing either Concept or hybrid evidence. Empty, unavailable, added, deleted and replaced files remain visible in coverage; source changes refresh within the operation deadline and mixed generations cannot be reported complete.
+- Deduplicate repeated embedding inputs before inference and atomically cache each completed embedding batch, exposing progress for unique embeddings and mapped passages. Cache reads distinguish misses or rebuildable corruption from real I/O failures.
+- Add bounded static caller/callee traces for TypeScript and Go with immutable result cursors, independent exploration cursors, cumulative depth/node/edge/expansion budgets, and visible partial coverage.
+- Add `mode: "validate"` for saved trace and analysis evidence. Validation checks retained source, configuration, manifest, and provider dependencies against the current worktree and reports `current`, `stale`, or `unknown` without changing the original snapshot or turning partial coverage into a complete result.
+
 ## [1.5.6-3] - 2026-09-10
 
 - Provide ready-to-copy `baoer_signal_grep` requests when the hard search policy blocks a static standalone `rg` or `ripgrep` command that can be translated without ambiguity, while preserving search options, the original working-directory scope, and conservative manual recovery for unsupported shell behavior.

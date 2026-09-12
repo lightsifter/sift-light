@@ -1,6 +1,11 @@
 import { bindImpactCandidates } from "./impact-bindings.js";
 import { fileDiscoveryQueryHint } from "./discovery-errors.js";
-import { conceptSearch, type ConceptSearchRunner, validateConceptQuery } from "./concept-search.js";
+import {
+  conceptSearch,
+  type ConceptSearchExecution,
+  type ConceptSearchRunner,
+  validateConceptQuery,
+} from "./concept-search.js";
 import { structuralSearch } from "./structural-search.js";
 import { isSemanticMode } from "./semantic-protocol.js";
 import { navigateSemantics } from "./semantic-navigation.js";
@@ -48,12 +53,22 @@ import {
   legacySourceTarget,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
+import { validateSavedEvidence } from "./evidence-validation.js";
 import { sameSourceRevision } from "./source.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { filterRoleOccurrences, findFunctionConjunctions } from "./syntax-search.js";
 import { syntaxLanguage } from "./syntax.js";
 import { parsePythonOutline } from "./python-outline.js";
-import { combineHybridSearch, hybridConceptLimit, retainedHybridCounts } from "./hybrid-search.js";
+import {
+  combineHybridSearch,
+  hybridConceptLimit,
+  retainedHybridCounts,
+  sameHybridLiteralScan,
+  HybridSourceChangedError,
+} from "./hybrid-search.js";
+import { validationResult } from "./relationship-output.js";
+import { RelationshipService } from "./relationship-service.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
 import {
   MAX_ANY_OF_TERMS,
   MAX_CONFIGURABLE_STRUCTURE_FILES,
@@ -78,6 +93,8 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
     input.mode === "imports" ||
     input.mode === "tests" ||
     input.mode === "impact" ||
+    input.mode === "trace" ||
+    input.mode === "validate" ||
     input.sourceCursor !== undefined ||
     input.anyOf !== undefined ||
     input.allOf !== undefined ||
@@ -88,6 +105,10 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
     input.conceptLimit !== undefined ||
     (input.cursor?.includes(".analysis") ?? false)
   );
+}
+
+export interface EvidenceSearchOptions {
+  onProgress?: (progress: OperationProgress) => void;
 }
 
 function rejectFields(
@@ -277,6 +298,7 @@ export class EvidenceService {
   readonly #queue = new SyntaxQueue();
   readonly #analyses = new AnalysisStore();
   readonly #continuations = new SourceContinuations();
+  readonly #relationshipService: RelationshipService;
   constructor(
     runner: RipgrepRunner,
     snapshots: SnapshotStore,
@@ -287,15 +309,94 @@ export class EvidenceService {
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    this.#relationshipService = new RelationshipService({
+      queue: this.#queue,
+      resolveScope: async (cwd, target, input, signal) => ({
+        root: await navigationRoot(cwd, target, signal),
+        filters: navigationFilters(input),
+      }),
+      maxFilesToParse,
+    });
   }
   clear(): void {
     this.#analyses.clear();
     this.#continuations.clear();
     this.#queue.clear();
+    this.#relationshipService.clear();
   }
   async shutdown(): Promise<void> {
     this.clear();
+    await this.#relationshipService.shutdown();
     await this.#queue.shutdown();
+  }
+
+  async #relationshipValidate(
+    input: SignalGrepInput,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<SignalGrepResult> {
+    const cursor = input.cursor;
+    if (!cursor) throw new SignalGrepError("mode=validate requires a saved evidence cursor");
+    rejectFields(
+      input,
+      [
+        "path",
+        "line",
+        "column",
+        "symbol",
+        "relation",
+        "depth",
+        "maxNodes",
+        "maxEdges",
+        "maxExpansions",
+        "exploreCursor",
+      ],
+      "Evidence validation",
+      true,
+    );
+    if (cursor.startsWith("relationship.")) {
+      return this.#relationshipService.validate(input, signal);
+    }
+    return this.#validateSavedEvidence(input, cwd, signal);
+  }
+
+  async #validateSavedEvidence(
+    input: SignalGrepInput,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<SignalGrepResult> {
+    const cursor = input.cursor;
+    if (!cursor) throw new SignalGrepError("A saved evidence cursor is required");
+    const startedAt = Date.now();
+    const validated = await validateSavedEvidence({
+      cursor,
+      cwd,
+      ...(signal ? { signal } : {}),
+      ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
+      analyses: this.#analyses,
+      snapshots: this.#snapshots,
+      queue: this.#queue,
+      maxFiles: MAX_STRUCTURE_FILES,
+    });
+    const finishedAt = Date.now();
+    return validationResult(
+      {
+        scope: validated.scope,
+        coverage: { sources: validated.sources, status: validated.coverage },
+        status:
+          validated.storedPartial || validated.coverage === "partial" ? "partial" : "complete",
+        reasons: validated.reasons,
+      },
+      cursor,
+      validated.recheck,
+      {
+        start: startedAt,
+        end: finishedAt,
+        ...(input.matchIndex !== undefined ? { selected: input.matchIndex } : {}),
+      },
+      validated.comparisonTarget,
+      [],
+    );
   }
 
   async #testEntryPaths(
@@ -355,6 +456,7 @@ export class EvidenceService {
     input: SignalGrepInput,
     cwd: string,
     signal?: AbortSignal,
+    options: EvidenceSearchOptions = {},
   ): Promise<SignalGrepResult> {
     if (signal?.aborted) throw abortError();
     if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
@@ -364,6 +466,10 @@ export class EvidenceService {
     const analysisStarted = performance.now();
     const fileLimit = maxFilesToParse(input.maxFilesToParse);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
+    if (input.mode === "trace" || input.mode === "validate")
+      return input.mode === "trace"
+        ? this.#relationshipService.trace(input, cwd, signal)
+        : this.#relationshipValidate(input, cwd, signal);
     if (isSemanticMode(input.mode)) {
       rejectFields(
         input,
@@ -419,7 +525,8 @@ export class EvidenceService {
         false,
         "use only mode, query, path, glob, exclude, hidden and redact",
       );
-      return this.#analyses.page(this.#analyses.create(await this.#conceptSearch(input, access)));
+      const execution = await this.#conceptSearch(input, access, options.onProgress);
+      return this.#analyses.page(this.#analyses.create(execution.analysis));
     }
     if (input.mode === "hybrid") {
       rejectFields(
@@ -452,9 +559,10 @@ export class EvidenceService {
         redact: input.redact ?? false,
       });
       let literalResult: Awaited<ReturnType<RipgrepRunner>> | undefined;
-      let conceptResult: AnalysisResultSet | undefined;
+      let conceptResult: ConceptSearchExecution | undefined;
       let conceptAccess: SourceAccess | undefined;
       let conceptFailure: unknown;
+      options.onProgress?.({ phase: "literal-search" });
       await runOwnedParallel<void>((groupSignal) => {
         conceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
         return [
@@ -463,7 +571,7 @@ export class EvidenceService {
             return undefined;
           }),
           // Semantic failure must not cancel an in-flight literal search owned by the same group.
-          this.#conceptSearch(input, conceptAccess)
+          this.#conceptSearch(input, conceptAccess, options.onProgress)
             .then((result) => {
               conceptResult = result;
               return undefined;
@@ -478,21 +586,23 @@ export class EvidenceService {
       if (!literalResult || !conceptAccess)
         throw new Error("Hybrid search did not settle its owned literal operation");
       if (!conceptResult) {
-        const message =
-          conceptFailure instanceof Error
-            ? conceptFailure.message
-            : "concept search failed without a diagnostic";
-        conceptResult = {
-          kind: "concept",
-          unit: "evidence-items",
-          items: [],
-          partial: true,
-          reasons: [`Semantic candidates unavailable: ${message}`],
-          coverage: { conceptCandidates: "skipped" },
-        };
+        if (conceptFailure instanceof Error) throw conceptFailure;
+        throw new SignalGrepError("Concept search failed without a diagnostic");
+      }
+      const firstLiteralResult = literalResult;
+      const verifiedLiteralResult = await this.#runner(literalRequest, cwd, signal);
+      if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
+        throw new HybridSourceChangedError(
+          "Literal source evidence changed while concept evidence was being computed",
+        );
       }
       const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-      const hybrid = await combineHybridSearch(literalResult, conceptResult, literalAccess, limit);
+      const hybrid = await combineHybridSearch(
+        verifiedLiteralResult,
+        conceptResult,
+        literalAccess,
+        limit,
+      );
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items),

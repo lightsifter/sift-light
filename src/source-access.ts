@@ -111,7 +111,9 @@ export class SourceAccess {
   readonly #maxFiles: number;
   readonly #documents = new Map<string, Promise<SourceDocument>>();
   readonly #syntax = new Map<SourceDocument, Promise<SyntaxAnalysis>>();
+  readonly #maxVerificationBytes: number;
   #bytes = 0;
+  #verificationBytes = 0;
   #syntaxParses = 0;
   #syntaxCacheHits = 0;
   #readTail: Promise<void> = Promise.resolve();
@@ -120,12 +122,13 @@ export class SourceAccess {
     cwd: string,
     queue: SyntaxQueue,
     signal?: AbortSignal,
-    options: { maxFiles?: number } = {},
+    options: { maxFiles?: number; maxVerificationBytes?: number } = {},
   ) {
     this.cwd = cwd;
     this.#queue = queue;
     this.signal = signal;
     this.#maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
+    this.#maxVerificationBytes = options.maxVerificationBytes ?? MAX_STRUCTURE_BYTES;
   }
 
   get filesRead(): number {
@@ -146,7 +149,10 @@ export class SourceAccess {
 
   /** Derive a fresh request-local access scope that shares only the parser owner and limits. */
   withSignal(signal: AbortSignal): SourceAccess {
-    return new SourceAccess(this.cwd, this.#queue, signal, { maxFiles: this.#maxFiles });
+    return new SourceAccess(this.cwd, this.#queue, signal, {
+      maxFiles: this.#maxFiles,
+      maxVerificationBytes: this.#maxVerificationBytes,
+    });
   }
 
   async load(path: string, expected?: SourceReference): Promise<SourceDocument> {
@@ -162,12 +168,16 @@ export class SourceAccess {
         `Structural scan reached the ${String(this.#maxFiles)}-file limit`,
       );
     }
-    const pending = this.#read(path, expected);
+    const pending = this.#read(path, expected, false);
     this.#documents.set(key, pending);
     return pending;
   }
 
-  async #read(path: string, expected?: SourceReference): Promise<SourceDocument> {
+  async #read(
+    path: string,
+    expected: SourceReference | undefined,
+    verification: boolean,
+  ): Promise<SourceDocument> {
     const predecessor = this.#readTail;
     let release: () => void = noop;
     this.#readTail = new Promise<void>((done) => {
@@ -175,15 +185,21 @@ export class SourceAccess {
     });
     try {
       await predecessor;
-      return await this.#readOnce(path, expected);
+      return await this.#readOnce(path, expected, verification);
     } finally {
       release();
     }
   }
 
-  async #readOnce(path: string, expected?: SourceReference): Promise<SourceDocument> {
+  async #readOnce(
+    path: string,
+    expected: SourceReference | undefined,
+    verification: boolean,
+  ): Promise<SourceDocument> {
     let document: SourceDocument;
-    const remaining = MAX_STRUCTURE_BYTES - this.#bytes;
+    const consumed = verification ? this.#verificationBytes : this.#bytes - this.#verificationBytes;
+    const budget = verification ? this.#maxVerificationBytes : MAX_STRUCTURE_BYTES;
+    const remaining = budget - consumed;
     if (remaining <= 0)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     if (expected?.origin.kind !== "git") {
@@ -218,7 +234,8 @@ export class SourceAccess {
       );
     }
     this.#bytes += document.bytes.length;
-    if (this.#bytes > MAX_STRUCTURE_BYTES)
+    if (verification) this.#verificationBytes += document.bytes.length;
+    else if (this.#bytes - this.#verificationBytes > MAX_STRUCTURE_BYTES)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     return document;
   }
@@ -246,6 +263,6 @@ export class SourceAccess {
 
   /** Relationship validation must reread the expected version, not consult the request cache. */
   refresh(path: string, expected: SourceReference): Promise<SourceDocument> {
-    return this.#read(path, expected);
+    return this.#read(path, expected, true);
   }
 }

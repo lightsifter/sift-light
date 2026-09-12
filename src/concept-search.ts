@@ -2,7 +2,12 @@ import { rangeEvidence } from "./analysis-evidence.js";
 import { OwnedTaskQueue } from "./owned-task-queue.js";
 const inferenceQueue = new OwnedTaskQueue();
 import { dirname } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { StringDecoder } from "node:string_decoder";
+import { mkdir } from "node:fs/promises";
+import { rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import type { AnalysisResultSet, ConceptScoreProfile } from "./analysis-types.js";
 import {
   CONCEPT_MODEL,
@@ -10,16 +15,22 @@ import {
   CONCEPT_REVISION,
   MAX_CONCEPT_CHARS,
   MAX_CONCEPT_WORKER_OUTPUT_BYTES,
-  resolveConceptTimeoutMs,
+  conceptCacheDirectory,
 } from "./concept-model.js";
 import { abortError, ConceptUnavailableError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { rpcRecord } from "./owned-json-rpc.js";
 import { normalizeRequest } from "./request.js";
 import type { SignalGrepInput } from "./service.js";
-import { SourceAccess, SourceBudgetError } from "./source-access.js";
-import { SourceDocumentError, type SourceDocument, type ByteRange } from "./source-document.js";
-import { listWorkspaceFiles } from "./workspace-files.js";
+import { SourceAccess } from "./source-access.js";
+import type { SourceDocument, ByteRange } from "./source-document.js";
+import {
+  createConceptSourceGeneration,
+  conceptSourceSummary,
+  verifyConceptSourceGeneration,
+  type ConceptSourceGeneration,
+} from "./concept-source-generation.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
 
 export interface Passage {
   document: SourceDocument;
@@ -42,6 +53,17 @@ function conciseWorkerError(stderr: string): string {
     .find(Boolean);
   if (diagnostic) return diagnostic.slice(0, 512);
   return "worker returned no concise diagnostic";
+}
+
+/** A worker that disappears without a protocol result can be restarted once by the owner. */
+export class ConceptWorkerExitError extends SignalGrepError {
+  readonly exitCode: number | null;
+
+  constructor(exitCode: number | null, diagnostic: string) {
+    super(`Local concept worker exited unexpectedly (${String(exitCode)}): ${diagnostic}`);
+    this.name = "ConceptWorkerExitError";
+    this.exitCode = exitCode;
+  }
 }
 
 function scoreProfile(scores: readonly number[]): ConceptScoreProfile {
@@ -101,23 +123,35 @@ export interface ConceptInferenceResult {
   peakRssBytes: number;
 }
 
+export interface ConceptSearchExecution {
+  analysis: AnalysisResultSet;
+  sourceGeneration: ConceptSourceGeneration;
+}
+
 export type ConceptInferenceRunner = (
   query: string,
   passages: Passage[],
   parent?: AbortSignal,
+  onProgress?: (progress: OperationProgress) => void,
 ) => Promise<ConceptInferenceResult>;
 
 async function similarities(
   query: string,
   passages: Passage[],
   parent?: AbortSignal,
+  onProgress?: (progress: OperationProgress) => void,
 ): Promise<ConceptInferenceResult> {
   const worker = fileURLToPath(new URL("./concept-worker.mjs", import.meta.url));
   const config = fileURLToPath(new URL("./syntax-worker.toml", import.meta.url));
   const env = { ...process.env };
   delete env.NODE_OPTIONS;
-  const buffers: Buffer[] = [];
+  const stagingRoot = join(conceptCacheDirectory(), ".staging", randomUUID());
+  await mkdir(stagingRoot, { recursive: true });
   let bytes = 0;
+  let lineBuffer = "";
+  let finalValue: Record<string, unknown> | undefined;
+  let sawFinal = false;
+  const decoder = new StringDecoder("utf8");
   try {
     const processResult = await runOwnedProcess(
       {
@@ -133,7 +167,7 @@ async function similarities(
             ]
           : [worker, "--infer"],
         cwd: dirname(worker),
-        env,
+        env: { ...env, SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
         ...(parent ? { signal: parent } : {}),
         input: Buffer.from(
           JSON.stringify({
@@ -147,15 +181,71 @@ async function similarities(
           bytes += chunk.byteLength;
           if (bytes > MAX_CONCEPT_WORKER_OUTPUT_BYTES)
             throw new SignalGrepError("Concept worker exceeded its 4 MiB response budget");
-          buffers.push(Buffer.from(chunk));
+          lineBuffer += decoder.write(Buffer.from(chunk));
+          let newline = lineBuffer.indexOf("\n");
+          while (newline >= 0) {
+            const line = lineBuffer.slice(0, newline).trim();
+            lineBuffer = lineBuffer.slice(newline + 1);
+            newline = lineBuffer.indexOf("\n");
+            if (!line) continue;
+            const parsed: unknown = JSON.parse(line);
+            if (!rpcRecord(parsed) || typeof parsed.type !== "string")
+              throw new SignalGrepError("Invalid concept worker progress response");
+            if (parsed.type === "progress") {
+              if (sawFinal)
+                throw new SignalGrepError("Concept worker emitted progress after its result");
+              if (
+                typeof parsed.phase !== "string" ||
+                (parsed.completed !== undefined &&
+                  (typeof parsed.completed !== "number" ||
+                    !Number.isSafeInteger(parsed.completed) ||
+                    parsed.completed < 0)) ||
+                (parsed.total !== undefined &&
+                  (typeof parsed.total !== "number" ||
+                    !Number.isSafeInteger(parsed.total) ||
+                    parsed.total < 0))
+              )
+                throw new SignalGrepError("Invalid concept worker progress response");
+              const progress: OperationProgress = { phase: parsed.phase };
+              if (typeof parsed.completed === "number") progress.completed = parsed.completed;
+              if (typeof parsed.total === "number") progress.total = parsed.total;
+              if (
+                typeof parsed.uniqueEmbeddings === "number" &&
+                typeof parsed.passages === "number"
+              )
+                progress.detail = `unique embeddings ${String(parsed.uniqueEmbeddings)}, passages ${String(parsed.passages)}`;
+              onProgress?.(progress);
+            } else if (parsed.type === "result") {
+              if (sawFinal)
+                throw new SignalGrepError("Concept worker emitted more than one result");
+              sawFinal = true;
+              finalValue = parsed;
+            } else {
+              throw new SignalGrepError("Invalid concept worker response type");
+            }
+          }
         }
       },
     );
+    if (processResult.code === null)
+      throw new ConceptWorkerExitError(
+        processResult.code,
+        conciseWorkerError(processResult.stderr),
+      );
     if (processResult.code !== 0)
       throw new ConceptUnavailableError(
         `Local concept inference failed (${String(processResult.code)}): ${conciseWorkerError(processResult.stderr)}`,
       );
-    const value: unknown = JSON.parse(Buffer.concat(buffers).toString("utf8"));
+    lineBuffer += decoder.end();
+    if (lineBuffer.trim()) {
+      const parsed: unknown = JSON.parse(lineBuffer.trim());
+      if (!rpcRecord(parsed) || parsed.type !== "result")
+        throw new SignalGrepError("Concept worker did not return a result record");
+      if (sawFinal) throw new SignalGrepError("Concept worker emitted more than one result");
+      finalValue = parsed;
+      sawFinal = true;
+    }
+    const value: unknown = finalValue;
     if (
       !rpcRecord(value) ||
       !Array.isArray(value.scores) ||
@@ -196,11 +286,21 @@ async function similarities(
     };
   } catch (error) {
     if (parent?.aborted) throw abortError();
+    if (error instanceof ConceptWorkerExitError) throw error;
     if (error instanceof ConceptUnavailableError) throw error;
     const message = error instanceof Error ? error.message : "unknown provider failure";
     throw new ConceptUnavailableError(`Local concept inference failed: ${message}`, {
       cause: error,
     });
+  } finally {
+    try {
+      await rm(stagingRoot, { recursive: true, force: true });
+    } catch (error) {
+      // oxlint-disable-next-line no-unsafe-finally -- owner staging cleanup must report failure.
+      throw new ConceptUnavailableError("Unable to clean up concept worker staging files", {
+        cause: error,
+      });
+    }
   }
 }
 
@@ -216,51 +316,34 @@ async function runConceptSearch(
   input: SignalGrepInput,
   access: SourceAccess,
   infer: ConceptInferenceRunner,
-): Promise<AnalysisResultSet> {
+  onProgress?: (progress: OperationProgress) => void,
+): Promise<ConceptSearchExecution> {
   const query = validateConceptQuery(input.query);
   const started = performance.now();
   const request = normalizeRequest({ ...input, pattern: "" });
-  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+  const sourceGeneration = await createConceptSourceGeneration(access, {
     ...(request.path ? { path: request.path } : {}),
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden,
   });
+  onProgress?.({
+    phase: "source-generation",
+    completed: sourceGeneration.files.paths.length,
+    total: sourceGeneration.files.paths.length,
+    detail: `generation ${sourceGeneration.inventoryHash}; admitted ${String(sourceGeneration.documents.length)}, unavailable ${String(sourceGeneration.filesUnavailable)}`,
+  });
+  const files = sourceGeneration.files;
   const result: AnalysisResultSet = {
     kind: "concept",
     unit: "evidence-items",
     items: [],
-    partial: files.partial,
-    reasons: [...files.reasons],
+    partial: sourceGeneration.partial,
+    reasons: [...sourceGeneration.reasons],
     redact: input.redact ?? false,
   };
   const documents: { document: SourceDocument; next: number }[] = [];
-  let filesSkippedEmpty = 0;
-  let filesUnavailable = 0;
-  for (const path of files.paths) {
-    try {
-      // oxlint-disable-next-line no-await-in-loop -- shared verified source budget; no source is sent over the network.
-      const document = await access.load(path);
-      if (!document.utf8) throw new SourceDocumentError("encoding", "Not lossless UTF-8");
-      // Empty or whitespace-only files carry no passages; this is a normal skip, not a coverage gap.
-      if (!document.text.trim()) {
-        filesSkippedEmpty += 1;
-        continue;
-      }
-      documents.push({ document, next: 0 });
-    } catch (error) {
-      if (error instanceof SourceBudgetError) {
-        result.partial = true;
-        result.reasons.push(error.message);
-        filesUnavailable += 1;
-        break;
-      }
-      if (!(error instanceof SourceDocumentError)) throw error;
-      result.partial = true;
-      filesUnavailable += 1;
-      result.reasons.push(`${path}: ${error.message}`);
-    }
-  }
+  for (const document of sourceGeneration.documents) documents.push({ document, next: 0 });
   const passages: Passage[] = [];
   while (documents.some((item) => item.next < item.document.text.length)) {
     for (const item of documents) {
@@ -270,9 +353,10 @@ async function runConceptSearch(
       item.next = chunk.next;
     }
   }
+  onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
   const filesAdmitted = documents.length;
-  const filesProcessed = filesAdmitted + filesSkippedEmpty + filesUnavailable;
-  const filesNotProcessed = Math.max(0, files.paths.length - filesProcessed);
+  const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
+  const filesUnavailable = sourceGeneration.filesUnavailable;
   if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
     result.reasons.push(
       `Concept enumerated ${String(files.paths.length)} files; narrow path or glob for faster interactive retrieval`,
@@ -282,11 +366,11 @@ async function runConceptSearch(
     filesEnumerated: files.paths.length,
     filesAdmitted,
     filesSkippedEmpty,
-    filesUnavailable: filesUnavailable + filesNotProcessed,
+    filesUnavailable,
     passagesQueued: passages.length,
   };
   if (passages.length) {
-    const inferred = await infer(query, passages, access.signal);
+    const inferred = await infer(query, passages, access.signal, onProgress);
     result.reasons.push(...inferred.warnings);
     result.items = passages
       .map((item, index) => {
@@ -351,55 +435,35 @@ async function runConceptSearch(
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide",
   };
-  return result;
+  await verifyConceptSourceGeneration(sourceGeneration, access);
+  result.sourceGeneration = conceptSourceSummary(sourceGeneration);
+  return { analysis: result, sourceGeneration };
 }
 
 export function conceptSearch(
   input: SignalGrepInput,
   access: SourceAccess,
-): Promise<AnalysisResultSet> {
-  return runConceptSearchWithDeadline(input, access, similarities);
+  onProgress?: (progress: OperationProgress) => void,
+): Promise<ConceptSearchExecution> {
+  return runConceptSearchQueued(input, access, similarities, onProgress);
 }
 
 export type ConceptSearchRunner = typeof conceptSearch;
 
-type ConceptTimeoutResolver = () => number;
-
-async function runConceptSearchWithDeadline(
+async function runConceptSearchQueued(
   input: SignalGrepInput,
   access: SourceAccess,
   infer: ConceptInferenceRunner,
-  timeout: ConceptTimeoutResolver = resolveConceptTimeoutMs,
-): Promise<AnalysisResultSet> {
-  const timeoutMs = timeout();
-  const controller = new AbortController();
-  const signal = access.signal
-    ? AbortSignal.any([access.signal, controller.signal])
-    : controller.signal;
-  const scopedAccess = access.withSignal(signal);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await inferenceQueue.run(
-      () => runConceptSearch(input, scopedAccess, infer),
-      scopedAccess.signal,
-    );
-  } catch (error) {
-    if (access.signal?.aborted) throw abortError();
-    if (controller.signal.aborted) {
-      throw new ConceptUnavailableError(
-        `Concept request exceeded the ${String(timeoutMs)} ms deadline`,
-        { cause: error },
-      );
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  onProgress?: (progress: OperationProgress) => void,
+): Promise<ConceptSearchExecution> {
+  return inferenceQueue
+    .run(() => runConceptSearch(input, access, infer, onProgress), access.signal)
+    .catch((error: unknown) => {
+      if (access.signal?.aborted) throw abortError();
+      throw error;
+    });
 }
 
-export function createConceptSearchRunner(
-  infer: ConceptInferenceRunner,
-  timeout?: ConceptTimeoutResolver,
-): ConceptSearchRunner {
-  return (input, access) => runConceptSearchWithDeadline(input, access, infer, timeout);
+export function createConceptSearchRunner(infer: ConceptInferenceRunner): ConceptSearchRunner {
+  return (input, access, onProgress) => runConceptSearchQueued(input, access, infer, onProgress);
 }

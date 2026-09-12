@@ -30,7 +30,7 @@ function stringEnum<const Values extends readonly string[]>(
 }
 
 export const SIGNAL_GREP_DESCRIPTION =
-  "Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=concept accepts query, path, glob, exclude, hidden and redact, ranks every passage admitted by the source budget through token-safe windows, reuses a bounded local content-addressed embedding cache, and exposes scoreProfile/cache coverage without deciding relevance thresholds. mode=hybrid always runs exact literal and local concept retrieval once, ranks exact evidence first, deduplicates overlapping semantic passages, and retains a bounded semantic supplement in one pageable snapshot. allOf is a 2-3 term literal conjunction; within is valid only with allOf and must be omitted for ordinary single-pattern searches. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. files+query discovers filenames and stays inside the requested path; structure+pattern matches AST shapes. Python outline is supported as bounded indentation-based function/class evidence; JS/TS definitions, references, implementations, callers and callees use path+line+column (1-based UTF-16) or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit.";
+  "Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=concept accepts query, path, glob, exclude, hidden and redact, ranks every passage admitted by the source budget through token-safe windows, reuses a bounded local content-addressed embedding cache, and exposes scoreProfile/cache coverage without deciding relevance thresholds. mode=hybrid always runs exact literal and local concept retrieval once, ranks exact evidence first, deduplicates overlapping semantic passages, and retains a bounded semantic supplement in one pageable snapshot. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf is a 2-3 term literal conjunction; within is valid only with allOf and must be omitted for ordinary single-pattern searches. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. files+query discovers filenames and stays inside the requested path; structure+pattern matches AST shapes. Python outline is supported as bounded indentation-based function/class evidence; JS/TS definitions, references, implementations, callers and callees use path+line+column (1-based UTF-16) or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit.";
 
 export const SIGNAL_GREP_MODEL_DESCRIPTION =
   "Search local files with bounded evidence. Use pattern plus optional path for contents, mode=files plus query for names, and scope=strict to forbid zero-result expansion. Reuse returned cursors and inspect selectors. On rejection, keep the strongest applicable mode and apply its repair once without copying the old error/request. Only explicit capability unavailability permits a visibly partial alternative. Semantic and static-analysis results are candidates, not proof.";
@@ -269,12 +269,51 @@ export const signalGrepSchema = Type.Object({
         "callees",
         "dependencies",
         "dependents",
+        "trace",
+        "validate",
+        "await",
+        "cancel",
       ] as const,
       {
         description:
-          "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. inspect/outline/imports/tests/impact retain their documented location selectors. tests supports JS/TS/TSX sources; Python supports outline, not related-test navigation. Compiler results are static evidence; concept and related-test results remain candidates.",
+          "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates.",
       },
     ),
+  ),
+  relation: Type.Optional(
+    stringEnum(["callers", "callees"] as const, {
+      description:
+        "mode=trace relationship direction; required for a new trace and ignored only when paging a trace cursor.",
+    }),
+  ),
+  depth: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 8,
+      description:
+        "mode=trace maximum BFS depth; continuation increases the cumulative depth by one.",
+    }),
+  ),
+  maxNodes: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 2_000,
+      description: "mode=trace retained node budget across all continuation pages.",
+    }),
+  ),
+  maxEdges: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 4_000,
+      description: "mode=trace retained edge budget across all continuation pages.",
+    }),
+  ),
+  maxExpansions: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 2_000,
+      description: "mode=trace provider expansion budget across all continuation pages.",
+    }),
   ),
   line: Type.Optional(
     Type.Number({
@@ -312,5 +351,19 @@ export const signalGrepSchema = Type.Object({
   ),
   cursor: Type.Optional(
     Type.String({ description: "Opaque cursor from a previous stable search snapshot." }),
+  ),
+  operationId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 128,
+      description:
+        "Operation handle returned by a waiting concept/hybrid result. Required with mode=await or mode=cancel; copy it exactly and do not start a new query.",
+    }),
+  ),
+  exploreCursor: Type.Optional(
+    Type.String({
+      description:
+        "Independent relationship exploration handle returned by mode=trace; use it to extend depth without changing immutable result page cursors.",
+    }),
   ),
 });
