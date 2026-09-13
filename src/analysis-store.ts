@@ -107,6 +107,29 @@ function publicAnalysisLabel(result: AnalysisResultSet): string {
   throw new Error("Unknown analysis result kind");
 }
 
+function publicStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) return undefined;
+  return value;
+}
+
+function publicStructureDetails(item: AnalysisItem): Record<string, unknown> | undefined {
+  if (item.details?.kind !== "symbol") return undefined;
+  const details = item.details;
+  const scope = publicStringArray(details.scope);
+  return {
+    kind: "symbol",
+    ...(typeof details.language === "string" ? { language: details.language } : {}),
+    ...(typeof details.name === "string" ? { name: details.name } : {}),
+    ...(scope ? { scope } : {}),
+    ...(typeof details.hasBody === "boolean" ? { hasBody: details.hasBody } : {}),
+    ...(typeof details.exported === "boolean" ? { exported: details.exported } : {}),
+    ...(typeof details.syntax === "string" ? { syntax: details.syntax } : {}),
+    ...(typeof details.signatureTruncated === "boolean"
+      ? { signatureTruncated: details.signatureTruncated }
+      : {}),
+  };
+}
+
 function publicAnalysisItem(
   result: AnalysisResultSet,
   item: AnalysisItem,
@@ -122,12 +145,14 @@ function publicAnalysisItem(
           ...(result.redact ? { redact: true } : {}),
         }
       : undefined;
+  const publicDetails = publicStructureDetails(item);
   return {
     path: item.path,
     line: item.line,
     label: publicAnalysisLabel(result),
     index: index + 1,
     ...(inspect ? { inspect } : {}),
+    ...(publicDetails ? { details: publicDetails } : {}),
   };
 }
 

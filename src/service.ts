@@ -646,7 +646,7 @@ export class SignalGrepService {
         : undefined;
     const navigation = cursor
       ? [
-          `Snapshot cursor available: ${cursor}.`,
+          `Snapshot cursor="${cursor}".`,
           matchesRequest ? `Match metadata request: ${JSON.stringify(matchesRequest)}.` : undefined,
           nextRequest ? `Next summary page: ${JSON.stringify(nextRequest)}.` : undefined,
         ].filter((line): line is string => line !== undefined)

@@ -5432,6 +5432,27 @@ function publicAnalysisLabel(result) {
   }
   throw new Error("Unknown analysis result kind");
 }
+function publicStringArray(value) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))
+    return;
+  return value;
+}
+function publicStructureDetails(item) {
+  if (item.details?.kind !== "symbol")
+    return;
+  const details = item.details;
+  const scope = publicStringArray(details.scope);
+  return {
+    kind: "symbol",
+    ...typeof details.language === "string" ? { language: details.language } : {},
+    ...typeof details.name === "string" ? { name: details.name } : {},
+    ...scope ? { scope } : {},
+    ...typeof details.hasBody === "boolean" ? { hasBody: details.hasBody } : {},
+    ...typeof details.exported === "boolean" ? { exported: details.exported } : {},
+    ...typeof details.syntax === "string" ? { syntax: details.syntax } : {},
+    ...typeof details.signatureTruncated === "boolean" ? { signatureTruncated: details.signatureTruncated } : {}
+  };
+}
 function publicAnalysisItem(result, item, index, storedId) {
   const inspect = item.source && item.range ? {
     mode: "inspect",
@@ -5439,12 +5460,14 @@ function publicAnalysisItem(result, item, index, storedId) {
     matchIndex: index + 1,
     ...result.redact ? { redact: true } : {}
   } : undefined;
+  const publicDetails = publicStructureDetails(item);
   return {
     path: item.path,
     line: item.line,
     label: publicAnalysisLabel(result),
     index: index + 1,
-    ...inspect ? { inspect } : {}
+    ...inspect ? { inspect } : {},
+    ...publicDetails ? { details: publicDetails } : {}
   };
 }
 function safeTermCounts(termCounts) {
@@ -10991,7 +11014,7 @@ class SignalGrepService {
     const nextRequest = cursor && summary.hasNext ? { cursor, mode: "summary", ...redaction } : undefined;
     const matchesRequest = cursor && snapshot.matches.length > 0 && summary.shownPaths.length ? { cursor, paths: summary.shownPaths.slice(0, 1), ...redaction } : undefined;
     const navigation = cursor ? [
-      `Snapshot cursor available: ${cursor}.`,
+      `Snapshot cursor="${cursor}".`,
       matchesRequest ? `Match metadata request: ${JSON.stringify(matchesRequest)}.` : undefined,
       nextRequest ? `Next summary page: ${JSON.stringify(nextRequest)}.` : undefined
     ].filter((line) => line !== undefined) : [];
