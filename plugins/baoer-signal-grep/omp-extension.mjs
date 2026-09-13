@@ -1547,7 +1547,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "2.1.0",
+  version: "2.1.1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
