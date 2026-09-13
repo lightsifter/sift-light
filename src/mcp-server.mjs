@@ -7682,7 +7682,7 @@ import { resolve as resolve17 } from "node:path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
-function legacySourceTarget(target) {
+function matchInspectionTarget(target) {
   return {
     path: target.path,
     line: target.line,
@@ -9729,7 +9729,7 @@ class EvidenceService {
       if (input.targets) {
         if (input.cursor !== undefined)
           throw new SignalGrepError("targets cannot be combined with cursor");
-        return input.targets.map((target) => legacySourceTarget(resolveInspectionTarget(target, cwd, this.#snapshots)));
+        return input.targets.map((target) => matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)));
       }
       if (!input.cursor)
         throw new SignalGrepError("matchIndices requires a cursor");
@@ -9754,7 +9754,7 @@ class EvidenceService {
       };
     }
     return {
-      ...legacySourceTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
+      ...matchInspectionTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
       ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}
     };
   }

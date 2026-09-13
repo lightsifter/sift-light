@@ -89,7 +89,7 @@ MCP 需要 Node.js 22.19+；Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun
 pi install npm:baoer_signal_grep
 ```
 
-安装或更新后重启 Pi。Pi 默认让常规搜索使用本插件，读取、编辑、测试、构建和脚本仍可使用。`enforceSearch` 支持 `"hard"`（默认严格拦截）、`"prefer"`（保留专用工具和模型指引，但不拒绝其他搜索）和 `"off"`；已有的 `true`、`false` 分别继续等价于 `"hard"`、`"off"`。请在 `~/.pi/agent/baoer_signal_grep.json` 中配置后重启；设置 `"locale": "zh-CN"` 可启用中文界面。
+安装或更新后重启 Pi。Pi 默认让常规搜索使用本插件，读取、编辑、测试、构建和脚本仍可使用。`enforceSearch` 支持 `"hard"`（默认严格拦截）、`"prefer"`（保留专用工具和模型指引，但不拒绝其他搜索）和 `"off"`；布尔值及未知配置字段会直接报错。请在 `~/.pi/agent/baoer_signal_grep.json` 中配置后重启；设置 `"locale": "zh-CN"` 可启用中文界面。
 
 ### OMP（Oh My Pi）
 
@@ -97,7 +97,7 @@ pi install npm:baoer_signal_grep
 omp install npm:baoer_signal_grep@latest
 ```
 
-安装或更新后重启 OMP。安装包声明了 OMP 原生扩展并注册 `baoer_signal_grep`。默认 hard 模式会从活动工具集中移除 OMP 内置的 `grep` 和 `glob`，并在执行前阻止直接搜索命令，同时保留读取、编辑、测试、构建和其他开发工具。prefer 模式会同时保留专用工具与其他搜索工具，加入模型指引，但不拒绝 shell 搜索。OMP 当前 profile 会被正确识别：默认配置文件是 `~/.omp/agent/baoer_signal_grep.json`，命名 profile 使用 `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`。在当前文件中将 `enforceSearch` 设置为 `"hard"`（默认）、`"prefer"` 或 `"off"` 后重启 OMP；已有的 `true`、`false` 继续兼容。设置 `"locale": "zh-CN"` 可启用中文界面。
+安装或更新后重启 OMP。安装包声明了 OMP 原生扩展并注册 `baoer_signal_grep`。默认 hard 模式会从活动工具集中移除 OMP 内置的 `grep` 和 `glob`，并在执行前阻止直接搜索命令，同时保留读取、编辑、测试、构建和其他开发工具。prefer 模式会同时保留专用工具与其他搜索工具，加入模型指引，但不拒绝 shell 搜索。OMP 当前 profile 会被正确识别：默认配置文件是 `~/.omp/agent/baoer_signal_grep.json`，命名 profile 使用 `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`。在当前文件中将 `enforceSearch` 设置为 `"hard"`（默认）、`"prefer"` 或 `"off"` 后重启 OMP；布尔值及未知配置字段会直接报错。设置 `"locale": "zh-CN"` 可启用中文界面。
 
 ### Claude Code 或 Codex：连接 MCP
 

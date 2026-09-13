@@ -4,13 +4,12 @@ export const SIGNAL_GREP_CONFIG_FILE = "baoer_signal_grep.json";
 
 export type SignalGrepLocale = "en" | "zh-CN";
 export type SearchEnforcementMode = "hard" | "prefer" | "off";
-export type SearchEnforcementSetting = boolean | SearchEnforcementMode;
 
 export const SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
 
 export interface SignalGrepConfig {
   locale: SignalGrepLocale;
-  enforceSearch?: SearchEnforcementSetting;
+  enforceSearch?: SearchEnforcementMode;
 }
 
 export const DEFAULT_SIGNAL_GREP_CONFIG: Readonly<SignalGrepConfig> = {
@@ -39,6 +38,12 @@ function parseConfig(value: unknown, path: string): SignalGrepConfig {
   if (!isRawSignalGrepConfig(value)) {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
   }
+  const unknown = Object.keys(value).filter((key) => key !== "locale" && key !== "enforceSearch");
+  if (unknown.length > 0) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale and enforceSearch are accepted`,
+    );
+  }
   const { locale, enforceSearch } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
@@ -51,11 +56,11 @@ function parseConfig(value: unknown, path: string): SignalGrepConfig {
 }
 
 export function normalizeSearchEnforcement(value: unknown, source: string): SearchEnforcementMode {
-  if (value === undefined || value === true || value === "hard") return "hard";
+  if (value === undefined || value === "hard") return "hard";
   if (value === "prefer") return "prefer";
-  if (value === false || value === "off") return "off";
+  if (value === "off") return "off";
   throw new Error(
-    `Invalid baoer_signal_grep ${source}: enforceSearch must be true, false, "hard", "prefer", or "off"`,
+    `Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`,
   );
 }
 

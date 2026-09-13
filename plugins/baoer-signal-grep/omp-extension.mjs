@@ -69,6 +69,10 @@ function parseConfig(value, path) {
   if (!isRawSignalGrepConfig(value)) {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
   }
+  const unknown = Object.keys(value).filter((key) => key !== "locale" && key !== "enforceSearch");
+  if (unknown.length > 0) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale and enforceSearch are accepted`);
+  }
   const { locale, enforceSearch } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
@@ -80,13 +84,13 @@ function parseConfig(value, path) {
   };
 }
 function normalizeSearchEnforcement(value, source) {
-  if (value === undefined || value === true || value === "hard")
+  if (value === undefined || value === "hard")
     return "hard";
   if (value === "prefer")
     return "prefer";
-  if (value === false || value === "off")
+  if (value === "off")
     return "off";
-  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be true, false, "hard", "prefer", or "off"`);
+  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
 }
 async function readSignalGrepConfigFile(path) {
   try {
@@ -7067,7 +7071,7 @@ import { resolve as resolve17 } from "path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
-function legacySourceTarget(target) {
+function matchInspectionTarget(target) {
   return {
     path: target.path,
     line: target.line,
@@ -9594,7 +9598,7 @@ class EvidenceService {
       if (input.targets) {
         if (input.cursor !== undefined)
           throw new SignalGrepError("targets cannot be combined with cursor");
-        return input.targets.map((target) => legacySourceTarget(resolveInspectionTarget(target, cwd, this.#snapshots)));
+        return input.targets.map((target) => matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)));
       }
       if (!input.cursor)
         throw new SignalGrepError("matchIndices requires a cursor");
@@ -9619,7 +9623,7 @@ class EvidenceService {
       };
     }
     return {
-      ...legacySourceTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
+      ...matchInspectionTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
       ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}
     };
   }

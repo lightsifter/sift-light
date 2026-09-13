@@ -4,6 +4,8 @@
 
 ## [2.1.0] - 2026-09-13
 
+- Accept only current configuration: `enforceSearch` uses `hard`, `prefer` or `off`; retired boolean values and unknown config keys fail explicitly. No compatibility aliases or silent ignored settings.
+
 - Remove language-service navigation and its runtime dependencies, provider processes, graph traversal, snapshots and filesystem watchers. Removed modes: `definitions`, `references`, `implementations`, `callers`, `callees`, `dependencies`, `dependents`, `trace` and `impact`; requests fail explicitly without a weaker automatic fallback.
 - Retain ast-grep syntax analysis, bounded Python outline, static JS/TS/TSX imports/tests, exact/file searches, source inspection, Concept and hybrid. Swift outline is no longer advertised; Swift content search and inspection remain available.
 - Preserve the complete source-validation report in compact MCP output, including freshness, comparison target, check interval and per-source status; source rows use one-based indices and retained/returned counts agree.

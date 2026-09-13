@@ -30,7 +30,7 @@ export interface SourceInspectionTarget {
   matchIndex?: number;
   reference?: SourceReference;
   range?: ByteRange;
-  /** Raw source byte offset; legacy retained-match focus is line-relative. */
+  /** Raw source byte offset; retained-match focus is line-relative. */
   absoluteFocus?: number;
   focus?: number;
   expectedRevision?: SourceRevision;
@@ -61,7 +61,7 @@ function usesDocumentLineWindow(path: string): boolean {
   return /\.(?:md|markdown)$/iu.test(path);
 }
 
-export function legacySourceTarget(target: InspectionTarget): SourceInspectionTarget {
+export function matchInspectionTarget(target: InspectionTarget): SourceInspectionTarget {
   return {
     path: target.path,
     line: target.line,

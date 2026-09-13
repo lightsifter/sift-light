@@ -38,7 +38,7 @@ import { type ByteRange, type SourceDocument, type SourceReference } from "./sou
 import {
   continueSource,
   inspectDocuments,
-  legacySourceTarget,
+  matchInspectionTarget,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
 import { validateSavedEvidence } from "./evidence-validation.js";
@@ -743,7 +743,7 @@ export class EvidenceService {
         if (input.cursor !== undefined)
           throw new SignalGrepError("targets cannot be combined with cursor");
         return input.targets.map((target) =>
-          legacySourceTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
+          matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
         );
       }
       if (!input.cursor) throw new SignalGrepError("matchIndices requires a cursor");
@@ -770,7 +770,7 @@ export class EvidenceService {
       };
     }
     return {
-      ...legacySourceTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
+      ...matchInspectionTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
       ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
     };
   }
