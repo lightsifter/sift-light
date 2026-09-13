@@ -6,6 +6,7 @@ const SENSITIVE_ASSIGNMENT = new RegExp(
   String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`,
   "gi",
 );
+const SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
 const TYPE_ONLY_VALUES = new Set([
   "boolean",
   "number",
@@ -31,7 +32,24 @@ function redactString(value: string): { value: string; count: number } {
       return `${prefix}"[REDACTED]"`;
     },
   );
+  redacted = redacted.replace(SENSITIVE_TOKEN, () => {
+    count += 1;
+    return "[REDACTED]";
+  });
   return { value: redacted, count };
+}
+
+/** Apply the same display redaction recognizer to bounded runtime diagnostics. */
+export function redactDiagnosticText(value: string): string {
+  return redactString(value).value;
+}
+
+/** Reuse the display redaction recognizer before placing request data in an error. */
+export function containsSensitiveText(value: unknown): boolean {
+  if (typeof value === "string") return redactString(value).count > 0;
+  if (Array.isArray(value)) return value.some((item) => containsSensitiveText(item));
+  if (typeof value !== "object" || value === null) return false;
+  return Object.values(value).some((item) => containsSensitiveText(item));
 }
 
 function redactInPlace(value: unknown, seen: WeakSet<object>): number {

@@ -4,6 +4,8 @@ import type { SourceFragment } from "./source-pages.js";
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
 import type { OperationProgress } from "./operation-lifecycle.js";
+import type { RequestContractDetails } from "./request-contract.js";
+import type { LanguageCapabilityInventory } from "./language-capabilities.js";
 
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_PAGE_SIZE = 100;
@@ -58,6 +60,7 @@ export type SearchMode =
   | "impact"
   | "trace"
   | "validate"
+  | "capabilities"
   | "await"
   | "cancel";
 
@@ -252,6 +255,7 @@ export interface SignalGrepDetails {
   version: 1;
   mode: SearchMode;
   status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";
+  error?: RequestContractDetails;
   totalMatches: number;
   storedMatches: number;
   totalFiles: number;
@@ -289,6 +293,7 @@ export interface SignalGrepDetails {
   redactionRequested?: boolean;
   redactionApplied?: boolean;
   operation?: OperationDetails;
+  capabilities?: LanguageCapabilityInventory;
 }
 
 export interface SignalGrepResult {

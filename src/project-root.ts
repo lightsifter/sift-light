@@ -81,3 +81,35 @@ export async function resolveSemanticProjectRoot(
   }
   return packageRoot ?? targetDirectory;
 }
+
+/**
+ * Resolve a non-TypeScript relationship provider to the nearest known project
+ * manifest. The walk is target-ancestor-only; it never enumerates a repository
+ * to guess which sibling project owns a request.
+ */
+export async function resolveRelationshipProjectRoot(
+  cwd: string,
+  targetPath: string,
+  language: "go" | "swift",
+  signal?: AbortSignal,
+): Promise<string> {
+  const absoluteCwd = resolve(cwd);
+  const absoluteTarget = resolve(absoluteCwd, targetPath);
+  const markers = language === "go" ? new Set(["go.mod", "go.work"]) : new Set(["Package.swift"]);
+  let current = dirname(absoluteTarget);
+  while (isPathInsideCwd(current, absoluteCwd)) {
+    if (signal?.aborted) throw abortError();
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- ancestor order is the project-boundary contract.
+      const entries = await readdir(current, { withFileTypes: true });
+      if (entries.some((entry) => markers.has(entry.name))) return current;
+    } catch (error) {
+      if (!isMissingPath(error)) throw error;
+    }
+    if (current === absoluteCwd) break;
+    const parent = dirname(current);
+    if (parent === current || !isPathInsideCwd(parent, absoluteCwd)) break;
+    current = parent;
+  }
+  return dirname(absoluteTarget);
+}

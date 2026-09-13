@@ -17,6 +17,14 @@ import {
   MAX_PATH_CHARACTERS,
   MAX_PATTERN_CHARACTERS,
 } from "./types.js";
+import {
+  MODE_CONTRACT_DESCRIPTION,
+  MODE_FIELD_SUMMARY,
+  MODEL_USAGE_GUIDANCE,
+  REQUEST_USAGE_GUIDANCE,
+  SIGNAL_GREP_MODES,
+  fieldGuidance,
+} from "./request-contract.js";
 
 function stringEnum<const Values extends readonly string[]>(
   values: Values,
@@ -29,11 +37,9 @@ function stringEnum<const Values extends readonly string[]>(
   });
 }
 
-export const SIGNAL_GREP_DESCRIPTION =
-  "Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=concept accepts query, path, glob, exclude, hidden and redact, ranks every passage admitted by the source budget through token-safe windows, reuses a bounded local content-addressed embedding cache, and exposes scoreProfile/cache coverage without deciding relevance thresholds. mode=hybrid always runs exact literal and local concept retrieval once, ranks exact evidence first, deduplicates overlapping semantic passages, and retains a bounded semantic supplement in one pageable snapshot. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf is a 2-3 term literal conjunction; within is valid only with allOf and must be omitted for ordinary single-pattern searches. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. files+query discovers filenames and stays inside the requested path; structure+pattern matches AST shapes. Python outline is supported as bounded indentation-based function/class evidence; JS/TS definitions, references, implementations, callers and callees use path+line+column (1-based UTF-16) or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit.";
+export const SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure+pattern matches AST shapes. Outline uses a source path or retained cursor+matchIndex and follows declared capabilities (Swift requires SourceKit-LSP); semantic definitions/references/implementations/callers/callees use path+line+column or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 
-export const SIGNAL_GREP_MODEL_DESCRIPTION =
-  "Search local files with bounded evidence. Use pattern plus optional path for contents, mode=files plus query for names, and scope=strict to forbid zero-result expansion. Reuse returned cursors and inspect selectors. On rejection, keep the strongest applicable mode and apply its repair once without copying the old error/request. Only explicit capability unavailability permits a visibly partial alternative. Semantic and static-analysis results are candidates, not proof.";
+export const SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 
 export const signalGrepSchema = Type.Object({
   column: Type.Optional(
@@ -45,14 +51,12 @@ export const signalGrepSchema = Type.Object({
   query: Type.Optional(
     Type.String({
       maxLength: 256,
-      description:
-        "With mode=files, a filename/path/fuzzy query (optional); with mode=concept or hybrid, a required natural-language question. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model.",
+      description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model.`,
     }),
   ),
   scope: Type.Optional(
     stringEnum(["strict", "expand"] as const, {
-      description:
-        "Content search scope: strict never expands a zero-result path; expand (default) retries from project cwd. Applies to ordinary, multi-term and role searches.",
+      description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`,
     }),
   ),
   wholeWord: Type.Optional(
@@ -65,15 +69,14 @@ export const signalGrepSchema = Type.Object({
     Type.Array(Type.String({ maxLength: MAX_LITERAL_TERM_BYTES }), {
       minItems: MIN_ANY_OF_TERMS,
       maxItems: MAX_ANY_OF_TOTAL_TERMS,
-      description: `Exact literal union: ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term. Omit pattern, allOf, within, roles, literal and ignoreCase.`,
+      description: `${fieldGuidance("anyOf")}. ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term.`,
     }),
   ),
   allOf: Type.Optional(
     Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
       minItems: 2,
       maxItems: 3,
-      description:
-        "Explicit AND: 2-3 distinct case-sensitive literal terms, all in one file (default) or one function. Omit pattern, roles, literal and ignoreCase.",
+      description: `${fieldGuidance("allOf")}. 2-3 distinct terms must occur in one file (default) or one function.`,
     }),
   ),
   within: Type.Optional(
@@ -140,15 +143,13 @@ export const signalGrepSchema = Type.Object({
   pattern: Type.Optional(
     Type.String({
       maxLength: MAX_PATTERN_CHARACTERS,
-      description:
-        "Ordinary search: regex or literal=true text. mode=structure: ast-grep code pattern, at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.",
+      description: `${fieldGuidance("pattern")}. mode=structure uses an ast-grep code pattern, at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.`,
     }),
   ),
   path: Type.Optional(
     Type.String({
       maxLength: MAX_PATH_CHARACTERS,
-      description:
-        "Search root or source file. A zero-result content search expands from cwd unless scope=strict. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.",
+      description: `${fieldGuidance("path")}. A zero-result content search expands from cwd unless scope=strict. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.`,
     }),
   ),
   paths: Type.Optional(
@@ -186,7 +187,7 @@ export const signalGrepSchema = Type.Object({
       },
     ),
   ),
-  literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal text." })),
+  literal: Type.Optional(Type.Boolean({ description: fieldGuidance("literal") })),
   ignoreCase: Type.Optional(
     Type.Boolean({
       description: "true for insensitive, false for sensitive; omitted uses smart-case.",
@@ -235,50 +236,20 @@ export const signalGrepSchema = Type.Object({
     Type.Integer({
       minimum: 0,
       maximum: MAX_CONTEXT_LINES,
-      description:
-        "New search only: nearby lines (0-20). MUST be omitted for inspect, which selects its own bounded source window.",
+      description: `${fieldGuidance("context")}. New search only: nearby lines (0-20). MUST be omitted for inspect, which selects its own bounded source window.`,
     }),
   ),
   limit: Type.Optional(
     Type.Integer({
       minimum: 1,
       maximum: MAX_PAGE_SIZE,
-      description:
-        "New search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; not valid for inspect.",
+      description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`,
     }),
   ),
   mode: Type.Optional(
-    stringEnum(
-      [
-        "auto",
-        "summary",
-        "matches",
-        "inspect",
-        "outline",
-        "imports",
-        "tests",
-        "impact",
-        "files",
-        "structure",
-        "concept",
-        "hybrid",
-        "definitions",
-        "references",
-        "implementations",
-        "callers",
-        "callees",
-        "dependencies",
-        "dependents",
-        "trace",
-        "validate",
-        "await",
-        "cancel",
-      ] as const,
-      {
-        description:
-          "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates.",
-      },
-    ),
+    stringEnum(SIGNAL_GREP_MODES, {
+      description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} Fields: ${MODE_FIELD_SUMMARY}`,
+    }),
   ),
   relation: Type.Optional(
     stringEnum(["callers", "callees"] as const, {

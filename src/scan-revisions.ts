@@ -3,6 +3,7 @@ import { abortError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import {
   classifyRipgrepDiagnostics,
+  createRipgrepInputError,
   type RipgrepUnreadableDiagnostic,
 } from "./ripgrep-diagnostics.js";
 import { getSourceRevision, sameSourceRevision } from "./source.js";
@@ -34,6 +35,7 @@ export async function captureCandidateRevisions(
   cwd: string,
   maxFiles: number,
   signal?: AbortSignal,
+  redact = false,
 ): Promise<{ revisions: Map<string, SourceRevision>; unreadable: RipgrepUnreadableDiagnostic[] }> {
   const revisions = new Map<string, SourceRevision>();
   let candidateCount = 0;
@@ -78,6 +80,8 @@ export async function captureCandidateRevisions(
     },
   );
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
+  const inputError = createRipgrepInputError(result.stderr, redact);
+  if (inputError) throw inputError;
   if (result.code === 2 && diagnostics.other.length === 0 && diagnostics.unreadable.length > 0)
     return { revisions, unreadable: diagnostics.unreadable };
   if (result.code !== 0 && result.code !== 1) {

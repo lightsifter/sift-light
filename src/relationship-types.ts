@@ -89,6 +89,17 @@ export interface RelationshipNode {
   evidence: readonly RelationshipEvidence[];
 }
 
+export interface RelationshipOutlineItem {
+  path: string;
+  name: string;
+  kind: string;
+  range: ByteRange;
+  start: SourcePosition;
+  end?: SourcePosition;
+  source?: SourceReference;
+  children: readonly RelationshipOutlineItem[];
+}
+
 export interface RelationshipEdge {
   /** Unique only within one analysis view; callers must not persist it across views. */
   edgeKey: string;
@@ -199,6 +210,8 @@ export interface RelationshipPublicDetails {
     observedAt: number;
     reason?: string;
   }[];
+  /** Number of best-effort change hints omitted by the bounded public projection. */
+  changeHintOmitted?: number;
   watchHealth?: {
     status: "healthy" | "degraded" | "unknown" | "closed";
     activeSources: number;
@@ -234,7 +247,7 @@ export interface RelationshipView {
   readonly analysisViewId: string;
   readonly sourceScope: RelationshipSourceScope;
   resolveNode(
-    input: { path: string; line: number; column?: number; symbol?: string },
+    input: { path: string; line?: number; column?: number; symbol?: string },
     signal?: AbortSignal,
   ): Promise<RelationshipResolution>;
   expand(
@@ -242,6 +255,8 @@ export interface RelationshipView {
     operation: RelationshipOperation,
     signal?: AbortSignal,
   ): Promise<RelationshipExpansion>;
+  /** Optional provider-owned outline evidence for languages without the shared syntax parser. */
+  outline?(path: string): Promise<readonly RelationshipOutlineItem[]>;
   /** Recheck all source/config/manifest/metadata dependencies used by this view. */
   recheck(signal?: AbortSignal): Promise<RelationshipRecheck>;
   close(): Promise<void>;

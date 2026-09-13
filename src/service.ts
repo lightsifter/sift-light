@@ -6,6 +6,7 @@ import type { SyntaxRoleName } from "./syntax.js";
 import { resolve } from "node:path";
 import { CursorError, SignalGrepError } from "./errors.js";
 import { DISCOVERY_MODE_REQUIRED_ERROR } from "./discovery-errors.js";
+import { validateRequestContract } from "./request-contract.js";
 import { formatMatchPage, MatchPageSoftLimitError, type MatchPageOptions } from "./format.js";
 import { formatSummary } from "./summary.js";
 import { summarySourcePreviews } from "./summary-previews.js";
@@ -33,6 +34,11 @@ import {
 } from "./operation-output.js";
 import { modificationTimeBoundsText } from "./source.js";
 import { resolveConceptTimeoutMs } from "./concept-model.js";
+import {
+  LanguageCapabilityCatalog,
+  type LanguageCapabilityInventory,
+} from "./language-capabilities.js";
+import type { RelationshipProviderRegistration } from "./relationship-provider-registry.js";
 import {
   DEFAULT_SUMMARY_FILE_LIMIT,
   MAX_INSPECT_TARGETS,
@@ -80,11 +86,54 @@ export interface SignalGrepServiceOptions {
   summaryFileLimit?: number;
   structure?: CodeStructureProvider;
   conceptSearch?: ConceptSearchRunner;
+  additionalRelationshipProviders?: readonly RelationshipProviderRegistration[];
 }
 
 export interface SignalGrepSearchOptions {
   contextBudget?: ContextBudget;
   onProgress?: (progress: OperationProgress) => void;
+}
+
+function filterList(value: string | string[] | undefined): string[] {
+  return value === undefined ? [] : Array.isArray(value) ? [...value] : [value];
+}
+
+function capabilitiesResult(inventory: LanguageCapabilityInventory): SignalGrepResult {
+  const languageText = inventory.languages.length
+    ? inventory.languages
+        .map((entry) => {
+          const providers = [
+            ...new Set(
+              inventory.capabilityDefinitions
+                .filter((capability) =>
+                  entry.capabilities.some((reference) => reference.id === capability.id),
+                )
+                .map((capability) => capability.provider),
+            ),
+          ].join(" + ");
+          const load = entry.capabilities.length ? "lazy" : "none";
+          const names = entry.capabilities.map((reference) => reference.name).join(", ");
+          return `${entry.language} (${String(entry.files)} file${entry.files === 1 ? "" : "s"}): ${names || "no language analysis capability is currently registered"}; providers=${providers || "none"}; availability=${entry.availability}; readiness=${entry.readiness}; load=${load}`;
+        })
+        .join("\n")
+    : "No recognized language source files were found in the requested scope.";
+  const partial = inventory.partial ? "partial" : "complete";
+  const reason = inventory.reasons.length ? `\nReasons: ${inventory.reasons.join("; ")}` : "";
+  const text = `Project language capability inventory (${partial}; names-only; providers load lazily).\nLanguage-specific modes:\n${languageText}\nLanguage-neutral modes: ${inventory.neutral.map((capability) => `${capability.name} [${capability.availability}; ${capability.load}]`).join(", ")}.${reason}`;
+  return {
+    text,
+    details: {
+      version: 1,
+      mode: "capabilities",
+      status: inventory.partial ? "partial" : "complete",
+      totalMatches: 0,
+      storedMatches: 0,
+      totalFiles: inventory.languages.reduce((sum, entry) => sum + entry.files, 0),
+      returnedMatches: 0,
+      snapshotComplete: !inventory.partial,
+      capabilities: inventory,
+    },
+  };
 }
 interface PathSelection {
   labels: string[];
@@ -240,33 +289,6 @@ function attachContextBudget(
   };
 }
 
-function rejectCursorOnlyOptions(input: SignalGrepInput): void {
-  const ignored: string[] = [];
-  if (input.scope !== undefined) ignored.push("scope");
-  if (input.wholeWord !== undefined) ignored.push("wholeWord");
-  if (input.query !== undefined) ignored.push("query");
-  if (input.pattern !== undefined) ignored.push("pattern");
-  if (input.glob !== undefined) ignored.push("glob");
-  if (input.exclude !== undefined) ignored.push("exclude");
-  if (input.literal !== undefined) ignored.push("literal");
-  if (input.ignoreCase !== undefined) ignored.push("ignoreCase");
-  if (input.hidden !== undefined) ignored.push("hidden");
-  if (input.context !== undefined) ignored.push("context");
-  if (input.limit !== undefined) ignored.push("limit");
-  if (input.modifiedAfter !== undefined) ignored.push("modifiedAfter");
-  if (input.modifiedBefore !== undefined) ignored.push("modifiedBefore");
-  if (input.line !== undefined) ignored.push("line");
-  if (input.matchIndex !== undefined) ignored.push("matchIndex");
-  if (input.matchIndices !== undefined) ignored.push("matchIndices");
-  if (input.targets !== undefined) ignored.push("targets");
-  if (ignored.length > 0) {
-    throw new CursorError(
-      `The following options cannot be used with cursor: ${ignored.join(", ")}`,
-      "E_CURSOR_OPTIONS_CONFLICT",
-    );
-  }
-}
-
 async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promise<void> {
   if (signal.aborted)
     throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
@@ -288,6 +310,7 @@ export class SignalGrepService {
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
   readonly #summaryFileLimit: number;
+  readonly #capabilities = new LanguageCapabilityCatalog();
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
   readonly #active = new Set<Promise<SignalGrepResult>>();
@@ -304,6 +327,7 @@ export class SignalGrepService {
       this.#snapshots,
       options.structure,
       options.conceptSearch,
+      options.additionalRelationshipProviders,
     );
   }
 
@@ -314,6 +338,7 @@ export class SignalGrepService {
     options: SignalGrepSearchOptions = {},
   ): Promise<SignalGrepResult> {
     validateRawSearchInput(input);
+    validateRequestContract(input);
     let request: Promise<SignalGrepResult>;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);
@@ -454,6 +479,17 @@ export class SignalGrepService {
       throw new CursorError("Invalid cursor. Copy a nonempty cursor from a previous result.");
     }
     const mode = input.mode ?? "auto";
+    if (mode === "capabilities") {
+      const inventory = await this.#capabilities.inspect({
+        cwd,
+        ...(input.path !== undefined ? { path: input.path } : {}),
+        glob: filterList(input.glob),
+        exclude: filterList(input.exclude),
+        ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+        ...(signal ? { signal } : {}),
+      });
+      return capabilitiesResult(inventory);
+    }
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal, options);
     if (input.column !== undefined)
@@ -563,7 +599,6 @@ export class SignalGrepService {
     const cursor = input.cursor;
     if (!cursor) throw new CursorError("A cursor is required to continue a search");
     const { snapshot, offset, kind, selectionKey } = this.#snapshots.resolve(cursor);
-    rejectCursorOnlyOptions(input);
     const mode = input.mode ?? "auto";
     if (mode === "summary") {
       if (input.path !== undefined || input.paths !== undefined) {

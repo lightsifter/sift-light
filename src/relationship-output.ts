@@ -109,6 +109,9 @@ function evidenceKey(evidence: RelationshipEdge["evidence"][number]): string {
   ]);
 }
 
+const MAX_PUBLIC_CHANGE_HINT_BYTES = 4_096;
+const MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES = 2_048;
+
 function evidenceTable(edges: readonly RelationshipEdge[]): {
   table: NonNullable<RelationshipPublicDetails["evidenceTable"]>;
   ids: Map<string, number>;
@@ -173,7 +176,7 @@ function edgeItem(
   };
 }
 
-function publicDetails(
+export function publicRelationshipDetails(
   scope: RelationshipSourceScope,
   sources: readonly RelationshipSourceStatus[],
   values: Partial<RelationshipPublicDetails> &
@@ -204,22 +207,38 @@ function publicDetails(
   };
 }
 
-function publicChangeHints(
-  hints: readonly RelationshipChangeHint[],
-): RelationshipPublicDetails["changeHints"] {
-  if (hints.length === 0) return undefined;
-  return hints
-    .toSorted((left, right) => left.observedAt - right.observedAt)
-    .slice(-32)
-    .map((hint) => {
-      const value: NonNullable<RelationshipPublicDetails["changeHints"]>[number] = {
-        path: hint.path,
-        role: hint.role,
-        observedAt: hint.observedAt,
-      };
-      if (hint.reason) value.reason = hint.reason;
-      return value;
-    });
+interface PublicChangeHintProjection {
+  readonly items: RelationshipPublicDetails["changeHints"];
+  readonly omitted: number;
+}
+
+function publicChangeHints(hints: readonly RelationshipChangeHint[]): PublicChangeHintProjection {
+  if (hints.length === 0) return { items: undefined, omitted: 0 };
+  const candidates = hints.toSorted((left, right) => left.observedAt - right.observedAt).slice(-32);
+  const visible: Array<NonNullable<RelationshipPublicDetails["changeHints"]>[number]> = [];
+  let bytes = 2;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const hint = candidates[index];
+    if (!hint) continue;
+    const value: NonNullable<RelationshipPublicDetails["changeHints"]>[number] = {
+      path: hint.path,
+      role: hint.role,
+      observedAt: hint.observedAt,
+    };
+    if (hint.reason) value.reason = hint.reason;
+    const valueBytes = Buffer.byteLength(JSON.stringify(value));
+    if (
+      valueBytes > MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES ||
+      bytes + valueBytes > MAX_PUBLIC_CHANGE_HINT_BYTES
+    )
+      continue;
+    visible.push(value);
+    bytes += valueBytes;
+  }
+  return {
+    items: visible.length > 0 ? visible.toReversed() : undefined,
+    omitted: hints.length - visible.length,
+  };
 }
 
 function changeHintText(hints: readonly RelationshipChangeHint[]): string {
@@ -267,10 +286,15 @@ export function traceResult(
 ): SignalGrepResult {
   const state = stored.state;
   const paths = new Set(state.edges.flatMap((edge) => [edge.from.path, edge.to.path]));
-  const dependencies = dependencyTable(state.edges);
-  const evidence = evidenceTable(state.edges);
-  const hints = publicChangeHints(changeHints);
-  const relationship = publicDetails(scope, state.coverage.sources, {
+  // Public pages are bounded independently from the retained snapshot.  Keep
+  // evidence/dependency ids local to the visible edge page so a large or
+  // heterogeneous snapshot cannot make a one-edge page exceed the transport
+  // budget.  The store still retains the complete immutable edge set for
+  // cursor continuation and validation.
+  const dependencies = dependencyTable(page.items);
+  const evidence = evidenceTable(page.items);
+  const hintProjection = publicChangeHints(changeHints);
+  const relationship = publicRelationshipDetails(scope, state.coverage.sources, {
     operation: state.operation,
     ...(state.nodes[0]
       ? {
@@ -287,7 +311,8 @@ export function traceResult(
     expansions: state.expansions,
     dependencyTable: dependencies.table,
     evidenceTable: evidence.table,
-    ...(hints ? { changeHints: hints } : {}),
+    ...(hintProjection.items ? { changeHints: hintProjection.items } : {}),
+    ...(hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {}),
     ...(watchHealth ? { watchHealth } : {}),
   });
   const status =
@@ -369,8 +394,8 @@ export function validationResult(
       ? "partial"
       : recheck.coverage;
   const reasons = [...new Set([...(state.reasons ?? []), ...recheck.reasons])];
-  const hints = publicChangeHints(changeHints);
-  const relationship = publicDetails(state.scope, recheck.sources, {
+  const hintProjection = publicChangeHints(changeHints);
+  const relationship = publicRelationshipDetails(state.scope, recheck.sources, {
     comparisonTarget,
     freshness: recheck.validity,
     coverage,
@@ -380,7 +405,8 @@ export function validationResult(
       .filter((edge) => recheck.affectedEdgeKeys.includes(edge.edgeKey))
       .map(publicEdgeKey),
     checkInterval,
-    ...(hints ? { changeHints: hints } : {}),
+    ...(hintProjection.items ? { changeHints: hintProjection.items } : {}),
+    ...(hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {}),
     ...(watchHealth ? { watchHealth } : {}),
   });
   const analysis: AnalysisDetails = {

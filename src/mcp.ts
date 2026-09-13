@@ -19,7 +19,12 @@ import {
   type SignalGrepMcpOutputMode,
 } from "./mcp-output.js";
 import { compactMcpModelText } from "./mcp-model-output.js";
-import { modelErrorText } from "./model-error.js";
+import { modelErrorText, requestContractProjection } from "./model-error.js";
+import {
+  isSignalGrepDiagnosticError,
+  RequestContractError,
+  schemaContractError,
+} from "./request-contract.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
 import { SignalGrepService, type SignalGrepInput } from "./service.js";
@@ -89,25 +94,51 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function validationMessage(value: unknown): string | undefined {
+function validationError(value: unknown): RequestContractError | undefined {
   if (Value.Check(signalGrepSchema, value)) return undefined;
   const first = Value.Errors(signalGrepSchema, value)[0];
-  if (!first) return "Invalid baoer_signal_grep arguments";
-  return `Invalid baoer_signal_grep arguments at ${first.instancePath || "/"}: ${first.message}`;
+  return schemaContractError(
+    value,
+    first?.instancePath,
+    first ? `expected ${first.message}` : "the request does not match the advertised schema",
+  );
 }
 
 function parseSignalGrepInput(value: unknown): SignalGrepInput {
-  const message = validationMessage(value);
-  if (message) throw new Error(message);
+  const failure = validationError(value);
+  if (failure) throw failure;
   // Value.Check has validated the complete public schema before this boundary.
   // oxlint-disable-next-line no-unsafe-type-assertion -- TypeBox's inferred shape feeds the existing service contract
   return value as SignalGrepInput;
 }
 
-function toolError(error: unknown) {
+function toolError(error: unknown, outputMode: SignalGrepMcpOutputMode) {
+  const contractProjection = isSignalGrepDiagnosticError(error)
+    ? requestContractProjection(error)
+    : undefined;
+  const text = contractProjection?.text ?? modelErrorText(error);
+  const structuredError = contractProjection?.details;
   return {
-    content: [{ type: "text" as const, text: modelErrorText(error) }],
+    content: [{ type: "text" as const, text }],
     isError: true,
+    ...(outputMode === "structured" && structuredError
+      ? {
+          structuredContent: {
+            text,
+            details: {
+              version: 1,
+              mode: structuredError.mode ?? "auto",
+              status: "failed" as const,
+              totalMatches: 0,
+              storedMatches: 0,
+              totalFiles: 0,
+              returnedMatches: 0,
+              snapshotComplete: false,
+              error: structuredError,
+            },
+          },
+        }
+      : {}),
   };
 }
 
@@ -132,7 +163,7 @@ export function createSignalGrepMcpServer(
 
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if (request.params.name !== tool.name) {
-      return toolError(new Error(`Unknown tool: ${request.params.name}`));
+      return toolError(new Error(`Unknown tool: ${request.params.name}`), resolvedOutputMode);
     }
     try {
       const input = parseSignalGrepInput(request.params.arguments ?? {});
@@ -144,7 +175,7 @@ export function createSignalGrepMcpServer(
       // must use the same final page, after service-level formatting and redaction.
       return { content, structuredContent: { text: result.text, details: result.details } };
     } catch (error) {
-      return toolError(error);
+      return toolError(error, resolvedOutputMode);
     }
   });
 

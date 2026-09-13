@@ -120,5 +120,7 @@ export interface AnalysisResultSet {
   coverage?: Record<string, CoverageStatus>;
   stats?: AnalysisDetails["stats"];
   sourceGeneration?: ConceptSourceSummary;
+  /** Public provider, freshness and coverage metadata for semantic navigation. */
+  relationship?: RelationshipPublicDetails;
   redact?: boolean;
 }

@@ -1,5 +1,4 @@
 import { bindImpactCandidates } from "./impact-bindings.js";
-import { fileDiscoveryQueryHint } from "./discovery-errors.js";
 import {
   conceptSearch,
   type ConceptSearchExecution,
@@ -8,13 +7,13 @@ import {
 } from "./concept-search.js";
 import { structuralSearch } from "./structural-search.js";
 import { isSemanticMode } from "./semantic-protocol.js";
-import { navigateSemantics } from "./semantic-navigation.js";
-import { dirname, resolve } from "node:path";
+import { dirname, extname, resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
 import type { AnalysisItem, AnalysisResultSet, CoverageStatus } from "./analysis-types.js";
 import { abortError, CursorError, SignalGrepError } from "./errors.js";
 import { findGitRepository } from "./git-repository.js";
-import { isPathInsideCwd } from "./path-policy.js";
+import { isPathInsideCwd, isPathInsideRoot } from "./path-policy.js";
+import { resolveRelationshipProjectRoot, resolveSemanticProjectRoot } from "./project-root.js";
 import { resolveInspectionTarget } from "./inspect.js";
 import {
   collectEvidenceCandidates,
@@ -58,6 +57,10 @@ import { sameSourceRevision } from "./source.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { filterRoleOccurrences, findFunctionConjunctions } from "./syntax-search.js";
 import { syntaxLanguage } from "./syntax.js";
+import {
+  languageForPath,
+  DEFAULT_LANGUAGE_CAPABILITIES,
+} from "./language-capability-definitions.js";
 import { parsePythonOutline } from "./python-outline.js";
 import {
   combineHybridSearch,
@@ -69,6 +72,20 @@ import {
 import { validationResult } from "./relationship-output.js";
 import { RelationshipService } from "./relationship-service.js";
 import type { OperationProgress } from "./operation-lifecycle.js";
+import { outlineCapabilityError } from "./request-contract.js";
+import { realpath } from "node:fs/promises";
+import {
+  createRelationshipProviderRegistry,
+  type RelationshipProviderRegistration,
+} from "./relationship-provider-registry.js";
+import {
+  createOutlineProviderRegistry,
+  createSemanticProviderRegistry,
+  findSemanticProvider,
+  findOutlineProvider,
+  type SemanticProviderRegistration,
+  type OutlineProviderRegistration,
+} from "./semantic-provider-registry.js";
 import {
   MAX_ANY_OF_TERMS,
   MAX_CONFIGURABLE_STRUCTURE_FILES,
@@ -110,49 +127,6 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
 export interface EvidenceSearchOptions {
   onProgress?: (progress: OperationProgress) => void;
 }
-
-function rejectFields(
-  input: SignalGrepInput,
-  fields: (keyof SignalGrepInput)[],
-  operation: string,
-  cursor = false,
-  repair = "copy the complete returned request unchanged",
-): void {
-  const present = fields.filter((field) => input[field] !== undefined);
-  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: ${repair}. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
-  if (present.length)
-    throw cursor
-      ? new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT")
-      : new SignalGrepError(message);
-}
-const searchFields = [
-  "query",
-  "scope",
-  "wholeWord",
-  "pattern",
-  "anyOf",
-  "allOf",
-  "within",
-  "roles",
-  "changes",
-  "glob",
-  "exclude",
-  "literal",
-  "ignoreCase",
-  "hidden",
-  "context",
-  "limit",
-  "modifiedAfter",
-  "modifiedBefore",
-  "conceptLimit",
-] satisfies (keyof SignalGrepInput)[];
-const navigationFilterFields = new Set<keyof SignalGrepInput>(["glob", "exclude", "hidden"]);
-const inspectFields = [
-  "paths",
-  "matchIndices",
-  "targets",
-  "sourceCursor",
-] satisfies (keyof SignalGrepInput)[];
 
 function maxFilesToParse(value: number | undefined): number {
   const candidate = value ?? MAX_STRUCTURE_FILES;
@@ -253,8 +227,36 @@ function searchScope(request: SearchRequest): SearchScopeDetails {
   };
 }
 
-async function navigationRoot(cwd: string, path: string, signal?: AbortSignal): Promise<string> {
+type NavigationRootFamily = "relationship" | "semantic" | "workspace";
+
+function navigationRootFamily(input: SignalGrepInput, path: string): NavigationRootFamily {
+  const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
+  const providerModes =
+    isSemanticMode(input.mode) ||
+    input.mode === "outline" ||
+    input.mode === "trace" ||
+    input.mode === "validate";
+  if (!providerModes) return "workspace";
+  if (language === "go" || language === "swift") return "relationship";
+  if (language === "javascript" || language === "typescript" || language === "tsx")
+    return "semantic";
+  return "workspace";
+}
+
+async function navigationRoot(
+  cwd: string,
+  path: string,
+  input: SignalGrepInput,
+  signal?: AbortSignal,
+): Promise<string> {
   const absolute = resolve(cwd, path);
+  const family = navigationRootFamily(input, path);
+  if (family === "relationship") {
+    const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
+    if (language === "go" || language === "swift")
+      return resolveRelationshipProjectRoot(cwd, path, language, signal);
+  }
+  if (family === "semantic") return resolveSemanticProjectRoot(cwd, path, signal);
   const repository = await findGitRepository(dirname(absolute), signal);
   if (repository) return repository;
   return isPathInsideCwd(absolute, cwd) ? resolve(cwd) : dirname(absolute);
@@ -272,22 +274,46 @@ function navigationFilters(input: SignalGrepInput): NavigationFilters {
   return { glob: request.glob, exclude: request.exclude, hidden: request.hidden };
 }
 
-function navigationScope(
+async function navigationScope(
   cwd: string,
   root: string,
   requestedPath: string,
   filters: NavigationFilters,
-): SearchScopeDetails {
-  const projectRoot = resolve(cwd);
+): Promise<SearchScopeDetails> {
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath(resolve(cwd)).catch(() => resolve(cwd)),
+    realpath(root).catch(() => resolve(root)),
+  ]);
+  const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
-    path: root === projectRoot ? "." : root,
+    path: isProjectRoot ? "." : canonicalRoot,
     requestedPath,
     glob: [...filters.glob],
     exclude: [...filters.exclude],
     hidden: filters.hidden,
     expandedToProjectRoot: false,
-    assertion: root === projectRoot ? "project-wide" : "requested-scope",
+    assertion: isProjectRoot ? "project-wide" : "requested-scope",
   };
+}
+
+async function canonicalNavigationPath(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
+
+async function canonicalNavigationFiles(
+  cwd: string,
+  root: string,
+  files: { paths: readonly string[] },
+  primaryPath: string,
+): Promise<{ allowed: ReadonlySet<string>; primaryPath: string }> {
+  const canonicalRoot = await canonicalNavigationPath(root);
+  const [enumerated, canonicalPrimary] = await Promise.all([
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve(cwd, file)))),
+    canonicalNavigationPath(resolve(cwd, primaryPath)),
+  ]);
+  const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
+  if (isPathInsideRoot(canonicalPrimary, canonicalRoot)) allowed.add(canonicalPrimary);
+  return { allowed, primaryPath: canonicalPrimary };
 }
 
 export class EvidenceService {
@@ -299,23 +325,47 @@ export class EvidenceService {
   readonly #analyses = new AnalysisStore();
   readonly #continuations = new SourceContinuations();
   readonly #relationshipService: RelationshipService;
+  readonly #semanticProviders: readonly SemanticProviderRegistration[];
+  readonly #outlineProviders: readonly OutlineProviderRegistration[];
   constructor(
     runner: RipgrepRunner,
     snapshots: SnapshotStore,
     structure?: CodeStructureProvider,
     runConceptSearch: ConceptSearchRunner = conceptSearch,
+    additionalRelationshipProviders?: readonly RelationshipProviderRegistration[],
   ) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    const providers = [
+      ...createRelationshipProviderRegistry(this.#queue),
+      ...(additionalRelationshipProviders ?? []),
+    ];
+    const resolveScope = async (
+      cwd: string,
+      target: string,
+      input: SignalGrepInput,
+      signal?: AbortSignal,
+    ) => ({
+      root: await navigationRoot(cwd, target, input, signal),
+      filters: navigationFilters(input),
+    });
     this.#relationshipService = new RelationshipService({
       queue: this.#queue,
-      resolveScope: async (cwd, target, input, signal) => ({
-        root: await navigationRoot(cwd, target, signal),
-        filters: navigationFilters(input),
-      }),
+      providers,
+      resolveScope,
       maxFilesToParse,
+    });
+    this.#semanticProviders = createSemanticProviderRegistry({
+      relationships: providers,
+      queue: this.#queue,
+      resolveScope,
+    });
+    this.#outlineProviders = createOutlineProviderRegistry({
+      relationships: providers,
+      queue: this.#queue,
+      resolveScope,
     });
   }
   clear(): void {
@@ -337,23 +387,6 @@ export class EvidenceService {
   ): Promise<SignalGrepResult> {
     const cursor = input.cursor;
     if (!cursor) throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    rejectFields(
-      input,
-      [
-        "path",
-        "line",
-        "column",
-        "symbol",
-        "relation",
-        "depth",
-        "maxNodes",
-        "maxEdges",
-        "maxExpansions",
-        "exploreCursor",
-      ],
-      "Evidence validation",
-      true,
-    );
     if (cursor.startsWith("relationship.")) {
       return this.#relationshipService.validate(input, signal);
     }
@@ -471,12 +504,12 @@ export class EvidenceService {
         ? this.#relationshipService.trace(input, cwd, signal)
         : this.#relationshipValidate(input, cwd, signal);
     if (isSemanticMode(input.mode)) {
-      rejectFields(
-        input,
-        [...searchFields, ...inspectFields, "cursor", "matchIndex"],
-        `mode=${input.mode}`,
-      );
-      return this.#analyses.page(this.#analyses.create(await navigateSemantics(input, access)));
+      const provider = findSemanticProvider(this.#semanticProviders, input);
+      if (!provider)
+        throw new SignalGrepError(
+          `No semantic provider is registered for ${input.path ?? "the requested path"} and mode=${input.mode}; use mode=capabilities to inspect available language modes`,
+        );
+      return this.#analyses.page(this.#analyses.create(await provider.navigate(input, access)));
     }
     if (input.column !== undefined)
       throw new SignalGrepError("column requires semantic navigation");
@@ -484,68 +517,17 @@ export class EvidenceService {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect") throw new SignalGrepError("sourceCursor requires mode=inspect");
-      rejectFields(
-        input,
-        [
-          ...searchFields,
-          "cursor",
-          "path",
-          "paths",
-          "line",
-          "matchIndex",
-          "matchIndices",
-          "targets",
-          "symbol",
-          "maxFilesToParse",
-        ],
-        "Source continuation",
-        true,
-      );
       return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
-      rejectFields(input, [...searchFields, "paths", "symbol", "maxFilesToParse"], "mode=inspect");
       const targets = this.#inspectionTargets(input, cwd);
       return inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["query", "glob", "exclude", "hidden"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-        ],
-        "mode=concept",
-        false,
-        "use only mode, query, path, glob, exclude, hidden and redact",
-      );
       const execution = await this.#conceptSearch(input, access, options.onProgress);
       return this.#analyses.page(this.#analyses.create(execution.analysis));
     }
     if (input.mode === "hybrid") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["query", "glob", "exclude", "hidden", "conceptLimit"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-          "maxFilesToParse",
-        ],
-        "mode=hybrid",
-        false,
-        "use only mode, query, path, glob, exclude, hidden, conceptLimit and redact",
-      );
       const query = validateConceptQuery(input.query);
       const limit = hybridConceptLimit(input.conceptLimit);
       const literalRequest = normalizeRequest({
@@ -610,69 +592,14 @@ export class EvidenceService {
       return this.#analyses.page(cursor);
     }
     if (input.mode === "structure") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["pattern", "glob", "exclude", "hidden"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-        ],
-        "mode=structure",
-      );
       return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
     }
     if (input.mode === "files") {
-      rejectFields(
-        input,
-        [
-          "pattern",
-          "cursor",
-          "line",
-          "matchIndex",
-          "symbol",
-          "maxFilesToParse",
-          "wholeWord",
-          "scope",
-          "literal",
-          "ignoreCase",
-          "context",
-          "limit",
-          "anyOf",
-          "allOf",
-          "within",
-          "roles",
-          "changes",
-          "conceptLimit",
-          ...inspectFields,
-        ],
-        "mode=files",
-        false,
-        fileDiscoveryQueryHint(input.query ?? input.pattern),
-      );
       return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
     }
     if (input.mode === "impact") return this.#impact(input, access);
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
-      rejectFields(
-        input,
-        [
-          ...searchFields,
-          ...inspectFields,
-          "path",
-          "line",
-          "matchIndex",
-          "symbol",
-          "maxFilesToParse",
-        ],
-        "Analysis continuation",
-        true,
-      );
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError(
           "Analysis cursor cannot continue in the requested mode",
@@ -682,13 +609,6 @@ export class EvidenceService {
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access);
-    rejectFields(
-      input,
-      [...inspectFields, "query", "line", "matchIndex", "symbol", "cursor", "conceptLimit"],
-      "Evidence search",
-      false,
-      "a new search accepts one path; split multiple paths into separate requests without widening their scope",
-    );
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (
@@ -946,7 +866,10 @@ export class EvidenceService {
     if (input.targets !== undefined && input.matchIndices !== undefined)
       throw new SignalGrepError("Use targets or matchIndices, not both");
     if (input.targets !== undefined || input.matchIndices !== undefined) {
-      rejectFields(input, ["path", "line", "matchIndex"], "Batch inspection");
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
+        throw new SignalGrepError(
+          "Batch inspection accepts targets or matchIndices instead of path, line or matchIndex",
+        );
       const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
       if (size < 1 || size > MAX_INSPECT_TARGETS)
         throw new SignalGrepError("Batch inspection requires 1-5 targets");
@@ -991,11 +914,6 @@ export class EvidenceService {
 
   async #impact(input: SignalGrepInput, access: SourceAccess): Promise<SignalGrepResult> {
     const impactStarted = performance.now();
-    rejectFields(
-      input,
-      [...searchFields.filter((field) => !navigationFilterFields.has(field)), ...inspectFields],
-      "mode=impact",
-    );
     const filters = navigationFilters(input);
     let path: string;
     let line = input.line;
@@ -1036,7 +954,7 @@ export class EvidenceService {
     }
     if (document.reference.origin.kind !== "worktree")
       throw new SignalGrepError("Impact currently supports worktree sources only");
-    const root = await navigationRoot(access.cwd, document.path, access.signal);
+    const root = await navigationRoot(access.cwd, document.path, input, access.signal);
 
     const targetSyntax = await access.syntax(document);
     let target;
@@ -1089,15 +1007,18 @@ export class EvidenceService {
         exclude: filters.exclude,
         hidden: filters.hidden,
       });
-      const allowed = new Set(files.paths.map((file) => resolve(access.cwd, file)));
-      const primaryPath = resolve(access.cwd, document.path);
-      allowed.add(primaryPath);
+      const { allowed, primaryPath } = await canonicalNavigationFiles(
+        access.cwd,
+        root,
+        files,
+        document.path,
+      );
       const host = {
         cwd: access.cwd,
         ...(access.signal ? { signal: access.signal } : {}),
         normalizePath: (file: string) => workspaceRelativePath(access.cwd, file),
         load: async (file: string, expected?: SourceReference) => {
-          const absolutePath = resolve(access.cwd, file);
+          const absolutePath = await canonicalNavigationPath(resolve(access.cwd, file));
           if (!allowed.has(absolutePath))
             throw new SignalGrepError("Navigation source is excluded by current ignore rules");
           if (absolutePath === primaryPath && expected === undefined) return document;
@@ -1160,7 +1081,7 @@ export class EvidenceService {
         syntaxClassification: occurrences.partial ? "partial" : "complete",
         relatedTests: relatedTestsCoverage,
       },
-      scope: navigationScope(access.cwd, root, document.path, filters),
+      scope: await navigationScope(access.cwd, root, document.path, filters),
       redact: input.redact ?? false,
     };
     return this.#analyses.page(
@@ -1174,17 +1095,6 @@ export class EvidenceService {
 
   async #navigate(input: SignalGrepInput, access: SourceAccess): Promise<SignalGrepResult> {
     const navigationStarted = performance.now();
-    const allowsFilters = input.mode === "imports" || input.mode === "tests";
-    rejectFields(
-      input,
-      [
-        ...(allowsFilters
-          ? searchFields.filter((field) => !navigationFilterFields.has(field))
-          : searchFields),
-        ...inspectFields,
-      ],
-      `mode=${input.mode}`,
-    );
     let path = input.path;
     let reference: SourceReference | undefined;
     let line = input.line;
@@ -1216,9 +1126,26 @@ export class EvidenceService {
     const document = loaded ?? (await access.load(path, reference));
     const language = syntaxLanguage(document.path);
     const isPython = /\.py$/iu.test(document.path);
+    if (input.mode === "outline") {
+      const outlineProvider = findOutlineProvider(this.#outlineProviders, document.path);
+      if (outlineProvider) {
+        const providerInput =
+          input.path === document.path ? input : { ...input, path: document.path };
+        return this.#analyses.page(
+          this.#analyses.create(await outlineProvider.navigate(providerInput, access)),
+        );
+      }
+      const capabilityFailure = outlineCapabilityError(document.path, "outline", true);
+      if (capabilityFailure) throw capabilityFailure;
+      if (!language && !isPython)
+        throw new SignalGrepError(
+          `No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`,
+        );
+    }
     if ((!language && !isPython) || language === "go") {
+      const extension = extname(document.path) || "extensionless source";
       throw new SignalGrepError(
-        `${input.mode} requires reliable JS/TS/TSX or Python outline syntax (${language ?? "unsupported"})`,
+        `${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`,
       );
     }
     if (input.mode === "outline") {
@@ -1313,7 +1240,7 @@ export class EvidenceService {
           ],
         }),
       );
-    const root = await navigationRoot(access.cwd, document.path, access.signal);
+    const root = await navigationRoot(access.cwd, document.path, input, access.signal);
     const filters = navigationFilters(input);
     if (input.mode === "tests" && isPython)
       return this.#analyses.page(
@@ -1336,7 +1263,7 @@ export class EvidenceService {
             budgetExhausted: false,
           },
           coverage: { navigation: "not-applicable" },
-          scope: navigationScope(access.cwd, root, document.path, filters),
+          scope: await navigationScope(access.cwd, root, document.path, filters),
           redact: input.redact ?? false,
         }),
       );
@@ -1346,15 +1273,18 @@ export class EvidenceService {
       exclude: filters.exclude,
       hidden: filters.hidden,
     });
-    const allowed = new Set(files.paths.map((file) => resolve(access.cwd, file)));
-    const primaryPath = resolve(access.cwd, document.path);
-    allowed.add(primaryPath);
+    const { allowed, primaryPath } = await canonicalNavigationFiles(
+      access.cwd,
+      root,
+      files,
+      document.path,
+    );
     const host = {
       cwd: access.cwd,
       ...(access.signal ? { signal: access.signal } : {}),
       normalizePath: (file: string) => workspaceRelativePath(access.cwd, file),
       load: async (file: string, expected?: SourceReference) => {
-        const absolutePath = resolve(access.cwd, file);
+        const absolutePath = await canonicalNavigationPath(resolve(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SignalGrepError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined) return document;
@@ -1398,7 +1328,7 @@ export class EvidenceService {
           filesParsed: access.syntaxParses,
           cacheHits: access.syntaxCacheHits,
         },
-        scope: navigationScope(access.cwd, root, document.path, filters),
+        scope: await navigationScope(access.cwd, root, document.path, filters),
         redact: input.redact ?? false,
       }),
     );

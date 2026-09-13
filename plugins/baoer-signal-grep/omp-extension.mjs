@@ -178,6 +178,28 @@ class ConceptUnavailableError extends SignalGrepError {
   }
 }
 
+class RipgrepInputError extends SignalGrepError {
+  code;
+  guidance;
+  details;
+  constructor(code, message, guidance) {
+    super(`${message} ${guidance}`);
+    this.name = "RipgrepInputError";
+    this.code = code;
+    this.guidance = guidance;
+    this.details = {
+      code,
+      issues: [
+        {
+          field: code === "E_REGEX_INVALID" ? "pattern" : "path",
+          reason: guidance
+        }
+      ],
+      recovery: { action: "manual", reason: guidance }
+    };
+  }
+}
+
 class CursorError extends SignalGrepError {
   code;
   constructor(message, code = "E_CURSOR_MALFORMED") {
@@ -671,10 +693,141 @@ async function resolveRipgrepExecutable() {
 
 // src/ripgrep-diagnostics.ts
 import { resolve as resolve2 } from "path";
+
+// src/redaction.ts
+var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
+var SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
+var SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`, "gi");
+var SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
+var TYPE_ONLY_VALUES = new Set([
+  "boolean",
+  "number",
+  "string",
+  "unknown",
+  "never",
+  "undefined",
+  "null"
+]);
+function redactString(value) {
+  let count = 0;
+  let redacted = value.replace(PRIVATE_KEY, (_match, kind) => {
+    count += 1;
+    return `-----BEGIN ${kind}-----
+[REDACTED]
+-----END ${kind}-----`;
+  });
+  redacted = redacted.replace(SENSITIVE_ASSIGNMENT, (match, prefix, rawValue) => {
+    const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
+    if (TYPE_ONLY_VALUES.has(unquoted))
+      return match;
+    count += 1;
+    return `${prefix}"[REDACTED]"`;
+  });
+  redacted = redacted.replace(SENSITIVE_TOKEN, () => {
+    count += 1;
+    return "[REDACTED]";
+  });
+  return { value: redacted, count };
+}
+function redactDiagnosticText(value) {
+  return redactString(value).value;
+}
+function containsSensitiveText(value) {
+  if (typeof value === "string")
+    return redactString(value).count > 0;
+  if (Array.isArray(value))
+    return value.some((item) => containsSensitiveText(item));
+  if (typeof value !== "object" || value === null)
+    return false;
+  return Object.values(value).some((item) => containsSensitiveText(item));
+}
+function redactInPlace(value, seen) {
+  if (typeof value !== "object" || value === null)
+    return 0;
+  if (seen.has(value))
+    return 0;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    let count = 0;
+    for (let index = 0;index < value.length; index += 1) {
+      const item = value[index];
+      if (typeof item === "string") {
+        const redacted = redactString(item);
+        value[index] = redacted.value;
+        count += redacted.count;
+      } else
+        count += redactInPlace(item, seen);
+    }
+    return count;
+  }
+  let count = 0;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") {
+      const redacted = redactString(item);
+      Reflect.set(value, key, redacted.value);
+      count += redacted.count;
+    } else
+      count += redactInPlace(item, seen);
+  }
+  return count;
+}
+function redactSignalGrepResult(result) {
+  const text = redactString(result.text);
+  const details = structuredClone(result.details);
+  const redactedCount = text.count + redactInPlace(details, new WeakSet);
+  return {
+    text: text.value,
+    details: {
+      ...details,
+      redactedCount,
+      redactionApplied: true
+    }
+  };
+}
+
+// src/ripgrep-diagnostics.ts
 var UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
 var UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
+var INVALID_REGEX_DIAGNOSTIC = /(?:^|\n)\s*(?:rg:\s*)?regex parse error:/iu;
+var MISSING_PATH_DIAGNOSTIC = /(?:IO error for operation on .+?:\s*)?No such file or directory \(os error 2\)\s*$/iu;
+var MAX_RIPGREP_DIAGNOSTIC_CHARACTERS = 4096;
 function diagnosticLines(stderr) {
   return stderr.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+}
+function boundedRipgrepDiagnostic(value, redact = false) {
+  const safe = redact ? redactDiagnosticText(value) : value;
+  const normalized = safe.toWellFormed();
+  return normalized.length <= MAX_RIPGREP_DIAGNOSTIC_CHARACTERS ? normalized : `${normalized.slice(0, MAX_RIPGREP_DIAGNOSTIC_CHARACTERS - 1)}\u2026`;
+}
+function classifyRipgrepInputFailure(stderr) {
+  if (INVALID_REGEX_DIAGNOSTIC.test(stderr))
+    return "E_REGEX_INVALID";
+  if (diagnosticLines(stderr).some((line) => MISSING_PATH_DIAGNOSTIC.test(line)))
+    return "E_SEARCH_PATH_NOT_FOUND";
+  return;
+}
+function missingPathFromDiagnostics(stderr) {
+  for (const line of diagnosticLines(stderr)) {
+    const operation = /IO error for operation on (.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
+    if (operation?.[1])
+      return operation[1].trim();
+    const direct = /^rg:\s*(.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
+    if (direct?.[1])
+      return direct[1].trim();
+  }
+  return;
+}
+function createRipgrepInputError(stderr, redact = false) {
+  const code = classifyRipgrepInputFailure(stderr);
+  if (code === "E_REGEX_INVALID") {
+    return new RipgrepInputError(code, "ripgrep regex parse error: pattern is not a valid regular expression.", "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.");
+  }
+  if (code === "E_SEARCH_PATH_NOT_FOUND") {
+    const path = missingPathFromDiagnostics(stderr);
+    const location = path ? ` (${JSON.stringify(boundedRipgrepDiagnostic(path, redact))})` : "";
+    return new RipgrepInputError(code, `A searched path${location} does not exist or became unavailable.`, "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.");
+  }
+  return;
 }
 function unreadablePath(line, suffix) {
   const match = suffix.exec(line);
@@ -875,7 +1028,7 @@ async function captureBatch(paths, revisions, signal) {
   if (signal?.aborted)
     throw abortError();
 }
-async function captureCandidateRevisions(executable, args2, cwd, maxFiles, signal) {
+async function captureCandidateRevisions(executable, args2, cwd, maxFiles, signal, redact = false) {
   const revisions = new Map;
   let candidateCount = 0;
   const result = await runOwnedProcess({ executable, args: args2, cwd, ...signal ? { signal } : {} }, async (stdout) => {
@@ -915,6 +1068,9 @@ async function captureCandidateRevisions(executable, args2, cwd, maxFiles, signa
     await captureBatch(batch, revisions, signal);
   });
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
+  const inputError = createRipgrepInputError(result.stderr, redact);
+  if (inputError)
+    throw inputError;
   if (result.code === 2 && diagnostics.other.length === 0 && diagnostics.unreadable.length > 0)
     return { revisions, unreadable: diagnostics.unreadable };
   if (result.code !== 0 && result.code !== 1) {
@@ -1231,7 +1387,7 @@ function createRipgrepRunner(options = {}) {
         ...policy.ripgrepGlobArguments(validatedSearchPath),
         "--",
         searchTarget
-      ], cwd, maxSourceRevisionFiles, signal);
+      ], cwd, maxSourceRevisionFiles, signal, request.redact);
       if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
         throw new SignalGrepError(describeUnreadableDiagnostics(before.unreadable));
       candidateRevisions = before.revisions;
@@ -1250,6 +1406,9 @@ function createRipgrepRunner(options = {}) {
         }
       }));
       const diagnostics = classifyRipgrepDiagnostics(stderr);
+      const inputError = createRipgrepInputError(stderr, request.redact);
+      if (inputError)
+        throw inputError;
       if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
         throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
       if (diagnostics.unreadable.length > 0)
@@ -1276,9 +1435,11 @@ function createRipgrepRunner(options = {}) {
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError")
         throw abortError();
+      if (error instanceof RipgrepInputError)
+        throw error;
       const cause = error instanceof Error ? error : new Error(String(error));
       const executableMissing = "code" in cause && cause.code === "ENOENT";
-      const message = executableMissing ? `ripgrep executable not found: ${executable}` : cause.message;
+      const message = executableMissing ? `ripgrep executable not found: ${boundedRipgrepDiagnostic(executable, request.redact)}` : boundedRipgrepDiagnostic(cause.message, request.redact);
       throw new SignalGrepError(message, { cause });
     }
   };
@@ -1545,7 +1706,7 @@ class SignalGrepRuntime {
 }
 
 // src/service.ts
-import { createHash as createHash6 } from "crypto";
+import { createHash as createHash9 } from "crypto";
 
 // src/analysis-evidence.ts
 function sourceEvidence(document2, range) {
@@ -2076,7 +2237,7 @@ async function openTypeScriptSession(cwd, documents, parent, sourceCwd = cwd) {
 }
 
 // src/syntax.ts
-import { dirname as dirname2, extname } from "path";
+import { dirname as dirname2 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 
 // src/analysis-limits.ts
@@ -2533,21 +2694,248 @@ function classifySyntaxRange(analysis, start2, end) {
   return analysis.roles.filter((role) => role.start <= start2 && end <= role.end && start2 < role.end);
 }
 
+// src/language-capability-definitions.ts
+import { extname } from "path";
+var TYPESCRIPT_LANGUAGE_CAPABILITIES = [
+  {
+    id: "ast-grep.outline",
+    name: "outline",
+    provider: "ast-grep",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "ast-grep.structure",
+    name: "structure",
+    provider: "ast-grep",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "ast-grep.roles",
+    name: "roles",
+    provider: "ast-grep",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "static-navigation.imports",
+    name: "imports",
+    provider: "bounded static module resolver",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "static-navigation.tests",
+    name: "tests",
+    provider: "bounded static module resolver",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "impact.mixed",
+    name: "impact",
+    provider: "TypeScript language service + ast-grep",
+    providerKind: "builtin",
+    evidence: "compiler",
+    certainty: "mixed",
+    availability: "implemented",
+    load: "lazy"
+  },
+  ...[
+    "definitions",
+    "references",
+    "implementations",
+    "callers",
+    "callees",
+    "dependencies",
+    "dependents"
+  ].map((name2) => ({
+    id: `typescript.compiler.${name2}`,
+    name: name2,
+    provider: "TypeScript language service relationship provider",
+    providerKind: "builtin",
+    evidence: "compiler",
+    availability: "implemented",
+    load: "lazy"
+  })),
+  {
+    id: "typescript.relationship.trace",
+    name: "trace",
+    provider: "TypeScript language service relationship provider",
+    providerKind: "builtin",
+    evidence: "compiler",
+    availability: "implemented",
+    load: "lazy",
+    relationshipOperations: ["callers", "callees"]
+  }
+];
+var GO_LANGUAGE_CAPABILITIES = [
+  {
+    id: "ast-grep-go.structure",
+    name: "structure",
+    provider: "ast-grep lang-go",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "ast-grep-go.roles",
+    name: "roles",
+    provider: "ast-grep lang-go",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  {
+    id: "gopls.trace",
+    name: "trace",
+    provider: "gopls",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["gopls executable and a valid Go workspace"],
+    relationshipOperations: ["callers", "callees"]
+  }
+];
+var PYTHON_LANGUAGE_CAPABILITIES = [
+  {
+    id: "python-outline.outline",
+    name: "outline",
+    provider: "bounded Python outline parser",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
+  },
+  ...["definitions", "references", "callers", "callees"].map((name2) => ({
+    id: `pyright-python.${name2}`,
+    name: name2,
+    provider: "pyright-python",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["bundled Pyright language server and an admitted Python workspace"]
+  }))
+];
+var SWIFT_LANGUAGE_CAPABILITIES = [
+  {
+    id: "sourcekit-lsp.outline",
+    name: "outline",
+    provider: "sourcekit-lsp-swift",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"]
+  },
+  ...["definitions", "references", "implementations", "callers", "callees"].map((name2) => ({
+    id: `sourcekit-lsp.${name2}`,
+    name: name2,
+    provider: "sourcekit-lsp-swift",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"]
+  }))
+];
+var DEFAULT_LANGUAGE_CAPABILITIES = [
+  {
+    language: "javascript",
+    extensions: [".js", ".jsx", ".mjs", ".cjs"],
+    capabilities: TYPESCRIPT_LANGUAGE_CAPABILITIES
+  },
+  {
+    language: "typescript",
+    extensions: [".ts", ".mts", ".cts"],
+    capabilities: TYPESCRIPT_LANGUAGE_CAPABILITIES
+  },
+  {
+    language: "tsx",
+    extensions: [".tsx"],
+    capabilities: TYPESCRIPT_LANGUAGE_CAPABILITIES
+  },
+  { language: "go", extensions: [".go"], capabilities: GO_LANGUAGE_CAPABILITIES },
+  { language: "python", extensions: [".py"], capabilities: PYTHON_LANGUAGE_CAPABILITIES },
+  { language: "swift", extensions: [".swift"], capabilities: SWIFT_LANGUAGE_CAPABILITIES }
+];
+var DEFAULT_NEUTRAL_CAPABILITIES = [
+  {
+    id: "neutral.content",
+    name: "content",
+    provider: "ripgrep",
+    providerKind: "builtin",
+    evidence: "text",
+    availability: "implemented",
+    load: "none"
+  },
+  {
+    id: "neutral.files",
+    name: "files",
+    provider: "ripgrep --files",
+    providerKind: "builtin",
+    evidence: "text",
+    availability: "implemented",
+    load: "none"
+  },
+  {
+    id: "neutral.concept",
+    name: "concept",
+    provider: "local multilingual-e5 model",
+    providerKind: "model",
+    evidence: "model",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["verified local model assets"]
+  },
+  {
+    id: "neutral.hybrid",
+    name: "hybrid",
+    provider: "ripgrep + local multilingual-e5 model",
+    providerKind: "model",
+    evidence: "model",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["verified local model assets"]
+  }
+];
+function descriptorForPath(descriptors, path) {
+  const extension = extname(path).toLowerCase();
+  return descriptors.find((item) => item.extensions.includes(extension));
+}
+function languageForPath(descriptors, path) {
+  return descriptorForPath(descriptors, path)?.language;
+}
+function outlineExtension(path) {
+  const extension = extname(path).toLowerCase();
+  return extension || undefined;
+}
+
 // src/syntax.ts
 function syntaxLanguage(path) {
-  switch (extname(path).toLowerCase()) {
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
+  switch (languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)) {
+    case "javascript":
       return "javascript";
-    case ".ts":
-    case ".mts":
-    case ".cts":
+    case "typescript":
       return "typescript";
-    case ".tsx":
+    case "tsx":
       return "tsx";
-    case ".go":
+    case "go":
       return "go";
     default:
       return;
@@ -2759,16 +3147,6 @@ async function bindImpactCandidates(target, files, occurrences, access) {
   }
   return { items: [...retained.values()], bound };
 }
-
-// src/discovery-errors.ts
-var FILE_DISCOVERY_QUERY_PLACEHOLDER = "<filename-or-path>";
-function repairQuery(value) {
-  return typeof value === "string" && value.length <= 256 && value.isWellFormed() && !/[\r\n\0]/.test(value) ? value : FILE_DISCOVERY_QUERY_PLACEHOLDER;
-}
-function fileDiscoveryQueryHint(value) {
-  return `file discovery uses query; retry with ${JSON.stringify({ mode: "files", query: repairQuery(value) })}`;
-}
-var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/concept-search.ts
 import { dirname as dirname4 } from "path";
@@ -4831,403 +5209,8 @@ async function structuralSearch(input, access) {
   return result;
 }
 
-// src/evidence-ranking.ts
-function rankEvidence(items, priority) {
-  const tiers = new Map;
-  const ordered = items.toSorted((a, b) => priority(a) - priority(b) || a.path.localeCompare(b.path) || a.line - b.line || (a.range?.start ?? 0) - (b.range?.start ?? 0));
-  for (const item of ordered) {
-    const score = priority(item);
-    let files = tiers.get(score);
-    if (!files) {
-      files = new Map;
-      tiers.set(score, files);
-    }
-    let entries = files.get(item.path);
-    if (!entries) {
-      entries = [];
-      files.set(item.path, entries);
-    }
-    entries.push(item);
-  }
-  const result = [];
-  for (const files of tiers.values()) {
-    const groups = [...files.values()];
-    const depth = Math.max(0, ...groups.map((group) => group.length));
-    for (let index = 0;index < depth; index += 1)
-      for (const group of groups) {
-        const item = group[index];
-        if (item)
-          result.push({
-            ...item,
-            details: {
-              ...item.details,
-              rankingOrder: "evidence tier, then round-robin files, then source position"
-            }
-          });
-      }
-  }
-  return result;
-}
-
-// src/semantic-navigation.ts
-import { resolve as resolve16 } from "path";
-
-// src/semantic-project.ts
-import { resolve as resolve15 } from "path";
-import { stat as stat3 } from "fs/promises";
-
-// src/project-root.ts
-import { readdir, realpath as realpath5 } from "fs/promises";
-import { dirname as dirname5, relative as relative7, resolve as resolve14 } from "path";
-var TYPESCRIPT_CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/i;
-function isMissingPath(error) {
-  return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
-}
-async function projectConfig(directory, signal) {
-  if (signal?.aborted)
-    throw abortError();
-  try {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const files = entries.filter((entry) => entry.isFile() || entry.isSymbolicLink());
-    if (files.some((entry) => TYPESCRIPT_CONFIG_FILE.test(entry.name)))
-      return "typescript";
-    if (files.some((entry) => entry.name.toLowerCase() === "package.json"))
-      return "package";
-    return;
-  } catch (error) {
-    if (isMissingPath(error))
-      return;
-    throw error;
-  }
-}
-async function gitRootWithinCwd(cwd, gitRoot) {
-  const absoluteCwd = resolve14(cwd);
-  const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath5(absoluteCwd),
-    realpath5(gitRoot)
-  ]);
-  if (!isPathInsideCwd(canonicalRoot, canonicalCwd))
-    return;
-  return resolve14(absoluteCwd, relative7(canonicalCwd, canonicalRoot));
-}
-async function resolveSemanticProjectRoot(cwd, targetPath, signal) {
-  const absoluteCwd = resolve14(cwd);
-  const absoluteTarget = resolve14(absoluteCwd, targetPath);
-  if (!isPathInsideCwd(absoluteTarget, absoluteCwd))
-    return absoluteCwd;
-  const targetDirectory = dirname5(absoluteTarget);
-  const gitRoot = await findGitRepository(targetDirectory, signal);
-  if (gitRoot) {
-    const localGitRoot = await gitRootWithinCwd(absoluteCwd, gitRoot);
-    if (localGitRoot)
-      return localGitRoot;
-  }
-  let packageRoot;
-  let current = targetDirectory;
-  while (isPathInsideCwd(current, absoluteCwd)) {
-    const marker = await projectConfig(current, signal);
-    if (marker === "typescript")
-      return current;
-    if (marker === "package" && packageRoot === undefined)
-      packageRoot = current;
-    if (current === absoluteCwd)
-      break;
-    const parent = dirname5(current);
-    if (parent === current || !isPathInsideCwd(parent, absoluteCwd))
-      break;
-    current = parent;
-  }
-  return packageRoot ?? targetDirectory;
-}
-
-// src/semantic-project.ts
-var semanticMetadataPath = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|package\.json)$/;
-function semanticWorkspacePaths(files) {
-  return files.paths.filter((path) => {
-    const language = syntaxLanguage(path);
-    return language !== undefined && language !== "go" || semanticMetadataPath.test(path);
-  }).toSorted((left, right) => left.localeCompare(right));
-}
-async function semanticProject(access, targetPath, allowDirectoryTarget = false, filters = {}) {
-  let requestedTarget = targetPath;
-  if (allowDirectoryTarget) {
-    try {
-      if ((await stat3(resolve15(access.cwd, targetPath))).isDirectory())
-        requestedTarget = resolve15(targetPath, "__relationship_target__.ts");
-    } catch {}
-  }
-  const root = await resolveSemanticProjectRoot(access.cwd, requestedTarget, access.signal);
-  const workspaceFilters = {
-    ...filters.glob === undefined ? {} : { glob: [...filters.glob] },
-    ...filters.exclude === undefined ? {} : { exclude: [...filters.exclude] },
-    ...filters.hidden === undefined ? {} : { hidden: filters.hidden }
-  };
-  const files = await listWorkspaceFiles(access.cwd, access.signal, {
-    path: root,
-    ...workspaceFilters
-  });
-  const trackedPaths = semanticWorkspacePaths(files);
-  const paths = files.paths.filter((path) => {
-    const language = syntaxLanguage(path);
-    return language && language !== "go";
-  });
-  const metadataPaths = files.paths.filter((path) => semanticMetadataPath.test(path));
-  let target = resolve15(access.cwd, targetPath);
-  if (allowDirectoryTarget) {
-    try {
-      if ((await stat3(target)).isDirectory()) {
-        const first = paths.find((path) => resolve15(access.cwd, path).startsWith(`${target}/`));
-        if (first)
-          target = resolve15(access.cwd, first);
-      }
-    } catch {}
-  }
-  if (!paths.some((path) => resolve15(access.cwd, path) === target))
-    throw new SignalGrepError("Semantic target must be an admitted JS/TS workspace file under current ignore rules");
-  paths.sort((a, b) => Number(resolve15(access.cwd, b) === target) - Number(resolve15(access.cwd, a) === target) || a.localeCompare(b));
-  const documents = new Map;
-  const reasons = [...files.reasons];
-  const metadata2 = [];
-  for (const path of [...paths, ...metadataPaths]) {
-    try {
-      const document2 = await access.load(path);
-      if (!document2.utf8)
-        throw new SourceDocumentError("encoding", `Non-UTF-8 semantic source: ${path}`);
-      if (paths.includes(path))
-        documents.set(resolve15(access.cwd, path), document2);
-      else
-        metadata2.push(document2);
-    } catch (error) {
-      if (error instanceof SourceBudgetError) {
-        reasons.push(error.message);
-        break;
-      }
-      if (!(error instanceof SourceDocumentError))
-        throw error;
-      reasons.push(`${path}: ${error.message}`);
-    }
-  }
-  const primary = documents.get(target);
-  if (!primary)
-    throw new SignalGrepError("Semantic target could not be read within the source budget");
-  const recheckInventory = async () => {
-    const after = await listWorkspaceFiles(access.cwd, access.signal, {
-      path: root,
-      ...workspaceFilters
-    });
-    if (JSON.stringify(semanticWorkspacePaths(after)) !== JSON.stringify(trackedPaths))
-      throw new SignalGrepError("Workspace file set changed during semantic query; retry");
-  };
-  const recheck = async () => {
-    for (const document2 of [...documents.values(), ...metadata2]) {
-      if (document2.reference.origin.kind !== "worktree")
-        throw new Error("Expected worktree semantic source");
-      await access.refresh(document2.path, document2.reference);
-    }
-    await recheckInventory();
-  };
-  const result = {
-    kind: "references",
-    unit: "relationships",
-    items: [],
-    partial: reasons.length > 0,
-    reasons,
-    filesRead: access.filesRead,
-    bytesRead: access.bytesRead,
-    coverage: {
-      admittedSources: reasons.length ? "partial" : "complete",
-      runtimeDispatch: "not-applicable"
-    },
-    stats: { filesEnumerated: paths.length, filesSkipped: paths.length - documents.size }
-  };
-  return { documents, metadata: metadata2, primary, result, recheck, recheckInventory, root, trackedPaths };
-}
-
-// src/semantic-navigation.ts
-var semanticRequestQueue = new OwnedTaskQueue;
-async function selection(input, access, document2) {
-  if (input.column !== undefined) {
-    if (input.line === undefined || !Number.isSafeInteger(input.column) || input.column < 1 || input.symbol !== undefined)
-      throw new SignalGrepError("Semantic column requires line and no symbol; both are 1-based UTF-16 positions");
-    const position = { line: input.line - 1, character: input.column - 1 };
-    byteAt(document2, position);
-    return position;
-  }
-  const syntax = await access.syntax(document2);
-  if (syntax.status !== "ok")
-    throw new SignalGrepError("Selecting a semantic symbol requires valid syntax; supply an exact line+column position");
-  const candidates = syntax.nodes.filter((node) => /^(?:identifier|property_identifier|type_identifier|shorthand_property_identifier(?:_pattern)?)$/.test(node.kind) && (input.symbol === undefined || document2.text.slice(node.start, node.end) === input.symbol) && (input.line === undefined || document2.lineAt(document2.toByteOffset(node.start)) === input.line));
-  if (input.line === undefined && input.symbol === undefined)
-    throw new SignalGrepError("Semantic navigation requires path and line+column, or an unambiguous symbol");
-  if (candidates.length !== 1)
-    throw new SignalGrepError(`Semantic target is ${candidates.length ? "ambiguous" : "absent"}; supply an exact 1-based line and UTF-16 column`);
-  const candidate = candidates[0];
-  if (!candidate)
-    throw new Error("Missing semantic candidate");
-  return lspPosition(document2, candidate.start);
-}
-function itemFor(document2, location, relation) {
-  const range = byteRange(document2, location.range);
-  const line = document2.lineAt(range.start);
-  const evidence = sourceEvidence(document2, range);
-  return {
-    path: document2.path,
-    line,
-    range,
-    source: document2.reference,
-    label: `Compiler-bound ${relation}`,
-    excerpt: evidence.excerpt,
-    details: {
-      kind: "semantic",
-      excerptRange: evidence.excerptRange,
-      excerptTruncated: evidence.excerptTruncated || range.end > evidence.excerptRange.end,
-      relation,
-      binding: "typescript-compiler",
-      certainty: "static",
-      runtimeDispatch: "unproven",
-      score: 100,
-      rankingReason: "compiler binding with verified source range",
-      position: { line: location.range.start.line + 1, column: location.range.start.character + 1 },
-      nextRequest: {
-        mode: relation === "definitions" ? "references" : "definitions",
-        path: document2.path,
-        line: location.range.start.line + 1,
-        column: location.range.start.character + 1
-      }
-    }
-  };
-}
-async function queryLocations(channel, mode, params) {
-  if (mode === "callers" || mode === "callees") {
-    const prepared = await channel.request("textDocument/prepareCallHierarchy", params);
-    if (prepared === null)
-      return [];
-    if (!Array.isArray(prepared))
-      throw new SignalGrepError("Invalid compiler call hierarchy");
-    const found = [];
-    for (const item of prepared) {
-      const calls = await channel.request(mode === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls", { item });
-      if (calls === null)
-        continue;
-      if (!Array.isArray(calls))
-        throw new SignalGrepError("Invalid compiler call relationships");
-      for (const call of calls) {
-        if (!rpcRecord(call))
-          throw new SignalGrepError("Invalid compiler call relationship");
-        found.push(semanticLocation(mode === "callers" ? call.from : call.to));
-      }
-    }
-    return found;
-  }
-  const method = mode === "definitions" ? "definition" : mode === "implementations" ? "implementation" : "references";
-  if (!rpcRecord(params))
-    throw new Error("Expected semantic request parameters");
-  return locations(await channel.request(`textDocument/${method}`, {
-    ...params,
-    ...method === "references" ? { context: { includeDeclaration: true } } : {}
-  }));
-}
-async function runSemanticNavigation(input, access) {
-  if (!input.path || !isSemanticMode(input.mode))
-    throw new SignalGrepError("Semantic navigation requires a mode and workspace path");
-  const project = await semanticProject(access, input.path);
-  const { result, documents, primary, root } = project;
-  result.kind = input.mode;
-  result.redact = input.redact ?? false;
-  const mode = input.mode;
-  const graph = mode === "dependencies" || mode === "dependents";
-  if (graph && (input.line !== undefined || input.column !== undefined || input.symbol !== undefined))
-    throw new SignalGrepError("File dependencies/dependents accept path without line, column or symbol");
-  const position = graph ? undefined : await selection(input, access, primary);
-  const sourceAt = await semanticSources(access.cwd, documents.values());
-  const add = async (location, relation) => {
-    const document2 = await sourceAt(location.path);
-    if (document2)
-      result.items.push(itemFor(document2, location, relation));
-    else {
-      result.partial = true;
-      result.reasons.push("Compiler returned a location outside admitted source coverage; dependency/ignored/over-budget source was not exposed");
-    }
-  };
-  await withTypeScript(root, [...documents.values()], async (channel) => {
-    if (!graph) {
-      const found = await queryLocations(channel, mode, {
-        textDocument: { uri: await semanticUri(access.cwd, primary.path) },
-        position
-      });
-      for (const location of found) {
-        await add(location, mode);
-      }
-      return;
-    }
-    for (const document2 of mode === "dependencies" ? [primary] : documents.values()) {
-      const syntax = await access.syntax(document2);
-      if (syntax.status !== "ok") {
-        result.partial = true;
-        result.reasons.push(`${document2.path}: module syntax ${syntax.status}`);
-        continue;
-      }
-      const uri = await semanticUri(access.cwd, document2.path);
-      const specifiers = syntax.nodes.filter((node) => node.kind === "string" && node.parent !== null && (() => {
-        const parent = syntax.nodes[node.parent];
-        if (!parent)
-          return false;
-        if (parent.kind === "import_statement" || parent.kind === "export_statement")
-          return true;
-        if (parent.kind !== "arguments" || parent.parent === null)
-          return false;
-        const call = syntax.nodes[parent.parent];
-        return call?.kind === "call_expression" && /^(?:import|require)\s*\(/.test(document2.text.slice(call.start, node.start));
-      })());
-      for (const specifier of specifiers) {
-        const resolved = locations(await channel.request("textDocument/definition", {
-          textDocument: { uri },
-          position: lspPosition(document2, specifier.start + 1)
-        }));
-        if (!resolved.length) {
-          result.partial = true;
-          result.reasons.push(`${document2.path}: unresolved module ${document2.text.slice(specifier.start, specifier.end)}`);
-        }
-        for (const target of resolved) {
-          const targetDocument = await sourceAt(target.path);
-          if (mode === "dependencies") {
-            await add(target, "dependency");
-          } else if (targetDocument === primary) {
-            await add({
-              path: resolve16(access.cwd, document2.path),
-              range: {
-                start: lspPosition(document2, specifier.start),
-                end: lspPosition(document2, specifier.end)
-              }
-            }, "dependent");
-          }
-        }
-      }
-      access.releaseSyntax(document2);
-    }
-  }, access.signal, access.cwd);
-  await project.recheck();
-  result.filesRead = access.filesRead;
-  result.bytesRead = access.bytesRead;
-  result.items = rankEvidence([
-    ...new Map(result.items.map((item) => [
-      `${item.path}:${String(item.range?.start)}:${String(item.range?.end)}`,
-      item
-    ])).values()
-  ], () => 0);
-  result.reasons = [...new Set(result.reasons)];
-  result.coverage = {
-    ...result.coverage,
-    compilerBindings: result.partial ? "partial" : "complete"
-  };
-  return result;
-}
-function navigateSemantics(input, access) {
-  return semanticRequestQueue.run(() => runSemanticNavigation(input, access), access.signal);
-}
-
 // src/evidence-service.ts
-import { dirname as dirname8, resolve as resolve28 } from "path";
+import { dirname as dirname9, extname as extname3, resolve as resolve37 } from "path";
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "crypto";
@@ -5573,8 +5556,10 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...result.coverage ? { coverage: result.coverage } : {},
           ...result.stats ? { stats: result.stats } : {},
           ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
+          ...result.relationship ? { relationship: result.relationship } : {},
           ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}
         },
+        ...result.relationship ? { relationship: result.relationship } : {},
         ...result.scope ? { scope: result.scope } : {},
         ...result.redact ? { redactionRequested: true } : {}
       }
@@ -5604,8 +5589,97 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
   }
 }
 
+// src/project-root.ts
+import { readdir, realpath as realpath5 } from "fs/promises";
+import { dirname as dirname5, relative as relative7, resolve as resolve14 } from "path";
+var TYPESCRIPT_CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/i;
+function isMissingPath(error) {
+  return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+async function projectConfig(directory, signal) {
+  if (signal?.aborted)
+    throw abortError();
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const files = entries.filter((entry) => entry.isFile() || entry.isSymbolicLink());
+    if (files.some((entry) => TYPESCRIPT_CONFIG_FILE.test(entry.name)))
+      return "typescript";
+    if (files.some((entry) => entry.name.toLowerCase() === "package.json"))
+      return "package";
+    return;
+  } catch (error) {
+    if (isMissingPath(error))
+      return;
+    throw error;
+  }
+}
+async function gitRootWithinCwd(cwd, gitRoot) {
+  const absoluteCwd = resolve14(cwd);
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath5(absoluteCwd),
+    realpath5(gitRoot)
+  ]);
+  if (!isPathInsideCwd(canonicalRoot, canonicalCwd))
+    return;
+  return resolve14(absoluteCwd, relative7(canonicalCwd, canonicalRoot));
+}
+async function resolveSemanticProjectRoot(cwd, targetPath, signal) {
+  const absoluteCwd = resolve14(cwd);
+  const absoluteTarget = resolve14(absoluteCwd, targetPath);
+  if (!isPathInsideCwd(absoluteTarget, absoluteCwd))
+    return absoluteCwd;
+  const targetDirectory = dirname5(absoluteTarget);
+  const gitRoot = await findGitRepository(targetDirectory, signal);
+  if (gitRoot) {
+    const localGitRoot = await gitRootWithinCwd(absoluteCwd, gitRoot);
+    if (localGitRoot)
+      return localGitRoot;
+  }
+  let packageRoot;
+  let current = targetDirectory;
+  while (isPathInsideCwd(current, absoluteCwd)) {
+    const marker = await projectConfig(current, signal);
+    if (marker === "typescript")
+      return current;
+    if (marker === "package" && packageRoot === undefined)
+      packageRoot = current;
+    if (current === absoluteCwd)
+      break;
+    const parent = dirname5(current);
+    if (parent === current || !isPathInsideCwd(parent, absoluteCwd))
+      break;
+    current = parent;
+  }
+  return packageRoot ?? targetDirectory;
+}
+async function resolveRelationshipProjectRoot(cwd, targetPath, language, signal) {
+  const absoluteCwd = resolve14(cwd);
+  const absoluteTarget = resolve14(absoluteCwd, targetPath);
+  const markers = language === "go" ? new Set(["go.mod", "go.work"]) : new Set(["Package.swift"]);
+  let current = dirname5(absoluteTarget);
+  while (isPathInsideCwd(current, absoluteCwd)) {
+    if (signal?.aborted)
+      throw abortError();
+    try {
+      const entries = await readdir(current, { withFileTypes: true });
+      if (entries.some((entry) => markers.has(entry.name)))
+        return current;
+    } catch (error) {
+      if (!isMissingPath(error))
+        throw error;
+    }
+    if (current === absoluteCwd)
+      break;
+    const parent = dirname5(current);
+    if (parent === current || !isPathInsideCwd(parent, absoluteCwd))
+      break;
+    current = parent;
+  }
+  return dirname5(absoluteTarget);
+}
+
 // src/inspect.ts
-import { resolve as resolve17 } from "path";
+import { resolve as resolve15 } from "path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -5632,7 +5706,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SignalGrepError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve17(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve15(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -5654,7 +5728,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve18 } from "path";
+import { resolve as resolve16 } from "path";
 class CandidateLimit extends SignalGrepError {
 }
 function record(value) {
@@ -5819,7 +5893,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve18(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve16(options.cwd, options.request.path), options.cwd)) {
     throw new SignalGrepError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -5876,6 +5950,8 @@ async function collectEvidenceCandidates(options) {
 
 // src/import-model.ts
 import { posix } from "path";
+import { realpath as realpath6 } from "fs/promises";
+import { relative as relative8, resolve as resolve17 } from "path";
 class NavigationFailure extends Error {
   reason;
   constructor(reason) {
@@ -6224,6 +6300,7 @@ class NavigationContext {
   reasons = new Set;
   bytesRead = 0;
   #files;
+  #pathAliases = new Map;
   #fileLimit;
   #failures = new Map;
   #attempted = new Set;
@@ -6236,7 +6313,8 @@ class NavigationContext {
       throw abortError();
   }
   normalizePath(path) {
-    return this.host.normalizePath?.(path) ?? navigationPath(path);
+    const normalized = this.host.normalizePath?.(path) ?? navigationPath(path);
+    return this.#pathAliases.get(normalized) ?? normalized;
   }
   async files() {
     this.checkAbort();
@@ -6246,7 +6324,26 @@ class NavigationContext {
     if (!Array.isArray(listed) && listed.partial)
       for (const reason of listed.reasons)
         this.reasons.add(reason);
-    this.#files = new Set((Array.isArray(listed) ? listed : listed.paths).map((path) => this.normalizePath(path)));
+    const paths = new Set;
+    const canonicalCwd = await realpath6(this.host.cwd).catch(() => {
+      return;
+    });
+    const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map((path) => this.host.normalizePath?.(path) ?? navigationPath(path));
+    const canonicalPaths = await Promise.all(normalizedPaths.map(async (normalized) => {
+      try {
+        const target = await realpath6(resolve17(this.host.cwd, normalized));
+        const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative8(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
+        return [normalized, canonical];
+      } catch {
+        return [normalized, normalized];
+      }
+    }));
+    for (const [normalized, canonical] of canonicalPaths) {
+      this.#pathAliases.set(normalized, canonical);
+      this.#pathAliases.set(canonical, canonical);
+      paths.add(canonical);
+    }
+    this.#files = paths;
     return this.#files;
   }
   async module(path, retainSyntax = false) {
@@ -7292,6 +7389,44 @@ function selectImpactTarget(document2, syntax, input) {
   };
 }
 
+// src/evidence-ranking.ts
+function rankEvidence(items, priority) {
+  const tiers = new Map;
+  const ordered = items.toSorted((a, b) => priority(a) - priority(b) || a.path.localeCompare(b.path) || a.line - b.line || (a.range?.start ?? 0) - (b.range?.start ?? 0));
+  for (const item of ordered) {
+    const score = priority(item);
+    let files = tiers.get(score);
+    if (!files) {
+      files = new Map;
+      tiers.set(score, files);
+    }
+    let entries = files.get(item.path);
+    if (!entries) {
+      entries = [];
+      files.set(item.path, entries);
+    }
+    entries.push(item);
+  }
+  const result = [];
+  for (const files of tiers.values()) {
+    const groups = [...files.values()];
+    const depth = Math.max(0, ...groups.map((group) => group.length));
+    for (let index = 0;index < depth; index += 1)
+      for (const group of groups) {
+        const item = group[index];
+        if (item)
+          result.push({
+            ...item,
+            details: {
+              ...item.details,
+              rankingOrder: "evidence tier, then round-robin files, then source position"
+            }
+          });
+      }
+  }
+  return result;
+}
+
 // src/impact-analysis.ts
 var CATEGORY_ORDER = [
   "declaration",
@@ -7573,10 +7708,10 @@ async function runOwnedParallel(start2, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve20, sep as sep4 } from "path";
+import { basename as platformBasename, posix as posix4, relative as relative9, resolve as resolve19, sep as sep4 } from "path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve19 } from "path";
+import { resolve as resolve18 } from "path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -7587,7 +7722,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve19(cwd, path));
+      const revision = await getSourceRevision(resolve18(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -7644,9 +7779,9 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve20(cwd, root);
-  const absolutePath = resolve20(cwd, path);
-  const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
+  const absoluteRoot = resolve19(cwd, root);
+  const absolutePath = resolve19(cwd, path);
+  const scoped = relative9(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
 async function discoverFiles(input, cwd, signal) {
@@ -7903,7 +8038,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve21 } from "path";
+import { resolve as resolve20 } from "path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -7972,7 +8107,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document2.utf8 && structure && document2.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document2.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve21(access.cwd, target.path),
+      absolutePath: resolve20(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document2.reference.origin.revision
@@ -8190,7 +8325,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve21(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve20(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -8284,8 +8419,8 @@ async function continueSource(cursor, access, continuations) {
 }
 
 // src/evidence-validation.ts
-import { realpath as realpath6, stat as stat4 } from "fs/promises";
-import { resolve as resolve22 } from "path";
+import { realpath as realpath7, stat as stat3 } from "fs/promises";
+import { resolve as resolve21 } from "path";
 
 // src/evidence-validity.ts
 function aggregateRelationshipValidity(sources) {
@@ -8328,14 +8463,14 @@ function policyFailure(error) {
   return error instanceof SignalGrepError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
 }
 async function confirmWorktreeState(path, cwd, signal) {
-  const absolute = resolve22(cwd, path);
+  const absolute = resolve21(cwd, path);
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
-    const before = await stat4(absolute);
-    const beforeCanonical = await realpath6(absolute);
-    const after = await stat4(absolute);
-    const afterCanonical = await realpath6(absolute);
+    const before = await stat3(absolute);
+    const beforeCanonical = await realpath7(absolute);
+    const after = await stat3(absolute);
+    const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return { status: "stale", reason: "Source is no longer a regular file" };
     }
@@ -8470,16 +8605,16 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
   if (!target.revision)
     throw new Error("Snapshot validation target omitted its revision");
   try {
-    const absolute = resolve22(cwd, target.path);
+    const absolute = resolve21(cwd, target.path);
     const canonical = await policy.resolveExistingPath(absolute);
     if (!canonical) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
       return { path: target.path, role: "source", ...result };
     }
-    const before = await stat4(absolute);
+    const before = await stat3(absolute);
     const beforeCanonical = canonical;
-    const after = await stat4(absolute);
-    const afterCanonical = await realpath6(absolute);
+    const after = await stat3(absolute);
+    const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return {
         path: target.path,
@@ -8562,14 +8697,14 @@ function evidenceScope(cwd, scope, request) {
   const exclude = scope?.exclude ?? request?.exclude;
   const hidden = scope?.hidden ?? request?.hidden;
   return {
-    root: resolve22(cwd, path),
+    root: resolve21(cwd, path),
     ...include && include.length > 0 ? { include: [...include] } : {},
     ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
     ...hidden === undefined ? {} : { hidden }
   };
 }
 async function validateSavedEvidence(options) {
-  let scope = { root: resolve22(options.cwd) };
+  let scope = { root: resolve21(options.cwd) };
   const reasons = [];
   let storedPartial = false;
   let targets;
@@ -9134,7 +9269,7 @@ function parsePythonOutline(document2) {
 }
 
 // src/hybrid-search.ts
-import { resolve as resolve23 } from "path";
+import { resolve as resolve22 } from "path";
 class HybridSourceChangedError extends ConceptSourceChangedError {
   constructor(message = "Hybrid source changed while exact and concept evidence were being merged") {
     super(message);
@@ -9194,12 +9329,12 @@ function absoluteOccurrenceRanges(document2, line, match) {
 async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
-  const generatedDocuments = new Map(generation.documents.map((document2) => [resolve23(access.cwd, document2.path), document2]));
+  const generatedDocuments = new Map(generation.documents.map((document2) => [resolve22(access.cwd, document2.path), document2]));
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const generated = generatedDocuments.get(resolve23(access.cwd, match.absolutePath));
+      const generated = generatedDocuments.get(resolve22(access.cwd, match.absolutePath));
       const document2 = generated ?? await access.load(match.absolutePath);
       const expected = scan.sourceRevisions.get(match.absolutePath);
       if (!expected) {
@@ -9420,6 +9555,8 @@ function evidenceKey(evidence) {
     evidence.providerBasis ?? null
   ]);
 }
+var MAX_PUBLIC_CHANGE_HINT_BYTES = 4096;
+var MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES = 2048;
 function evidenceTable(edges) {
   const ids = new Map;
   const table = [];
@@ -9471,7 +9608,7 @@ function edgeItem(edge, index, dependencyIds, evidenceIds) {
     }
   };
 }
-function publicDetails(scope, sources, values) {
+function publicRelationshipDetails(scope, sources, values) {
   const ordered = [...sources].toSorted((left, right) => {
     return sourceStatusRank(left.status) - sourceStatusRank(right.status) || left.path.localeCompare(right.path);
   });
@@ -9496,8 +9633,14 @@ function publicDetails(scope, sources, values) {
 }
 function publicChangeHints(hints) {
   if (hints.length === 0)
-    return;
-  return hints.toSorted((left, right) => left.observedAt - right.observedAt).slice(-32).map((hint) => {
+    return { items: undefined, omitted: 0 };
+  const candidates = hints.toSorted((left, right) => left.observedAt - right.observedAt).slice(-32);
+  const visible = [];
+  let bytes = 2;
+  for (let index = candidates.length - 1;index >= 0; index -= 1) {
+    const hint = candidates[index];
+    if (!hint)
+      continue;
     const value = {
       path: hint.path,
       role: hint.role,
@@ -9505,8 +9648,16 @@ function publicChangeHints(hints) {
     };
     if (hint.reason)
       value.reason = hint.reason;
-    return value;
-  });
+    const valueBytes = Buffer.byteLength(JSON.stringify(value));
+    if (valueBytes > MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES || bytes + valueBytes > MAX_PUBLIC_CHANGE_HINT_BYTES)
+      continue;
+    visible.push(value);
+    bytes += valueBytes;
+  }
+  return {
+    items: visible.length > 0 ? visible.toReversed() : undefined,
+    omitted: hints.length - visible.length
+  };
 }
 function changeHintText(hints) {
   if (hints.length === 0)
@@ -9536,10 +9687,10 @@ function base(mode, status, total, files, returned = total) {
 function traceResult(stored, page, scope, input, changeHints = [], watchHealth) {
   const state = stored.state;
   const paths = new Set(state.edges.flatMap((edge) => [edge.from.path, edge.to.path]));
-  const dependencies = dependencyTable(state.edges);
-  const evidence = evidenceTable(state.edges);
-  const hints = publicChangeHints(changeHints);
-  const relationship = publicDetails(scope, state.coverage.sources, {
+  const dependencies = dependencyTable(page.items);
+  const evidence = evidenceTable(page.items);
+  const hintProjection = publicChangeHints(changeHints);
+  const relationship = publicRelationshipDetails(scope, state.coverage.sources, {
     operation: state.operation,
     ...state.nodes[0] ? {
       providerId: state.nodes[0].identity.providerId,
@@ -9554,7 +9705,8 @@ function traceResult(stored, page, scope, input, changeHints = [], watchHealth) 
     expansions: state.expansions,
     dependencyTable: dependencies.table,
     evidenceTable: evidence.table,
-    ...hints ? { changeHints: hints } : {},
+    ...hintProjection.items ? { changeHints: hintProjection.items } : {},
+    ...hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {},
     ...watchHealth ? { watchHealth } : {}
   });
   const status = state.status === "complete" && state.coverage.freshness === "current" ? "complete" : "partial";
@@ -9594,8 +9746,8 @@ function validationResult(state, cursor, recheck, checkInterval, comparisonTarge
   const status = state.status === "partial" || recheck.validity !== "current" ? "partial" : "complete";
   const coverage = state.coverage.status === "partial" || recheck.coverage === "partial" ? "partial" : recheck.coverage;
   const reasons = [...new Set([...state.reasons ?? [], ...recheck.reasons])];
-  const hints = publicChangeHints(changeHints);
-  const relationship = publicDetails(state.scope, recheck.sources, {
+  const hintProjection = publicChangeHints(changeHints);
+  const relationship = publicRelationshipDetails(state.scope, recheck.sources, {
     comparisonTarget,
     freshness: recheck.validity,
     coverage,
@@ -9603,7 +9755,8 @@ function validationResult(state, cursor, recheck, checkInterval, comparisonTarge
     affectedNodeKeys: recheck.affectedNodeKeys,
     affectedEdgeKeys: (state.edges ?? []).filter((edge) => recheck.affectedEdgeKeys.includes(edge.edgeKey)).map(publicEdgeKey),
     checkInterval,
-    ...hints ? { changeHints: hints } : {},
+    ...hintProjection.items ? { changeHints: hintProjection.items } : {},
+    ...hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {},
     ...watchHealth ? { watchHealth } : {}
   });
   const analysis = {
@@ -9628,11 +9781,11 @@ function validationResult(state, cursor, recheck, checkInterval, comparisonTarge
 }
 
 // src/relationship-service.ts
-import { resolve as resolve27 } from "path";
+import { resolve as resolve34 } from "path";
 
 // src/change-awareness.ts
 import { statSync, watch } from "fs";
-import { dirname as dirname6, relative as relative9, resolve as resolve24 } from "path";
+import { dirname as dirname6, relative as relative10, resolve as resolve23 } from "path";
 var DEFAULT_MAX_SOURCES = 1024;
 var DEFAULT_MAX_HINTS = 1024;
 var MAX_HEALTH_REASONS = 32;
@@ -9651,7 +9804,7 @@ function sourceUnavailableReason(error) {
   return `relationship watcher source is unavailable${code === undefined ? "" : ` (${code})`}`;
 }
 function isInsideOrEqual(root, candidate) {
-  const value = relative9(root, candidate);
+  const value = relative10(root, candidate);
   const separator = process.platform === "win32" ? "\\" : "/";
   return value === "" || value !== ".." && !value.startsWith(`..${separator}`);
 }
@@ -9679,7 +9832,7 @@ class RelationshipChangeAwareness {
       observedAt,
       ...reason === undefined ? {} : { reason }
     };
-    this.#dirty.set(resolve24(path), { ...hint, path: resolve24(path) });
+    this.#dirty.set(resolve23(path), { ...hint, path: resolve23(path) });
     this.#trimHints();
     for (const listener of this.#listeners) {
       try {
@@ -9702,7 +9855,7 @@ class RelationshipChangeAwareness {
     if (requestedMaxSources < this.#subscriptions.size)
       throw new Error(`Relationship watcher source limit is below active subscriptions (${String(this.#subscriptions.size)})`);
     this.#maxSources = Math.min(this.#maxSources, requestedMaxSources);
-    const uniquePaths = new Set(paths.map((path) => resolve24(path)));
+    const uniquePaths = new Set(paths.map((path) => resolve23(path)));
     if (this.#subscriptions.size + uniquePaths.size > this.#maxSources)
       throw new Error(`Relationship watcher source limit exceeded (${String(this.#maxSources)})`);
     this.#maxHints = Math.min(this.#maxHints, requestedMaxHints);
@@ -9747,7 +9900,7 @@ class RelationshipChangeAwareness {
   }
   stop(path) {
     const tokenList = path === undefined ? [...this.#subscriptions.keys()] : (() => {
-      const token = [...this.#subscriptions.values()].find((subscription) => subscription.path === resolve24(path))?.token;
+      const token = [...this.#subscriptions.values()].find((subscription) => subscription.path === resolve23(path))?.token;
       return token === undefined ? [] : [token];
     })();
     const errors = [];
@@ -9789,7 +9942,7 @@ class RelationshipChangeAwareness {
   }
   dirty(path) {
     if (path !== undefined) {
-      const hint = this.#dirty.get(resolve24(path));
+      const hint = this.#dirty.get(resolve23(path));
       return hint === undefined ? [] : [hint];
     }
     return [...this.#dirty.values()];
@@ -9798,7 +9951,7 @@ class RelationshipChangeAwareness {
     if (path === undefined)
       this.#dirty.clear();
     else
-      this.#dirty.delete(resolve24(path));
+      this.#dirty.delete(resolve23(path));
   }
   clearAll() {
     this.#dirty.clear();
@@ -9907,7 +10060,7 @@ class RelationshipChangeAwareness {
   }
   #openWatcher(group) {
     const onChange = (_event, name2) => {
-      const changed = name2 === null ? undefined : resolve24(group.root, typeof name2 === "string" ? name2 : name2.toString());
+      const changed = name2 === null ? undefined : resolve23(group.root, typeof name2 === "string" ? name2 : name2.toString());
       for (const subscription of group.subscriptions.values()) {
         if (changed === undefined) {
           this.markDirty(subscription.path, subscription.role, "filesystem change");
@@ -9992,728 +10145,6 @@ class RelationshipChangeAwareness {
   }
 }
 
-// src/go-semantic-provider.ts
-import { createHash as createHash5, randomUUID as randomUUID4 } from "crypto";
-import { delimiter, dirname as dirname7, isAbsolute as isAbsolute6, resolve as resolve25 } from "path";
-import { fileURLToPath as fileURLToPath4 } from "url";
-var GO_SEMANTIC_QUERY_TIMEOUT_MS = 20000;
-var GO_SEMANTIC_PROVIDER_ID = "gopls";
-var goSource = /\.go$/i;
-var goManifest = /(?:^|\/)(?:go\.mod|go\.work|go\.sum)$/i;
-var goTextDocument = /(?:\.go|(?:^|\/)(?:go\.mod|go\.work))$/i;
-var GO_ENVIRONMENT_PATH = "go:environment";
-var GO_INVENTORY_PATH = "go:inventory";
-var GO_ENVIRONMENT_KEYS = [
-  "GO111MODULE",
-  "GOOS",
-  "GOARCH",
-  "GOARM",
-  "GO386",
-  "GOEXPERIMENT",
-  "CGO_ENABLED",
-  "GOFLAGS",
-  "GOMOD",
-  "GOWORK",
-  "GOWASM",
-  "GOMODCACHE",
-  "GOPRIVATE",
-  "GONOPROXY",
-  "GONOSUMDB",
-  "PATH"
-];
-var providerQueue = new OwnedTaskQueue;
-function executablePath2() {
-  const configured = process.env.BAOER_SIGNAL_GREP_GOPLS_PATH?.trim();
-  if (!configured)
-    return "gopls";
-  if (!isAbsolute6(configured))
-    throw new SignalGrepError("BAOER_SIGNAL_GREP_GOPLS_PATH must be an absolute executable path");
-  return configured;
-}
-function environment(executable) {
-  const path = process.env.PATH ?? "";
-  const executableDirectory = isAbsolute6(executable) ? dirname7(executable) : undefined;
-  const configuredFlags = process.env.GOFLAGS?.trim() ?? "";
-  const modFlag = configuredFlags.match(/(?:^|\s)-mod=(\S+)/)?.[1];
-  if (modFlag !== undefined && modFlag !== "readonly")
-    throw new SignalGrepError(`GOFLAGS requests -mod=${modFlag}; Go relationship search requires -mod=readonly`);
-  return {
-    ...process.env,
-    ...executableDirectory ? { PATH: `${executableDirectory}${delimiter}${path}` } : {},
-    GOTOOLCHAIN: "local",
-    GOPROXY: "off",
-    GOSUMDB: "off",
-    GOFLAGS: configuredFlags ? `${configuredFlags} -mod=readonly` : "-mod=readonly"
-  };
-}
-function configurationFingerprint(executable) {
-  const values = {
-    executable,
-    GOTOOLCHAIN: "local",
-    GOPROXY: "off",
-    GOSUMDB: "off"
-  };
-  for (const key of GO_ENVIRONMENT_KEYS)
-    values[key] = process.env[key] ?? "";
-  return createHash5("sha256").update(JSON.stringify(values)).digest("hex");
-}
-function isAdmittedGoFile(path) {
-  return goSource.test(path) || goManifest.test(path);
-}
-function documentRole(path) {
-  return goManifest.test(path) ? "manifest" : "source";
-}
-function languageId2(path) {
-  return goSource.test(path) ? "go" : "go.mod";
-}
-function fileUri(value) {
-  if (typeof value !== "string" || !value.startsWith("file:"))
-    throw new SignalGrepError("gopls returned a non-file URI");
-  return value;
-}
-function uriPath(uri) {
-  try {
-    return fileURLToPath4(uri);
-  } catch (error) {
-    throw new SignalGrepError("gopls returned an invalid file URI", { cause: error });
-  }
-}
-function readNode2(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("gopls returned an invalid navigation item");
-  const record = value;
-  const uri = fileUri(record.uri ?? record.targetUri);
-  const range = lspRange(record.range ?? record.targetRange ?? record.selectionRange);
-  const selectionRange = lspRange(record.selectionRange ?? record.targetSelectionRange ?? range);
-  return {
-    id: `${uri}:${String(selectionRange.start.line)}:${String(selectionRange.start.character)}:${String(selectionRange.end.line)}:${String(selectionRange.end.character)}`,
-    path: uriPath(uri),
-    uri,
-    range,
-    selectionRange,
-    ...typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {},
-    ...typeof record.kind === "number" && Number.isSafeInteger(record.kind) ? { kind: record.kind } : {}
-  };
-}
-function readLocations(value) {
-  if (value === null)
-    return [];
-  return (Array.isArray(value) ? value : [value]).map((item) => readNode2(item));
-}
-function readCallRanges(value) {
-  if (!Array.isArray(value))
-    return;
-  return value.map((range) => lspRange(range));
-}
-function positionOf(node) {
-  return node.selectionRange.start;
-}
-function sourceLocation(document2, range) {
-  return {
-    path: document2.path,
-    range: byteRange(document2, range),
-    start: { line: range.start.line + 1, column: range.start.character + 1 },
-    end: { line: range.end.line + 1, column: range.end.character + 1 },
-    source: document2.reference
-  };
-}
-function symbolPosition(document2, value, name2) {
-  if (value.selectionRange !== undefined)
-    return lspRange(value.selectionRange).start;
-  const location = rpcRecord(value.location) ? value.location : undefined;
-  if (!location || location.range === undefined)
-    return;
-  const range = lspRange(location.range);
-  const bytes = byteRange(document2, range);
-  const offset = document2.slice(bytes).indexOf(name2);
-  if (offset < 0)
-    return;
-  return lspPosition(document2, document2.toCharacterOffset(bytes.start) + offset);
-}
-function documentDependency(document2) {
-  return {
-    path: document2.path,
-    role: documentRole(document2.path),
-    reference: document2.reference,
-    exists: true
-  };
-}
-function environmentDependency(fingerprint) {
-  return { path: GO_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
-}
-function evidence(reason) {
-  return { reason, level: "compiler", basis: "semantic", providerBasis: GO_SEMANTIC_PROVIDER_ID };
-}
-function operationMethod(operation) {
-  switch (operation) {
-    case "definitions":
-      return "textDocument/definition";
-    case "references":
-      return "textDocument/references";
-    case "implementations":
-      return "textDocument/implementation";
-    case "callers":
-    case "callees":
-      return "textDocument/prepareCallHierarchy";
-    default:
-      throw new SignalGrepError("Unsupported Go relationship operation");
-  }
-}
-function relationReason(operation) {
-  if (operation === "callers" || operation === "callees")
-    return "gopls static call hierarchy; dynamic calls are excluded and runtime dispatch is unproven";
-  return "gopls compiler-bound navigation in the active Go build configuration";
-}
-function operationUnresolved(operation, reason) {
-  return { operation, reason, confidence: "unknown" };
-}
-
-class GoRelationshipView {
-  providerId = GO_SEMANTIC_PROVIDER_ID;
-  analysisViewId;
-  sourceScope;
-  #channel;
-  #completion;
-  #cwd;
-  #source;
-  #signal;
-  #configurationFingerprint;
-  #inventory;
-  #documents;
-  #openReasons;
-  #initialCoveragePartial;
-  #nodePaths = new Map;
-  #edgePaths = new Map;
-  #closed = false;
-  #closePromise;
-  constructor(options, channel, completion, documents, openReasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, clearTimeout2) {
-    this.analysisViewId = options.analysisViewId ?? randomUUID4();
-    this.sourceScope = options.scope;
-    this.#cwd = options.cwd;
-    this.#source = options.source;
-    this.#signal = signal;
-    this.#configurationFingerprint = configurationFingerprint(executable);
-    this.#inventory = inventory;
-    this.#channel = channel;
-    this.#completion = completion;
-    this.#documents = documents;
-    this.#openReasons = [...openReasons, `gopls executable: ${executable}`];
-    this.#initialCoveragePartial = initialCoveragePartial;
-    this.#releaseQueue = releaseQueue;
-    this.#clearTimeout = clearTimeout2;
-  }
-  #releaseQueue;
-  #clearTimeout;
-  async resolveNode(input, signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const document2 = this.#documents.get(resolve25(this.#cwd, input.path));
-    if (!document2)
-      return {
-        status: "unsupported",
-        reasons: ["Go target is outside admitted provider source"],
-        dependencies: []
-      };
-    const position = await this.position(document2, input);
-    const params = { textDocument: { uri: await semanticUri(this.#cwd, document2.path) }, position };
-    const prepared = await this.#channel.request("textDocument/prepareCallHierarchy", params);
-    const candidates = Array.isArray(prepared) ? prepared.map(readNode2) : [];
-    if (candidates.length > 1 && input.column === undefined)
-      return {
-        status: "ambiguous",
-        candidates: candidates.map((candidate) => this.node(candidate, document2)),
-        reasons: ["gopls returned multiple call hierarchy items; include a column"],
-        dependencies: [
-          documentDependency(document2),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    let selected = candidates[0];
-    if (!selected) {
-      const definitions = readLocations(await this.#channel.request("textDocument/definition", params));
-      selected = definitions[0];
-    }
-    if (!selected)
-      return {
-        status: "unknown",
-        reasons: ["gopls returned no definition or call hierarchy item"],
-        dependencies: [
-          documentDependency(document2),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    const target = this.#documents.get(resolve25(this.#cwd, selected.path));
-    if (!target)
-      return {
-        status: "unknown",
-        reasons: ["gopls resolved outside admitted provider source"],
-        dependencies: [
-          documentDependency(document2),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    return {
-      status: "resolved",
-      node: this.node(selected, target),
-      reasons: [],
-      dependencies: [
-        documentDependency(document2),
-        documentDependency(target),
-        environmentDependency(this.#configurationFingerprint)
-      ]
-    };
-  }
-  async expand(node, operation, signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const internal = this.internalNode(node);
-    const document2 = this.#documents.get(resolve25(this.#cwd, internal.path));
-    if (!document2)
-      return {
-        edges: [],
-        nodes: [],
-        unresolved: [
-          operationUnresolved(operation, "Node source is outside admitted provider source")
-        ],
-        dependencies: [],
-        coverage: {
-          status: "partial",
-          freshness: "unknown",
-          sources: [],
-          reasons: ["Node source is outside admitted provider source"]
-        }
-      };
-    const params = {
-      textDocument: { uri: await semanticUri(this.#cwd, document2.path) },
-      position: positionOf(internal)
-    };
-    const goEdges = [];
-    const unresolved = [];
-    if (operation === "callers" || operation === "callees") {
-      const prepared = await this.#channel.request(operationMethod(operation), params);
-      if (!Array.isArray(prepared))
-        unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
-      else {
-        for (const item of prepared) {
-          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-          const calls = await this.#channel.request(method, { item });
-          if (!Array.isArray(calls)) {
-            unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
-            continue;
-          }
-          for (const call of calls) {
-            if (!rpcRecord(call)) {
-              unresolved.push(operationUnresolved(operation, "gopls returned an invalid call edge"));
-              continue;
-            }
-            const record = call;
-            try {
-              const endpoint = readNode2(operation === "callers" ? record.from : record.to);
-              const callRanges = readCallRanges(record.fromRanges);
-              goEdges.push({
-                operation,
-                from: operation === "callers" ? endpoint : internal,
-                to: operation === "callers" ? internal : endpoint,
-                ...callRanges ? { callRanges } : {}
-              });
-            } catch (error) {
-              unresolved.push(operationUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
-            }
-          }
-        }
-      }
-    } else {
-      const value = await this.#channel.request(operationMethod(operation), {
-        ...params,
-        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
-      });
-      const candidates = readLocations(value);
-      for (const candidate of candidates)
-        goEdges.push({ operation, from: internal, to: candidate });
-    }
-    const nodes = [];
-    const edges = [];
-    for (const edge of goEdges) {
-      const from = this.convertNode(edge.from, unresolved, operation);
-      const to = this.convertNode(edge.to, unresolved, operation);
-      if (!from || !to)
-        continue;
-      nodes.push(from, to);
-      const callRanges = edge.callRanges?.length ? edge.callRanges : [undefined];
-      for (const [index, range] of callRanges.entries()) {
-        const callSite = range ? this.callSite(edge, range) : undefined;
-        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
-        const edgePaths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
-        this.#edgePaths.set(edgeKey, edgePaths);
-        edges.push({
-          edgeKey,
-          operation,
-          from,
-          to,
-          ...callSite ? { callSite } : {},
-          evidence: [evidence(relationReason(operation))],
-          confidence: "verified-static",
-          dependencies: [...edgePaths].map((path) => documentDependency(this.#documents.get(resolve25(this.#cwd, path)) ?? document2)).concat(environmentDependency(this.#configurationFingerprint))
-        });
-      }
-    }
-    const uniqueNodes = [...new Map(nodes.map((item) => [item.identity.localKey, item])).values()];
-    const reasons = [...this.#openReasons, relationReason(operation)];
-    return {
-      edges,
-      nodes: uniqueNodes,
-      unresolved,
-      dependencies: [
-        documentDependency(document2),
-        environmentDependency(this.#configurationFingerprint)
-      ],
-      coverage: {
-        status: this.#initialCoveragePartial || unresolved.length ? "partial" : "complete",
-        freshness: "current",
-        sources: this.currentSourceStatuses(),
-        reasons: [...new Set(reasons)]
-      }
-    };
-  }
-  async recheck(signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const sources = [];
-    const reasons = [];
-    for (const document2 of this.#documents.values()) {
-      try {
-        await this.#source.refresh(document2.path, document2.reference);
-        sources.push(this.sourceStatus(document2, "current"));
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : "source recheck failed";
-        sources.push(this.sourceStatus(document2, "stale", reason));
-        reasons.push(`${document2.path}: ${reason}`);
-      }
-    }
-    let configurationReason;
-    let currentConfigurationFingerprint;
-    try {
-      const executable = executablePath2();
-      environment(executable);
-      currentConfigurationFingerprint = configurationFingerprint(executable);
-    } catch (error) {
-      configurationReason = error instanceof Error ? error.message : "Go build configuration is invalid";
-    }
-    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.#configurationFingerprint;
-    sources.push({
-      path: GO_ENVIRONMENT_PATH,
-      role: "config",
-      status: configurationChanged ? "stale" : "current",
-      ...configurationReason ? { reason: configurationReason } : configurationChanged ? { reason: "Go build environment or gopls executable changed during relationship query" } : {}
-    });
-    if (configurationChanged)
-      reasons.push(configurationReason ?? "Go build environment or gopls executable changed during relationship query");
-    const inventory = await listWorkspaceFiles(this.#cwd, this.#signal, {
-      path: this.sourceScope.root,
-      glob: [...this.sourceScope.include ?? []],
-      exclude: [...this.sourceScope.exclude ?? []],
-      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden }
-    });
-    const currentInventory = new Set(inventory.paths.filter(isAdmittedGoFile));
-    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
-    if (inventoryChanged || inventory.partial) {
-      reasons.push(inventoryChanged ? "Go source/config inventory changed during relationship query; retry" : inventory.reasons.join("; "));
-      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
-        sources.push({
-          path,
-          role: documentRole(path),
-          status: "stale",
-          reason: "source removed during query"
-        });
-      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
-        sources.push({
-          path,
-          role: documentRole(path),
-          status: "stale",
-          reason: "source added during query; retry"
-        });
-      if (inventory.partial)
-        sources.push({
-          path: GO_INVENTORY_PATH,
-          role: "metadata",
-          status: "unknown",
-          reason: inventory.reasons.join("; ") || "Go source/config inventory is incomplete"
-        });
-    }
-    const stalePaths = new Set(sources.filter((source) => source.status === "stale").map((source) => source.path));
-    const inventoryUnknown = sources.some((source) => source.path === GO_INVENTORY_PATH && source.status === "unknown");
-    const sourceUnknown = sources.some((source) => source.status === "unknown");
-    const configurationStale = sources.some((source) => source.path === GO_ENVIRONMENT_PATH && source.status !== "current");
-    return {
-      validity: stalePaths.size ? "stale" : sourceUnknown ? "unknown" : "current",
-      coverage: this.#initialCoveragePartial || stalePaths.size || sourceUnknown ? "partial" : "complete",
-      sources,
-      affectedNodeKeys: configurationStale || inventoryUnknown ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => sources.some((source) => source.path === path && source.status !== "current")).map(([key]) => key),
-      affectedEdgeKeys: configurationStale || inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([key]) => key),
-      reasons: [...new Set(reasons)]
-    };
-  }
-  close() {
-    if (!this.#closePromise)
-      this.#closePromise = this.closeOnce();
-    return this.#closePromise;
-  }
-  async closeOnce() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    try {
-      await this.#channel.request("shutdown", undefined);
-      this.#channel.endInput();
-      const result = await this.#completion;
-      if (result.code !== 0)
-        throw new SignalGrepError(`gopls process failed (${String(result.code)}): ${result.stderr}`);
-    } catch (error) {
-      this.#channel.close();
-      await this.#completion.catch(() => {
-        return;
-      });
-      throw error;
-    } finally {
-      this.#clearTimeout();
-      this.#releaseQueue();
-    }
-  }
-  async position(document2, input) {
-    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-      throw new SignalGrepError("Go semantic target line must be one-based");
-    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
-      throw new SignalGrepError("Go semantic target column must be one-based");
-    if (input.column !== undefined) {
-      if (input.line === undefined)
-        throw new SignalGrepError("Go semantic column requires a line");
-      return { line: input.line - 1, character: input.column - 1 };
-    }
-    if (!input.symbol)
-      throw new SignalGrepError("Go semantic target requires a column or symbol");
-    const symbolName = input.symbol;
-    const symbols = await this.#channel.request("textDocument/documentSymbol", {
-      textDocument: { uri: await semanticUri(this.#cwd, document2.path) }
-    });
-    const found = [];
-    const visit = (value) => {
-      if (!value || typeof value !== "object" || Array.isArray(value))
-        return;
-      if (!rpcRecord(value))
-        return;
-      const record = value;
-      const position = symbolPosition(document2, record, symbolName);
-      if (record.name === symbolName && position) {
-        if (input.line === undefined || position.line + 1 === input.line)
-          found.push(position);
-      }
-      if (Array.isArray(record.children))
-        for (const child of record.children)
-          visit(child);
-    };
-    if (Array.isArray(symbols))
-      for (const symbol of symbols)
-        visit(symbol);
-    if (found.length !== 1)
-      throw new SignalGrepError(found.length ? "Go semantic target symbol is ambiguous" : "Go semantic target symbol is absent");
-    const position = found[0];
-    if (!position)
-      throw new SignalGrepError("Go semantic target symbol is absent");
-    return position;
-  }
-  node(internal, document2) {
-    const range = byteRange(document2, internal.range);
-    const selection = byteRange(document2, internal.selectionRange);
-    const localKey = `${document2.path}:${String(selection.start)}:${String(selection.end)}`;
-    this.#nodePaths.set(localKey, document2.path);
-    return {
-      identity: {
-        providerId: GO_SEMANTIC_PROVIDER_ID,
-        analysisViewId: this.analysisViewId,
-        sourceScope: this.sourceScope.root,
-        localKey
-      },
-      path: document2.path,
-      name: internal.name ?? document2.path,
-      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
-      range,
-      start: {
-        line: internal.selectionRange.start.line + 1,
-        column: internal.selectionRange.start.character + 1
-      },
-      end: {
-        line: internal.selectionRange.end.line + 1,
-        column: internal.selectionRange.end.character + 1
-      },
-      source: document2.reference,
-      evidence: [evidence("gopls compiler-bound Go navigation result")]
-    };
-  }
-  convertNode(internal, unresolved, operation) {
-    const document2 = this.#documents.get(resolve25(this.#cwd, internal.path));
-    if (!document2) {
-      unresolved.push(operationUnresolved(operation, "gopls result is outside admitted Go source"));
-      return;
-    }
-    return this.node(internal, document2);
-  }
-  callSite(edge, range) {
-    const document2 = this.#documents.get(resolve25(this.#cwd, edge.from.path));
-    return document2 ? sourceLocation(document2, range) : undefined;
-  }
-  sourceStatus(document2, status, reason) {
-    return {
-      path: document2.path,
-      role: documentRole(document2.path),
-      status,
-      expected: document2.reference,
-      ...reason ? { reason } : {}
-    };
-  }
-  currentSourceStatuses() {
-    return [
-      ...[...this.#documents.values()].map((document2) => this.sourceStatus(document2, "current")),
-      { path: GO_ENVIRONMENT_PATH, role: "config", status: "current" }
-    ];
-  }
-  internalNode(node) {
-    const document2 = this.#documents.get(resolve25(this.#cwd, node.path));
-    if (!document2)
-      throw new SignalGrepError("Relationship node is outside this Go view");
-    const start2 = { line: node.start.line - 1, character: node.start.column - 1 };
-    const end = {
-      line: (node.end?.line ?? node.start.line) - 1,
-      character: (node.end?.column ?? node.start.column) - 1
-    };
-    return {
-      id: node.identity.localKey,
-      path: document2.path,
-      uri: "",
-      range: { start: start2, end },
-      selectionRange: { start: start2, end },
-      name: node.name
-    };
-  }
-  assertOpen() {
-    if (this.#closed)
-      throw new SignalGrepError("Go relationship view is closed");
-  }
-}
-var goSemanticProvider = {
-  providerId: GO_SEMANTIC_PROVIDER_ID,
-  async open(options) {
-    const releaseQueue = await providerQueue.acquire(options.signal);
-    try {
-      const files = await listWorkspaceFiles(options.cwd, options.signal, {
-        path: options.scope.root,
-        glob: [...options.scope.include ?? []],
-        exclude: [...options.scope.exclude ?? []],
-        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
-        ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
-      });
-      const documents = new Map;
-      const reasons = [...files.reasons];
-      let initialCoveragePartial = files.partial;
-      for (const path of files.paths.filter(isAdmittedGoFile)) {
-        if (options.signal.aborted)
-          throw abortError();
-        try {
-          const document2 = await options.source.load(path);
-          if (!document2.utf8) {
-            reasons.push(`${path}: source is not lossless UTF-8`);
-            initialCoveragePartial = true;
-            continue;
-          }
-          documents.set(resolve25(options.cwd, path), document2);
-        } catch (error) {
-          reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
-          initialCoveragePartial = true;
-        }
-      }
-      if (documents.size === 0)
-        throw new SignalGrepError("Go semantic provider found no admitted Go source");
-      const executable = executablePath2();
-      const deadline = new AbortController;
-      const signal = AbortSignal.any([options.signal, deadline.signal]);
-      const timer = setTimeout(() => deadline.abort(), GO_SEMANTIC_QUERY_TIMEOUT_MS);
-      let owned;
-      try {
-        owned = await openOwnedJsonRpc({
-          executable,
-          args: ["serve"],
-          cwd: resolve25(options.cwd, options.scope.root),
-          signal,
-          env: environment(executable)
-        }, (method, params) => {
-          if (method === "workspace/configuration") {
-            if (!rpcRecord(params) || !Array.isArray(params.items))
-              throw new SignalGrepError("Invalid gopls configuration request");
-            return params.items.map(() => ({}));
-          }
-          if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
-            return null;
-          if (method === "workspace/applyEdit")
-            return { applied: false, failureReason: "Relationship search is read-only" };
-          throw new SignalGrepError(`Unsupported gopls client request: ${method}`);
-        });
-        const initialize = await owned.channel.request("initialize", {
-          processId: process.pid,
-          rootUri: await semanticUri(options.cwd, options.scope.root),
-          workspaceFolders: [
-            { uri: await semanticUri(options.cwd, options.scope.root), name: options.scope.root }
-          ],
-          capabilities: {
-            workspace: { workspaceFolders: true, configuration: true },
-            textDocument: {
-              definition: { linkSupport: true },
-              references: {},
-              implementation: { linkSupport: true },
-              callHierarchy: {}
-            },
-            general: { positionEncodings: ["utf-16"] }
-          },
-          initializationOptions: {}
-        });
-        if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || !("capabilities" in initialize))
-          throw new SignalGrepError("gopls initialize omitted capabilities");
-        await owned.channel.notify("initialized", {});
-        for (const document2 of documents.values()) {
-          if (!goTextDocument.test(document2.path))
-            continue;
-          const uri = await semanticUri(options.cwd, document2.path);
-          await owned.channel.notify("textDocument/didOpen", {
-            textDocument: {
-              uri,
-              languageId: languageId2(document2.path),
-              version: 1,
-              text: document2.text
-            }
-          });
-        }
-        const inventory = new Set(files.paths.filter(isAdmittedGoFile));
-        return new GoRelationshipView(options, owned.channel, owned.completion, documents, reasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, () => clearTimeout(timer));
-      } catch (error) {
-        deadline.abort();
-        clearTimeout(timer);
-        releaseQueue();
-        if (owned) {
-          owned.channel.close();
-          await owned.completion.catch(() => {
-            return;
-          });
-        }
-        throw error;
-      }
-    } catch (error) {
-      releaseQueue();
-      throw error;
-    }
-  }
-};
-
 // src/relationship-types.ts
 function relationshipNodeKey(node) {
   const identity = node.identity;
@@ -10734,6 +10165,12 @@ var DEFAULT_RELATIONSHIP_TRACE_BUDGET = {
   maxNodes: 200,
   maxEdges: 400,
   maxExpansions: 200
+};
+var RELATIONSHIP_TRACE_LIMITS = {
+  maxDepth: { minimum: 1, maximum: 8 },
+  maxNodes: { minimum: 1, maximum: 2000 },
+  maxEdges: { minimum: 1, maximum: 4000 },
+  maxExpansions: { minimum: 1, maximum: 2000 }
 };
 function validateBudget(budget) {
   for (const [name2, value] of Object.entries(budget)) {
@@ -10881,7 +10318,7 @@ class RelationshipExplorer {
 }
 
 // src/relationship-store.ts
-import { randomUUID as randomUUID5 } from "crypto";
+import { randomUUID as randomUUID4 } from "crypto";
 var PAGE_SIZE = 30;
 var DEFAULT_TTL_MS = 60000;
 var DEFAULT_MAX_ENTRIES = 32;
@@ -10997,7 +10434,7 @@ class RelationshipStore {
     if (bytes > this.#maxBytes)
       throw new SignalGrepError("Relationship snapshot exceeds the storage byte limit");
     this.#expire();
-    const id = randomUUID5();
+    const id = randomUUID4();
     const entry = {
       id,
       factory,
@@ -11214,10 +10651,839 @@ class RelationshipStore {
   }
 }
 
+// src/go-semantic-provider.ts
+import { createHash as createHash5, randomUUID as randomUUID5 } from "crypto";
+import { delimiter, dirname as dirname7, isAbsolute as isAbsolute6, resolve as resolve24 } from "path";
+import { fileURLToPath as fileURLToPath4 } from "url";
+var GO_SEMANTIC_QUERY_TIMEOUT_MS = 20000;
+var GO_SEMANTIC_PROVIDER_ID = "gopls";
+var goSource = /\.go$/i;
+var goManifest = /(?:^|\/)(?:go\.mod|go\.work|go\.sum)$/i;
+var goTextDocument = /(?:\.go|(?:^|\/)(?:go\.mod|go\.work))$/i;
+var GO_ENVIRONMENT_PATH = "go:environment";
+var GO_INVENTORY_PATH = "go:inventory";
+var GO_ENVIRONMENT_KEYS = [
+  "GO111MODULE",
+  "GOOS",
+  "GOARCH",
+  "GOARM",
+  "GO386",
+  "GOEXPERIMENT",
+  "CGO_ENABLED",
+  "GOFLAGS",
+  "GOMOD",
+  "GOWORK",
+  "GOWASM",
+  "GOMODCACHE",
+  "GOPRIVATE",
+  "GONOPROXY",
+  "GONOSUMDB",
+  "PATH"
+];
+var providerQueue = new OwnedTaskQueue;
+function executablePath2() {
+  const configured = process.env.BAOER_SIGNAL_GREP_GOPLS_PATH?.trim();
+  if (!configured)
+    return "gopls";
+  if (!isAbsolute6(configured))
+    throw new SignalGrepError("BAOER_SIGNAL_GREP_GOPLS_PATH must be an absolute executable path");
+  return configured;
+}
+function environment(executable) {
+  const path = process.env.PATH ?? "";
+  const executableDirectory = isAbsolute6(executable) ? dirname7(executable) : undefined;
+  const configuredFlags = process.env.GOFLAGS?.trim() ?? "";
+  const modFlag = configuredFlags.match(/(?:^|\s)-mod=(\S+)/)?.[1];
+  if (modFlag !== undefined && modFlag !== "readonly")
+    throw new SignalGrepError(`GOFLAGS requests -mod=${modFlag}; Go relationship search requires -mod=readonly`);
+  return {
+    ...process.env,
+    ...executableDirectory ? { PATH: `${executableDirectory}${delimiter}${path}` } : {},
+    GOTOOLCHAIN: "local",
+    GOPROXY: "off",
+    GOSUMDB: "off",
+    GOFLAGS: configuredFlags ? `${configuredFlags} -mod=readonly` : "-mod=readonly"
+  };
+}
+function configurationFingerprint(executable) {
+  const values = {
+    executable,
+    GOTOOLCHAIN: "local",
+    GOPROXY: "off",
+    GOSUMDB: "off"
+  };
+  for (const key of GO_ENVIRONMENT_KEYS)
+    values[key] = process.env[key] ?? "";
+  return createHash5("sha256").update(JSON.stringify(values)).digest("hex");
+}
+function isAdmittedGoFile(path) {
+  return goSource.test(path) || goManifest.test(path);
+}
+function documentRole(path) {
+  return goManifest.test(path) ? "manifest" : "source";
+}
+function languageId2(path) {
+  return goSource.test(path) ? "go" : "go.mod";
+}
+function fileUri(value) {
+  if (typeof value !== "string" || !value.startsWith("file:"))
+    throw new SignalGrepError("gopls returned a non-file URI");
+  return value;
+}
+function uriPath(uri) {
+  try {
+    return fileURLToPath4(uri);
+  } catch (error) {
+    throw new SignalGrepError("gopls returned an invalid file URI", { cause: error });
+  }
+}
+function readNode2(value) {
+  if (!rpcRecord(value))
+    throw new SignalGrepError("gopls returned an invalid navigation item");
+  const record = value;
+  const uri = fileUri(record.uri ?? record.targetUri);
+  const range = lspRange(record.range ?? record.targetRange ?? record.selectionRange);
+  const selectionRange = lspRange(record.selectionRange ?? record.targetSelectionRange ?? range);
+  return {
+    id: `${uri}:${String(selectionRange.start.line)}:${String(selectionRange.start.character)}:${String(selectionRange.end.line)}:${String(selectionRange.end.character)}`,
+    path: uriPath(uri),
+    uri,
+    range,
+    selectionRange,
+    ...typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {},
+    ...typeof record.kind === "number" && Number.isSafeInteger(record.kind) ? { kind: record.kind } : {}
+  };
+}
+function readLocations(value) {
+  if (value === null)
+    return [];
+  return (Array.isArray(value) ? value : [value]).map((item) => readNode2(item));
+}
+function readCallRanges(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.map((range) => lspRange(range));
+}
+function positionOf(node) {
+  return node.selectionRange.start;
+}
+function sourceLocation(document2, range) {
+  return {
+    path: document2.path,
+    range: byteRange(document2, range),
+    start: { line: range.start.line + 1, column: range.start.character + 1 },
+    end: { line: range.end.line + 1, column: range.end.character + 1 },
+    source: document2.reference
+  };
+}
+function symbolPosition(document2, value, name2) {
+  if (value.selectionRange !== undefined)
+    return lspRange(value.selectionRange).start;
+  const location = rpcRecord(value.location) ? value.location : undefined;
+  if (!location || location.range === undefined)
+    return;
+  const range = lspRange(location.range);
+  const bytes = byteRange(document2, range);
+  const offset = document2.slice(bytes).indexOf(name2);
+  if (offset < 0)
+    return;
+  return lspPosition(document2, document2.toCharacterOffset(bytes.start) + offset);
+}
+function documentDependency(document2) {
+  return {
+    path: document2.path,
+    role: documentRole(document2.path),
+    reference: document2.reference,
+    exists: true
+  };
+}
+function environmentDependency(fingerprint) {
+  return { path: GO_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
+}
+function evidence(reason) {
+  return { reason, level: "compiler", basis: "semantic", providerBasis: GO_SEMANTIC_PROVIDER_ID };
+}
+function operationMethod(operation) {
+  switch (operation) {
+    case "definitions":
+      return "textDocument/definition";
+    case "references":
+      return "textDocument/references";
+    case "implementations":
+      return "textDocument/implementation";
+    case "callers":
+    case "callees":
+      return "textDocument/prepareCallHierarchy";
+    default:
+      throw new SignalGrepError("Unsupported Go relationship operation");
+  }
+}
+function relationReason(operation) {
+  if (operation === "callers" || operation === "callees")
+    return "gopls static call hierarchy; dynamic calls are excluded and runtime dispatch is unproven";
+  return "gopls compiler-bound navigation in the active Go build configuration";
+}
+function operationUnresolved(operation, reason) {
+  return { operation, reason, confidence: "unknown" };
+}
+
+class GoRelationshipView {
+  providerId = GO_SEMANTIC_PROVIDER_ID;
+  analysisViewId;
+  sourceScope;
+  #channel;
+  #completion;
+  #cwd;
+  #source;
+  #signal;
+  #configurationFingerprint;
+  #inventory;
+  #documents;
+  #openReasons;
+  #initialCoveragePartial;
+  #nodePaths = new Map;
+  #edgePaths = new Map;
+  #closed = false;
+  #closePromise;
+  constructor(options, channel, completion, documents, openReasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, clearTimeout2) {
+    this.analysisViewId = options.analysisViewId ?? randomUUID5();
+    this.sourceScope = options.scope;
+    this.#cwd = options.cwd;
+    this.#source = options.source;
+    this.#signal = signal;
+    this.#configurationFingerprint = configurationFingerprint(executable);
+    this.#inventory = inventory;
+    this.#channel = channel;
+    this.#completion = completion;
+    this.#documents = documents;
+    this.#openReasons = [...openReasons, `gopls executable: ${executable}`];
+    this.#initialCoveragePartial = initialCoveragePartial;
+    this.#releaseQueue = releaseQueue;
+    this.#clearTimeout = clearTimeout2;
+  }
+  #releaseQueue;
+  #clearTimeout;
+  async resolveNode(input, signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const document2 = this.#documents.get(resolve24(this.#cwd, input.path));
+    if (!document2)
+      return {
+        status: "unsupported",
+        reasons: ["Go target is outside admitted provider source"],
+        dependencies: []
+      };
+    const position = await this.position(document2, input);
+    const params = { textDocument: { uri: await semanticUri(this.#cwd, document2.path) }, position };
+    const prepared = await this.#channel.request("textDocument/prepareCallHierarchy", params);
+    const candidates = Array.isArray(prepared) ? prepared.map(readNode2) : [];
+    if (candidates.length > 1 && input.column === undefined)
+      return {
+        status: "ambiguous",
+        candidates: candidates.map((candidate) => this.node(candidate, document2)),
+        reasons: ["gopls returned multiple call hierarchy items; include a column"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    let selected = candidates[0];
+    if (!selected) {
+      const definitions = readLocations(await this.#channel.request("textDocument/definition", params));
+      selected = definitions[0];
+    }
+    if (!selected)
+      return {
+        status: "unknown",
+        reasons: ["gopls returned no definition or call hierarchy item"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    const target = this.#documents.get(resolve24(this.#cwd, selected.path));
+    if (!target)
+      return {
+        status: "unknown",
+        reasons: ["gopls resolved outside admitted provider source"],
+        dependencies: [
+          documentDependency(document2),
+          environmentDependency(this.#configurationFingerprint)
+        ]
+      };
+    return {
+      status: "resolved",
+      node: this.node(selected, target),
+      reasons: [],
+      dependencies: [
+        documentDependency(document2),
+        documentDependency(target),
+        environmentDependency(this.#configurationFingerprint)
+      ]
+    };
+  }
+  async expand(node, operation, signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const internal = this.internalNode(node);
+    const document2 = this.#documents.get(resolve24(this.#cwd, internal.path));
+    if (!document2)
+      return {
+        edges: [],
+        nodes: [],
+        unresolved: [
+          operationUnresolved(operation, "Node source is outside admitted provider source")
+        ],
+        dependencies: [],
+        coverage: {
+          status: "partial",
+          freshness: "unknown",
+          sources: [],
+          reasons: ["Node source is outside admitted provider source"]
+        }
+      };
+    const params = {
+      textDocument: { uri: await semanticUri(this.#cwd, document2.path) },
+      position: positionOf(internal)
+    };
+    const goEdges = [];
+    const unresolved = [];
+    if (operation === "callers" || operation === "callees") {
+      const prepared = await this.#channel.request(operationMethod(operation), params);
+      if (!Array.isArray(prepared))
+        unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
+      else {
+        for (const item of prepared) {
+          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+          const calls = await this.#channel.request(method, { item });
+          if (!Array.isArray(calls)) {
+            unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
+            continue;
+          }
+          for (const call of calls) {
+            if (!rpcRecord(call)) {
+              unresolved.push(operationUnresolved(operation, "gopls returned an invalid call edge"));
+              continue;
+            }
+            const record = call;
+            try {
+              const endpoint = readNode2(operation === "callers" ? record.from : record.to);
+              const callRanges = readCallRanges(record.fromRanges);
+              goEdges.push({
+                operation,
+                from: operation === "callers" ? endpoint : internal,
+                to: operation === "callers" ? internal : endpoint,
+                ...callRanges ? { callRanges } : {}
+              });
+            } catch (error) {
+              unresolved.push(operationUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
+            }
+          }
+        }
+      }
+    } else {
+      const value = await this.#channel.request(operationMethod(operation), {
+        ...params,
+        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
+      });
+      const candidates = readLocations(value);
+      for (const candidate of candidates)
+        goEdges.push({ operation, from: internal, to: candidate });
+    }
+    const nodes = [];
+    const edges = [];
+    for (const edge of goEdges) {
+      const from = this.convertNode(edge.from, unresolved, operation);
+      const to = this.convertNode(edge.to, unresolved, operation);
+      if (!from || !to)
+        continue;
+      nodes.push(from, to);
+      const callRanges = edge.callRanges?.length ? edge.callRanges : [undefined];
+      for (const [index, range] of callRanges.entries()) {
+        const callSite = range ? this.callSite(edge, range) : undefined;
+        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
+        const edgePaths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
+        this.#edgePaths.set(edgeKey, edgePaths);
+        edges.push({
+          edgeKey,
+          operation,
+          from,
+          to,
+          ...callSite ? { callSite } : {},
+          evidence: [evidence(relationReason(operation))],
+          confidence: "verified-static",
+          dependencies: [...edgePaths].map((path) => documentDependency(this.#documents.get(resolve24(this.#cwd, path)) ?? document2)).concat(environmentDependency(this.#configurationFingerprint))
+        });
+      }
+    }
+    const uniqueNodes = [...new Map(nodes.map((item) => [item.identity.localKey, item])).values()];
+    const reasons = [...this.#openReasons, relationReason(operation)];
+    return {
+      edges,
+      nodes: uniqueNodes,
+      unresolved,
+      dependencies: [
+        documentDependency(document2),
+        environmentDependency(this.#configurationFingerprint)
+      ],
+      coverage: {
+        status: this.#initialCoveragePartial || unresolved.length ? "partial" : "complete",
+        freshness: "current",
+        sources: this.currentSourceStatuses(),
+        reasons: [...new Set(reasons)]
+      }
+    };
+  }
+  async recheck(signal) {
+    this.assertOpen();
+    if (signal?.aborted)
+      throw abortError();
+    const sources = [];
+    const reasons = [];
+    for (const document2 of this.#documents.values()) {
+      try {
+        await this.#source.refresh(document2.path, document2.reference);
+        sources.push(this.sourceStatus(document2, "current"));
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "source recheck failed";
+        sources.push(this.sourceStatus(document2, "stale", reason));
+        reasons.push(`${document2.path}: ${reason}`);
+      }
+    }
+    let configurationReason;
+    let currentConfigurationFingerprint;
+    try {
+      const executable = executablePath2();
+      environment(executable);
+      currentConfigurationFingerprint = configurationFingerprint(executable);
+    } catch (error) {
+      configurationReason = error instanceof Error ? error.message : "Go build configuration is invalid";
+    }
+    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.#configurationFingerprint;
+    sources.push({
+      path: GO_ENVIRONMENT_PATH,
+      role: "config",
+      status: configurationChanged ? "stale" : "current",
+      ...configurationReason ? { reason: configurationReason } : configurationChanged ? { reason: "Go build environment or gopls executable changed during relationship query" } : {}
+    });
+    if (configurationChanged)
+      reasons.push(configurationReason ?? "Go build environment or gopls executable changed during relationship query");
+    const inventory = await listWorkspaceFiles(this.#cwd, this.#signal, {
+      path: this.sourceScope.root,
+      glob: [...this.sourceScope.include ?? []],
+      exclude: [...this.sourceScope.exclude ?? []],
+      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden }
+    });
+    const currentInventory = new Set(inventory.paths.filter(isAdmittedGoFile));
+    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
+    if (inventoryChanged || inventory.partial) {
+      reasons.push(inventoryChanged ? "Go source/config inventory changed during relationship query; retry" : inventory.reasons.join("; "));
+      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
+        sources.push({
+          path,
+          role: documentRole(path),
+          status: "stale",
+          reason: "source removed during query"
+        });
+      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
+        sources.push({
+          path,
+          role: documentRole(path),
+          status: "stale",
+          reason: "source added during query; retry"
+        });
+      if (inventory.partial)
+        sources.push({
+          path: GO_INVENTORY_PATH,
+          role: "metadata",
+          status: "unknown",
+          reason: inventory.reasons.join("; ") || "Go source/config inventory is incomplete"
+        });
+    }
+    const stalePaths = new Set(sources.filter((source) => source.status === "stale").map((source) => source.path));
+    const inventoryUnknown = sources.some((source) => source.path === GO_INVENTORY_PATH && source.status === "unknown");
+    const sourceUnknown = sources.some((source) => source.status === "unknown");
+    const configurationStale = sources.some((source) => source.path === GO_ENVIRONMENT_PATH && source.status !== "current");
+    return {
+      validity: stalePaths.size ? "stale" : sourceUnknown ? "unknown" : "current",
+      coverage: this.#initialCoveragePartial || stalePaths.size || sourceUnknown ? "partial" : "complete",
+      sources,
+      affectedNodeKeys: configurationStale || inventoryUnknown ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => sources.some((source) => source.path === path && source.status !== "current")).map(([key]) => key),
+      affectedEdgeKeys: configurationStale || inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([key]) => key),
+      reasons: [...new Set(reasons)]
+    };
+  }
+  close() {
+    if (!this.#closePromise)
+      this.#closePromise = this.closeOnce();
+    return this.#closePromise;
+  }
+  async closeOnce() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    try {
+      await this.#channel.request("shutdown", undefined);
+      this.#channel.endInput();
+      const result = await this.#completion;
+      if (result.code !== 0)
+        throw new SignalGrepError(`gopls process failed (${String(result.code)}): ${result.stderr}`);
+    } catch (error) {
+      this.#channel.close();
+      await this.#completion.catch(() => {
+        return;
+      });
+      throw error;
+    } finally {
+      this.#clearTimeout();
+      this.#releaseQueue();
+    }
+  }
+  async position(document2, input) {
+    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
+      throw new SignalGrepError("Go semantic target line must be one-based");
+    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
+      throw new SignalGrepError("Go semantic target column must be one-based");
+    if (input.column !== undefined) {
+      if (input.line === undefined)
+        throw new SignalGrepError("Go semantic column requires a line");
+      return { line: input.line - 1, character: input.column - 1 };
+    }
+    if (!input.symbol)
+      throw new SignalGrepError("Go semantic target requires a column or symbol");
+    const symbolName = input.symbol;
+    const symbols = await this.#channel.request("textDocument/documentSymbol", {
+      textDocument: { uri: await semanticUri(this.#cwd, document2.path) }
+    });
+    const found = [];
+    const visit = (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        return;
+      if (!rpcRecord(value))
+        return;
+      const record = value;
+      const position = symbolPosition(document2, record, symbolName);
+      if (record.name === symbolName && position) {
+        if (input.line === undefined || position.line + 1 === input.line)
+          found.push(position);
+      }
+      if (Array.isArray(record.children))
+        for (const child of record.children)
+          visit(child);
+    };
+    if (Array.isArray(symbols))
+      for (const symbol of symbols)
+        visit(symbol);
+    if (found.length !== 1)
+      throw new SignalGrepError(found.length ? "Go semantic target symbol is ambiguous" : "Go semantic target symbol is absent");
+    const position = found[0];
+    if (!position)
+      throw new SignalGrepError("Go semantic target symbol is absent");
+    return position;
+  }
+  node(internal, document2) {
+    const range = byteRange(document2, internal.range);
+    const selection = byteRange(document2, internal.selectionRange);
+    const localKey = `${document2.path}:${String(selection.start)}:${String(selection.end)}`;
+    this.#nodePaths.set(localKey, document2.path);
+    return {
+      identity: {
+        providerId: GO_SEMANTIC_PROVIDER_ID,
+        analysisViewId: this.analysisViewId,
+        sourceScope: this.sourceScope.root,
+        localKey
+      },
+      path: document2.path,
+      name: internal.name ?? document2.path,
+      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
+      range,
+      start: {
+        line: internal.selectionRange.start.line + 1,
+        column: internal.selectionRange.start.character + 1
+      },
+      end: {
+        line: internal.selectionRange.end.line + 1,
+        column: internal.selectionRange.end.character + 1
+      },
+      source: document2.reference,
+      evidence: [evidence("gopls compiler-bound Go navigation result")]
+    };
+  }
+  convertNode(internal, unresolved, operation) {
+    const document2 = this.#documents.get(resolve24(this.#cwd, internal.path));
+    if (!document2) {
+      unresolved.push(operationUnresolved(operation, "gopls result is outside admitted Go source"));
+      return;
+    }
+    return this.node(internal, document2);
+  }
+  callSite(edge, range) {
+    const document2 = this.#documents.get(resolve24(this.#cwd, edge.from.path));
+    return document2 ? sourceLocation(document2, range) : undefined;
+  }
+  sourceStatus(document2, status, reason) {
+    return {
+      path: document2.path,
+      role: documentRole(document2.path),
+      status,
+      expected: document2.reference,
+      ...reason ? { reason } : {}
+    };
+  }
+  currentSourceStatuses() {
+    return [
+      ...[...this.#documents.values()].map((document2) => this.sourceStatus(document2, "current")),
+      { path: GO_ENVIRONMENT_PATH, role: "config", status: "current" }
+    ];
+  }
+  internalNode(node) {
+    const document2 = this.#documents.get(resolve24(this.#cwd, node.path));
+    if (!document2)
+      throw new SignalGrepError("Relationship node is outside this Go view");
+    const start2 = { line: node.start.line - 1, character: node.start.column - 1 };
+    const end = {
+      line: (node.end?.line ?? node.start.line) - 1,
+      character: (node.end?.column ?? node.start.column) - 1
+    };
+    return {
+      id: node.identity.localKey,
+      path: document2.path,
+      uri: "",
+      range: { start: start2, end },
+      selectionRange: { start: start2, end },
+      name: node.name
+    };
+  }
+  assertOpen() {
+    if (this.#closed)
+      throw new SignalGrepError("Go relationship view is closed");
+  }
+}
+var goSemanticProvider = {
+  providerId: GO_SEMANTIC_PROVIDER_ID,
+  async open(options) {
+    const releaseQueue = await providerQueue.acquire(options.signal);
+    try {
+      const files = await listWorkspaceFiles(options.cwd, options.signal, {
+        path: options.scope.root,
+        glob: [...options.scope.include ?? []],
+        exclude: [...options.scope.exclude ?? []],
+        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
+        ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
+      });
+      const documents = new Map;
+      const reasons = [...files.reasons];
+      let initialCoveragePartial = files.partial;
+      for (const path of files.paths.filter(isAdmittedGoFile)) {
+        if (options.signal.aborted)
+          throw abortError();
+        try {
+          const document2 = await options.source.load(path);
+          if (!document2.utf8) {
+            reasons.push(`${path}: source is not lossless UTF-8`);
+            initialCoveragePartial = true;
+            continue;
+          }
+          documents.set(resolve24(options.cwd, path), document2);
+        } catch (error) {
+          reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
+          initialCoveragePartial = true;
+        }
+      }
+      if (documents.size === 0)
+        throw new SignalGrepError("Go semantic provider found no admitted Go source");
+      const executable = executablePath2();
+      const deadline = new AbortController;
+      const signal = AbortSignal.any([options.signal, deadline.signal]);
+      const timer = setTimeout(() => deadline.abort(), GO_SEMANTIC_QUERY_TIMEOUT_MS);
+      let owned;
+      try {
+        owned = await openOwnedJsonRpc({
+          executable,
+          args: ["serve"],
+          cwd: resolve24(options.cwd, options.scope.root),
+          signal,
+          env: environment(executable)
+        }, (method, params) => {
+          if (method === "workspace/configuration") {
+            if (!rpcRecord(params) || !Array.isArray(params.items))
+              throw new SignalGrepError("Invalid gopls configuration request");
+            return params.items.map(() => ({}));
+          }
+          if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
+            return null;
+          if (method === "workspace/applyEdit")
+            return { applied: false, failureReason: "Relationship search is read-only" };
+          throw new SignalGrepError(`Unsupported gopls client request: ${method}`);
+        });
+        const initialize = await owned.channel.request("initialize", {
+          processId: process.pid,
+          rootUri: await semanticUri(options.cwd, options.scope.root),
+          workspaceFolders: [
+            { uri: await semanticUri(options.cwd, options.scope.root), name: options.scope.root }
+          ],
+          capabilities: {
+            workspace: { workspaceFolders: true, configuration: true },
+            textDocument: {
+              definition: { linkSupport: true },
+              references: {},
+              implementation: { linkSupport: true },
+              callHierarchy: {}
+            },
+            general: { positionEncodings: ["utf-16"] }
+          },
+          initializationOptions: {}
+        });
+        if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || !("capabilities" in initialize))
+          throw new SignalGrepError("gopls initialize omitted capabilities");
+        await owned.channel.notify("initialized", {});
+        for (const document2 of documents.values()) {
+          if (!goTextDocument.test(document2.path))
+            continue;
+          const uri = await semanticUri(options.cwd, document2.path);
+          await owned.channel.notify("textDocument/didOpen", {
+            textDocument: {
+              uri,
+              languageId: languageId2(document2.path),
+              version: 1,
+              text: document2.text
+            }
+          });
+        }
+        const inventory = new Set(files.paths.filter(isAdmittedGoFile));
+        return new GoRelationshipView(options, owned.channel, owned.completion, documents, reasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, () => clearTimeout(timer));
+      } catch (error) {
+        deadline.abort();
+        clearTimeout(timer);
+        releaseQueue();
+        if (owned) {
+          owned.channel.close();
+          await owned.completion.catch(() => {
+            return;
+          });
+        }
+        throw error;
+      }
+    } catch (error) {
+      releaseQueue();
+      throw error;
+    }
+  }
+};
+
 // src/typescript-relationship-provider.ts
 import { randomUUID as randomUUID6 } from "crypto";
 import { resolve as resolve26 } from "path";
 import { pathToFileURL as pathToFileURL2 } from "url";
+
+// src/semantic-project.ts
+import { resolve as resolve25 } from "path";
+import { stat as stat4 } from "fs/promises";
+var semanticMetadataPath = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|package\.json)$/;
+function semanticWorkspacePaths(files) {
+  return files.paths.filter((path) => {
+    const language = syntaxLanguage(path);
+    return language !== undefined && language !== "go" || semanticMetadataPath.test(path);
+  }).toSorted((left, right) => left.localeCompare(right));
+}
+async function semanticProject(access, targetPath, allowDirectoryTarget = false, filters = {}) {
+  let requestedTarget = targetPath;
+  if (allowDirectoryTarget) {
+    try {
+      if ((await stat4(resolve25(access.cwd, targetPath))).isDirectory())
+        requestedTarget = resolve25(targetPath, "__relationship_target__.ts");
+    } catch {}
+  }
+  const root = await resolveSemanticProjectRoot(access.cwd, requestedTarget, access.signal);
+  const workspaceFilters = {
+    ...filters.glob === undefined ? {} : { glob: [...filters.glob] },
+    ...filters.exclude === undefined ? {} : { exclude: [...filters.exclude] },
+    ...filters.hidden === undefined ? {} : { hidden: filters.hidden }
+  };
+  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+    path: root,
+    ...workspaceFilters
+  });
+  const trackedPaths = semanticWorkspacePaths(files);
+  const paths = files.paths.filter((path) => {
+    const language = syntaxLanguage(path);
+    return language && language !== "go";
+  });
+  const metadataPaths = files.paths.filter((path) => semanticMetadataPath.test(path));
+  let target = resolve25(access.cwd, targetPath);
+  if (allowDirectoryTarget) {
+    try {
+      if ((await stat4(target)).isDirectory()) {
+        const first = paths.find((path) => resolve25(access.cwd, path).startsWith(`${target}/`));
+        if (first)
+          target = resolve25(access.cwd, first);
+      }
+    } catch {}
+  }
+  if (!paths.some((path) => resolve25(access.cwd, path) === target))
+    throw new SignalGrepError("Semantic target must be an admitted JS/TS workspace file under current ignore rules");
+  paths.sort((a, b) => Number(resolve25(access.cwd, b) === target) - Number(resolve25(access.cwd, a) === target) || a.localeCompare(b));
+  const documents = new Map;
+  const reasons = [...files.reasons];
+  const metadata2 = [];
+  for (const path of [...paths, ...metadataPaths]) {
+    try {
+      const document2 = await access.load(path);
+      if (!document2.utf8)
+        throw new SourceDocumentError("encoding", `Non-UTF-8 semantic source: ${path}`);
+      if (paths.includes(path))
+        documents.set(resolve25(access.cwd, path), document2);
+      else
+        metadata2.push(document2);
+    } catch (error) {
+      if (error instanceof SourceBudgetError) {
+        reasons.push(error.message);
+        break;
+      }
+      if (!(error instanceof SourceDocumentError))
+        throw error;
+      reasons.push(`${path}: ${error.message}`);
+    }
+  }
+  const primary = documents.get(target);
+  if (!primary)
+    throw new SignalGrepError("Semantic target could not be read within the source budget");
+  const recheckInventory = async () => {
+    const after = await listWorkspaceFiles(access.cwd, access.signal, {
+      path: root,
+      ...workspaceFilters
+    });
+    if (JSON.stringify(semanticWorkspacePaths(after)) !== JSON.stringify(trackedPaths))
+      throw new SignalGrepError("Workspace file set changed during semantic query; retry");
+  };
+  const recheck = async () => {
+    for (const document2 of [...documents.values(), ...metadata2]) {
+      if (document2.reference.origin.kind !== "worktree")
+        throw new Error("Expected worktree semantic source");
+      await access.refresh(document2.path, document2.reference);
+    }
+    await recheckInventory();
+  };
+  const result = {
+    kind: "references",
+    unit: "relationships",
+    items: [],
+    partial: reasons.length > 0,
+    reasons,
+    filesRead: access.filesRead,
+    bytesRead: access.bytesRead,
+    coverage: {
+      admittedSources: reasons.length ? "partial" : "complete",
+      runtimeDispatch: "not-applicable"
+    },
+    stats: { filesEnumerated: paths.length, filesSkipped: paths.length - documents.size }
+  };
+  return { documents, metadata: metadata2, primary, result, recheck, recheckInventory, root, trackedPaths };
+}
+
+// src/typescript-relationship-provider.ts
 var TYPESCRIPT_PROVIDER_ID = "typescript";
 function record2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : undefined;
@@ -11295,6 +11561,8 @@ function currentStatuses(dependenciesList, status, reason) {
   }));
 }
 function inputPosition(document2, input) {
+  if (input.line === undefined)
+    throw new SignalGrepError("Semantic symbol selection requires an exact line or column");
   if (!Number.isSafeInteger(input.line) || input.line < 1)
     throw new SignalGrepError("Semantic line must be a positive integer");
   const line = document2.lineRange(input.line);
@@ -11307,12 +11575,12 @@ function inputPosition(document2, input) {
   return position;
 }
 function candidatesFor(document2, syntax, input) {
-  const character = inputPosition(document2, input);
+  const character = input.line === undefined ? undefined : inputPosition(document2, input);
   return syntax.symbols.filter((candidate) => {
     const line = document2.lineAt(document2.toByteOffset(candidate.start));
     const bySymbol = input.symbol === undefined || candidate.name === input.symbol;
     const byLine = input.line === undefined || line === input.line;
-    const byCharacter = input.column === undefined || candidate.start <= character && character <= candidate.end;
+    const byCharacter = input.column === undefined || character !== undefined && candidate.start <= character && character <= candidate.end;
     return bySymbol && byLine && byCharacter && candidate.hasBody;
   });
 }
@@ -11688,11 +11956,2107 @@ function createTypeScriptRelationshipProvider(access) {
   };
 }
 
+// src/swift-relationship-provider.ts
+import { randomUUID as randomUUID7 } from "crypto";
+import { resolve as resolve30 } from "path";
+
+// src/swift-source-context.ts
+import { realpathSync } from "fs";
+import { resolve as resolve28 } from "path";
+
+// src/swift-sourcekit-protocol.ts
+import { createHash as createHash6 } from "crypto";
+import { readFile as readFile3 } from "fs/promises";
+import { isAbsolute as isAbsolute7, resolve as resolve27 } from "path";
+import { fileURLToPath as fileURLToPath5, pathToFileURL as pathToFileURL3 } from "url";
+var SWIFT_SEMANTIC_PROVIDER_ID = "sourcekit-lsp-swift";
+var SWIFT_SEMANTIC_QUERY_TIMEOUT_MS = 60000;
+var SWIFT_TOOLCHAIN_PATH = "swift:sourcekit-lsp";
+var swiftSource = /\.swift$/iu;
+function executablePath3() {
+  const configured = process.env.BAOER_SIGNAL_GREP_SOURCEKIT_LSP_PATH?.trim();
+  if (!configured)
+    return "sourcekit-lsp";
+  if (!isAbsolute7(configured))
+    throw new SignalGrepError("BAOER_SIGNAL_GREP_SOURCEKIT_LSP_PATH must be absolute");
+  return configured;
+}
+function sourcePath(uri) {
+  if (typeof uri !== "string" || !uri.startsWith("file:"))
+    throw new SignalGrepError("SourceKit-LSP returned a non-file URI");
+  try {
+    return fileURLToPath5(uri);
+  } catch (error) {
+    throw new SignalGrepError("SourceKit-LSP returned an invalid file URI", { cause: error });
+  }
+}
+function sourceUri(cwd, path) {
+  return pathToFileURL3(resolve27(cwd, path)).href;
+}
+function sourceDocumentDependency(document2) {
+  return { path: document2.path, role: "source", reference: document2.reference, exists: true };
+}
+function toolchainDependency(fingerprint) {
+  return { path: SWIFT_TOOLCHAIN_PATH, role: "config", fingerprint, exists: true };
+}
+function sourceLocation2(document2, range) {
+  const rangeBytes = byteRange(document2, range);
+  return {
+    path: document2.path,
+    range: rangeBytes,
+    start: document2.positionAt(rangeBytes.start),
+    end: document2.positionAt(rangeBytes.end),
+    source: document2.reference
+  };
+}
+function evidence2(reason) {
+  return {
+    reason,
+    level: "compiler",
+    basis: "semantic",
+    providerBasis: SWIFT_SEMANTIC_PROVIDER_ID
+  };
+}
+function operationMethod3(operation) {
+  switch (operation) {
+    case "definitions":
+      return "textDocument/definition";
+    case "references":
+      return "textDocument/references";
+    case "implementations":
+      return "textDocument/implementation";
+    default:
+      throw new SignalGrepError("Unsupported Swift LSP operation: " + operation);
+  }
+}
+function relationReason2(operation) {
+  if (operation === "callers" || operation === "callees")
+    return "SourceKit-LSP indexed call hierarchy; dynamic dispatch is not runtime proof";
+  return "SourceKit-LSP compiler-bound " + operation + " result";
+}
+function operationUnresolved2(operation, reason) {
+  return { operation, reason, confidence: "unknown" };
+}
+function recordString(value, key) {
+  return rpcRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
+}
+function recordNumber(value, key) {
+  return rpcRecord(value) && typeof value[key] === "number" && Number.isSafeInteger(value[key]) ? value[key] : undefined;
+}
+function readSwiftNode(value) {
+  if (!rpcRecord(value))
+    throw new SignalGrepError("Invalid SourceKit-LSP navigation item");
+  const uri = recordString(value, "uri") ?? recordString(value, "targetUri");
+  if (!uri)
+    throw new SignalGrepError("SourceKit-LSP navigation item has no URI");
+  const range = lspRange(value.range ?? value.targetRange ?? value.selectionRange);
+  const selectionRange = lspRange(value.selectionRange ?? value.targetSelectionRange ?? range);
+  const name2 = recordString(value, "name");
+  const kind = recordNumber(value, "kind");
+  return {
+    id: uri + ":" + String(selectionRange.start.line) + ":" + String(selectionRange.start.character) + ":" + String(selectionRange.end.line) + ":" + String(selectionRange.end.character),
+    path: sourcePath(uri),
+    uri,
+    range,
+    selectionRange,
+    ...name2 ? { name: name2 } : {},
+    ...kind === undefined ? {} : { kind }
+  };
+}
+function readLocations2(value) {
+  if (value === null)
+    return [];
+  return (Array.isArray(value) ? value : [value]).map(readSwiftNode);
+}
+function readCallRanges2(value) {
+  if (!Array.isArray(value))
+    return;
+  return value.map((range) => lspRange(range));
+}
+function readOutlineItem(value) {
+  if (!rpcRecord(value) || typeof value.name !== "string")
+    throw new SignalGrepError("Invalid SourceKit-LSP document symbol");
+  const range = lspRange(value.range);
+  const selectionRange = lspRange(value.selectionRange ?? value.range);
+  const kind = recordNumber(value, "kind");
+  if (kind === undefined)
+    throw new SignalGrepError("SourceKit-LSP document symbol has no kind");
+  const children = value.children ?? [];
+  if (!Array.isArray(children))
+    throw new SignalGrepError("Invalid SourceKit-LSP document symbol children");
+  return { name: value.name, kind, range, selectionRange, children: children.map(readOutlineItem) };
+}
+function readSwiftOutline(value) {
+  if (!Array.isArray(value))
+    throw new SignalGrepError("Invalid SourceKit-LSP document symbols");
+  return value.map(readOutlineItem);
+}
+function readCapabilities(value) {
+  if (!rpcRecord(value) || !rpcRecord(value.capabilities))
+    throw new SignalGrepError("SourceKit-LSP initialize response has no capabilities");
+  const capabilities = value.capabilities;
+  const has = (key) => capabilities[key] !== undefined && capabilities[key] !== false;
+  const advertised = [];
+  if (has("definitionProvider"))
+    advertised.push("definitions");
+  if (has("referencesProvider"))
+    advertised.push("references");
+  if (has("implementationProvider"))
+    advertised.push("implementations");
+  if (has("callHierarchyProvider"))
+    advertised.push("callers", "callees");
+  const experimental = rpcRecord(capabilities.experimental) ? Object.keys(capabilities.experimental).toSorted() : [];
+  const reasons = [];
+  if (advertised.some((operation) => ["references", "callers", "callees"].includes(operation)))
+    reasons.push("Index-backed operations require workspace synchronize(index=true)");
+  return {
+    outline: has("documentSymbolProvider"),
+    advertised: [...new Set(advertised)],
+    experimental,
+    indexBarrier: "unknown",
+    reasons
+  };
+}
+function configurationFingerprint2(executable, workspaceFingerprint) {
+  return createHash6("sha256").update(JSON.stringify({
+    executable,
+    backgroundIndexing: "request-dependent",
+    swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] },
+    workspaceFingerprint
+  })).digest("hex");
+}
+async function readSwiftWorkspaceConfiguration(cwd, root) {
+  const path = resolve27(cwd, root, ".sourcekit-lsp", "config.json");
+  let text;
+  try {
+    text = await readFile3(path, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {
+        path,
+        fingerprint: "absent",
+        initializationOptions: {
+          backgroundIndexing: false,
+          swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] }
+        }
+      };
+    }
+    throw new SignalGrepError("Unable to read the Swift workspace SourceKit-LSP configuration", {
+      cause: error
+    });
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration is not valid JSON", {
+      cause: error
+    });
+  }
+  if (!rpcRecord(value))
+    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration must be an object");
+  const swiftPM = rpcRecord(value.swiftPM) ? value.swiftPM : undefined;
+  if (value.backgroundIndexing === true)
+    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration enables backgroundIndexing; relationship indexing requires explicit preparation");
+  if (swiftPM?.forceResolvedVersions === false)
+    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration disables forceResolvedVersions; dependency resolution is not locked");
+  if (swiftPM?.extraArguments !== undefined) {
+    if (!Array.isArray(swiftPM.extraArguments) || !swiftPM.extraArguments.every((item) => typeof item === "string") || !swiftPM.extraArguments.includes("--skip-update"))
+      throw new SignalGrepError("Swift workspace SourceKit-LSP extraArguments must include --skip-update");
+  }
+  return {
+    path,
+    fingerprint: createHash6("sha256").update(text).digest("hex"),
+    initializationOptions: {
+      backgroundIndexing: false,
+      swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] }
+    }
+  };
+}
+function isAdmittedSwiftFile(path) {
+  return swiftSource.test(path);
+}
+function documentRole2(path) {
+  return /(?:^|\/)Package\.swift$/iu.test(path) ? "manifest" : "source";
+}
+function sourceStatus(document2, status, reason) {
+  return {
+    path: document2.path,
+    role: documentRole2(document2.path),
+    status,
+    expected: document2.reference,
+    ...reason ? { reason } : {}
+  };
+}
+function currentSourceStatuses(documents, fingerprint) {
+  return [
+    ...[...documents].map((document2) => sourceStatus(document2, "current")),
+    { path: SWIFT_TOOLCHAIN_PATH, role: "config", status: "current", reason: fingerprint }
+  ];
+}
+function positionOf2(node) {
+  return node.selectionRange.start;
+}
+function sourceKitRequestCapabilities() {
+  return {
+    general: { positionEncodings: ["utf-16"] },
+    workspace: { workspaceFolders: true, configuration: true },
+    textDocument: {
+      definition: { linkSupport: true },
+      references: {},
+      implementation: { linkSupport: true },
+      documentSymbol: {},
+      callHierarchy: {}
+    },
+    experimental: {
+      "sourcekit/isIndexing": { supported: true },
+      "sourceKit/_isIndexing": { supported: true },
+      "sourcekit/workspace/synchronize": { supported: true },
+      "workspace/synchronize": { supported: true },
+      "sourcekit/workspace/triggerReindex": { supported: true },
+      "workspace/triggerReindex": { supported: true }
+    }
+  };
+}
+function isIndexBacked(operation) {
+  return operation === "references" || operation === "callers" || operation === "callees";
+}
+
+// src/swift-source-context.ts
+function isRecoverableSourceReadFailure(error) {
+  return error instanceof SourceDocumentError || error instanceof SourceBudgetError;
+}
+
+class SwiftSourceContext {
+  cwd;
+  scope;
+  signal;
+  source;
+  documents;
+  inventory;
+  initialReasons;
+  initialCoveragePartial;
+  configurationFingerprint;
+  workspaceConfiguration;
+  constructor(options) {
+    this.cwd = options.cwd;
+    this.scope = options.scope;
+    this.signal = options.signal;
+    this.source = options.source;
+    this.documents = options.documents;
+    this.inventory = options.inventory;
+    this.initialReasons = options.initialReasons;
+    this.initialCoveragePartial = options.initialCoveragePartial;
+    this.workspaceConfiguration = options.workspaceConfiguration;
+    this.configurationFingerprint = configurationFingerprint2(executablePath3(), options.workspaceConfiguration.fingerprint);
+  }
+  static async open(options) {
+    const files = await listWorkspaceFiles(options.cwd, options.signal, {
+      path: options.scope.root,
+      glob: [...options.scope.include ?? []],
+      exclude: [...options.scope.exclude ?? []],
+      ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
+      ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
+    });
+    const workspaceConfiguration = await readSwiftWorkspaceConfiguration(options.cwd, options.scope.root);
+    const documents = new Map;
+    const reasons = [...files.reasons];
+    let partial = files.partial;
+    const inventory = new Set(files.paths.filter(isAdmittedSwiftFile));
+    for (const path of inventory) {
+      if (options.signal.aborted)
+        throw abortError();
+      try {
+        const document2 = await options.source.load(path);
+        if (!document2.utf8) {
+          reasons.push(path + ": source is not lossless UTF-8");
+          partial = true;
+          continue;
+        }
+        documents.set(resolve28(options.cwd, path), document2);
+      } catch (error) {
+        if (options.signal.aborted || error instanceof Error && error.name === "AbortError")
+          throw abortError();
+        if (!isRecoverableSourceReadFailure(error))
+          throw error;
+        reasons.push(path + ": " + (error instanceof Error ? error.message : "source unavailable"));
+        partial = true;
+      }
+    }
+    if (documents.size === 0)
+      throw new SignalGrepError("Swift semantic provider found no admitted Swift source");
+    return new SwiftSourceContext({
+      cwd: options.cwd,
+      scope: options.scope,
+      signal: options.signal,
+      source: options.source,
+      documents,
+      inventory,
+      initialReasons: reasons,
+      initialCoveragePartial: partial,
+      workspaceConfiguration
+    });
+  }
+  documentForPath(path) {
+    const direct = this.documents.get(resolve28(this.cwd, path));
+    if (direct)
+      return direct;
+    let requested;
+    try {
+      requested = realpathSync(resolve28(this.cwd, path));
+    } catch {
+      return;
+    }
+    for (const [key, document2] of this.documents) {
+      try {
+        if (realpathSync(key) === requested)
+          return document2;
+      } catch {}
+    }
+    return;
+  }
+  async recheck() {
+    const statuses = [];
+    const reasons = [];
+    const stalePaths = new Set;
+    for (const document2 of this.documents.values()) {
+      try {
+        await this.source.refresh(document2.path, document2.reference);
+        statuses.push(sourceStatus(document2, "current"));
+      } catch (error) {
+        if (this.signal.aborted || error instanceof Error && error.name === "AbortError")
+          throw abortError();
+        if (!isRecoverableSourceReadFailure(error))
+          throw error;
+        const reason = error instanceof Error ? error.message : "Swift source recheck failed";
+        statuses.push(sourceStatus(document2, "stale", reason));
+        reasons.push(document2.path + ": " + reason);
+        stalePaths.add(document2.path);
+      }
+    }
+    const inventory = await listWorkspaceFiles(this.cwd, this.signal, {
+      path: this.scope.root,
+      glob: [...this.scope.include ?? []],
+      exclude: [...this.scope.exclude ?? []],
+      ...this.scope.hidden === undefined ? {} : { hidden: this.scope.hidden }
+    });
+    const currentInventory = new Set(inventory.paths.filter(isAdmittedSwiftFile));
+    const inventoryChanged = currentInventory.size !== this.inventory.size || [...currentInventory].some((path) => !this.inventory.has(path));
+    if (inventoryChanged || inventory.partial) {
+      reasons.push(inventoryChanged ? "Swift source inventory changed during relationship query; retry" : inventory.reasons.join("; "));
+      for (const path of [...this.inventory].filter((item) => !currentInventory.has(item))) {
+        statuses.push({
+          path,
+          role: documentRole2(path),
+          status: "stale",
+          reason: "source removed during query"
+        });
+        stalePaths.add(path);
+      }
+      for (const path of [...currentInventory].filter((item) => !this.inventory.has(item))) {
+        statuses.push({
+          path,
+          role: documentRole2(path),
+          status: "stale",
+          reason: "source added during query; retry"
+        });
+        stalePaths.add(path);
+      }
+    }
+    let currentConfigurationFingerprint;
+    let configurationReason;
+    try {
+      const workspaceConfiguration = await readSwiftWorkspaceConfiguration(this.cwd, this.scope.root);
+      currentConfigurationFingerprint = configurationFingerprint2(executablePath3(), workspaceConfiguration.fingerprint);
+    } catch (error) {
+      configurationReason = error instanceof Error ? error.message : "Swift toolchain configuration is invalid";
+    }
+    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.configurationFingerprint;
+    if (configurationChanged)
+      reasons.push(configurationReason ?? "Swift executable or SourceKit-LSP initialization configuration changed during relationship query");
+    statuses.push({
+      path: SWIFT_TOOLCHAIN_PATH,
+      role: "config",
+      status: configurationChanged ? "stale" : "current",
+      reason: configurationReason ?? currentConfigurationFingerprint ?? this.configurationFingerprint
+    });
+    const inventoryUnknown = inventory.partial;
+    const invalidated = stalePaths.size > 0 || configurationChanged;
+    return {
+      validity: invalidated ? "stale" : inventoryUnknown ? "unknown" : "current",
+      coverage: this.initialCoveragePartial || invalidated || inventoryUnknown ? "partial" : "complete",
+      sources: statuses,
+      reasons,
+      stalePaths,
+      configurationChanged,
+      inventoryUnknown
+    };
+  }
+}
+
+// src/swift-sourcekit-session.ts
+import { resolve as resolve29 } from "path";
+class SwiftSourceKitSession {
+  #cwd;
+  #scope;
+  #signal;
+  #workspaceConfiguration;
+  #channel;
+  #completion;
+  #abortProcess;
+  #runtimeCapabilities;
+  #openedUris = new Set;
+  #backgroundIndexingEnabled = false;
+  #indexSynchronized = false;
+  #closed = false;
+  constructor(options) {
+    this.#cwd = options.cwd;
+    this.#scope = options.scope;
+    this.#signal = options.signal;
+    this.#workspaceConfiguration = options.workspaceConfiguration;
+  }
+  async channel(indexRequired = false) {
+    return this.#ensureClient(indexRequired);
+  }
+  async requireOperationCapability(operation) {
+    const capabilities = this.#runtimeCapabilities ?? (await this.#ensureClient(isIndexBacked(operation)), this.#runtimeCapabilities);
+    if (!capabilities?.advertised.includes(operation))
+      throw new SignalGrepError("SourceKit-LSP did not advertise Swift operation: " + operation);
+  }
+  async requireOutlineCapability() {
+    const capabilities = this.#runtimeCapabilities ?? (await this.#ensureClient(), this.#runtimeCapabilities);
+    if (!capabilities?.outline)
+      throw new SignalGrepError("SourceKit-LSP did not advertise documentSymbolProvider");
+  }
+  async openDocument(document2, indexRequired = false) {
+    const channel = await this.#ensureClient(indexRequired);
+    const uri = sourceUri(this.#cwd, document2.path);
+    if (this.#openedUris.has(uri))
+      return;
+    await channel.notify("textDocument/didOpen", {
+      textDocument: { uri, languageId: "swift", version: 1, text: document2.text }
+    });
+    await channel.notify("textDocument/didChange", {
+      textDocument: { uri, version: 2 },
+      contentChanges: [{ text: document2.text }]
+    });
+    this.#openedUris.add(uri);
+  }
+  async synchronizeIndex(documents) {
+    if (this.#indexSynchronized)
+      return;
+    const channel = await this.#ensureClient(true);
+    for (const document2 of documents) {
+      await this.openDocument(document2, true);
+    }
+    try {
+      await channel.request("sourcekit/workspace/triggerReindex", {});
+    } catch (error) {
+      if (!(error instanceof SignalGrepError) || !/method not found/iu.test(error.message))
+        throw error;
+      await channel.request("workspace/triggerReindex", {});
+    }
+    try {
+      await channel.request("sourcekit/workspace/synchronize", { index: true });
+    } catch (error) {
+      if (!(error instanceof SignalGrepError) || !/method not found/iu.test(error.message))
+        throw error;
+      await channel.request("workspace/synchronize", { index: true });
+    }
+    this.#indexSynchronized = true;
+    if (this.#runtimeCapabilities)
+      this.#runtimeCapabilities.indexBarrier = "verified";
+  }
+  invalidateIndex() {
+    this.#indexSynchronized = false;
+  }
+  async close() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    try {
+      if (this.#channel && this.#completion)
+        await this.#gracefulClose();
+    } catch (error) {
+      await this.#stopClient();
+      if (this.#signal.aborted)
+        throw abortError();
+      throw error;
+    }
+  }
+  async#ensureClient(indexRequired = false) {
+    if (this.#closed)
+      throw new SignalGrepError("Swift SourceKit-LSP session is closed");
+    if (this.#channel && indexRequired && !this.#backgroundIndexingEnabled)
+      await this.#restartClientForIndex();
+    if (this.#channel)
+      return this.#channel;
+    const executable = executablePath3();
+    let owned;
+    try {
+      owned = await openOwnedJsonRpc({
+        executable,
+        args: [],
+        cwd: resolve29(this.#cwd, this.#scope.root),
+        signal: this.#signal,
+        env: process.env
+      }, (method, params) => this.clientRequest(method, params));
+      const initialize = await owned.channel.request("initialize", {
+        processId: process.pid,
+        rootUri: sourceUri(this.#cwd, this.#scope.root),
+        workspaceFolders: [
+          {
+            uri: sourceUri(this.#cwd, this.#scope.root),
+            name: this.#scope.root
+          }
+        ],
+        capabilities: sourceKitRequestCapabilities(),
+        initializationOptions: {
+          ...this.#workspaceConfiguration.initializationOptions,
+          backgroundIndexing: indexRequired
+        }
+      });
+      this.#runtimeCapabilities = readCapabilities(initialize);
+      await owned.channel.notify("initialized", {});
+      this.#channel = owned.channel;
+      this.#completion = owned.completion;
+      this.#abortProcess = () => owned?.abort();
+      this.#backgroundIndexingEnabled = indexRequired;
+      return owned.channel;
+    } catch (error) {
+      owned?.abort();
+      await owned?.completion.catch(() => {
+        return;
+      });
+      if (this.#signal.aborted)
+        throw abortError();
+      throw error;
+    }
+  }
+  async#restartClientForIndex() {
+    await this.#stopClient();
+    this.#runtimeCapabilities = undefined;
+    this.#openedUris.clear();
+    this.#indexSynchronized = false;
+  }
+  async#stopClient() {
+    const channel = this.#channel;
+    const completion = this.#completion;
+    const abortProcess = this.#abortProcess;
+    this.#channel = undefined;
+    this.#completion = undefined;
+    this.#abortProcess = undefined;
+    if (!channel)
+      return;
+    channel.close();
+    abortProcess?.();
+    await completion?.catch(() => {
+      return;
+    });
+  }
+  async#gracefulClose() {
+    const channel = this.#channel;
+    const completion = this.#completion;
+    if (!channel || !completion)
+      return;
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(abortError());
+      if (this.#signal.aborted)
+        onAbort();
+      else
+        this.#signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([channel.request("shutdown", {}), aborted]);
+      await Promise.race([channel.notify("exit", {}), aborted]);
+      channel.endInput();
+      const result = await Promise.race([completion, aborted]);
+      if (result.code !== 0)
+        throw new SignalGrepError("SourceKit-LSP process failed (" + String(result.code) + "): " + result.stderr);
+    } finally {
+      if (onAbort)
+        this.#signal.removeEventListener("abort", onAbort);
+    }
+  }
+  clientRequest(method, params) {
+    if (method === "workspace/configuration") {
+      if (!rpcRecord(params) || !Array.isArray(params.items))
+        throw new SignalGrepError("Invalid SourceKit-LSP workspace/configuration request");
+      return params.items.map(() => ({}));
+    }
+    if (method === "workspace/workspaceFolders")
+      return [{ uri: sourceUri(this.#cwd, this.#scope.root), name: this.#scope.root }];
+    if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
+      return null;
+    if (method === "workspace/applyEdit")
+      return { applied: false, failureReason: "Swift relationship provider is read-only" };
+    throw new SignalGrepError("Unsupported SourceKit-LSP client request: " + method);
+  }
+}
+
+// src/swift-relationship-provider.ts
+var providerQueue2 = new OwnedTaskQueue;
+
+class SwiftRelationshipView {
+  providerId = SWIFT_SEMANTIC_PROVIDER_ID;
+  analysisViewId;
+  sourceScope;
+  #cwd;
+  #signal;
+  #context;
+  #configurationFingerprint;
+  #releaseQueue;
+  #clearTimeout;
+  #nodes = new Map;
+  #edgePaths = new Map;
+  #session;
+  #closed = false;
+  #closePromise;
+  constructor(options, context, releaseQueue, clearTimeout2) {
+    this.analysisViewId = options.analysisViewId ?? randomUUID7();
+    this.sourceScope = options.scope;
+    this.#cwd = options.cwd;
+    this.#signal = options.signal;
+    this.#context = context;
+    this.#configurationFingerprint = context.configurationFingerprint;
+    this.#session = new SwiftSourceKitSession({
+      cwd: context.cwd,
+      scope: context.scope,
+      signal: context.signal,
+      workspaceConfiguration: context.workspaceConfiguration
+    });
+    this.#releaseQueue = releaseQueue;
+    this.#clearTimeout = clearTimeout2;
+  }
+  async#position(document2, input) {
+    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
+      throw new SignalGrepError("Swift semantic target line must be one-based");
+    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
+      throw new SignalGrepError("Swift semantic target column must be one-based");
+    if (input.column !== undefined) {
+      if (input.line === undefined)
+        throw new SignalGrepError("Swift semantic column requires a line");
+      return { line: input.line - 1, character: input.column - 1 };
+    }
+    if (!input.symbol)
+      throw new SignalGrepError("Swift semantic target requires a column or symbol");
+    const outline = await this.#rawOutline(document2.path);
+    const matches = [];
+    const visit = (items) => {
+      for (const item of items) {
+        if (item.name === input.symbol && (input.line === undefined || item.selectionRange.start.line + 1 === input.line))
+          matches.push(item);
+        visit(item.children);
+      }
+    };
+    visit(outline);
+    if (matches.length !== 1)
+      throw new SignalGrepError(matches.length ? "Swift semantic target symbol is ambiguous" : "Swift semantic target symbol is absent");
+    const match = matches[0];
+    if (!match)
+      throw new SignalGrepError("Swift semantic target symbol is absent");
+    return match.selectionRange.start;
+  }
+  async#rawOutline(path) {
+    const document2 = this.#context.documents.get(resolve30(this.#cwd, path));
+    if (!document2)
+      throw new SignalGrepError("Swift outline target is outside admitted source");
+    await this.#session.requireOutlineCapability();
+    await this.#session.openDocument(document2);
+    const response = await (await this.#session.channel()).request("textDocument/documentSymbol", {
+      textDocument: { uri: sourceUri(this.#cwd, document2.path) }
+    });
+    return readSwiftOutline(response);
+  }
+  async outline(path) {
+    const document2 = this.#context.documents.get(resolve30(this.#cwd, path));
+    if (!document2)
+      throw new SignalGrepError("Swift outline target is outside admitted source");
+    const convert = (item) => {
+      const range = byteRange(document2, item.range);
+      const selection = byteRange(document2, item.selectionRange);
+      return {
+        path: document2.path,
+        name: item.name,
+        kind: String(item.kind),
+        range,
+        start: document2.positionAt(selection.start),
+        end: document2.positionAt(selection.end),
+        source: document2.reference,
+        children: item.children.map(convert)
+      };
+    };
+    return (await this.#rawOutline(path)).map(convert);
+  }
+  async resolveNode(input, signal) {
+    this.assertOpen(signal);
+    const document2 = this.#context.documentForPath(input.path);
+    if (!document2)
+      return {
+        status: "unsupported",
+        reasons: ["Swift target is outside admitted provider source"],
+        dependencies: []
+      };
+    let position;
+    try {
+      position = await this.#position(document2, input);
+    } catch (error) {
+      if (error instanceof SignalGrepError && /ambiguous/iu.test(error.message))
+        return {
+          status: "ambiguous",
+          reasons: [error.message],
+          dependencies: [
+            sourceDocumentDependency(document2),
+            toolchainDependency(this.#configurationFingerprint)
+          ]
+        };
+      if (error instanceof SignalGrepError && /absent/iu.test(error.message))
+        return {
+          status: "unknown",
+          reasons: [error.message],
+          dependencies: [
+            sourceDocumentDependency(document2),
+            toolchainDependency(this.#configurationFingerprint)
+          ]
+        };
+      throw error;
+    }
+    await this.#session.openDocument(document2);
+    const channel = await this.#session.channel();
+    await this.#session.requireOperationCapability("definitions");
+    const params = { textDocument: { uri: sourceUri(this.#cwd, document2.path) }, position };
+    const definitions = readLocations2(await channel.request("textDocument/definition", params));
+    if (definitions.length === 0)
+      return {
+        status: "unknown",
+        reasons: ["SourceKit-LSP returned no definition for the requested Swift symbol"],
+        dependencies: [
+          sourceDocumentDependency(document2),
+          toolchainDependency(this.#configurationFingerprint)
+        ]
+      };
+    const candidates = definitions.flatMap((candidate) => {
+      const targetDocument = this.#context.documentForPath(candidate.path);
+      return targetDocument ? [this.node(candidate, targetDocument, input.symbol)] : [];
+    });
+    if (definitions.length !== 1)
+      return {
+        status: "ambiguous",
+        candidates,
+        reasons: [
+          "SourceKit-LSP returned multiple Swift definitions; include a more precise position"
+        ],
+        dependencies: [
+          sourceDocumentDependency(document2),
+          toolchainDependency(this.#configurationFingerprint)
+        ]
+      };
+    const selected = definitions[0];
+    if (!selected)
+      throw new SignalGrepError("SourceKit-LSP definition candidate disappeared");
+    const target = this.#context.documentForPath(selected.path);
+    if (!target)
+      return {
+        status: "unknown",
+        reasons: ["SourceKit-LSP resolved outside admitted Swift source"],
+        dependencies: [
+          sourceDocumentDependency(document2),
+          toolchainDependency(this.#configurationFingerprint)
+        ]
+      };
+    const resolvedName = input.symbol ?? await this.nodeName(target, selected);
+    return {
+      status: "resolved",
+      node: this.node(selected, target, resolvedName),
+      reasons: [],
+      dependencies: [
+        sourceDocumentDependency(document2),
+        sourceDocumentDependency(target),
+        toolchainDependency(this.#configurationFingerprint)
+      ]
+    };
+  }
+  async nodeName(document2, target) {
+    const symbols = await this.#rawOutline(document2.path);
+    const visit = (items) => {
+      for (const item of items) {
+        if (item.selectionRange.start.line === target.selectionRange.start.line && item.selectionRange.start.character === target.selectionRange.start.character)
+          return item.name;
+        const child = visit(item.children);
+        if (child)
+          return child;
+      }
+      return;
+    };
+    return visit(symbols);
+  }
+  async expand(node, operation, signal) {
+    this.assertOpen(signal);
+    const document2 = this.#context.documents.get(resolve30(this.#cwd, node.path));
+    if (!document2)
+      return {
+        edges: [],
+        nodes: [],
+        unresolved: [
+          operationUnresolved2(operation, "Swift node source is outside admitted source")
+        ],
+        dependencies: [],
+        coverage: {
+          status: "partial",
+          freshness: "unknown",
+          sources: [],
+          reasons: ["Swift node source is outside admitted source"]
+        }
+      };
+    const indexRequired = isIndexBacked(operation);
+    const channel = await this.#session.channel(indexRequired);
+    await this.#session.openDocument(document2, indexRequired);
+    const internal = {
+      id: node.identity.localKey,
+      path: document2.path,
+      uri: sourceUri(this.#cwd, document2.path),
+      range: {
+        start: { line: node.start.line - 1, character: node.start.column - 1 },
+        end: {
+          line: (node.end?.line ?? node.start.line) - 1,
+          character: (node.end?.column ?? node.start.column) - 1
+        }
+      },
+      selectionRange: {
+        start: { line: node.start.line - 1, character: node.start.column - 1 },
+        end: {
+          line: (node.end?.line ?? node.start.line) - 1,
+          character: (node.end?.column ?? node.start.column) - 1
+        }
+      },
+      name: node.name
+    };
+    await this.#session.requireOperationCapability(operation);
+    const params = {
+      textDocument: { uri: internal.uri },
+      position: positionOf2(internal)
+    };
+    const unresolved = [];
+    const rawEdges = [];
+    if (indexRequired)
+      await this.#session.synchronizeIndex(this.#context.documents.values());
+    if (operation === "callers" || operation === "callees") {
+      const prepared = await channel.request("textDocument/prepareCallHierarchy", params);
+      if (!Array.isArray(prepared))
+        unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned no call hierarchy"));
+      else {
+        for (const item of prepared) {
+          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+          const response = await channel.request(method, { item });
+          if (!Array.isArray(response)) {
+            unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned an invalid call hierarchy"));
+            continue;
+          }
+          for (const value of response) {
+            if (!rpcRecord(value)) {
+              unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned an invalid call edge"));
+              continue;
+            }
+            try {
+              const endpoint = readSwiftNode(operation === "callers" ? value.from : value.to);
+              const callRanges = readCallRanges2(value.fromRanges);
+              rawEdges.push({
+                operation,
+                endpoint,
+                ...callRanges ? { callRanges } : {}
+              });
+            } catch (error) {
+              unresolved.push(operationUnresolved2(operation, error instanceof Error ? error.message : "invalid call edge"));
+            }
+          }
+        }
+      }
+    } else {
+      const response = await channel.request(operationMethod3(operation), {
+        ...params,
+        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
+      });
+      for (const candidate of readLocations2(response))
+        rawEdges.push({ operation, endpoint: candidate });
+    }
+    const nodes = [];
+    const edges = [];
+    for (const raw of rawEdges) {
+      const endpoint = this.convertNode(raw.endpoint, unresolved, operation);
+      if (!endpoint)
+        continue;
+      const from = operation === "definitions" || operation === "implementations" || operation === "callees" ? node : endpoint;
+      const to = operation === "definitions" || operation === "implementations" || operation === "callees" ? endpoint : node;
+      const ranges = raw.callRanges?.length ? raw.callRanges : [undefined];
+      for (const [index, range] of ranges.entries()) {
+        const callSite = range ? this.callSite(operation === "callers" ? raw.endpoint : internal, range) : undefined;
+        const edgeKey = operation + ":" + relationshipNodeKey(from) + "->" + relationshipNodeKey(to) + ":" + String(index);
+        const paths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
+        this.#edgePaths.set(edgeKey, paths);
+        edges.push({
+          edgeKey,
+          operation,
+          from,
+          to,
+          ...callSite ? { callSite } : {},
+          evidence: [evidence2(relationReason2(operation))],
+          confidence: "verified-static",
+          dependencies: [...paths].map((path) => this.#context.documents.get(resolve30(this.#cwd, path))).filter((item) => item !== undefined).map(sourceDocumentDependency).concat(toolchainDependency(this.#configurationFingerprint))
+        });
+        nodes.push(from, to);
+      }
+    }
+    return {
+      edges: [...new Map(edges.map((edge) => [edge.edgeKey, edge])).values()],
+      nodes: [...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()],
+      unresolved,
+      dependencies: [
+        sourceDocumentDependency(document2),
+        toolchainDependency(this.#configurationFingerprint)
+      ],
+      coverage: {
+        status: this.#context.initialCoveragePartial || unresolved.length ? "partial" : "complete",
+        freshness: "current",
+        sources: currentSourceStatuses(this.#context.documents.values(), this.#configurationFingerprint),
+        reasons: [
+          ...new Set([
+            ...this.#context.initialReasons,
+            relationReason2(operation),
+            ...unresolved.map((item) => item.reason)
+          ])
+        ]
+      }
+    };
+  }
+  async recheck(signal) {
+    this.assertOpen(signal);
+    const result = await this.#context.recheck();
+    if (result.configurationChanged || result.inventoryUnknown)
+      this.#session.invalidateIndex();
+    return {
+      validity: result.validity,
+      coverage: result.coverage,
+      sources: result.sources,
+      affectedNodeKeys: result.configurationChanged || result.inventoryUnknown ? [...this.#nodes.keys()] : [...this.#nodes.entries()].filter(([, path]) => result.stalePaths.has(path)).map(([key]) => key),
+      affectedEdgeKeys: result.configurationChanged || result.inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => result.stalePaths.has(path))).map(([key]) => key),
+      reasons: [...result.reasons]
+    };
+  }
+  close() {
+    if (!this.#closePromise)
+      this.#closePromise = this.closeOnce();
+    return this.#closePromise;
+  }
+  async closeOnce() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    try {
+      await this.#session.close();
+    } catch (error) {
+      if (this.#signal.aborted)
+        throw abortError();
+      throw error;
+    } finally {
+      this.#clearTimeout();
+      this.#releaseQueue();
+    }
+  }
+  node(internal, document2, fallbackName) {
+    const range = byteRange(document2, internal.range);
+    const selection = byteRange(document2, internal.selectionRange);
+    const localKey = document2.path + ":" + String(selection.start) + ":" + String(selection.end);
+    const fallback = fallbackName ?? (document2.slice(selection) || document2.path);
+    const node = {
+      identity: {
+        providerId: SWIFT_SEMANTIC_PROVIDER_ID,
+        analysisViewId: this.analysisViewId,
+        sourceScope: this.sourceScope.root,
+        localKey
+      },
+      path: document2.path,
+      name: internal.name ?? fallback,
+      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
+      range,
+      start: document2.positionAt(selection.start),
+      end: document2.positionAt(selection.end),
+      source: document2.reference,
+      evidence: [evidence2("SourceKit-LSP Swift compiler navigation result")]
+    };
+    this.#nodes.set(relationshipNodeKey(node), document2.path);
+    return node;
+  }
+  convertNode(internal, unresolved, operation) {
+    const document2 = this.#context.documentForPath(internal.path);
+    if (!document2) {
+      unresolved.push(operationUnresolved2(operation, "SourceKit-LSP result is outside admitted Swift source: " + internal.path));
+      return;
+    }
+    return this.node(internal, document2);
+  }
+  callSite(endpoint, range) {
+    const document2 = this.#context.documentForPath(endpoint.path);
+    return document2 ? sourceLocation2(document2, range) : undefined;
+  }
+  assertOpen(signal) {
+    if (this.#closed)
+      throw new SignalGrepError("Swift relationship view is closed");
+    if (signal?.aborted || this.#signal.aborted)
+      throw abortError();
+  }
+}
+var swiftSemanticProvider = {
+  providerId: SWIFT_SEMANTIC_PROVIDER_ID,
+  async open(options) {
+    const releaseQueue = await providerQueue2.acquire(options.signal);
+    const deadline = new AbortController;
+    const sessionSignal = AbortSignal.any([options.signal, deadline.signal]);
+    const timeout = setTimeout(() => deadline.abort(), SWIFT_SEMANTIC_QUERY_TIMEOUT_MS);
+    const clearTimeoutHandle = () => clearTimeout(timeout);
+    const viewOptions = { ...options, signal: sessionSignal };
+    try {
+      const context = await SwiftSourceContext.open(viewOptions);
+      return new SwiftRelationshipView(viewOptions, context, releaseQueue, clearTimeoutHandle);
+    } catch (error) {
+      deadline.abort();
+      clearTimeoutHandle();
+      releaseQueue();
+      throw error;
+    }
+  }
+};
+
+// src/python-relationship-provider.ts
+import { createHash as createHash8, randomUUID as randomUUID8 } from "crypto";
+import { fileURLToPath as fileURLToPath6 } from "url";
+import { resolve as resolve33 } from "path";
+
+// src/python-language-discovery.ts
+import { createHash as createHash7 } from "crypto";
+import { access as access2, constants as constants4, readdir as readdir2, stat as stat5 } from "fs/promises";
+import { readFileSync } from "fs";
+import { createRequire as createRequire3 } from "module";
+import { delimiter as delimiter2, dirname as dirname8, isAbsolute as isAbsolute8, resolve as resolve31 } from "path";
+var PYTHON_PROJECT_MARKERS = new Set([
+  "pyproject.toml",
+  "pyrightconfig.json",
+  "setup.cfg",
+  "setup.py"
+]);
+var PYTHON_ENVIRONMENT_KEYS = [
+  "PATH",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "VIRTUAL_ENV",
+  "CONDA_PREFIX"
+];
+var require3 = createRequire3(import.meta.url);
+function configuredExecutable() {
+  const pyright = process.env.BAOER_SIGNAL_GREP_PYRIGHT_PATH?.trim();
+  if (!pyright)
+    return;
+  const path = pyright;
+  if (!path || !isAbsolute8(path))
+    throw new SignalGrepError("BAOER_SIGNAL_GREP_PYRIGHT_PATH must be an absolute executable path");
+  return { kind: "pyright", path };
+}
+function commandArgs(kind) {
+  return kind === "pyright" ? ["--stdio"] : [];
+}
+function environment2(executable) {
+  const currentPath = process.env.PATH ?? "";
+  const directory = isAbsolute8(executable) ? dirname8(executable) : undefined;
+  return {
+    ...process.env,
+    ...directory ? { PATH: `${directory}${delimiter2}${currentPath}` } : {}
+  };
+}
+function pythonLanguageServerCommand() {
+  const configured = configuredExecutable();
+  const kind = configured?.kind ?? "pyright";
+  const script = configured ? undefined : require3.resolve("pyright/langserver.index.js");
+  const executable = configured?.path ?? process.execPath;
+  const args2 = configured ? commandArgs(kind) : [script, "--stdio"];
+  const env = environment2(executable);
+  const values = { kind, executable, args: args2.join("\x00") };
+  if (script) {
+    values.script = script;
+    values.scriptHash = createHash7("sha256").update(readFileSync(script)).digest("hex");
+  }
+  for (const key of PYTHON_ENVIRONMENT_KEYS)
+    values[key] = env[key] ?? "";
+  return {
+    kind,
+    executable,
+    args: args2,
+    environment: env,
+    fingerprint: createHash7("sha256").update(JSON.stringify(values)).digest("hex")
+  };
+}
+async function resolvePythonProjectRoot(cwd, targetPath, signal) {
+  const absoluteCwd = resolve31(cwd);
+  const absoluteTarget = resolve31(absoluteCwd, targetPath);
+  let current = dirname8(absoluteTarget);
+  try {
+    if ((await stat5(absoluteTarget)).isDirectory())
+      current = absoluteTarget;
+  } catch (error) {
+    if (!(error instanceof Error && ("code" in error) && (error.code === "ENOENT" || error.code === "ENOTDIR")))
+      throw error;
+  }
+  while (current === absoluteCwd || current.startsWith(`${absoluteCwd}/`)) {
+    if (signal?.aborted)
+      throw abortError();
+    try {
+      const entries = await readdir2(current, { withFileTypes: true });
+      if (entries.some((entry) => PYTHON_PROJECT_MARKERS.has(entry.name)))
+        return current;
+    } catch (error) {
+      if (!(error instanceof Error && ("code" in error) && (error.code === "ENOENT" || error.code === "ENOTDIR")))
+        throw error;
+    }
+    if (current === absoluteCwd)
+      break;
+    const parent = dirname8(current);
+    if (parent === current || !parent.startsWith(`${absoluteCwd}/`))
+      break;
+    current = parent;
+  }
+  return dirname8(resolve31(absoluteCwd, targetPath));
+}
+function isPythonProjectMarker(path) {
+  const name2 = path.replaceAll("\\", "/").split("/").at(-1) ?? "";
+  return PYTHON_PROJECT_MARKERS.has(name2);
+}
+function pythonEnvironmentKeys() {
+  return PYTHON_ENVIRONMENT_KEYS;
+}
+
+// src/python-lsp-session.ts
+var PYTHON_LSP_REQUEST_TIMEOUT_MS = 60000;
+function advertised(value) {
+  return value === true || value !== null && typeof value === "object";
+}
+function readCapabilities2(value) {
+  if (!rpcRecord(value) || !rpcRecord(value.capabilities))
+    throw new SignalGrepError("Pyright initialize omitted capabilities");
+  const capabilities = value.capabilities;
+  const operations = new Set;
+  if (advertised(capabilities.definitionProvider))
+    operations.add("definitions");
+  if (advertised(capabilities.referencesProvider))
+    operations.add("references");
+  if (advertised(capabilities.implementationProvider))
+    operations.add("implementations");
+  if (advertised(capabilities.callHierarchyProvider)) {
+    operations.add("callers");
+    operations.add("callees");
+  }
+  return {
+    operations,
+    documentSymbols: advertised(capabilities.documentSymbolProvider)
+  };
+}
+function clientRequest(cwd, rootUri, method, params) {
+  if (method === "workspace/configuration") {
+    if (!rpcRecord(params) || !Array.isArray(params.items))
+      throw new SignalGrepError("Invalid Pyright workspace/configuration request");
+    return params.items.map(() => null);
+  }
+  if (method === "workspace/workspaceFolders")
+    return [{ uri: rootUri, name: cwd }];
+  if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create" || method === "window/showMessageRequest")
+    return null;
+  if (method === "window/logMessage" || method === "window/showMessage" || method === "telemetry/event")
+    return null;
+  if (method === "workspace/applyEdit")
+    return { applied: false, failureReason: "Python relationship search is read-only" };
+  throw new SignalGrepError(`Unsupported Pyright client request: ${method}`);
+}
+
+class PythonLspSession {
+  #context;
+  #command;
+  #signal;
+  #channel;
+  #completion;
+  #abortProcess;
+  #capabilities;
+  #closed = false;
+  #closePromise;
+  constructor(context) {
+    this.#context = context;
+    this.#command = context.command;
+    this.#signal = context.signal;
+  }
+  get capabilities() {
+    if (!this.#capabilities)
+      throw new SignalGrepError("Pyright session is not initialized");
+    return this.#capabilities;
+  }
+  get channel() {
+    if (!this.#channel)
+      throw new SignalGrepError("Pyright session is not initialized");
+    return this.#channel;
+  }
+  async request(method, params) {
+    const channel = this.channel;
+    const deadline = AbortSignal.timeout(PYTHON_LSP_REQUEST_TIMEOUT_MS);
+    let onAbort;
+    const timedOut = new Promise((_, reject) => {
+      onAbort = () => reject(abortError());
+      if (deadline.aborted)
+        onAbort();
+      else
+        deadline.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([channel.request(method, params), timedOut]);
+    } catch (error) {
+      if (deadline.aborted || this.#signal.aborted) {
+        this.#closed = true;
+        channel.close();
+        this.#abortProcess?.();
+        await this.#completion?.catch(() => {
+          return;
+        });
+        throw abortError();
+      }
+      throw error;
+    } finally {
+      if (onAbort)
+        deadline.removeEventListener("abort", onAbort);
+    }
+  }
+  async start() {
+    if (this.#closed)
+      throw new SignalGrepError("Pyright session is closed");
+    if (this.#channel && this.#capabilities)
+      return this.#capabilities;
+    const rootUri = await semanticUri(this.#context.cwd, this.#context.root);
+    let owned;
+    try {
+      owned = await openOwnedJsonRpc({
+        executable: this.#command.executable,
+        args: [...this.#command.args],
+        cwd: this.#context.root,
+        signal: this.#signal,
+        env: this.#command.environment
+      }, (method, params) => clientRequest(this.#context.cwd, rootUri, method, params));
+      this.#channel = owned.channel;
+      this.#completion = owned.completion;
+      this.#abortProcess = () => owned?.abort();
+      const initialize = await this.request("initialize", {
+        processId: process.pid,
+        rootUri,
+        workspaceFolders: [{ uri: rootUri, name: this.#context.root }],
+        capabilities: {
+          workspace: { workspaceFolders: true, configuration: true },
+          textDocument: {
+            definition: { linkSupport: true },
+            references: {},
+            implementation: { linkSupport: true },
+            documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+            callHierarchy: {}
+          },
+          general: { positionEncodings: ["utf-16"] }
+        },
+        initializationOptions: {}
+      });
+      const capabilities = readCapabilities2(initialize);
+      await owned.channel.notify("initialized", {});
+      this.#capabilities = capabilities;
+      return capabilities;
+    } catch (error) {
+      owned?.channel.close();
+      owned?.abort();
+      await owned?.completion.catch(() => {
+        return;
+      });
+      this.#channel = undefined;
+      this.#completion = undefined;
+      this.#abortProcess = undefined;
+      if (this.#signal.aborted)
+        throw abortError();
+      throw error;
+    }
+  }
+  async openDocuments(documents) {
+    await this.start();
+    for (const document2 of documents) {
+      if (this.#signal.aborted)
+        throw abortError();
+      await this.channel.notify("textDocument/didOpen", {
+        textDocument: {
+          uri: await semanticUri(this.#context.cwd, document2.path),
+          languageId: "python",
+          version: 1,
+          text: document2.text
+        }
+      });
+    }
+  }
+  async close() {
+    if (!this.#closePromise)
+      this.#closePromise = this.closeOnce();
+    return this.#closePromise;
+  }
+  async closeOnce() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    const channel = this.#channel;
+    const completion = this.#completion;
+    if (!channel || !completion)
+      return;
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(abortError());
+      if (this.#signal.aborted)
+        onAbort();
+      else
+        this.#signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([this.request("shutdown", {}), aborted]);
+      await Promise.race([channel.notify("exit", {}), aborted]);
+      channel.endInput();
+      const result = await Promise.race([completion, aborted]);
+      if (result.code !== 0)
+        throw new SignalGrepError(`Pyright language-server process failed (${String(result.code)}): ${result.stderr}`);
+    } catch (error) {
+      channel.close();
+      this.#abortProcess?.();
+      await completion.catch(() => {
+        return;
+      });
+      if (this.#signal.aborted)
+        throw abortError();
+      throw error;
+    } finally {
+      if (onAbort)
+        this.#signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+// src/python-source-context.ts
+import { realpath as realpath8 } from "fs/promises";
+import { resolve as resolve32 } from "path";
+var PYTHON_SOURCE = /\.py$/iu;
+function admittedSource(path) {
+  return PYTHON_SOURCE.test(path);
+}
+function key(cwd, path) {
+  return resolve32(cwd, path);
+}
+
+class PythonSourceContext {
+  cwd;
+  root;
+  scope;
+  source;
+  signal;
+  command;
+  maxFiles;
+  inventory;
+  documents;
+  metadata;
+  aliases;
+  initialReasons;
+  initialPartial;
+  constructor(options) {
+    this.cwd = options.source.cwd;
+    this.root = options.root;
+    this.scope = options.source.scope;
+    this.source = options.source.source;
+    this.signal = options.source.signal;
+    this.command = options.source.command;
+    this.maxFiles = options.source.maxFiles;
+    this.inventory = options.inventory;
+    this.documents = options.documents;
+    this.metadata = options.metadata;
+    this.aliases = options.aliases;
+    this.initialReasons = options.reasons;
+    this.initialPartial = options.partial;
+  }
+  static async open(options) {
+    if (options.signal.aborted)
+      throw abortError();
+    const target = options.scope.root;
+    const root = await resolvePythonProjectRoot(options.cwd, target, options.signal);
+    const files = await listWorkspaceFiles(options.cwd, options.signal, {
+      path: root,
+      glob: [...options.scope.include ?? []],
+      exclude: [...options.scope.exclude ?? []],
+      ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
+      maxFiles: options.maxFiles
+    });
+    const inventory = new Set(files.paths.filter((path) => admittedSource(path) || isPythonProjectMarker(path)));
+    const documents = new Map;
+    const metadata2 = new Map;
+    const aliases = new Map;
+    const reasons = [...files.reasons];
+    let partial = files.partial;
+    for (const path of inventory) {
+      if (options.signal.aborted)
+        throw abortError();
+      try {
+        const document2 = await options.source.load(path);
+        if (!document2.utf8) {
+          reasons.push(`${path}: source is not lossless UTF-8`);
+          partial = true;
+          continue;
+        }
+        if (admittedSource(path))
+          documents.set(key(options.cwd, path), document2);
+        if (isPythonProjectMarker(path))
+          metadata2.set(key(options.cwd, path), document2);
+        const absolute = key(options.cwd, path);
+        aliases.set(absolute, document2);
+        try {
+          aliases.set(await realpath8(absolute), document2);
+        } catch {}
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError")
+          throw error;
+        reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
+        partial = true;
+      }
+    }
+    if (documents.size === 0)
+      throw new SignalGrepError("Python semantic provider found no admitted Python source");
+    const context = new PythonSourceContext({
+      source: options,
+      root,
+      inventory,
+      documents,
+      metadata: metadata2,
+      aliases,
+      reasons,
+      partial
+    });
+    return {
+      context,
+      documents: [...documents.values()],
+      metadata: [...metadata2.values()],
+      reasons,
+      partial
+    };
+  }
+  document(path) {
+    return this.aliases.get(key(this.cwd, path));
+  }
+  documentAtAbsolute(path) {
+    return this.aliases.get(path);
+  }
+  configDocuments() {
+    return [...this.metadata.values()];
+  }
+  sourceReference(path) {
+    return this.document(path)?.reference ?? this.metadata.get(key(this.cwd, path))?.reference;
+  }
+}
+
+// src/python-relationship-provider.ts
+var PYTHON_SEMANTIC_PROVIDER_ID = "pyright-python";
+var providerQueue3 = new OwnedTaskQueue;
+var PYTHON_SOURCE2 = /\.py$/iu;
+var PYTHON_ENVIRONMENT_PATH = "python:environment";
+var PYTHON_INVENTORY_PATH = "python:inventory";
+function readLocation(value) {
+  if (!rpcRecord(value))
+    throw new SignalGrepError("Pyright returned an invalid navigation item");
+  const uri = value.uri ?? value.targetUri;
+  const range = value.range ?? value.targetRange ?? value.targetSelectionRange;
+  const selectionRange = value.selectionRange ?? value.targetSelectionRange ?? range;
+  if (typeof uri !== "string" || !uri.startsWith("file:"))
+    throw new SignalGrepError("Pyright returned a non-file navigation URI");
+  if (!range || !selectionRange)
+    throw new SignalGrepError("Pyright navigation item omitted range");
+  return {
+    uri,
+    range: lspRange(range),
+    selectionRange: lspRange(selectionRange),
+    ...typeof value.name === "string" ? { name: value.name } : {},
+    ...typeof value.kind === "number" ? { kind: value.kind } : {}
+  };
+}
+function locations2(value) {
+  if (value === null)
+    return [];
+  return (Array.isArray(value) ? value : [value]).map(readLocation);
+}
+function sourceLocation3(document2, range) {
+  const bytes = byteRange(document2, range);
+  return {
+    path: document2.path,
+    range: bytes,
+    start: document2.positionAt(bytes.start),
+    end: document2.positionAt(bytes.end),
+    source: document2.reference
+  };
+}
+function position(document2, input) {
+  if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
+    throw new SignalGrepError("Python semantic target line must be one-based");
+  if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
+    throw new SignalGrepError("Python semantic target column must be one-based");
+  if (input.column !== undefined) {
+    if (input.line === undefined)
+      throw new SignalGrepError("Python semantic column requires a line");
+    return { line: input.line - 1, character: input.column - 1 };
+  }
+  return { line: (input.line ?? 1) - 1, character: 0 };
+}
+function documentDependency2(document2) {
+  return { path: document2.path, role: "source", reference: document2.reference, exists: true };
+}
+function metadataDependency(document2) {
+  return { path: document2.path, role: "config", reference: document2.reference, exists: true };
+}
+function environmentDependency2(fingerprint) {
+  return { path: PYTHON_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
+}
+function evidence3(operation) {
+  return {
+    level: "compiler",
+    basis: "semantic",
+    providerBasis: "pyright",
+    reason: operation === "callers" || operation === "callees" ? "Pyright static call hierarchy; dynamic dispatch and runtime execution remain unproven" : `Pyright compiler-bound ${operation} result in the admitted Python project`
+  };
+}
+function operationMethod4(operation) {
+  switch (operation) {
+    case "definitions":
+      return "textDocument/definition";
+    case "references":
+      return "textDocument/references";
+    case "implementations":
+      return "textDocument/implementation";
+    default:
+      throw new SignalGrepError(`Pyright operation ${operation} uses call hierarchy`);
+  }
+}
+function callUnresolved(operation, reason) {
+  return { operation, reason, confidence: "unknown" };
+}
+function pathFromUri(uri) {
+  try {
+    return fileURLToPath6(uri);
+  } catch (error) {
+    throw new SignalGrepError("Pyright returned an invalid file URI", { cause: error });
+  }
+}
+function configurationFingerprint3(command, context) {
+  const configurations = [...context.configDocuments()].map((document2) => [
+    document2.path,
+    document2.reference.origin.kind === "worktree" ? document2.reference.origin.contentHash : document2.reference.origin.blob
+  ]);
+  const environment = pythonEnvironmentKeys().map((key) => [key, process.env[key] ?? ""]);
+  return createHash8("sha256").update(JSON.stringify({
+    command: command.fingerprint,
+    configurations,
+    environment,
+    root: context.root
+  })).digest("hex");
+}
+
+class PythonRelationshipView {
+  providerId = PYTHON_SEMANTIC_PROVIDER_ID;
+  analysisViewId;
+  sourceScope;
+  #context;
+  #session;
+  #documents;
+  #metadata;
+  #configurationFingerprint;
+  #inventory;
+  #nodePaths = new Map;
+  #edgePaths = new Map;
+  #initialReasons;
+  #initialPartial;
+  #releaseQueue;
+  #closed = false;
+  #closePromise;
+  constructor(options, context, session, releaseQueue, open) {
+    this.analysisViewId = options.analysisViewId ?? randomUUID8();
+    this.sourceScope = { ...options.scope, root: context.root };
+    this.#context = context;
+    this.#session = session;
+    this.#documents = context.documents;
+    this.#metadata = context.configDocuments();
+    this.#configurationFingerprint = configurationFingerprint3(context.command, context);
+    this.#inventory = context.inventory;
+    this.#releaseQueue = releaseQueue;
+    this.#initialReasons = [...open.reasons];
+    this.#initialPartial = open.partial;
+  }
+  async resolveNode(input, signal) {
+    this.assertOpen(signal);
+    const document2 = this.#context.document(input.path);
+    if (!document2)
+      return {
+        status: "unsupported",
+        reasons: ["Python target is outside the admitted Pyright project"],
+        dependencies: []
+      };
+    let selected;
+    let candidates = [];
+    if (input.symbol !== undefined || input.column === undefined) {
+      if (!this.#session.capabilities.documentSymbols)
+        return {
+          status: "unsupported",
+          reasons: ["Pyright did not advertise documentSymbolProvider for symbol selection"],
+          dependencies: [documentDependency2(document2), ...this.configurationDependencies()]
+        };
+      candidates = await this.symbolCandidates(document2, input);
+      if (input.symbol !== undefined && candidates.length === 0)
+        return {
+          status: "unknown",
+          reasons: [`Pyright returned no admitted Python symbol named ${input.symbol}`],
+          dependencies: [documentDependency2(document2), ...this.configurationDependencies()]
+        };
+      if (candidates.length > 1)
+        return {
+          status: "ambiguous",
+          candidates: candidates.map((item) => this.node(item, document2, item.name ?? input.symbol ?? "Python symbol")),
+          reasons: ["Pyright returned multiple Python symbols; include a line and column"],
+          dependencies: [documentDependency2(document2), ...this.configurationDependencies()]
+        };
+      selected = candidates[0];
+    }
+    if (!selected) {
+      const selectedPosition = position(document2, input);
+      selected = {
+        uri: await semanticUri(this.#context.cwd, document2.path),
+        range: {
+          start: selectedPosition,
+          end: selectedPosition
+        },
+        selectionRange: {
+          start: selectedPosition,
+          end: selectedPosition
+        },
+        ...input.symbol ? { name: input.symbol } : {}
+      };
+    }
+    const node = this.node(selected, document2, selected.name ?? input.symbol ?? "Python symbol");
+    return {
+      status: "resolved",
+      node,
+      reasons: [...this.#initialReasons],
+      dependencies: [documentDependency2(document2), ...this.configurationDependencies()]
+    };
+  }
+  async expand(node, operation, signal) {
+    this.assertOpen(signal);
+    if (!this.#session.capabilities.operations.has(operation))
+      throw new SignalGrepError(`Pyright did not advertise Python operation: ${operation}`);
+    const document2 = this.#context.document(node.path);
+    if (!document2)
+      return {
+        edges: [],
+        nodes: [],
+        unresolved: [callUnresolved(operation, "Python node is outside the admitted project")],
+        dependencies: [],
+        coverage: {
+          status: "partial",
+          freshness: "unknown",
+          sources: [],
+          reasons: ["Python node is outside the admitted project"]
+        }
+      };
+    const internal = this.internalLocation(node);
+    const unresolved = [];
+    const rawEdges = [];
+    const uri = await semanticUri(this.#context.cwd, document2.path);
+    const internalWithUri = { ...internal, uri };
+    if (operation === "callers" || operation === "callees") {
+      const prepared = await this.#session.request("textDocument/prepareCallHierarchy", {
+        textDocument: { uri },
+        position: internal.selectionRange.start
+      });
+      if (!Array.isArray(prepared) || prepared.length === 0) {
+        unresolved.push(callUnresolved(operation, "Pyright returned no call hierarchy item"));
+      } else {
+        if (prepared.length > 1)
+          unresolved.push(callUnresolved(operation, "Pyright returned ambiguous call hierarchy items"));
+        for (const candidate of prepared) {
+          try {
+            const item = readLocation(candidate);
+            const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
+            const values = await this.#session.request(method, { item: candidate });
+            if (!Array.isArray(values)) {
+              unresolved.push(callUnresolved(operation, "Pyright returned an invalid call hierarchy response"));
+              continue;
+            }
+            for (const value of values) {
+              if (!rpcRecord(value)) {
+                unresolved.push(callUnresolved(operation, "Pyright returned an invalid call hierarchy edge"));
+                continue;
+              }
+              const endpointValue = operation === "callers" ? value.from : value.to;
+              const endpoint = readLocation(endpointValue);
+              const ranges = Array.isArray(value.fromRanges) ? value.fromRanges.map(lspRange) : [];
+              rawEdges.push({
+                from: operation === "callers" ? endpoint : item,
+                to: operation === "callers" ? item : endpoint,
+                ranges
+              });
+            }
+          } catch (error) {
+            unresolved.push(callUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
+          }
+        }
+      }
+    } else {
+      const response = await this.#session.request(operationMethod4(operation), {
+        textDocument: { uri },
+        position: internal.selectionRange.start,
+        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
+      });
+      for (const candidate of locations2(response))
+        rawEdges.push({
+          from: internalWithUri,
+          to: candidate,
+          ranges: []
+        });
+    }
+    const edges = [];
+    const nodes = [];
+    for (const raw of rawEdges) {
+      const fromDocument = this.documentForLocation(raw.from);
+      const toDocument = this.documentForLocation(raw.to);
+      if (!fromDocument || !toDocument) {
+        unresolved.push(callUnresolved(operation, "Pyright returned a location outside admitted Python source"));
+        continue;
+      }
+      const from = this.node(raw.from, fromDocument, raw.from.name ?? node.name);
+      const to = this.node(raw.to, toDocument, raw.to.name ?? node.name);
+      const ranges = raw.ranges.length ? raw.ranges : [undefined];
+      for (const [index, range] of ranges.entries()) {
+        const callSite = range ? sourceLocation3(fromDocument, range) : undefined;
+        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
+        const paths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
+        this.#edgePaths.set(edgeKey, paths);
+        edges.push({
+          edgeKey,
+          operation,
+          from,
+          to,
+          ...callSite ? { callSite } : {},
+          evidence: [evidence3(operation)],
+          confidence: "verified-static",
+          dependencies: [...paths].map((path) => this.#documents.get(resolve33(this.#context.cwd, path))).filter((item) => item !== undefined).map(documentDependency2).concat(this.configurationDependencies())
+        });
+        nodes.push(from, to);
+      }
+    }
+    const uniqueNodes = [
+      ...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()
+    ];
+    const reasons = [
+      ...this.#initialReasons,
+      ...unresolved.map((item) => item.reason),
+      evidence3(operation).reason
+    ];
+    return {
+      edges,
+      nodes: uniqueNodes,
+      unresolved,
+      dependencies: [documentDependency2(document2), ...this.configurationDependencies()],
+      coverage: {
+        status: this.#initialPartial || unresolved.length ? "partial" : "complete",
+        freshness: "current",
+        sources: this.currentSourceStatuses(),
+        reasons: [...new Set(reasons)]
+      }
+    };
+  }
+  async recheck(signal) {
+    this.assertOpen(signal);
+    const sources = [];
+    const reasons = [];
+    for (const document2 of [...this.#documents.values(), ...this.#metadata]) {
+      try {
+        await this.#context.source.refresh(document2.path, document2.reference);
+        sources.push(this.sourceStatus(document2, "current"));
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError")
+          throw error;
+        const reason = error instanceof Error ? error.message : "Python source recheck failed";
+        sources.push(this.sourceStatus(document2, "stale", reason));
+        reasons.push(`${document2.path}: ${reason}`);
+      }
+    }
+    const command = pythonLanguageServerCommand();
+    const currentFingerprint = configurationFingerprint3(command, this.#context);
+    const configurationChanged = currentFingerprint !== this.#configurationFingerprint;
+    sources.push({
+      path: PYTHON_ENVIRONMENT_PATH,
+      role: "config",
+      status: configurationChanged ? "stale" : "current",
+      ...configurationChanged ? { reason: "Python executable, environment or project configuration changed" } : {}
+    });
+    if (configurationChanged)
+      reasons.push("Python executable, environment or project configuration changed");
+    const files = await listWorkspaceFiles(this.#context.cwd, this.#context.signal, {
+      path: this.#context.root,
+      glob: [...this.sourceScope.include ?? []],
+      exclude: [...this.sourceScope.exclude ?? []],
+      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden },
+      maxFiles: this.#context.maxFiles
+    });
+    const currentInventory = new Set(files.paths.filter((path) => PYTHON_SOURCE2.test(path) || isPythonProjectMarker(path)));
+    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
+    if (inventoryChanged || files.partial) {
+      reasons.push(inventoryChanged ? "Python source/config inventory changed during query; retry" : files.reasons.join("; "));
+      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
+        sources.push({
+          path,
+          role: isPythonProjectMarker(path) ? "config" : "source",
+          status: "stale",
+          reason: "source removed during query"
+        });
+      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
+        sources.push({
+          path,
+          role: isPythonProjectMarker(path) ? "config" : "source",
+          status: "stale",
+          reason: "source added during query; retry"
+        });
+      if (files.partial)
+        sources.push({
+          path: PYTHON_INVENTORY_PATH,
+          role: "metadata",
+          status: "unknown",
+          reason: files.reasons.join("; ") || "Python inventory is incomplete"
+        });
+    }
+    const stalePaths = new Set(sources.filter((item) => item.status === "stale").map((item) => item.path));
+    const unknown = sources.some((item) => item.status === "unknown");
+    const configurationStale = configurationChanged || sources.some((item) => item.path === PYTHON_INVENTORY_PATH && item.status !== "current");
+    return {
+      validity: stalePaths.size ? "stale" : unknown ? "unknown" : aggregateRelationshipValidity(sources),
+      coverage: this.#initialPartial || stalePaths.size || unknown ? "partial" : "complete",
+      sources,
+      affectedNodeKeys: configurationStale ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => stalePaths.has(path)).map(([nodeKey]) => nodeKey),
+      affectedEdgeKeys: configurationStale ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([edgeKey]) => edgeKey),
+      reasons: [...new Set(reasons)]
+    };
+  }
+  async close() {
+    if (!this.#closePromise)
+      this.#closePromise = this.closeOnce();
+    return this.#closePromise;
+  }
+  async closeOnce() {
+    if (this.#closed)
+      return;
+    this.#closed = true;
+    try {
+      await this.#session.close();
+    } finally {
+      this.#releaseQueue();
+    }
+  }
+  async symbolCandidates(document2, input) {
+    const documentUri = await semanticUri(this.#context.cwd, document2.path);
+    const response = await this.#session.request("textDocument/documentSymbol", {
+      textDocument: { uri: documentUri }
+    });
+    if (!Array.isArray(response))
+      return [];
+    const found = [];
+    const visit = (value) => {
+      if (!rpcRecord(value))
+        return;
+      try {
+        const item = readLocation(value.location ? { ...value.location, name: value.name, kind: value.kind } : { ...value, uri: documentUri });
+        const matchesName = input.symbol === undefined || item.name === input.symbol;
+        const matchesLine = input.line === undefined || item.selectionRange.start.line + 1 === input.line;
+        if (matchesName && matchesLine)
+          found.push(item);
+        if (Array.isArray(value.children))
+          for (const child of value.children)
+            visit(child);
+      } catch {}
+    };
+    for (const item of response)
+      visit(item);
+    return found;
+  }
+  documentForLocation(location) {
+    try {
+      const path = pathFromUri(location.uri);
+      return this.#context.documentAtAbsolute(resolve33(this.#context.cwd, path));
+    } catch {
+      return;
+    }
+  }
+  internalLocation(node) {
+    const start2 = { line: node.start.line - 1, character: node.start.column - 1 };
+    const end = {
+      line: (node.end?.line ?? node.start.line) - 1,
+      character: (node.end?.column ?? node.start.column) - 1
+    };
+    return { uri: "", range: { start: start2, end }, selectionRange: { start: start2, end }, name: node.name };
+  }
+  node(location, document2, name2) {
+    const range = byteRange(document2, location.range);
+    const selection = byteRange(document2, location.selectionRange);
+    const localKey = `${document2.path}:${String(selection.start)}:${String(selection.end)}:${name2}`;
+    const node = {
+      identity: {
+        providerId: this.providerId,
+        analysisViewId: this.analysisViewId,
+        sourceScope: this.sourceScope.root,
+        localKey
+      },
+      path: document2.path,
+      name: name2,
+      kind: location.kind === undefined ? "symbol" : String(location.kind),
+      range,
+      start: document2.positionAt(selection.start),
+      end: document2.positionAt(selection.end),
+      source: document2.reference,
+      evidence: [evidence3("references")]
+    };
+    this.#nodePaths.set(relationshipNodeKey(node), document2.path);
+    return node;
+  }
+  sourceStatus(document2, status, reason) {
+    return {
+      path: document2.path,
+      role: isPythonProjectMarker(document2.path) ? "config" : "source",
+      status,
+      expected: document2.reference,
+      ...reason ? { reason } : {}
+    };
+  }
+  currentSourceStatuses() {
+    return [
+      ...[...this.#documents.values()].map((document2) => this.sourceStatus(document2, "current")),
+      ...this.#metadata.map((document2) => this.sourceStatus(document2, "current")),
+      { path: PYTHON_ENVIRONMENT_PATH, role: "config", status: "current" }
+    ];
+  }
+  configurationDependencies() {
+    return [
+      ...this.#metadata.map(metadataDependency),
+      environmentDependency2(this.#configurationFingerprint)
+    ];
+  }
+  assertOpen(signal) {
+    if (this.#closed)
+      throw new SignalGrepError("Python relationship view is closed");
+    if (signal?.aborted || this.#context.signal.aborted)
+      throw abortError();
+  }
+}
+var pythonSemanticProvider = {
+  providerId: PYTHON_SEMANTIC_PROVIDER_ID,
+  async open(options) {
+    const releaseQueue = await providerQueue3.acquire(options.signal);
+    try {
+      const command = pythonLanguageServerCommand();
+      const opened = await PythonSourceContext.open({
+        cwd: options.cwd,
+        scope: options.scope,
+        source: options.source,
+        signal: options.signal,
+        maxFiles: options.limits?.maxFiles ?? 200,
+        command
+      });
+      const session = new PythonLspSession(opened.context);
+      await session.start();
+      await session.openDocuments(opened.documents);
+      return new PythonRelationshipView(options, opened.context, session, releaseQueue, {
+        reasons: opened.reasons,
+        partial: opened.partial
+      });
+    } catch (error) {
+      releaseQueue();
+      throw error;
+    }
+  }
+};
+
+// src/relationship-provider-registry.ts
+function sourceProvider(provider, queue, languages, capabilityProvider, supports, limitsForOperation) {
+  return {
+    providerId: provider.providerId,
+    languages,
+    operations: relationshipOperations(capabilityProvider),
+    ...limitsForOperation ? { limitsForOperation } : {},
+    supports,
+    open: async (options) => {
+      const source = new SourceAccess(options.cwd, queue, options.signal, {
+        maxFiles: options.maxFiles
+      });
+      return provider.open({
+        ...options,
+        source,
+        limits: { ...options.limits, maxFiles: options.maxFiles }
+      });
+    }
+  };
+}
+function relationshipOperations(provider) {
+  const operationNames = new Set([
+    "definitions",
+    "references",
+    "implementations",
+    "callers",
+    "callees"
+  ]);
+  const isOperation = (value) => operationNames.has(value);
+  return [
+    ...new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.filter((capability) => capability.provider === provider).flatMap((capability) => capability.relationshipOperations ?? (isOperation(capability.name) ? [capability.name] : []))))
+  ];
+}
+function relationshipLanguages(provider) {
+  return DEFAULT_LANGUAGE_CAPABILITIES.filter((descriptor) => descriptor.capabilities.some((capability) => capability.provider === provider)).map((descriptor) => descriptor.language);
+}
+function createRelationshipProviderRegistry(queue) {
+  const goLanguages = relationshipLanguages("gopls");
+  const swiftLanguages = relationshipLanguages(SWIFT_SEMANTIC_PROVIDER_ID);
+  const pythonLanguages = relationshipLanguages(PYTHON_SEMANTIC_PROVIDER_ID);
+  return [
+    sourceProvider(goSemanticProvider, queue, goLanguages, "gopls", (path) => goLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? "")),
+    createTypeScriptRelationshipRegistration(queue),
+    sourceProvider(swiftSemanticProvider, queue, swiftLanguages, SWIFT_SEMANTIC_PROVIDER_ID, (path) => swiftLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""), (operation) => ["references", "implementations", "callers", "callees"].includes(operation) ? { swiftIndex: 1 } : {}),
+    sourceProvider(pythonSemanticProvider, queue, pythonLanguages, PYTHON_SEMANTIC_PROVIDER_ID, (path) => pythonLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""))
+  ];
+}
+function createTypeScriptRelationshipRegistration(queue) {
+  const languages = relationshipLanguages("TypeScript language service relationship provider");
+  return {
+    providerId: TYPESCRIPT_PROVIDER_ID,
+    languages,
+    operations: relationshipOperations("TypeScript language service relationship provider"),
+    supports: (path) => languages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""),
+    open: async (options) => {
+      const source = new SourceAccess(options.cwd, queue, options.signal, {
+        maxFiles: options.maxFiles
+      });
+      return createTypeScriptRelationshipProvider(source).open({
+        ...options,
+        source,
+        limits: { ...options.limits, maxFiles: options.maxFiles }
+      });
+    }
+  };
+}
+
 // src/relationship-service.ts
 class RelationshipService {
   #queue;
   #resolveScope;
   #maxFilesToParse;
+  #providers;
   #relationships = new RelationshipStore;
   #changeAwareness = new RelationshipChangeAwareness;
   #relationshipWatchStops = new Set;
@@ -11701,6 +14065,7 @@ class RelationshipService {
     this.#queue = options.queue;
     this.#resolveScope = options.resolveScope;
     this.#maxFilesToParse = options.maxFilesToParse;
+    this.#providers = options.providers ?? createRelationshipProviderRegistry(this.#queue);
   }
   clear() {
     this.#relationships.clear();
@@ -11717,33 +14082,10 @@ class RelationshipService {
     if (input.cursor?.startsWith("relationship.") && input.exploreCursor !== undefined)
       throw new CursorError("Use cursor for immutable pages or exploreCursor for continuation, not both", "E_CURSOR_OPTIONS_CONFLICT");
     if (input.exploreCursor !== undefined) {
-      rejectFields(input, [
-        "path",
-        "line",
-        "column",
-        "symbol",
-        "relation",
-        "depth",
-        "maxNodes",
-        "maxEdges",
-        "maxExpansions",
-        "cursor"
-      ], "Trace continuation", true);
       const stored = await this.#relationships.continue(input.exploreCursor, signal);
       return this.#pageResult(stored, stored.state.scope, input, this.#relationshipHints(stored.state.scope), this.#relationshipWatchHealth());
     }
     if (input.cursor?.startsWith("relationship.")) {
-      rejectFields(input, [
-        "path",
-        "line",
-        "column",
-        "symbol",
-        "relation",
-        "depth",
-        "maxNodes",
-        "maxEdges",
-        "maxExpansions"
-      ], "Trace continuation", true);
       if (input.cursor.includes(".explore."))
         throw new SignalGrepError("Use exploreCursor for relationship continuation; cursor is reserved for immutable pages");
       const state = this.#relationships.snapshot(input.cursor);
@@ -11754,26 +14096,6 @@ class RelationshipService {
         ...page.exploreCursor ? { exploreCursor: page.exploreCursor } : {}
       }, state.scope, input, this.#relationshipHints(state.scope), this.#relationshipWatchHealth());
     }
-    rejectFields(input, [
-      "query",
-      "pattern",
-      "context",
-      "wholeWord",
-      "literal",
-      "ignoreCase",
-      "changes",
-      "modifiedAfter",
-      "modifiedBefore",
-      "anyOf",
-      "allOf",
-      "within",
-      "roles",
-      "paths",
-      "matchIndices",
-      "targets",
-      "sourceCursor",
-      "conceptLimit"
-    ], "mode=trace");
     const operation = input.relation;
     if (operation !== "callers" && operation !== "callees")
       throw new SignalGrepError("mode=trace requires relation=callers or relation=callees");
@@ -11809,18 +14131,6 @@ class RelationshipService {
     const cursor = input.cursor;
     if (!cursor)
       throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    rejectFields(input, [
-      "path",
-      "line",
-      "column",
-      "symbol",
-      "relation",
-      "depth",
-      "maxNodes",
-      "maxEdges",
-      "maxExpansions",
-      "exploreCursor"
-    ], "Evidence validation", true);
     const state = this.#relationships.snapshot(cursor);
     const startedAt = Date.now();
     const recheck = await this.#relationships.validate(cursor, signal);
@@ -11850,27 +14160,27 @@ class RelationshipService {
       this.#relationshipWatchStops.add(stop2);
       this.#watchedRelationshipRoots.add(scope.root);
     }
-    const go = /\.go$/iu.test(target);
-    const providerId = go ? goSemanticProvider.providerId : "typescript";
+    const registration = this.#providers.find((provider) => provider.supports(target));
+    if (!registration)
+      throw new SignalGrepError(`No relationship provider is registered for ${target}; use mode=capabilities to inspect available language modes`);
     const factory = {
-      providerId,
+      providerId: registration.providerId,
       open: async (operationSignal = new AbortController().signal, analysisViewId) => {
-        const access = new SourceAccess(cwd, this.#queue, operationSignal, { maxFiles });
-        const implementation = go ? goSemanticProvider : createTypeScriptRelationshipProvider(access);
-        return implementation.open({
+        return registration.open({
           cwd,
           scope,
-          source: access,
           signal: operationSignal,
-          ...analysisViewId ? { analysisViewId } : {},
-          limits: { maxFiles }
+          queue: this.#queue,
+          maxFiles,
+          ...input.relation && registration.limitsForOperation ? { limits: registration.limitsForOperation(input.relation) } : {},
+          ...analysisViewId ? { analysisViewId } : {}
         });
       }
     };
     return { factory, scope };
   }
   #relationshipHints(scope) {
-    return this.#changeAwareness.dirty().filter((hint) => isPathInsideCwd(resolve27(hint.path), scope.root));
+    return this.#changeAwareness.dirty().filter((hint) => isPathInsideCwd(resolve34(hint.path), scope.root));
   }
   #relationshipWatchHealth() {
     return this.#changeAwareness.health();
@@ -11889,54 +14199,1080 @@ class RelationshipService {
     }
   }
 }
-function rejectFields(input, fields, operation, cursor = false) {
-  const present = fields.filter((field) => input[field] !== undefined);
-  if (!present.length)
+
+// src/request-contract-error.ts
+var MAX_REQUEST_RECOVERY_BYTES = 64 * 1024;
+var MAX_REQUEST_DISPLAY_CHARACTERS = 256;
+function boundedDisplay(value, maximum = MAX_REQUEST_DISPLAY_CHARACTERS) {
+  const normalized = value.toWellFormed();
+  return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}\u2026`;
+}
+
+class RequestContractError extends SignalGrepError {
+  code;
+  mode;
+  issues;
+  recovery;
+  constructor(details, message) {
+    super(message);
+    this.name = "RequestContractError";
+    this.code = details.code;
+    this.mode = details.mode;
+    this.issues = details.issues;
+    this.recovery = details.recovery;
+  }
+  get details() {
+    return boundedRequestContractDetails({
+      code: this.code,
+      ...this.mode ? { mode: this.mode } : {},
+      issues: this.issues,
+      recovery: this.recovery
+    });
+  }
+}
+function isSignalGrepDiagnosticError(error) {
+  if (!(error instanceof Error))
+    return false;
+  const details = Reflect.get(error, "details");
+  return typeof details === "object" && details !== null;
+}
+function boundedRequestContractDetails(details) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(details);
+  } catch {
+    serialized = undefined;
+  }
+  if (serialized !== undefined && Buffer.byteLength(serialized) <= MAX_REQUEST_RECOVERY_BYTES)
+    return details;
+  return {
+    code: boundedDisplay(details.code, 128),
+    ...details.mode ? { mode: boundedDisplay(details.mode, 128) } : {},
+    issues: [
+      {
+        field: "<payload>",
+        reason: "The request-contract diagnostic exceeded the bounded payload budget."
+      }
+    ],
+    recovery: {
+      action: "manual",
+      reason: "Exact recovery was omitted because the request-contract payload exceeded its bounded budget; preserve valid selectors and filters and correct the request explicitly."
+    }
+  };
+}
+
+// src/request-contract-catalog.ts
+var SIGNAL_GREP_MODES = [
+  "auto",
+  "summary",
+  "matches",
+  "inspect",
+  "outline",
+  "imports",
+  "tests",
+  "impact",
+  "files",
+  "structure",
+  "concept",
+  "hybrid",
+  "definitions",
+  "references",
+  "implementations",
+  "callers",
+  "callees",
+  "dependencies",
+  "dependents",
+  "trace",
+  "validate",
+  "capabilities",
+  "await",
+  "cancel"
+];
+var commonFields = ["mode", "redact"];
+var sourceFilters = [
+  "path",
+  "glob",
+  "exclude",
+  "hidden"
+];
+var ordinaryFields = [
+  ...commonFields,
+  "pattern",
+  ...sourceFilters,
+  "literal",
+  "ignoreCase",
+  "context",
+  "limit",
+  "scope",
+  "wholeWord",
+  "modifiedAfter",
+  "modifiedBefore",
+  "anyOf",
+  "allOf",
+  "within",
+  "roles",
+  "changes",
+  "maxFilesToParse",
+  "cursor",
+  "matchIndex"
+];
+var MODE_FIELDS_BY_MODE = {
+  auto: ordinaryFields,
+  summary: ordinaryFields,
+  matches: ordinaryFields,
+  inspect: [...commonFields, "path", "line", "cursor", "matchIndex", "matchIndices", "targets"],
+  outline: [...commonFields, "path", "line", "symbol", "cursor", "matchIndex", "maxFilesToParse"],
+  imports: [
+    ...commonFields,
+    ...sourceFilters,
+    "line",
+    "symbol",
+    "cursor",
+    "matchIndex",
+    "maxFilesToParse"
+  ],
+  tests: [
+    ...commonFields,
+    ...sourceFilters,
+    "line",
+    "symbol",
+    "cursor",
+    "matchIndex",
+    "maxFilesToParse"
+  ],
+  impact: [...commonFields, ...sourceFilters, "path", "line", "symbol", "cursor", "matchIndex"],
+  files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
+  structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
+  concept: [...commonFields, "query", ...sourceFilters],
+  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit"],
+  definitions: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
+  references: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
+  implementations: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
+  callers: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
+  callees: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
+  dependencies: [...commonFields, "path"],
+  dependents: [...commonFields, "path"],
+  trace: [
+    ...commonFields,
+    ...sourceFilters,
+    "path",
+    "line",
+    "column",
+    "symbol",
+    "relation",
+    "depth",
+    "maxNodes",
+    "maxEdges",
+    "maxExpansions",
+    "maxFilesToParse",
+    "cursor",
+    "exploreCursor",
+    "matchIndex"
+  ],
+  validate: [...commonFields, "cursor", "matchIndex"],
+  capabilities: [...commonFields, ...sourceFilters],
+  await: ["mode", "operationId"],
+  cancel: ["mode", "operationId"]
+};
+var SAFE_DROP_FIELDS = {
+  files: ["scope"]
+};
+var SUPPORTED_OUTLINE_EXTENSIONS = new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.some((capability) => capability.name === "outline") ? descriptor.extensions : []));
+function modeFields(mode) {
+  return MODE_FIELDS_BY_MODE[mode];
+}
+function modeFieldSummary(mode) {
+  return `${mode}={${modeFields(mode).join(",")}}`;
+}
+var MODE_SUMMARY_MODES = [
+  "files",
+  "concept",
+  "hybrid",
+  "inspect",
+  "outline",
+  "references",
+  "trace",
+  "capabilities",
+  "await",
+  "cancel"
+];
+var MODE_FIELD_SUMMARY = MODE_SUMMARY_MODES.map((mode) => modeFieldSummary(mode)).join("; ");
+var REQUEST_FIELD_GUIDANCE = {
+  pattern: "pattern is regex by default; literal=true matches source text exactly",
+  literal: "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
+  path: "path must be an existing exact file or root; use mode=files+query for unknown names",
+  query: "files+query discovers unknown filenames/paths; concept/hybrid query is natural language",
+  anyOf: "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
+  allOf: "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
+  context: "context is an output-context budget and is never silently dropped",
+  limit: "limit is an output/page budget and is never silently dropped",
+  scope: "scope applies to ordinary content search; mode=files rejects this field because its scope is fixed strict, and only redundant strict may be removed"
+};
+function fieldGuidance(field) {
+  return REQUEST_FIELD_GUIDANCE[field] ?? `${field} is accepted only by its cataloged modes`;
+}
+var GUIDANCE_FIELDS = [
+  "pattern",
+  "literal",
+  "path",
+  "query",
+  "anyOf",
+  "allOf",
+  "context",
+  "limit",
+  "scope"
+];
+var SEARCH_GUIDANCE_FIELDS = ["pattern", "literal", "path", "query"];
+var VARIANT_GUIDANCE_FIELDS = ["anyOf", "allOf"];
+var BUDGET_GUIDANCE_FIELDS = ["limit", "context"];
+var REQUEST_USAGE_GUIDANCE = [
+  `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => `${field}=${fieldGuidance(field)}`).join("; ")}`,
+  `variants: ${VARIANT_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
+  `budgets: ${BUDGET_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
+  `selectors: inspect=${modeFieldSummary("inspect")}; references=${modeFieldSummary("references")}; hybrid=${modeFieldSummary("hybrid")}; files=${modeFieldSummary("files")}; capabilities=${modeFieldSummary("capabilities")}`,
+  "use only the advertised names: exact, any-of and max_results are not parameters"
+].join("; ");
+var MODEL_USAGE_GUIDANCE = [
+  "pattern is regex by default; literal=true matches source text exactly",
+  "path is an existing exact file or root; use files+query for an unknown name",
+  "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
+  "limit/context are output budgets and are never silently dropped",
+  "outline and semantic modes follow capabilities; Swift needs SourceKit-LSP, Go trace needs gopls and a valid workspace; bounded evidence",
+  `selectors: inspect={${modeFields("inspect").join(",")}}; references={${modeFields("references").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
+  "exact, any-of and max_results are not parameters"
+].join("; ");
+var MODE_CONTRACT_DESCRIPTION = [
+  `fields: ${MODE_FIELD_SUMMARY}`,
+  `rules: ${GUIDANCE_FIELDS.map((field) => `${field} \u2014 ${fieldGuidance(field)}`).join("; ")}`,
+  "inspect uses cursor+matchIndex or explicit targets; references and other semantic navigation use path+line+column or an unambiguous symbol",
+  "capabilities performs a bounded names-only project inventory and reports per-language modes with lazy loading; it does not start a parser, compiler, model or language server",
+  "outline follows declared capabilities; Swift needs SourceKit-LSP; unavailable languages appear in capabilities",
+  "there are no exact, any-of or max_results fields; use literal, anyOf or limit",
+  "context 0\u201320 is never clamped"
+].join("; ");
+function outlineExtension2(path) {
+  if (typeof path !== "string")
     return;
-  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: copy the complete returned request unchanged. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
-  if (cursor)
-    throw new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT");
-  throw new SignalGrepError(message);
+  return outlineExtension(path);
+}
+
+// src/request-contract.ts
+var MAX_REQUEST_RECOVERY_ISSUES = 16;
+function boundedField(value) {
+  return boundedDisplay(value, 128);
+}
+function record3(value) {
+  return typeof value === "object" && value !== null;
+}
+function modeOf(input) {
+  const mode = input.mode;
+  if (mode === undefined)
+    return "auto";
+  if (typeof mode !== "string")
+    return;
+  return SIGNAL_GREP_MODES.find((candidate) => candidate === mode);
+}
+function inputModeLabel(input) {
+  return typeof input.mode === "string" ? input.mode.slice(0, 128) : undefined;
+}
+function outlineCapability(path, resolvedDocument = false) {
+  const extension = outlineExtension2(path);
+  return {
+    ...extension ? { extension } : {},
+    supported: extension !== undefined ? SUPPORTED_OUTLINE_EXTENSIONS.has(extension) : !resolvedDocument
+  };
+}
+function capabilityError(code, mode, field, reason, message) {
+  return new RequestContractError({
+    code,
+    ...mode ? { mode } : {},
+    issues: [{ field, reason }],
+    recovery: { action: "choose-capability", reason }
+  }, message);
+}
+function schemaError(input, field, reason) {
+  const mode = inputModeLabel(input);
+  return new RequestContractError({
+    code: `E_${field.replaceAll(/[^a-z0-9]+/giu, "_").toUpperCase()}_RANGE`,
+    ...mode ? { mode } : {},
+    issues: [{ field, reason }],
+    recovery: { action: "manual", reason }
+  }, `${field} is invalid: ${reason}`);
+}
+function safeNextRequest(input, mode, invalid) {
+  if (input.redact === true && containsSensitiveText(input))
+    return;
+  const safe = new Set(SAFE_DROP_FIELDS[mode] ?? []);
+  if (invalid.some((field) => !safe.has(field)))
+    return;
+  const next = { ...input };
+  for (const field of invalid)
+    delete next[field];
+  if (selectorIssuesFor(next, mode).length > 0)
+    return;
+  try {
+    if (Buffer.byteLength(JSON.stringify(next)) > MAX_REQUEST_RECOVERY_BYTES)
+      return;
+  } catch {
+    return;
+  }
+  return next;
+}
+function fieldsError(input, mode, invalid, selectorIssues = []) {
+  const nextRequest = safeNextRequest(input, mode, invalid);
+  const visibleInvalid = invalid.slice(0, MAX_REQUEST_RECOVERY_ISSUES);
+  const omitted = invalid.length - visibleInvalid.length;
+  const issues = [
+    ...visibleInvalid.map((field) => ({
+      field: boundedField(field),
+      reason: `not accepted by mode=${boundedDisplay(mode, 128)}`
+    })),
+    ...selectorIssues
+  ];
+  if (omitted > 0)
+    issues.push({
+      field: "<additional-fields>",
+      reason: `${String(omitted)} additional fields are not accepted`
+    });
+  const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
+  const reason = omitted > 0 ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)` : `mode=${mode} does not accept ${visibleFields}`;
+  return new RequestContractError({
+    code: "E_MODE_FIELDS",
+    mode,
+    issues,
+    recovery: nextRequest ? {
+      action: "retry",
+      reason: `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+      nextRequest
+    } : {
+      action: "manual",
+      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope.`
+    }
+  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
+}
+function selectorIssuesFor(input, mode) {
+  if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof input.cursor === "string" && input.cursor.trim().length > 0 && !input.cursor.includes(".analysis")) {
+    const issues = [];
+    if (mode === "summary" && input.path !== undefined)
+      issues.push({ field: "path", reason: "summary cursor paging cannot select a direct path" });
+    if (mode === "summary" && input.paths !== undefined)
+      issues.push({ field: "paths", reason: "summary cursor paging cannot select retained paths" });
+    if (mode !== "summary" && input.path !== undefined && input.paths !== undefined)
+      issues.push({ field: "paths", reason: "cursor selection accepts path or paths, not both" });
+    return issues;
+  }
+  if (mode === "outline" || mode === "imports" || mode === "tests") {
+    if (input.cursor !== undefined) {
+      const issues = [];
+      if (!Number.isSafeInteger(input.matchIndex))
+        issues.push({ field: "matchIndex", reason: "cursor continuation requires matchIndex" });
+      for (const field of ["path", "line", "symbol"])
+        if (input[field] !== undefined)
+          issues.push({ field, reason: "cursor continuation cannot combine a direct selector" });
+      return issues;
+    }
+    if (typeof input.path !== "string" || input.path.length === 0)
+      return [
+        { field: "path", reason: `mode=${mode} requires a source path or cursor+matchIndex` }
+      ];
+    return [];
+  }
+  if (mode === "inspect") {
+    const issues = [];
+    const hasMatchIndices = input.matchIndices !== undefined;
+    const hasTargets = input.targets !== undefined;
+    if (hasMatchIndices && hasTargets)
+      issues.push({ field: "targets", reason: "use either matchIndices or targets, not both" });
+    if (hasMatchIndices && typeof input.cursor !== "string")
+      issues.push({ field: "cursor", reason: "matchIndices requires a cursor" });
+    if (hasTargets && input.cursor !== undefined)
+      issues.push({ field: "cursor", reason: "targets cannot be combined with cursor" });
+    if (hasMatchIndices || hasTargets) {
+      for (const field of ["path", "line", "matchIndex"])
+        if (input[field] !== undefined)
+          issues.push({
+            field,
+            reason: "batch inspection accepts targets or matchIndices instead of path, line or matchIndex"
+          });
+      return issues;
+    }
+    if (typeof input.cursor === "string" && input.cursor.includes(".analysis")) {
+      if (!Number.isSafeInteger(input.matchIndex))
+        issues.push({
+          field: "matchIndex",
+          reason: "cursor inspection requires matchIndex"
+        });
+      if (input.path !== undefined)
+        issues.push({ field: "path", reason: "analysis cursor inspection cannot combine path" });
+      if (input.line !== undefined)
+        issues.push({ field: "line", reason: "analysis cursor inspection cannot combine line" });
+    }
+    return issues;
+  }
+  if (mode === "impact") {
+    if (input.cursor !== undefined) {
+      const issues = [];
+      if (!Number.isSafeInteger(input.matchIndex))
+        issues.push({ field: "matchIndex", reason: "snapshot impact requires cursor+matchIndex" });
+      for (const field of ["path", "line", "symbol"])
+        if (input[field] !== undefined)
+          issues.push({ field, reason: "snapshot impact cursor cannot combine a direct selector" });
+      return issues;
+    }
+    if (typeof input.path !== "string" || input.line === undefined && input.symbol === undefined)
+      return [{ field: "path", reason: "direct impact requires path and line or symbol" }];
+    return [];
+  }
+  if (mode === "definitions" || mode === "references" || mode === "implementations" || mode === "callers" || mode === "callees") {
+    if (typeof input.path !== "string" || !(Number.isSafeInteger(input.line) && Number.isSafeInteger(input.column)) && typeof input.symbol !== "string")
+      return [
+        {
+          field: "path",
+          reason: "semantic navigation requires path and line+column, or an unambiguous symbol"
+        }
+      ];
+    return [];
+  }
+  if (mode === "trace" && input.cursor === undefined && input.exploreCursor === undefined) {
+    const issues = [];
+    if (input.relation !== "callers" && input.relation !== "callees")
+      issues.push({
+        field: "relation",
+        reason: "mode=trace requires relation=callers or relation=callees"
+      });
+    if (typeof input.path !== "string")
+      issues.push({ field: "path", reason: "mode=trace requires path" });
+    if (!Number.isSafeInteger(input.line))
+      issues.push({ field: "line", reason: "mode=trace requires line" });
+    return issues;
+  }
+  if (mode === "validate" && typeof input.cursor !== "string")
+    return [{ field: "cursor", reason: "mode=validate requires a saved evidence cursor" }];
+  return [];
+}
+function selectorError(input, mode, issues) {
+  const reason = issues.map((issue) => `${issue.field}: ${issue.reason}`).join("; ");
+  return new RequestContractError({
+    code: "E_MODE_SELECTOR",
+    mode,
+    issues,
+    recovery: {
+      action: "manual",
+      reason: `${reason}; choose a complete selector variant explicitly. No executable nextRequest can be inferred.`
+    }
+  }, `mode=${mode} has an incomplete or conflicting selector: ${reason}`);
+}
+function validateValueRanges(input) {
+  const integerRanges = [
+    ["context", 0, MAX_CONTEXT_LINES],
+    ["limit", 1, MAX_PAGE_SIZE],
+    ["conceptLimit", 1, MAX_HYBRID_CONCEPT_LIMIT],
+    ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES],
+    [
+      "depth",
+      RELATIONSHIP_TRACE_LIMITS.maxDepth.minimum,
+      RELATIONSHIP_TRACE_LIMITS.maxDepth.maximum
+    ],
+    [
+      "maxNodes",
+      RELATIONSHIP_TRACE_LIMITS.maxNodes.minimum,
+      RELATIONSHIP_TRACE_LIMITS.maxNodes.maximum
+    ],
+    [
+      "maxEdges",
+      RELATIONSHIP_TRACE_LIMITS.maxEdges.minimum,
+      RELATIONSHIP_TRACE_LIMITS.maxEdges.maximum
+    ],
+    [
+      "maxExpansions",
+      RELATIONSHIP_TRACE_LIMITS.maxExpansions.minimum,
+      RELATIONSHIP_TRACE_LIMITS.maxExpansions.maximum
+    ]
+  ];
+  for (const [field, minimum, maximum] of integerRanges) {
+    const value = input[field];
+    if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum))
+      throw schemaError(input, field, `must be an integer from ${String(minimum)} through ${String(maximum)}`);
+  }
+}
+function validateRequired(input, mode) {
+  if ((mode === "concept" || mode === "hybrid") && (typeof input.query !== "string" || !input.query.trim()))
+    throw capabilityError("E_MODE_QUERY_REQUIRED", mode, "query", `mode=${mode} requires a nonempty natural-language query`, `mode=${mode} requires query; provide the natural-language question and retry`);
+  if (mode === "await" || mode === "cancel") {
+    if (typeof input.operationId !== "string" || !input.operationId.trim())
+      throw capabilityError("E_OPERATION_ID_REQUIRED", mode, "operationId", `${mode} requires the exact operationId returned by a prior waiting result`, `${mode} requires operationId; copy the returned nextRequest exactly`);
+  }
+}
+function validateOutlineCapability(input, mode) {
+  if (mode !== "outline")
+    return;
+  const capability = outlineCapability(typeof input.path === "string" ? input.path : undefined);
+  if (!capability.supported && typeof input.path === "string")
+    throw outlineCapabilityError(input.path, mode);
+}
+function outlineCapabilityError(path, mode = "outline", resolvedDocument = false) {
+  const capability = outlineCapability(path, resolvedDocument);
+  if (capability.supported)
+    return;
+  const extension = capability.extension ?? "extensionless source";
+  return capabilityError("E_MODE_UNSUPPORTED", mode, "language", `outline requires a declared language outline capability; ${extension} is unsupported`, `mode=outline is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`);
+}
+function validateRequestContract(input) {
+  const value = input;
+  if (!record3(value))
+    throw schemaError({}, "request", "request must be an object");
+  const raw = value;
+  validateValueRanges(raw);
+  const mode = modeOf(raw);
+  if (!mode)
+    throw capabilityError("E_MODE_UNKNOWN", inputModeLabel(raw), "mode", `mode must be one of ${SIGNAL_GREP_MODES.join(", ")}`, "Choose one of the advertised modes and retry");
+  if (raw.sourceCursor !== undefined && mode !== "inspect")
+    throw capabilityError("E_SOURCE_CURSOR_MODE", mode, "sourceCursor", "sourceCursor is only valid with mode=inspect", "Copy the source continuation request with mode=inspect");
+  if (raw.operationId !== undefined && mode !== "await" && mode !== "cancel")
+    throw capabilityError("E_OPERATION_MODE", mode, "operationId", "operationId is only valid with mode=await or mode=cancel", "Copy the returned await or cancel request exactly");
+  validateRequired(raw, mode);
+  validateOutlineCapability(raw, mode);
+  if (mode === "auto" && raw.query !== undefined)
+    throw capabilityError("E_MODE_REQUIRED", mode, "query", "query is ambiguous without an explicit discovery or semantic mode", 'Use mode="files" for filename discovery or mode="concept" for semantic discovery');
+  if (mode === "files" && raw.scope === "expand")
+    throw new RequestContractError({
+      code: "E_FILES_SCOPE_EXPAND",
+      mode,
+      issues: [
+        { field: "scope", reason: "scope=expand has no semantics-preserving files repair" }
+      ],
+      recovery: {
+        action: "manual",
+        reason: "Choose mode=files with the intended discovery root and preserve path/filters explicitly."
+      }
+    }, "mode=files does not support scope=expand; choose the intended discovery root explicitly and preserve path/glob/exclude/hidden filters");
+  const allowed = new Set(MODE_FIELDS_BY_MODE[mode]);
+  if (mode === "inspect" && raw.sourceCursor !== undefined) {
+    allowed.clear();
+    for (const field of ["mode", "sourceCursor", "redact"])
+      allowed.add(field);
+  }
+  if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof raw.cursor === "string" && raw.cursor.includes(".analysis")) {
+    allowed.clear();
+    for (const field of ["mode", "cursor", "redact"])
+      allowed.add(field);
+  }
+  if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof raw.cursor === "string" && raw.cursor.trim().length > 0 && !raw.cursor.includes(".analysis")) {
+    allowed.clear();
+    for (const field of ["mode", "cursor", "path", "paths", "redact"])
+      allowed.add(field);
+  }
+  if (mode === "trace" && raw.exploreCursor !== undefined) {
+    allowed.clear();
+    for (const field of ["mode", "exploreCursor", "redact"])
+      allowed.add(field);
+  } else if (mode === "trace" && typeof raw.cursor === "string" && raw.cursor.startsWith("relationship.")) {
+    allowed.clear();
+    for (const field of ["mode", "cursor", "matchIndex", "redact"])
+      allowed.add(field);
+  }
+  const allowedNames = new Set(allowed);
+  const invalid = Object.keys(raw).filter((field) => !allowedNames.has(field));
+  const selectorIssues = selectorIssuesFor(raw, mode);
+  if (invalid.length > 0) {
+    throw fieldsError(raw, mode, invalid, selectorIssues);
+  }
+  if (selectorIssues.length > 0)
+    throw selectorError(raw, mode, selectorIssues);
+}
+
+// src/evidence-service.ts
+import { realpath as realpath10 } from "fs/promises";
+
+// src/semantic-navigation.ts
+import { resolve as resolve35 } from "path";
+var semanticRequestQueue = new OwnedTaskQueue;
+async function selection(input, access, document2) {
+  if (input.column !== undefined) {
+    if (input.line === undefined || !Number.isSafeInteger(input.column) || input.column < 1 || input.symbol !== undefined)
+      throw new SignalGrepError("Semantic column requires line and no symbol; both are 1-based UTF-16 positions");
+    const position = { line: input.line - 1, character: input.column - 1 };
+    byteAt(document2, position);
+    return position;
+  }
+  const syntax = await access.syntax(document2);
+  if (syntax.status !== "ok")
+    throw new SignalGrepError("Selecting a semantic symbol requires valid syntax; supply an exact line+column position");
+  const candidates = syntax.nodes.filter((node) => /^(?:identifier|property_identifier|type_identifier|shorthand_property_identifier(?:_pattern)?)$/.test(node.kind) && (input.symbol === undefined || document2.text.slice(node.start, node.end) === input.symbol) && (input.line === undefined || document2.lineAt(document2.toByteOffset(node.start)) === input.line));
+  if (input.line === undefined && input.symbol === undefined)
+    throw new SignalGrepError("Semantic navigation requires path and line+column, or an unambiguous symbol");
+  if (candidates.length !== 1)
+    throw new SignalGrepError(`Semantic target is ${candidates.length ? "ambiguous" : "absent"}; supply an exact 1-based line and UTF-16 column`);
+  const candidate = candidates[0];
+  if (!candidate)
+    throw new Error("Missing semantic candidate");
+  return lspPosition(document2, candidate.start);
+}
+function itemFor(document2, location, relation) {
+  const range = byteRange(document2, location.range);
+  const line = document2.lineAt(range.start);
+  const evidence = sourceEvidence(document2, range);
+  return {
+    path: document2.path,
+    line,
+    range,
+    source: document2.reference,
+    label: `Compiler-bound ${relation}`,
+    excerpt: evidence.excerpt,
+    details: {
+      kind: "semantic",
+      excerptRange: evidence.excerptRange,
+      excerptTruncated: evidence.excerptTruncated || range.end > evidence.excerptRange.end,
+      relation,
+      binding: "typescript-compiler",
+      certainty: "static",
+      runtimeDispatch: "unproven",
+      score: 100,
+      rankingReason: "compiler binding with verified source range",
+      position: { line: location.range.start.line + 1, column: location.range.start.character + 1 },
+      nextRequest: {
+        mode: relation === "definitions" ? "references" : "definitions",
+        path: document2.path,
+        line: location.range.start.line + 1,
+        column: location.range.start.character + 1
+      }
+    }
+  };
+}
+async function queryLocations(channel, mode, params) {
+  if (mode === "callers" || mode === "callees") {
+    const prepared = await channel.request("textDocument/prepareCallHierarchy", params);
+    if (prepared === null)
+      return [];
+    if (!Array.isArray(prepared))
+      throw new SignalGrepError("Invalid compiler call hierarchy");
+    const found = [];
+    for (const item of prepared) {
+      const calls = await channel.request(mode === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls", { item });
+      if (calls === null)
+        continue;
+      if (!Array.isArray(calls))
+        throw new SignalGrepError("Invalid compiler call relationships");
+      for (const call of calls) {
+        if (!rpcRecord(call))
+          throw new SignalGrepError("Invalid compiler call relationship");
+        found.push(semanticLocation(mode === "callers" ? call.from : call.to));
+      }
+    }
+    return found;
+  }
+  const method = mode === "definitions" ? "definition" : mode === "implementations" ? "implementation" : "references";
+  if (!rpcRecord(params))
+    throw new Error("Expected semantic request parameters");
+  return locations(await channel.request(`textDocument/${method}`, {
+    ...params,
+    ...method === "references" ? { context: { includeDeclaration: true } } : {}
+  }));
+}
+async function runSemanticNavigation(input, access) {
+  if (!input.path || !isSemanticMode(input.mode))
+    throw new SignalGrepError("Semantic navigation requires a mode and workspace path");
+  const project = await semanticProject(access, input.path);
+  const { result, documents, primary, root } = project;
+  result.kind = input.mode;
+  result.redact = input.redact ?? false;
+  const mode = input.mode;
+  const graph = mode === "dependencies" || mode === "dependents";
+  if (graph && (input.line !== undefined || input.column !== undefined || input.symbol !== undefined))
+    throw new SignalGrepError("File dependencies/dependents accept path without line, column or symbol");
+  const position = graph ? undefined : await selection(input, access, primary);
+  const sourceAt = await semanticSources(access.cwd, documents.values());
+  const add = async (location, relation) => {
+    const document2 = await sourceAt(location.path);
+    if (document2)
+      result.items.push(itemFor(document2, location, relation));
+    else {
+      result.partial = true;
+      result.reasons.push("Compiler returned a location outside admitted source coverage; dependency/ignored/over-budget source was not exposed");
+    }
+  };
+  await withTypeScript(root, [...documents.values()], async (channel) => {
+    if (!graph) {
+      const found = await queryLocations(channel, mode, {
+        textDocument: { uri: await semanticUri(access.cwd, primary.path) },
+        position
+      });
+      for (const location of found) {
+        await add(location, mode);
+      }
+      return;
+    }
+    for (const document2 of mode === "dependencies" ? [primary] : documents.values()) {
+      const syntax = await access.syntax(document2);
+      if (syntax.status !== "ok") {
+        result.partial = true;
+        result.reasons.push(`${document2.path}: module syntax ${syntax.status}`);
+        continue;
+      }
+      const uri = await semanticUri(access.cwd, document2.path);
+      const specifiers = syntax.nodes.filter((node) => node.kind === "string" && node.parent !== null && (() => {
+        const parent = syntax.nodes[node.parent];
+        if (!parent)
+          return false;
+        if (parent.kind === "import_statement" || parent.kind === "export_statement")
+          return true;
+        if (parent.kind !== "arguments" || parent.parent === null)
+          return false;
+        const call = syntax.nodes[parent.parent];
+        return call?.kind === "call_expression" && /^(?:import|require)\s*\(/.test(document2.text.slice(call.start, node.start));
+      })());
+      for (const specifier of specifiers) {
+        const resolved = locations(await channel.request("textDocument/definition", {
+          textDocument: { uri },
+          position: lspPosition(document2, specifier.start + 1)
+        }));
+        if (!resolved.length) {
+          result.partial = true;
+          result.reasons.push(`${document2.path}: unresolved module ${document2.text.slice(specifier.start, specifier.end)}`);
+        }
+        for (const target of resolved) {
+          const targetDocument = await sourceAt(target.path);
+          if (mode === "dependencies") {
+            await add(target, "dependency");
+          } else if (targetDocument === primary) {
+            await add({
+              path: resolve35(access.cwd, document2.path),
+              range: {
+                start: lspPosition(document2, specifier.start),
+                end: lspPosition(document2, specifier.end)
+              }
+            }, "dependent");
+          }
+        }
+      }
+      access.releaseSyntax(document2);
+    }
+  }, access.signal, access.cwd);
+  await project.recheck();
+  result.filesRead = access.filesRead;
+  result.bytesRead = access.bytesRead;
+  result.items = rankEvidence([
+    ...new Map(result.items.map((item) => [
+      `${item.path}:${String(item.range?.start)}:${String(item.range?.end)}`,
+      item
+    ])).values()
+  ], () => 0);
+  result.reasons = [...new Set(result.reasons)];
+  result.coverage = {
+    ...result.coverage,
+    compilerBindings: result.partial ? "partial" : "complete"
+  };
+  return result;
+}
+function navigateSemantics(input, access) {
+  return semanticRequestQueue.run(() => runSemanticNavigation(input, access), access.signal);
+}
+
+// src/semantic-navigation-adapter.ts
+import { realpath as realpath9 } from "fs/promises";
+import { resolve as resolve36 } from "path";
+function scopeFromResolution(resolved) {
+  return {
+    root: resolved.root,
+    ...resolved.filters.glob.length ? { include: resolved.filters.glob } : {},
+    ...resolved.filters.exclude.length ? { exclude: resolved.filters.exclude } : {},
+    hidden: resolved.filters.hidden
+  };
+}
+async function searchScope(cwd, target, scope) {
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath9(resolve36(cwd)).catch(() => resolve36(cwd)),
+    realpath9(scope.root).catch(() => resolve36(scope.root))
+  ]);
+  const isProjectRoot = canonicalRoot === canonicalCwd;
+  return {
+    path: isProjectRoot ? "." : canonicalRoot,
+    requestedPath: target,
+    glob: [...scope.include ?? []],
+    exclude: [...scope.exclude ?? []],
+    hidden: scope.hidden ?? false,
+    expandedToProjectRoot: false,
+    assertion: isProjectRoot ? "project-wide" : "requested-scope"
+  };
+}
+function relatedNode(operation, edge) {
+  return operation === "definitions" || operation === "implementations" || operation === "callees" ? edge.to : edge.from;
+}
+var RELATIONSHIP_OPERATIONS = [
+  "definitions",
+  "references",
+  "implementations",
+  "callers",
+  "callees"
+];
+function isRelationshipOperation(mode) {
+  return RELATIONSHIP_OPERATIONS.some((candidate) => candidate === mode);
+}
+async function itemFor2(access, operation, edge) {
+  const node = relatedNode(operation, edge);
+  const document2 = await access.load(node.path, node.source);
+  const evidence = sourceEvidence(document2, node.range);
+  return {
+    path: node.path,
+    line: node.start.line,
+    label: `Compiler-bound ${operation}`,
+    excerpt: evidence.excerpt,
+    ...node.source ? { source: node.source } : {},
+    range: node.range,
+    details: {
+      kind: "semantic",
+      relation: operation,
+      binding: edge.evidence[0]?.providerBasis ?? edge.from.identity.providerId,
+      certainty: edge.confidence,
+      runtimeDispatch: "unproven",
+      evidence: edge.evidence.map(({ reason, level, basis, providerBasis }) => ({
+        reason,
+        level,
+        basis,
+        ...providerBasis ? { providerBasis } : {}
+      })),
+      excerptRange: evidence.excerptRange,
+      excerptTruncated: evidence.excerptTruncated
+    }
+  };
+}
+async function navigateRelationship(registration, input, access, resolveScope, queue) {
+  if (!isSemanticMode(input.mode))
+    throw new SignalGrepError("A semantic provider requires a semantic mode");
+  const mode = input.mode;
+  if (!isRelationshipOperation(mode))
+    throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=${mode}; use mode=capabilities`);
+  if (!input.path)
+    throw new SignalGrepError(`mode=${mode} requires a workspace path`);
+  if (!registration.operations.includes(mode))
+    throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=${mode}; use mode=capabilities`);
+  if (access.signal?.aborted)
+    throw abortError();
+  const target = input.path.replace(/^@/, "");
+  const resolved = await resolveScope(access.cwd, target, input, access.signal);
+  const scope = scopeFromResolution(resolved);
+  const options = {
+    cwd: access.cwd,
+    scope,
+    signal: access.signal ?? new AbortController().signal,
+    queue,
+    maxFiles: access.maxFiles,
+    ...registration.limitsForOperation ? { limits: registration.limitsForOperation(mode) } : {}
+  };
+  const view = await registration.open(options);
+  try {
+    const resolution = await view.resolveNode({
+      path: target,
+      ...input.line === undefined ? {} : { line: input.line },
+      ...input.column === undefined ? {} : { column: input.column },
+      ...input.symbol === undefined ? {} : { symbol: input.symbol }
+    }, access.signal);
+    if (!resolution.node) {
+      const relationship = publicRelationshipDetails(scope, [], {
+        operation: mode,
+        providerId: registration.providerId,
+        freshness: "unknown",
+        coverage: "partial",
+        comparisonTarget: "current-worktree",
+        truncation: { truncated: false, reasons: resolution.reasons }
+      });
+      return {
+        kind: mode,
+        unit: "relationships",
+        items: [],
+        partial: true,
+        reasons: [
+          ...resolution.reasons,
+          `Semantic provider returned ${resolution.status} without a resolved target`
+        ],
+        filesRead: access.filesRead,
+        bytesRead: access.bytesRead,
+        scope: await searchScope(access.cwd, target, scope),
+        coverage: { compilerBindings: "partial" },
+        relationship,
+        redact: input.redact ?? false
+      };
+    }
+    const expansion = await view.expand(resolution.node, mode, access.signal);
+    const items = await Promise.all(expansion.edges.map((edge) => itemFor2(access, mode, edge)));
+    const recheck = await view.recheck(access.signal);
+    const reasons = [
+      ...resolution.reasons,
+      ...expansion.coverage.reasons,
+      ...expansion.unresolved.map((item) => item.reason),
+      ...recheck.reasons
+    ];
+    const partial = resolution.status !== "resolved" || expansion.coverage.status !== "complete" || expansion.unresolved.length > 0 || recheck.validity !== "current";
+    const relationship = publicRelationshipDetails(scope, recheck.sources, {
+      operation: mode,
+      providerId: registration.providerId,
+      freshness: recheck.validity,
+      coverage: partial ? "partial" : "complete",
+      comparisonTarget: "current-worktree",
+      truncation: { truncated: false, reasons: [...new Set(reasons)] }
+    });
+    return {
+      kind: mode,
+      unit: "relationships",
+      items,
+      partial,
+      reasons: [...new Set(reasons)],
+      filesRead: access.filesRead,
+      bytesRead: access.bytesRead,
+      scope: await searchScope(access.cwd, target, scope),
+      coverage: {
+        compilerBindings: partial ? "partial" : "complete",
+        freshness: recheck.validity === "current" ? "complete" : "partial"
+      },
+      relationship,
+      redact: input.redact ?? false
+    };
+  } finally {
+    await view.close();
+  }
+}
+function outlineItems(nodes, depth = 0) {
+  return nodes.flatMap((node) => [
+    {
+      path: node.path,
+      line: node.start.line,
+      label: `${"  ".repeat(depth)}${node.kind} ${node.name}`,
+      ...node.source ? { source: node.source } : {},
+      range: node.range,
+      details: {
+        kind: "symbol",
+        name: node.name,
+        syntax: "provider-owned outline; it does not prove runtime relationships"
+      }
+    },
+    ...outlineItems(node.children, depth + 1)
+  ]);
+}
+async function navigateOutline(registration, input, access, resolveScope, queue) {
+  if (!input.path)
+    throw new SignalGrepError("mode=outline requires a workspace path");
+  const target = input.path.replace(/^@/, "");
+  const resolved = await resolveScope(access.cwd, target, input, access.signal);
+  const scope = scopeFromResolution(resolved);
+  const view = await registration.open({
+    cwd: access.cwd,
+    scope,
+    signal: access.signal ?? new AbortController().signal,
+    queue,
+    maxFiles: access.maxFiles
+  });
+  try {
+    if (!view.outline)
+      throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=outline; use mode=capabilities`);
+    const nodes = await view.outline(target);
+    const allItems = outlineItems(nodes);
+    const selectedItems = allItems.filter((item) => {
+      const matchesLine = input.line === undefined || item.line === input.line;
+      const matchesSymbol = input.symbol === undefined || item.details?.name === input.symbol;
+      return matchesLine && matchesSymbol;
+    });
+    const selectorRequested = input.line !== undefined || input.symbol !== undefined;
+    const recheck = await view.recheck(access.signal);
+    const reasons = [...recheck.reasons];
+    if (selectorRequested && selectedItems.length === 0)
+      reasons.push("Outline selector did not match an admitted symbol");
+    const partial = recheck.validity !== "current" || recheck.coverage !== "complete" || selectorRequested && selectedItems.length === 0;
+    return {
+      kind: "outline",
+      unit: "symbols",
+      items: selectedItems,
+      partial,
+      reasons: [...new Set(reasons)],
+      filesRead: access.filesRead,
+      bytesRead: access.bytesRead,
+      scope: await searchScope(access.cwd, target, scope),
+      coverage: { outline: partial ? "partial" : "complete" },
+      redact: input.redact ?? false
+    };
+  } finally {
+    await view.close();
+  }
+}
+function outlineProviderSupports(relationship, path) {
+  return relationship.supports(path) && Boolean(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.capabilities.some((capability) => capability.name === "outline" && capability.provider === relationship.providerId && capability.availability !== "unavailable"));
+}
+function hasDeclaredOutlineProvider(relationship) {
+  return DEFAULT_LANGUAGE_CAPABILITIES.some((descriptor) => descriptor.capabilities.some((capability) => capability.name === "outline" && capability.provider === relationship.providerId));
+}
+
+// src/semantic-provider-registry.ts
+var RELATIONSHIP_OPERATIONS2 = [
+  "definitions",
+  "references",
+  "implementations",
+  "callers",
+  "callees"
+];
+function relationshipMode(mode) {
+  return RELATIONSHIP_OPERATIONS2.some((candidate) => candidate === mode);
+}
+function descriptorSupports(path, mode, provider) {
+  return Boolean(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.capabilities.some((capability) => capability.name === mode && capability.provider === provider && capability.availability !== "unavailable"));
+}
+function declaredModes(provider) {
+  const isSemanticCapability = (capability) => capability.provider === provider && SEMANTIC_MODES.some((mode) => mode === capability.name);
+  return [
+    ...new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.filter(isSemanticCapability).map((capability) => capability.name)))
+  ];
+}
+function createSemanticProviderRegistry(options) {
+  const typescriptProvider = "TypeScript language service relationship provider";
+  const typescriptModes = declaredModes(typescriptProvider);
+  const registrations = [
+    {
+      providerId: "typescript",
+      modes: typescriptModes,
+      supports: (path, mode) => descriptorSupports(path, mode, typescriptProvider),
+      navigate: (input, access) => navigateSemantics(input, access)
+    }
+  ];
+  for (const relationship of options.relationships) {
+    if (!relationship.operations.length)
+      continue;
+    const modes = declaredModes(relationship.providerId);
+    if (!modes.length)
+      continue;
+    registrations.push({
+      providerId: relationship.providerId,
+      modes,
+      supports: (path, mode) => relationshipMode(mode) && relationship.operations.includes(mode) && descriptorSupports(path, mode, relationship.providerId),
+      navigate: (input, access) => navigateRelationship(relationship, input, access, options.resolveScope, options.queue)
+    });
+  }
+  return registrations;
+}
+function createOutlineProviderRegistry(options) {
+  return options.relationships.flatMap((relationship) => {
+    if (!hasDeclaredOutlineProvider(relationship))
+      return [];
+    return [
+      {
+        providerId: relationship.providerId,
+        supports: (path) => outlineProviderSupports(relationship, path),
+        navigate: (input, access) => navigateOutline(relationship, input, access, options.resolveScope, options.queue)
+      }
+    ];
+  });
+}
+function findOutlineProvider(registrations, path) {
+  return registrations.find((registration) => registration.supports(path));
+}
+function findSemanticProvider(registrations, input) {
+  if (!input.path || !isSemanticMode(input.mode))
+    return;
+  const mode = input.mode;
+  return registrations.find((registration) => registration.supports(input.path, mode));
 }
 
 // src/evidence-service.ts
 function isEvidenceRequest(input) {
   return isSemanticMode(input.mode) || input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "impact" || input.mode === "trace" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
-function rejectFields2(input, fields, operation, cursor = false, repair = "copy the complete returned request unchanged") {
-  const present = fields.filter((field) => input[field] !== undefined);
-  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: ${repair}. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
-  if (present.length)
-    throw cursor ? new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT") : new SignalGrepError(message);
-}
-var searchFields = [
-  "query",
-  "scope",
-  "wholeWord",
-  "pattern",
-  "anyOf",
-  "allOf",
-  "within",
-  "roles",
-  "changes",
-  "glob",
-  "exclude",
-  "literal",
-  "ignoreCase",
-  "hidden",
-  "context",
-  "limit",
-  "modifiedAfter",
-  "modifiedBefore",
-  "conceptLimit"
-];
-var navigationFilterFields = new Set(["glob", "exclude", "hidden"]);
-var inspectFields = [
-  "paths",
-  "matchIndices",
-  "targets",
-  "sourceCursor"
-];
 function maxFilesToParse(value) {
   const candidate = value ?? MAX_STRUCTURE_FILES;
   if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > MAX_CONFIGURABLE_STRUCTURE_FILES) {
@@ -11992,7 +15328,7 @@ function fileConjunction(document2, terms, allowed) {
     }
   };
 }
-function searchScope(request) {
+function searchScope2(request) {
   const path = request.path ?? ".";
   const requestedPath = request.expandedFromPath ?? path;
   return {
@@ -12007,12 +15343,31 @@ function searchScope(request) {
     ...request.modifiedBeforeMs !== undefined ? { modifiedBeforeMs: request.modifiedBeforeMs } : {}
   };
 }
-async function navigationRoot(cwd, path, signal) {
-  const absolute = resolve28(cwd, path);
-  const repository = await findGitRepository(dirname8(absolute), signal);
+function navigationRootFamily(input, path) {
+  const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
+  const providerModes = isSemanticMode(input.mode) || input.mode === "outline" || input.mode === "trace" || input.mode === "validate";
+  if (!providerModes)
+    return "workspace";
+  if (language === "go" || language === "swift")
+    return "relationship";
+  if (language === "javascript" || language === "typescript" || language === "tsx")
+    return "semantic";
+  return "workspace";
+}
+async function navigationRoot(cwd, path, input, signal) {
+  const absolute = resolve37(cwd, path);
+  const family = navigationRootFamily(input, path);
+  if (family === "relationship") {
+    const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
+    if (language === "go" || language === "swift")
+      return resolveRelationshipProjectRoot(cwd, path, language, signal);
+  }
+  if (family === "semantic")
+    return resolveSemanticProjectRoot(cwd, path, signal);
+  const repository = await findGitRepository(dirname9(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve28(cwd) : dirname8(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve37(cwd) : dirname9(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -12023,17 +15378,35 @@ function navigationFilters(input) {
   });
   return { glob: request.glob, exclude: request.exclude, hidden: request.hidden };
 }
-function navigationScope(cwd, root, requestedPath, filters) {
-  const projectRoot = resolve28(cwd);
+async function navigationScope(cwd, root, requestedPath, filters) {
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath10(resolve37(cwd)).catch(() => resolve37(cwd)),
+    realpath10(root).catch(() => resolve37(root))
+  ]);
+  const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
-    path: root === projectRoot ? "." : root,
+    path: isProjectRoot ? "." : canonicalRoot,
     requestedPath,
     glob: [...filters.glob],
     exclude: [...filters.exclude],
     hidden: filters.hidden,
     expandedToProjectRoot: false,
-    assertion: root === projectRoot ? "project-wide" : "requested-scope"
+    assertion: isProjectRoot ? "project-wide" : "requested-scope"
   };
+}
+async function canonicalNavigationPath(path) {
+  return realpath10(path).catch(() => resolve37(path));
+}
+async function canonicalNavigationFiles(cwd, root, files, primaryPath) {
+  const canonicalRoot = await canonicalNavigationPath(root);
+  const [enumerated, canonicalPrimary] = await Promise.all([
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve37(cwd, file)))),
+    canonicalNavigationPath(resolve37(cwd, primaryPath))
+  ]);
+  const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
+  if (isPathInsideRoot(canonicalPrimary, canonicalRoot))
+    allowed.add(canonicalPrimary);
+  return { allowed, primaryPath: canonicalPrimary };
 }
 
 class EvidenceService {
@@ -12045,18 +15418,36 @@ class EvidenceService {
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
   #relationshipService;
-  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch) {
+  #semanticProviders;
+  #outlineProviders;
+  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch, additionalRelationshipProviders) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    const providers = [
+      ...createRelationshipProviderRegistry(this.#queue),
+      ...additionalRelationshipProviders ?? []
+    ];
+    const resolveScope = async (cwd, target, input, signal) => ({
+      root: await navigationRoot(cwd, target, input, signal),
+      filters: navigationFilters(input)
+    });
     this.#relationshipService = new RelationshipService({
       queue: this.#queue,
-      resolveScope: async (cwd, target, input, signal) => ({
-        root: await navigationRoot(cwd, target, signal),
-        filters: navigationFilters(input)
-      }),
+      providers,
+      resolveScope,
       maxFilesToParse
+    });
+    this.#semanticProviders = createSemanticProviderRegistry({
+      relationships: providers,
+      queue: this.#queue,
+      resolveScope
+    });
+    this.#outlineProviders = createOutlineProviderRegistry({
+      relationships: providers,
+      queue: this.#queue,
+      resolveScope
     });
   }
   clear() {
@@ -12074,18 +15465,6 @@ class EvidenceService {
     const cursor = input.cursor;
     if (!cursor)
       throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    rejectFields2(input, [
-      "path",
-      "line",
-      "column",
-      "symbol",
-      "relation",
-      "depth",
-      "maxNodes",
-      "maxEdges",
-      "maxExpansions",
-      "exploreCursor"
-    ], "Evidence validation", true);
     if (cursor.startsWith("relationship.")) {
       return this.#relationshipService.validate(input, signal);
     }
@@ -12161,8 +15540,10 @@ class EvidenceService {
     if (input.mode === "trace" || input.mode === "validate")
       return input.mode === "trace" ? this.#relationshipService.trace(input, cwd, signal) : this.#relationshipValidate(input, cwd, signal);
     if (isSemanticMode(input.mode)) {
-      rejectFields2(input, [...searchFields, ...inspectFields, "cursor", "matchIndex"], `mode=${input.mode}`);
-      return this.#analyses.page(this.#analyses.create(await navigateSemantics(input, access)));
+      const provider = findSemanticProvider(this.#semanticProviders, input);
+      if (!provider)
+        throw new SignalGrepError(`No semantic provider is registered for ${input.path ?? "the requested path"} and mode=${input.mode}; use mode=capabilities to inspect available language modes`);
+      return this.#analyses.page(this.#analyses.create(await provider.navigate(input, access)));
     }
     if (input.column !== undefined)
       throw new SignalGrepError("column requires semantic navigation");
@@ -12171,47 +15552,17 @@ class EvidenceService {
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect")
         throw new SignalGrepError("sourceCursor requires mode=inspect");
-      rejectFields2(input, [
-        ...searchFields,
-        "cursor",
-        "path",
-        "paths",
-        "line",
-        "matchIndex",
-        "matchIndices",
-        "targets",
-        "symbol",
-        "maxFilesToParse"
-      ], "Source continuation", true);
       return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
-      rejectFields2(input, [...searchFields, "paths", "symbol", "maxFilesToParse"], "mode=inspect");
       const targets = this.#inspectionTargets(input, cwd);
       return inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
-      rejectFields2(input, [
-        ...searchFields.filter((field) => !["query", "glob", "exclude", "hidden"].includes(field)),
-        ...inspectFields,
-        "cursor",
-        "line",
-        "symbol",
-        "matchIndex"
-      ], "mode=concept", false, "use only mode, query, path, glob, exclude, hidden and redact");
       const execution = await this.#conceptSearch(input, access, options.onProgress);
       return this.#analyses.page(this.#analyses.create(execution.analysis));
     }
     if (input.mode === "hybrid") {
-      rejectFields2(input, [
-        ...searchFields.filter((field) => !["query", "glob", "exclude", "hidden", "conceptLimit"].includes(field)),
-        ...inspectFields,
-        "cursor",
-        "line",
-        "symbol",
-        "matchIndex",
-        "maxFilesToParse"
-      ], "mode=hybrid", false, "use only mode, query, path, glob, exclude, hidden, conceptLimit and redact");
       const query = validateConceptQuery(input.query);
       const limit = hybridConceptLimit(input.conceptLimit);
       const literalRequest = normalizeRequest({
@@ -12268,60 +15619,21 @@ class EvidenceService {
       return this.#analyses.page(cursor);
     }
     if (input.mode === "structure") {
-      rejectFields2(input, [
-        ...searchFields.filter((field) => !["pattern", "glob", "exclude", "hidden"].includes(field)),
-        ...inspectFields,
-        "cursor",
-        "line",
-        "symbol",
-        "matchIndex"
-      ], "mode=structure");
       return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
     }
     if (input.mode === "files") {
-      rejectFields2(input, [
-        "pattern",
-        "cursor",
-        "line",
-        "matchIndex",
-        "symbol",
-        "maxFilesToParse",
-        "wholeWord",
-        "scope",
-        "literal",
-        "ignoreCase",
-        "context",
-        "limit",
-        "anyOf",
-        "allOf",
-        "within",
-        "roles",
-        "changes",
-        "conceptLimit",
-        ...inspectFields
-      ], "mode=files", false, fileDiscoveryQueryHint(input.query ?? input.pattern));
       return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
     }
     if (input.mode === "impact")
       return this.#impact(input, access);
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
-      rejectFields2(input, [
-        ...searchFields,
-        ...inspectFields,
-        "path",
-        "line",
-        "matchIndex",
-        "symbol",
-        "maxFilesToParse"
-      ], "Analysis continuation", true);
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError("Analysis cursor cannot continue in the requested mode", "E_CURSOR_WRONG_KIND");
       return this.#analyses.page(input.cursor);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access);
-    rejectFields2(input, [...inspectFields, "query", "line", "matchIndex", "symbol", "cursor", "conceptLimit"], "Evidence search", false, "a new search accepts one path; split multiple paths into separate requests without widening their scope");
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (input.pattern !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
@@ -12384,7 +15696,7 @@ class EvidenceService {
       partial ||= expanded.partial;
       for (const reason of expanded.reasons)
         reasons.add(reason);
-      const scope = searchScope(chunkResults[0]?.request ?? normalizeRequest({
+      const scope = searchScope2(chunkResults[0]?.request ?? normalizeRequest({
         ...input,
         pattern: chunks[0]?.map(escapeRegexLiteral).join("|") ?? "",
         literal: false,
@@ -12444,7 +15756,7 @@ class EvidenceService {
       filesRead: candidates.filesRead,
       bytesRead: candidates.bytesRead,
       ...candidates.changes ? { changes: candidates.changes } : {},
-      scope: searchScope(selected.request),
+      scope: searchScope2(selected.request),
       coverage: {
         candidateSearch: candidates.partial ? "partial" : "complete",
         ...terms || input.roles ? { syntaxClassification: "complete" } : {}
@@ -12520,7 +15832,8 @@ class EvidenceService {
     if (input.targets !== undefined && input.matchIndices !== undefined)
       throw new SignalGrepError("Use targets or matchIndices, not both");
     if (input.targets !== undefined || input.matchIndices !== undefined) {
-      rejectFields2(input, ["path", "line", "matchIndex"], "Batch inspection");
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
+        throw new SignalGrepError("Batch inspection accepts targets or matchIndices instead of path, line or matchIndex");
       const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
       if (size < 1 || size > MAX_INSPECT_TARGETS)
         throw new SignalGrepError("Batch inspection requires 1-5 targets");
@@ -12558,7 +15871,6 @@ class EvidenceService {
   }
   async#impact(input, access) {
     const impactStarted = performance.now();
-    rejectFields2(input, [...searchFields.filter((field) => !navigationFilterFields.has(field)), ...inspectFields], "mode=impact");
     const filters = navigationFilters(input);
     let path;
     let line = input.line;
@@ -12586,7 +15898,7 @@ class EvidenceService {
     }
     if (document2.reference.origin.kind !== "worktree")
       throw new SignalGrepError("Impact currently supports worktree sources only");
-    const root = await navigationRoot(access.cwd, document2.path, access.signal);
+    const root = await navigationRoot(access.cwd, document2.path, input, access.signal);
     const targetSyntax = await access.syntax(document2);
     let target;
     try {
@@ -12635,15 +15947,13 @@ class EvidenceService {
         exclude: filters.exclude,
         hidden: filters.hidden
       });
-      const allowed = new Set(files.paths.map((file) => resolve28(access.cwd, file)));
-      const primaryPath = resolve28(access.cwd, document2.path);
-      allowed.add(primaryPath);
+      const { allowed, primaryPath } = await canonicalNavigationFiles(access.cwd, root, files, document2.path);
       const host = {
         cwd: access.cwd,
         ...access.signal ? { signal: access.signal } : {},
         normalizePath: (file) => workspaceRelativePath(access.cwd, file),
         load: async (file, expected) => {
-          const absolutePath = resolve28(access.cwd, file);
+          const absolutePath = await canonicalNavigationPath(resolve37(access.cwd, file));
           if (!allowed.has(absolutePath))
             throw new SignalGrepError("Navigation source is excluded by current ignore rules");
           if (absolutePath === primaryPath && expected === undefined)
@@ -12694,18 +16004,13 @@ class EvidenceService {
         syntaxClassification: occurrences.partial ? "partial" : "complete",
         relatedTests: relatedTestsCoverage
       },
-      scope: navigationScope(access.cwd, root, document2.path, filters),
+      scope: await navigationScope(access.cwd, root, document2.path, filters),
       redact: input.redact ?? false
     };
     return this.#analyses.page(this.#analyses.create(result, (items) => retainedImpactCounts(items), impactRetentionPriority));
   }
   async#navigate(input, access) {
     const navigationStarted = performance.now();
-    const allowsFilters = input.mode === "imports" || input.mode === "tests";
-    rejectFields2(input, [
-      ...allowsFilters ? searchFields.filter((field) => !navigationFilterFields.has(field)) : searchFields,
-      ...inspectFields
-    ], `mode=${input.mode}`);
     let path = input.path;
     let reference;
     let line = input.line;
@@ -12733,8 +16038,21 @@ class EvidenceService {
     const document2 = loaded ?? await access.load(path, reference);
     const language = syntaxLanguage(document2.path);
     const isPython = /\.py$/iu.test(document2.path);
+    if (input.mode === "outline") {
+      const outlineProvider = findOutlineProvider(this.#outlineProviders, document2.path);
+      if (outlineProvider) {
+        const providerInput = input.path === document2.path ? input : { ...input, path: document2.path };
+        return this.#analyses.page(this.#analyses.create(await outlineProvider.navigate(providerInput, access)));
+      }
+      const capabilityFailure = outlineCapabilityError(document2.path, "outline", true);
+      if (capabilityFailure)
+        throw capabilityFailure;
+      if (!language && !isPython)
+        throw new SignalGrepError(`No outline provider is registered for ${document2.path}; use mode=capabilities to inspect available language modes`);
+    }
     if (!language && !isPython || language === "go") {
-      throw new SignalGrepError(`${input.mode} requires reliable JS/TS/TSX or Python outline syntax (${language ?? "unsupported"})`);
+      const extension = extname3(document2.path) || "extensionless source";
+      throw new SignalGrepError(`${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`);
     }
     if (input.mode === "outline") {
       const syntax = isPython ? undefined : await access.syntax(document2);
@@ -12813,7 +16131,7 @@ class EvidenceService {
           "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree"
         ]
       }));
-    const root = await navigationRoot(access.cwd, document2.path, access.signal);
+    const root = await navigationRoot(access.cwd, document2.path, input, access.signal);
     const filters = navigationFilters(input);
     if (input.mode === "tests" && isPython)
       return this.#analyses.page(this.#analyses.create({
@@ -12835,7 +16153,7 @@ class EvidenceService {
           budgetExhausted: false
         },
         coverage: { navigation: "not-applicable" },
-        scope: navigationScope(access.cwd, root, document2.path, filters),
+        scope: await navigationScope(access.cwd, root, document2.path, filters),
         redact: input.redact ?? false
       }));
     const files = await listWorkspaceFiles(access.cwd, access.signal, {
@@ -12844,15 +16162,13 @@ class EvidenceService {
       exclude: filters.exclude,
       hidden: filters.hidden
     });
-    const allowed = new Set(files.paths.map((file) => resolve28(access.cwd, file)));
-    const primaryPath = resolve28(access.cwd, document2.path);
-    allowed.add(primaryPath);
+    const { allowed, primaryPath } = await canonicalNavigationFiles(access.cwd, root, files, document2.path);
     const host = {
       cwd: access.cwd,
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = resolve28(access.cwd, file);
+        const absolutePath = await canonicalNavigationPath(resolve37(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SignalGrepError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -12887,17 +16203,20 @@ class EvidenceService {
         filesParsed: access.syntaxParses,
         cacheHits: access.syntaxCacheHits
       },
-      scope: navigationScope(access.cwd, root, document2.path, filters),
+      scope: await navigationScope(access.cwd, root, document2.path, filters),
       redact: input.redact ?? false
     }));
   }
 }
 
 // src/service.ts
-import { resolve as resolve29 } from "path";
+import { resolve as resolve39 } from "path";
+
+// src/discovery-errors.ts
+var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/format.ts
-import { readFile as readFile3 } from "fs/promises";
+import { readFile as readFile4 } from "fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -12956,7 +16275,7 @@ async function loadContextLines(match, expectedRevision, cache, signal) {
       cache.set(match.absolutePath, changed);
       return changed;
     }
-    const content = await readFile3(match.absolutePath, { encoding: "utf8", signal });
+    const content = await readFile4(match.absolutePath, { encoding: "utf8", signal });
     const afterRevision = await getSourceRevision(match.absolutePath);
     if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
       const changed = { status: "changed" };
@@ -13262,82 +16581,8 @@ ${lineRows.join(`
 `), indices, windows, filesRead, reasons };
 }
 
-// src/redaction.ts
-var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
-var SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
-var SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`, "gi");
-var TYPE_ONLY_VALUES = new Set([
-  "boolean",
-  "number",
-  "string",
-  "unknown",
-  "never",
-  "undefined",
-  "null"
-]);
-function redactString(value) {
-  let count = 0;
-  let redacted = value.replace(PRIVATE_KEY, (_match, kind) => {
-    count += 1;
-    return `-----BEGIN ${kind}-----
-[REDACTED]
------END ${kind}-----`;
-  });
-  redacted = redacted.replace(SENSITIVE_ASSIGNMENT, (match, prefix, rawValue) => {
-    const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
-    if (TYPE_ONLY_VALUES.has(unquoted))
-      return match;
-    count += 1;
-    return `${prefix}"[REDACTED]"`;
-  });
-  return { value: redacted, count };
-}
-function redactInPlace(value, seen) {
-  if (typeof value !== "object" || value === null)
-    return 0;
-  if (seen.has(value))
-    return 0;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    let count = 0;
-    for (let index = 0;index < value.length; index += 1) {
-      const item = value[index];
-      if (typeof item === "string") {
-        const redacted = redactString(item);
-        value[index] = redacted.value;
-        count += redacted.count;
-      } else
-        count += redactInPlace(item, seen);
-    }
-    return count;
-  }
-  let count = 0;
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") {
-      const redacted = redactString(item);
-      Reflect.set(value, key, redacted.value);
-      count += redacted.count;
-    } else
-      count += redactInPlace(item, seen);
-  }
-  return count;
-}
-function redactSignalGrepResult(result) {
-  const text = redactString(result.text);
-  const details = structuredClone(result.details);
-  const redactedCount = text.count + redactInPlace(details, new WeakSet);
-  return {
-    text: text.value,
-    details: {
-      ...details,
-      redactedCount,
-      redactionApplied: true
-    }
-  };
-}
-
 // src/snapshot-store.ts
-import { randomUUID as randomUUID7 } from "crypto";
+import { randomUUID as randomUUID9 } from "crypto";
 class SnapshotStore {
   #snapshots = new Map;
   #expired = new Set;
@@ -13362,7 +16607,7 @@ class SnapshotStore {
     const now = this.#now();
     const snapshot = {
       ...scan,
-      id: randomUUID7(),
+      id: randomUUID9(),
       createdAt: now,
       lastAccessedAt: now
     };
@@ -13467,7 +16712,7 @@ class SnapshotStore {
 }
 
 // src/operation-lifecycle.ts
-import { randomUUID as randomUUID8 } from "crypto";
+import { randomUUID as randomUUID10 } from "crypto";
 var OPERATION_INITIAL_WAIT_MS = 5000;
 var OPERATION_DEFAULT_DEADLINE_MS = 10 * 60000;
 var OPERATION_DEFAULT_LEASE_MS = 2 * 60000;
@@ -13529,7 +16774,7 @@ class OperationLifecycle {
       throw new Error("Operation lifecycle is closed");
     if (this.#pending.size >= this.#maxOperations)
       throw new Error(`Operation resource limit reached (${String(this.#maxOperations)} pending operations)`);
-    const id = randomUUID8();
+    const id = randomUUID10();
     const startedAt = this.#now();
     const controller = new AbortController;
     const promise = Promise.resolve().then(() => run2(controller.signal, id));
@@ -13879,7 +17124,118 @@ function operationOutcome(outcome, mode) {
   throw outcome.error;
 }
 
+// src/language-capabilities.ts
+import { resolve as resolve38 } from "path";
+function normalizeLists(values) {
+  return values === undefined ? [] : [...values];
+}
+function languageAvailability(capabilities) {
+  if (capabilities.length === 0)
+    return "unavailable";
+  if (capabilities.some((capability) => capability.availability === "conditional"))
+    return "conditional";
+  return "implemented";
+}
+
+class LanguageCapabilityCatalog {
+  #descriptors;
+  #neutral;
+  constructor(descriptors = DEFAULT_LANGUAGE_CAPABILITIES, neutral = DEFAULT_NEUTRAL_CAPABILITIES) {
+    this.#descriptors = [...descriptors];
+    this.#neutral = [...neutral];
+  }
+  descriptor(language) {
+    return this.#descriptors.find((item) => item.language === language);
+  }
+  descriptorForPath(path) {
+    return descriptorForPath(this.#descriptors, path);
+  }
+  async inspect(request) {
+    const path = request.path?.replace(/^@/, "");
+    const files = await listWorkspaceFiles(request.cwd, request.signal, {
+      ...path ? { path } : {},
+      glob: normalizeLists(request.glob),
+      exclude: normalizeLists(request.exclude),
+      hidden: request.hidden ?? true
+    });
+    const counts = new Map;
+    for (const file of files.paths) {
+      const descriptor = this.descriptorForPath(file);
+      if (descriptor)
+        counts.set(descriptor.language, (counts.get(descriptor.language) ?? 0) + 1);
+    }
+    const entries = [...counts.entries()].flatMap(([language, count]) => {
+      const descriptor = this.descriptor(language);
+      if (!descriptor)
+        return [];
+      return [this.#entry(descriptor, count, "inventory")];
+    });
+    const target = path ? this.descriptorForPath(path) : undefined;
+    if (target && !counts.has(target.language))
+      entries.push(this.#entry(target, 0, "target-extension"));
+    entries.sort((left, right) => left.language.localeCompare(right.language));
+    const capabilityDefinitions = [
+      ...new Map(entries.flatMap((entry) => this.descriptor(entry.language)?.capabilities ?? []).map((capability) => [capability.id, capability])).values()
+    ];
+    return {
+      root: resolve38(request.cwd),
+      ...path ? { path } : {},
+      partial: files.partial,
+      reasons: files.reasons,
+      languages: entries,
+      capabilityDefinitions,
+      neutral: this.#neutral
+    };
+  }
+  #entry(descriptor, files, evidence) {
+    return {
+      language: descriptor.language,
+      files,
+      extensions: descriptor.extensions,
+      capabilities: descriptor.capabilities.map(({ id, name: name2 }) => ({ id, name: name2 })),
+      availability: languageAvailability(descriptor.capabilities),
+      readiness: "not-probed",
+      evidence
+    };
+  }
+}
+
 // src/service.ts
+function filterList(value) {
+  return value === undefined ? [] : Array.isArray(value) ? [...value] : [value];
+}
+function capabilitiesResult(inventory) {
+  const languageText = inventory.languages.length ? inventory.languages.map((entry) => {
+    const providers = [
+      ...new Set(inventory.capabilityDefinitions.filter((capability) => entry.capabilities.some((reference) => reference.id === capability.id)).map((capability) => capability.provider))
+    ].join(" + ");
+    const load = entry.capabilities.length ? "lazy" : "none";
+    const names = entry.capabilities.map((reference) => reference.name).join(", ");
+    return `${entry.language} (${String(entry.files)} file${entry.files === 1 ? "" : "s"}): ${names || "no language analysis capability is currently registered"}; providers=${providers || "none"}; availability=${entry.availability}; readiness=${entry.readiness}; load=${load}`;
+  }).join(`
+`) : "No recognized language source files were found in the requested scope.";
+  const partial = inventory.partial ? "partial" : "complete";
+  const reason = inventory.reasons.length ? `
+Reasons: ${inventory.reasons.join("; ")}` : "";
+  const text = `Project language capability inventory (${partial}; names-only; providers load lazily).
+Language-specific modes:
+${languageText}
+Language-neutral modes: ${inventory.neutral.map((capability) => `${capability.name} [${capability.availability}; ${capability.load}]`).join(", ")}.${reason}`;
+  return {
+    text,
+    details: {
+      version: 1,
+      mode: "capabilities",
+      status: inventory.partial ? "partial" : "complete",
+      totalMatches: 0,
+      storedMatches: 0,
+      totalFiles: inventory.languages.reduce((sum, entry) => sum + entry.files, 0),
+      returnedMatches: 0,
+      snapshotComplete: !inventory.partial,
+      capabilities: inventory
+    }
+  };
+}
 function cursorPathSelection(input, cwd) {
   if (input.path !== undefined && input.paths !== undefined) {
     throw new SignalGrepError("Use either path or paths with a cursor, not both");
@@ -13901,14 +17257,14 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SignalGrepError("Cursor paths cannot be empty");
-    const absolutePath = resolve29(cwd, label);
+    const absolutePath = resolve39(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash6("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash9("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails(snapshot, mode) {
@@ -13923,13 +17279,13 @@ function baseDetails(snapshot, mode) {
     returnedMatches: 0,
     snapshotComplete: snapshot.snapshotComplete,
     ...snapshot.retention ? { retention: snapshot.retention } : {},
-    scope: searchScope2(snapshot.request),
+    scope: searchScope3(snapshot.request),
     ...snapshot.request.redact ? { redactionRequested: true } : {},
     ...snapshot.truncatedLines > 0 ? { lineContentTruncated: snapshot.truncatedLines } : {},
     ...sourceUnverifiedFileCount > 0 ? { sourceUnverifiedFileCount } : {}
   };
 }
-function searchScope2(request) {
+function searchScope3(request) {
   const path = request.path ?? ".";
   const requestedPath = request.expandedFromPath ?? path;
   return {
@@ -13999,46 +17355,6 @@ function attachContextBudget(result, budget, totalMatches) {
     }
   };
 }
-function rejectCursorOnlyOptions(input) {
-  const ignored = [];
-  if (input.scope !== undefined)
-    ignored.push("scope");
-  if (input.wholeWord !== undefined)
-    ignored.push("wholeWord");
-  if (input.query !== undefined)
-    ignored.push("query");
-  if (input.pattern !== undefined)
-    ignored.push("pattern");
-  if (input.glob !== undefined)
-    ignored.push("glob");
-  if (input.exclude !== undefined)
-    ignored.push("exclude");
-  if (input.literal !== undefined)
-    ignored.push("literal");
-  if (input.ignoreCase !== undefined)
-    ignored.push("ignoreCase");
-  if (input.hidden !== undefined)
-    ignored.push("hidden");
-  if (input.context !== undefined)
-    ignored.push("context");
-  if (input.limit !== undefined)
-    ignored.push("limit");
-  if (input.modifiedAfter !== undefined)
-    ignored.push("modifiedAfter");
-  if (input.modifiedBefore !== undefined)
-    ignored.push("modifiedBefore");
-  if (input.line !== undefined)
-    ignored.push("line");
-  if (input.matchIndex !== undefined)
-    ignored.push("matchIndex");
-  if (input.matchIndices !== undefined)
-    ignored.push("matchIndices");
-  if (input.targets !== undefined)
-    ignored.push("targets");
-  if (ignored.length > 0) {
-    throw new CursorError(`The following options cannot be used with cursor: ${ignored.join(", ")}`, "E_CURSOR_OPTIONS_CONFLICT");
-  }
-}
 async function waitForSourceRefresh(signal, delayMs) {
   if (signal.aborted)
     throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
@@ -14060,6 +17376,7 @@ class SignalGrepService {
   #runRipgrep;
   #snapshots;
   #summaryFileLimit;
+  #capabilities = new LanguageCapabilityCatalog;
   #evidence;
   #lifecycle = new AbortController;
   #active = new Set;
@@ -14070,10 +17387,11 @@ class SignalGrepService {
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
-    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch);
+    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.additionalRelationshipProviders);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
+    validateRequestContract(input);
     let request;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);
@@ -14154,7 +17472,7 @@ class SignalGrepService {
       throw new SignalGrepError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
-    if (resolve29(cwd) !== resolve29(existing.metadata.cwd))
+    if (resolve39(cwd) !== resolve39(existing.metadata.cwd))
       throw new SignalGrepError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
@@ -14173,6 +17491,17 @@ class SignalGrepService {
       throw new CursorError("Invalid cursor. Copy a nonempty cursor from a previous result.");
     }
     const mode = input.mode ?? "auto";
+    if (mode === "capabilities") {
+      const inventory = await this.#capabilities.inspect({
+        cwd,
+        ...input.path !== undefined ? { path: input.path } : {},
+        glob: filterList(input.glob),
+        exclude: filterList(input.exclude),
+        ...input.hidden !== undefined ? { hidden: input.hidden } : {},
+        ...signal ? { signal } : {}
+      });
+      return capabilitiesResult(inventory);
+    }
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input))
       return this.#evidence.search(input, cwd, signal, options);
@@ -14208,7 +17537,7 @@ class SignalGrepService {
       if (snapshot.totalMatches === 0) {
         const details = baseDetails(snapshot, mode);
         result = {
-          text: emptyResultText(details.scope ?? searchScope2(snapshot.request)),
+          text: emptyResultText(details.scope ?? searchScope3(snapshot.request)),
           details
         };
       } else if (snapshot.matches.length === 0) {
@@ -14266,7 +17595,6 @@ class SignalGrepService {
     if (!cursor)
       throw new CursorError("A cursor is required to continue a search");
     const { snapshot, offset, kind, selectionKey } = this.#snapshots.resolve(cursor);
-    rejectCursorOnlyOptions(input);
     const mode = input.mode ?? "auto";
     if (mode === "summary") {
       if (input.path !== undefined || input.paths !== undefined) {
@@ -14437,17 +17765,17 @@ function signalGrepPromptGuidelines(structuredOutput = true) {
   return [
     `Use baoer_signal_grep for content search. Start with pattern and optional path; omit mode and limit to let auto choose a complete small result or a broad summary. Use literal=true for literal code fragments rather than escaping them as regex.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide matches with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
-    `For external source navigation, imports/tests/impact use the containing Git repository when detected, otherwise the target file's directory.`,
+    `For source navigation, imports/tests/impact use the containing Git repository; semantic providers use their declared JS/TS, Go-module or admitted Swift-package root.`,
     `Use sufficient exact-match evidence directly; do not inspect or reread it only to obtain a citation, since returned matches already have path/line numbers. When definitions repeat, follow the relevant imports/callers before choosing the authoritative file.`,
     `Use the file samples in baoer_signal_grep summaries to choose evidence. Reuse the visible cursor with path or paths for matching lines; mode=summary pages the remaining files. Match counts are not relevance scores.`,
     `When source context is missing, use one baoer_signal_grep batch before reading whole files: {mode:"inspect",cursor:"<returned cursor>",matchIndices:[1,2]} or {mode:"inspect",targets:[{path:"src/example.ts",line:42}]}, at most ${String(MAX_INSPECT_TARGETS)} locations. Copy actual returned selectors. Inspection chooses its own bounded window: omit pattern, context, limit, glob, exclude, literal, ignoreCase and hidden.`,
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrences.`,
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports retained counts per input term, and runs requests above eight terms as bounded parallel chunks. Large term-count inventories have separate termCountsNextRequest pages; copy those requests to retrieve the complete term map.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted evidence. Copy returned continuation requests to preserve source versions.`,
-    `Use mode:"outline" with path to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX sources only; Python supports outline but not related-test navigation. Imports/tests accept glob, exclude and hidden to narrow the repository candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
+    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with path to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift outline and relationships require SourceKit-LSP prerequisites. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
     `Before changing one known JS/TS/TSX symbol, use mode:"impact" with path plus symbol or line to retrieve the exact target, every exact same-spelling candidate, and related-test evidence together. Compiler-confirmed references in verified candidate documents are ranked first; remaining same spelling does not prove binding, and returned tests have not been run. Use references for a dedicated workspace reference inventory.`,
     `Use mode:"files" plus query for unknown filenames and fuzzy paths. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
-    `Use JS/TS modes definitions, references, implementations, callers or callees with path+line+column (1-based UTF-16), or an unambiguous symbol. Returned evidence includes exact positions and executable next requests. The compiler resolves project aliases, package exports and workspace packages; static relationships do not prove runtime dispatch. dependencies/dependents take only a workspace file path.`,
+    `Use declared semantic modes definitions, references, implementations, callers or callees with path+line+column (1-based UTF-16), or an unambiguous symbol. JS/TS use the TypeScript service; Go trace needs gopls; Swift relationships need SourceKit-LSP indexing. Returned evidence includes exact positions and executable next requests; static relationships do not prove runtime dispatch. dependencies/dependents take only a workspace file path.`,
     `Use mode:"structure" plus an ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; no literal/regex or scope options. Use path/glob/exclude to narrow admitted syntax.`,
     `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Every passage admitted by the source budget is ranked through token-safe windows, and content-addressed embeddings are reused from a bounded local cache. Similarity scores identify source candidates, not proof. File/concept/structure discovery never expands its requested path.`,
     `Use mode:"hybrid" plus query when wording may differ from the source. It always runs exact literal and local concept retrieval, keeps exact evidence first, removes semantic passages that overlap exact evidence, and retains the top three non-overlapping semantic candidates by default. conceptLimit changes only that semantic supplement. Hybrid uses one pageable snapshot and never treats similarity as exact evidence.`,
@@ -17197,20 +20525,20 @@ markdownParser.setOptions({
 });
 markdownParser.use({ extensions: [...LATEX_MARKDOWN_EXTENSIONS] });
 // node_modules/@earendil-works/pi-tui/dist/terminal.js
+import { createRequire as createRequire6 } from "module";
+
+// node_modules/@earendil-works/pi-tui/dist/native-modifiers.js
 import { createRequire as createRequire5 } from "module";
 
-// node_modules/@earendil-works/pi-tui/dist/native-modifiers.js
-import { createRequire as createRequire4 } from "module";
-
 // node_modules/@earendil-works/pi-tui/dist/native-module-path.js
-import { createRequire as createRequire3 } from "module";
-var moduleRequire = createRequire3(import.meta.url);
+import { createRequire as createRequire4 } from "module";
+var moduleRequire = createRequire4(import.meta.url);
 
 // node_modules/@earendil-works/pi-tui/dist/native-modifiers.js
-var cjsRequire = createRequire4(import.meta.url);
+var cjsRequire = createRequire5(import.meta.url);
 
 // node_modules/@earendil-works/pi-tui/dist/terminal.js
-var cjsRequire2 = createRequire5(import.meta.url);
+var cjsRequire2 = createRequire6(import.meta.url);
 var DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7;
 var KITTY_KEYBOARD_PROTOCOL_QUERY = `\x1B[>${DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS}u\x1B[?u\x1B[c`;
 // node_modules/@earendil-works/pi-tui/dist/alt-screen-search.js
@@ -17893,7 +21221,7 @@ function renderSignalGrepResult(result, options, locale, theme) {
 }
 
 // src/search-policy-recovery.ts
-import { isAbsolute as isAbsolute7, relative as relative10, resolve as resolve30, sep as sep5 } from "path";
+import { isAbsolute as isAbsolute9, relative as relative11, resolve as resolve40, sep as sep5 } from "path";
 var MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
 function manual() {
   return { kind: "manual", reason: MANUAL_REASON };
@@ -18099,7 +21427,7 @@ function hasNormalizationSensitivePath(path) {
   if (process.platform === "win32" && /^[A-Za-z]:(?![\\/])/u.test(path))
     return true;
   const segments = path.split(process.platform === "win32" ? /[\\/]/u : "/");
-  let namedSegmentSeen = isAbsolute7(path);
+  let namedSegmentSeen = isAbsolute9(path);
   for (const segment of segments) {
     if (segment === "..")
       return true;
@@ -18140,10 +21468,10 @@ function recoverShellSearch(command, match, workingDirectory) {
     return manual();
   if (hasNormalizationSensitivePath(parsed.path))
     return manual();
-  const base = resolve30(workingDirectory);
-  const path = resolve30(base, parsed.path);
-  const localPath = relative10(base, path);
-  if (isAbsolute7(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
+  const base = resolve40(workingDirectory);
+  const path = resolve40(base, parsed.path);
+  const localPath = relative11(base, path);
+  if (isAbsolute9(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
     return manual();
   if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git"))
     return manual();
@@ -18171,7 +21499,7 @@ function recoverShellSearch(command, match, workingDirectory) {
 }
 
 // src/search-policy-shell.ts
-import { fileURLToPath as fileURLToPath5 } from "url";
+import { fileURLToPath as fileURLToPath7 } from "url";
 
 // node_modules/web-tree-sitter/tree-sitter.js
 var __defProp2 = Object.defineProperty;
@@ -21671,12 +24999,12 @@ class ShellSearchPolicy {
     if (Buffer.byteLength(command, "utf8") > MAX_POLICY_COMMAND_BYTES)
       throw new Error("Search policy command exceeds 64 KiB; split the shell request");
     this.#initialization ??= Parser.init({
-      locateFile: () => fileURLToPath5(new URL("tree-sitter.wasm", this.#assets))
+      locateFile: () => fileURLToPath7(new URL("tree-sitter.wasm", this.#assets))
     });
     await this.#initialization;
     for (const shell of ["bash", "powershell"]) {
       if (!this.#languages.has(shell))
-        this.#languages.set(shell, Language.load(fileURLToPath5(new URL(`tree-sitter-${shell}.wasm`, this.#assets))));
+        this.#languages.set(shell, Language.load(fileURLToPath7(new URL(`tree-sitter-${shell}.wasm`, this.#assets))));
     }
     const [bash, powershell] = await Promise.all([
       this.#languages.get("bash"),
@@ -22117,6 +25445,8 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
+var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure+pattern matches AST shapes. Outline uses a source path or retained cursor+matchIndex and follows declared capabilities (Swift requires SourceKit-LSP); semantic definitions/references/implementations/callers/callees use path+line+column or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var signalGrepSchema = _Object_({
   column: Optional(Integer({
     minimum: 1,
@@ -22124,10 +25454,10 @@ var signalGrepSchema = _Object_({
   })),
   query: Optional(String2({
     maxLength: 256,
-    description: "With mode=files, a filename/path/fuzzy query (optional); with mode=concept or hybrid, a required natural-language question. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model."
+    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model.`
   })),
   scope: Optional(stringEnum(["strict", "expand"], {
-    description: "Content search scope: strict never expands a zero-result path; expand (default) retries from project cwd. Applies to ordinary, multi-term and role searches."
+    description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
   })),
   wholeWord: Optional(Boolean2({
     description: "Single-pattern search only: require ripgrep Unicode word boundaries around the match. Works with regex or literal=true."
@@ -22135,12 +25465,12 @@ var signalGrepSchema = _Object_({
   anyOf: Optional(_Array_(String2({ maxLength: MAX_LITERAL_TERM_BYTES }), {
     minItems: MIN_ANY_OF_TERMS,
     maxItems: MAX_ANY_OF_TOTAL_TERMS,
-    description: `Exact literal union: ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term. Omit pattern, allOf, within, roles, literal and ignoreCase.`
+    description: `${fieldGuidance("anyOf")}. ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term.`
   })),
   allOf: Optional(_Array_(String2({ maxLength: MAX_PATH_CHARACTERS }), {
     minItems: 2,
     maxItems: 3,
-    description: "Explicit AND: 2-3 distinct case-sensitive literal terms, all in one file (default) or one function. Omit pattern, roles, literal and ignoreCase."
+    description: `${fieldGuidance("allOf")}. 2-3 distinct terms must occur in one file (default) or one function.`
   })),
   within: Optional(stringEnum(["file", "function"], {
     description: "Only valid with allOf; omit for ordinary single-pattern searches. function requires JS/TS/TSX and counts only that implementation's own code, excluding nested callbacks, strings/comments/types. Not proof of a shared execution path."
@@ -22181,11 +25511,11 @@ var signalGrepSchema = _Object_({
   })),
   pattern: Optional(String2({
     maxLength: MAX_PATTERN_CHARACTERS,
-    description: "Ordinary search: regex or literal=true text. mode=structure: ast-grep code pattern, at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors."
+    description: `${fieldGuidance("pattern")}. mode=structure uses an ast-grep code pattern, at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.`
   })),
   path: Optional(String2({
     maxLength: MAX_PATH_CHARACTERS,
-    description: "Search root or source file. A zero-result content search expands from cwd unless scope=strict. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped."
+    description: `${fieldGuidance("path")}. A zero-result content search expands from cwd unless scope=strict. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.`
   })),
   paths: Optional(_Array_(String2(), {
     minItems: 1,
@@ -22208,7 +25538,7 @@ var signalGrepSchema = _Object_({
   ], {
     description: "Exclude file/path globs (not content negation); applied after include globs. A leading ! is optional."
   })),
-  literal: Optional(Boolean2({ description: "Treat pattern as literal text." })),
+  literal: Optional(Boolean2({ description: fieldGuidance("literal") })),
   ignoreCase: Optional(Boolean2({
     description: "true for insensitive, false for sensitive; omitted uses smart-case."
   })),
@@ -22239,39 +25569,15 @@ var signalGrepSchema = _Object_({
   context: Optional(Integer({
     minimum: 0,
     maximum: MAX_CONTEXT_LINES,
-    description: "New search only: nearby lines (0-20). MUST be omitted for inspect, which selects its own bounded source window."
+    description: `${fieldGuidance("context")}. New search only: nearby lines (0-20). MUST be omitted for inspect, which selects its own bounded source window.`
   })),
   limit: Optional(Integer({
     minimum: 1,
     maximum: MAX_PAGE_SIZE,
-    description: "New search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; not valid for inspect."
+    description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`
   })),
-  mode: Optional(stringEnum([
-    "auto",
-    "summary",
-    "matches",
-    "inspect",
-    "outline",
-    "imports",
-    "tests",
-    "impact",
-    "files",
-    "structure",
-    "concept",
-    "hybrid",
-    "definitions",
-    "references",
-    "implementations",
-    "callers",
-    "callees",
-    "dependencies",
-    "dependents",
-    "trace",
-    "validate",
-    "await",
-    "cancel"
-  ], {
-    description: "Ordinary search defaults to auto; summary/matches request explicit pages. files uses query, structure uses an AST pattern, concept uses natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates."
+  mode: Optional(stringEnum(SIGNAL_GREP_MODES, {
+    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} Fields: ${MODE_FIELD_SUMMARY}`
   })),
   relation: Optional(stringEnum(["callers", "callees"], {
     description: "mode=trace relationship direction; required for a new trace and ignored only when paging a trace cursor."
@@ -22365,6 +25671,8 @@ function errorMessage(error) {
   }
 }
 function modelErrorText(error) {
+  if (isSignalGrepDiagnosticError(error))
+    return requestContractErrorText(error);
   const raw = errorMessage(error);
   const normalized = raw.slice(0, MAX_RAW_ERROR_SCAN_CHARACTERS).toWellFormed().replace(/\s+/gu, " ").trim();
   const message = normalized.replace(/^(?:baoer_signal_grep failed:\s*)+/u, "") || "unknown failure";
@@ -22372,6 +25680,43 @@ function modelErrorText(error) {
   if (text.length <= MAX_MODEL_ERROR_CHARACTERS)
     return text;
   return `${text.slice(0, MAX_MODEL_ERROR_CHARACTERS - 1).toWellFormed()}\u2026`;
+}
+function requestContractErrorText(error) {
+  return requestContractProjection(error).text;
+}
+function projectRequestContract(projected, serialized, message) {
+  const prefix = `baoer_signal_grep failed: request rejected [${projected.code}]: ${message}`;
+  const recovery = projected.recovery;
+  const next = recovery.nextRequest ? `
+Copy the nested recovery.nextRequest object unchanged; do not repeat the original query.` : `
+Recovery action: ${recovery.action}. ${recovery.reason}`;
+  return `
+Error details: ${serialized}
+${prefix}${next}`;
+}
+function requestContractProjection(error) {
+  const details = boundedRequestContractDetails(error.details);
+  const serializedDetails = JSON.stringify(details);
+  const boundedMessage = error.message.toWellFormed().slice(0, 1024);
+  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES)
+    return { details, text: result };
+  const compact = {
+    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    ...details.mode ? { mode: details.mode } : {},
+    issues: [
+      {
+        field: "<payload>",
+        reason: "The visible request-contract error exceeded its bounded payload budget."
+      }
+    ],
+    recovery: {
+      action: "manual",
+      reason: "Exact recovery was omitted; correct the request explicitly."
+    }
+  };
+  const compactText = projectRequestContract(compact, JSON.stringify(compact), "The request-contract error exceeded the bounded payload budget; correct the request explicitly.");
+  return { details: compact, text: compactText };
 }
 
 // src/omp-index.ts

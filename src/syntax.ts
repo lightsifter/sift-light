@@ -1,4 +1,4 @@
-import { dirname, extname } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_PARSE_TIME_MS, MAX_STRUCTURE_BYTES, MAX_SYNTAX_NODES } from "./analysis-limits.js";
 import { abortError, SignalGrepError } from "./errors.js";
@@ -13,6 +13,10 @@ import type {
   SyntaxWorkerResult,
 } from "./syntax-types.js";
 import { MAX_SOURCE_FILE_BYTES } from "./types.js";
+import {
+  DEFAULT_LANGUAGE_CAPABILITIES,
+  languageForPath,
+} from "./language-capability-definitions.js";
 
 export type {
   SyntaxAnalysis,
@@ -28,19 +32,14 @@ export { classifySyntaxRange } from "./syntax-facts.js";
 export { syntaxField, syntaxFields, syntaxText } from "./syntax-tree.js";
 
 export function syntaxLanguage(path: string): SyntaxLanguage | undefined {
-  switch (extname(path).toLowerCase()) {
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
+  switch (languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)) {
+    case "javascript":
       return "javascript";
-    case ".ts":
-    case ".mts":
-    case ".cts":
+    case "typescript":
       return "typescript";
-    case ".tsx":
+    case "tsx":
       return "tsx";
-    case ".go":
+    case "go":
       return "go";
     default:
       return undefined;

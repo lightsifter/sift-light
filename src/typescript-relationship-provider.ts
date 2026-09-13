@@ -152,7 +152,12 @@ function currentStatuses(
   }));
 }
 
-function inputPosition(document: SourceDocument, input: { line: number; column?: number }): number {
+function inputPosition(
+  document: SourceDocument,
+  input: { line?: number; column?: number },
+): number {
+  if (input.line === undefined)
+    throw new SignalGrepError("Semantic symbol selection requires an exact line or column");
   if (!Number.isSafeInteger(input.line) || input.line < 1)
     throw new SignalGrepError("Semantic line must be a positive integer");
   const line = document.lineRange(input.line);
@@ -167,15 +172,16 @@ function inputPosition(document: SourceDocument, input: { line: number; column?:
 function candidatesFor(
   document: SourceDocument,
   syntax: SyntaxAnalysis,
-  input: { line: number; column?: number; symbol?: string },
+  input: { line?: number; column?: number; symbol?: string },
 ): SyntaxSymbol[] {
-  const character = inputPosition(document, input);
+  const character = input.line === undefined ? undefined : inputPosition(document, input);
   return syntax.symbols.filter((candidate) => {
     const line = document.lineAt(document.toByteOffset(candidate.start));
     const bySymbol = input.symbol === undefined || candidate.name === input.symbol;
     const byLine = input.line === undefined || line === input.line;
     const byCharacter =
-      input.column === undefined || (candidate.start <= character && character <= candidate.end);
+      input.column === undefined ||
+      (character !== undefined && candidate.start <= character && character <= candidate.end);
     return bySymbol && byLine && byCharacter && candidate.hasBody;
   });
 }
@@ -253,7 +259,7 @@ class TypeScriptRelationshipView implements RelationshipView {
   }
 
   async resolveNode(
-    input: { path: string; line: number; column?: number; symbol?: string },
+    input: { path: string; line?: number; column?: number; symbol?: string },
     signal?: AbortSignal,
   ): Promise<RelationshipResolution> {
     this.#assertOpen(signal);

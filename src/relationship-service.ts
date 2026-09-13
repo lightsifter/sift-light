@@ -5,7 +5,6 @@ import {
   type RelationshipChangeHint,
   type RelationshipWatchHealth,
 } from "./change-awareness.js";
-import { goSemanticProvider } from "./go-semantic-provider.js";
 import {
   DEFAULT_RELATIONSHIP_TRACE_BUDGET,
   type RelationshipTraceBudget,
@@ -13,16 +12,15 @@ import {
 } from "./relationship-explorer.js";
 import { traceResult, validationResult } from "./relationship-output.js";
 import { RelationshipStore, type StoredRelationshipResult } from "./relationship-store.js";
-import type {
-  RelationshipProvider,
-  RelationshipSourceScope,
-  RelationshipViewFactory,
-} from "./relationship-types.js";
-import { createTypeScriptRelationshipProvider } from "./typescript-relationship-provider.js";
+import type { RelationshipSourceScope, RelationshipViewFactory } from "./relationship-types.js";
 import type { SignalGrepInput } from "./service.js";
 import { MAX_RESULT_BYTES, type SearchRequest, type SignalGrepResult } from "./types.js";
-import { SourceAccess, SyntaxQueue } from "./source-access.js";
+import { SyntaxQueue } from "./source-access.js";
 import { isPathInsideCwd } from "./path-policy.js";
+import {
+  createRelationshipProviderRegistry,
+  type RelationshipProviderRegistration,
+} from "./relationship-provider-registry.js";
 
 export interface RelationshipScopeResolution {
   root: string;
@@ -31,6 +29,7 @@ export interface RelationshipScopeResolution {
 
 export interface RelationshipServiceOptions {
   queue: SyntaxQueue;
+  providers?: readonly RelationshipProviderRegistration[];
   resolveScope: (
     cwd: string,
     target: string,
@@ -49,6 +48,7 @@ export class RelationshipService {
   readonly #queue: SyntaxQueue;
   readonly #resolveScope: RelationshipServiceOptions["resolveScope"];
   readonly #maxFilesToParse: RelationshipServiceOptions["maxFilesToParse"];
+  readonly #providers: readonly RelationshipProviderRegistration[];
   readonly #relationships = new RelationshipStore();
   readonly #changeAwareness = new RelationshipChangeAwareness();
   readonly #relationshipWatchStops = new Set<() => void>();
@@ -58,6 +58,7 @@ export class RelationshipService {
     this.#queue = options.queue;
     this.#resolveScope = options.resolveScope;
     this.#maxFilesToParse = options.maxFilesToParse;
+    this.#providers = options.providers ?? createRelationshipProviderRegistry(this.#queue);
   }
 
   clear(): void {
@@ -83,23 +84,6 @@ export class RelationshipService {
         "E_CURSOR_OPTIONS_CONFLICT",
       );
     if (input.exploreCursor !== undefined) {
-      rejectFields(
-        input,
-        [
-          "path",
-          "line",
-          "column",
-          "symbol",
-          "relation",
-          "depth",
-          "maxNodes",
-          "maxEdges",
-          "maxExpansions",
-          "cursor",
-        ],
-        "Trace continuation",
-        true,
-      );
       const stored = await this.#relationships.continue(input.exploreCursor, signal);
       return this.#pageResult(
         stored,
@@ -110,22 +94,6 @@ export class RelationshipService {
       );
     }
     if (input.cursor?.startsWith("relationship.")) {
-      rejectFields(
-        input,
-        [
-          "path",
-          "line",
-          "column",
-          "symbol",
-          "relation",
-          "depth",
-          "maxNodes",
-          "maxEdges",
-          "maxExpansions",
-        ],
-        "Trace continuation",
-        true,
-      );
       if (input.cursor.includes(".explore."))
         throw new SignalGrepError(
           "Use exploreCursor for relationship continuation; cursor is reserved for immutable pages",
@@ -144,30 +112,6 @@ export class RelationshipService {
         this.#relationshipWatchHealth(),
       );
     }
-    rejectFields(
-      input,
-      [
-        "query",
-        "pattern",
-        "context",
-        "wholeWord",
-        "literal",
-        "ignoreCase",
-        "changes",
-        "modifiedAfter",
-        "modifiedBefore",
-        "anyOf",
-        "allOf",
-        "within",
-        "roles",
-        "paths",
-        "matchIndices",
-        "targets",
-        "sourceCursor",
-        "conceptLimit",
-      ],
-      "mode=trace",
-    );
     const operation = input.relation;
     if (operation !== "callers" && operation !== "callees")
       throw new SignalGrepError("mode=trace requires relation=callers or relation=callees");
@@ -214,23 +158,6 @@ export class RelationshipService {
   async validate(input: SignalGrepInput, signal?: AbortSignal): Promise<SignalGrepResult> {
     const cursor = input.cursor;
     if (!cursor) throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    rejectFields(
-      input,
-      [
-        "path",
-        "line",
-        "column",
-        "symbol",
-        "relation",
-        "depth",
-        "maxNodes",
-        "maxEdges",
-        "maxExpansions",
-        "exploreCursor",
-      ],
-      "Evidence validation",
-      true,
-    );
     const state = this.#relationships.snapshot(cursor);
     const startedAt = Date.now();
     const recheck = await this.#relationships.validate(cursor, signal);
@@ -273,22 +200,24 @@ export class RelationshipService {
       this.#relationshipWatchStops.add(stop);
       this.#watchedRelationshipRoots.add(scope.root);
     }
-    const go = /\.go$/iu.test(target);
-    const providerId = go ? goSemanticProvider.providerId : "typescript";
+    const registration = this.#providers.find((provider) => provider.supports(target));
+    if (!registration)
+      throw new SignalGrepError(
+        `No relationship provider is registered for ${target}; use mode=capabilities to inspect available language modes`,
+      );
     const factory: RelationshipViewFactory = {
-      providerId,
+      providerId: registration.providerId,
       open: async (operationSignal = new AbortController().signal, analysisViewId) => {
-        const access = new SourceAccess(cwd, this.#queue, operationSignal, { maxFiles });
-        const implementation: RelationshipProvider = go
-          ? goSemanticProvider
-          : createTypeScriptRelationshipProvider(access);
-        return implementation.open({
+        return registration.open({
           cwd,
           scope,
-          source: access,
           signal: operationSignal,
+          queue: this.#queue,
+          maxFiles,
+          ...(input.relation && registration.limitsForOperation
+            ? { limits: registration.limitsForOperation(input.relation) }
+            : {}),
           ...(analysisViewId ? { analysisViewId } : {}),
-          limits: { maxFiles },
         });
       },
     };
@@ -325,17 +254,4 @@ export class RelationshipService {
       limit = Math.max(1, Math.floor(page.items.length / 2));
     }
   }
-}
-
-function rejectFields(
-  input: SignalGrepInput,
-  fields: (keyof SignalGrepInput)[],
-  operation: string,
-  cursor = false,
-): void {
-  const present = fields.filter((field) => input[field] !== undefined);
-  if (!present.length) return;
-  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: copy the complete returned request unchanged. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
-  if (cursor) throw new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT");
-  throw new SignalGrepError(message);
 }
