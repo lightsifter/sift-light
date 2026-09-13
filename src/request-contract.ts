@@ -1,7 +1,6 @@
 import type { SignalGrepInput } from "./service.js";
 import { MAX_HYBRID_CONCEPT_LIMIT, MAX_CONFIGURABLE_STRUCTURE_FILES } from "./analysis-limits.js";
 import { MAX_CONTEXT_LINES, MAX_PAGE_SIZE } from "./types.js";
-import { RELATIONSHIP_TRACE_LIMITS } from "./relationship-explorer.js";
 import { containsSensitiveText } from "./redaction.js";
 import {
   MAX_REQUEST_RECOVERY_BYTES,
@@ -248,53 +247,6 @@ function selectorIssuesFor(input: Record<string, unknown>, mode: SignalGrepMode)
     }
     return issues;
   }
-  if (mode === "impact") {
-    if (input.cursor !== undefined) {
-      const issues: RequestIssue[] = [];
-      if (!Number.isSafeInteger(input.matchIndex))
-        issues.push({ field: "matchIndex", reason: "snapshot impact requires cursor+matchIndex" });
-      for (const field of ["path", "line", "symbol"] as const)
-        if (input[field] !== undefined)
-          issues.push({ field, reason: "snapshot impact cursor cannot combine a direct selector" });
-      return issues;
-    }
-    if (typeof input.path !== "string" || (input.line === undefined && input.symbol === undefined))
-      return [{ field: "path", reason: "direct impact requires path and line or symbol" }];
-    return [];
-  }
-  if (
-    mode === "definitions" ||
-    mode === "references" ||
-    mode === "implementations" ||
-    mode === "callers" ||
-    mode === "callees"
-  ) {
-    if (
-      typeof input.path !== "string" ||
-      (!(Number.isSafeInteger(input.line) && Number.isSafeInteger(input.column)) &&
-        typeof input.symbol !== "string")
-    )
-      return [
-        {
-          field: "path",
-          reason: "semantic navigation requires path and line+column, or an unambiguous symbol",
-        },
-      ];
-    return [];
-  }
-  if (mode === "trace" && input.cursor === undefined && input.exploreCursor === undefined) {
-    const issues: RequestIssue[] = [];
-    if (input.relation !== "callers" && input.relation !== "callees")
-      issues.push({
-        field: "relation",
-        reason: "mode=trace requires relation=callers or relation=callees",
-      });
-    if (typeof input.path !== "string")
-      issues.push({ field: "path", reason: "mode=trace requires path" });
-    if (!Number.isSafeInteger(input.line))
-      issues.push({ field: "line", reason: "mode=trace requires line" });
-    return issues;
-  }
   if (mode === "validate" && typeof input.cursor !== "string")
     return [{ field: "cursor", reason: "mode=validate requires a saved evidence cursor" }];
   return [];
@@ -326,26 +278,6 @@ function validateValueRanges(input: Record<string, unknown>): void {
     ["limit", 1, MAX_PAGE_SIZE],
     ["conceptLimit", 1, MAX_HYBRID_CONCEPT_LIMIT],
     ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES],
-    [
-      "depth",
-      RELATIONSHIP_TRACE_LIMITS.maxDepth.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxDepth.maximum,
-    ],
-    [
-      "maxNodes",
-      RELATIONSHIP_TRACE_LIMITS.maxNodes.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxNodes.maximum,
-    ],
-    [
-      "maxEdges",
-      RELATIONSHIP_TRACE_LIMITS.maxEdges.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxEdges.maximum,
-    ],
-    [
-      "maxExpansions",
-      RELATIONSHIP_TRACE_LIMITS.maxExpansions.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxExpansions.maximum,
-    ],
   ];
   for (const [field, minimum, maximum] of integerRanges) {
     const value = input[field];
@@ -494,17 +426,6 @@ export function validateRequestContract(input: SignalGrepInput): void {
   ) {
     allowed.clear();
     for (const field of ["mode", "cursor", "path", "paths", "redact"] as const) allowed.add(field);
-  }
-  if (mode === "trace" && raw.exploreCursor !== undefined) {
-    allowed.clear();
-    for (const field of ["mode", "exploreCursor", "redact"] as const) allowed.add(field);
-  } else if (
-    mode === "trace" &&
-    typeof raw.cursor === "string" &&
-    raw.cursor.startsWith("relationship.")
-  ) {
-    allowed.clear();
-    for (const field of ["mode", "cursor", "matchIndex", "redact"] as const) allowed.add(field);
   }
   const allowedNames = new Set<string>(allowed);
   const invalid = Object.keys(raw).filter((field) => !allowedNames.has(field));

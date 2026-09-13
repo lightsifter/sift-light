@@ -42,21 +42,19 @@ Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: 
 
 ### 先发现语言能力，再按需加载提供方
 
-使用 `mode: "capabilities"` 和项目根目录，可以得到紧凑的、只含名称的语言能力清单，查看项目中的语言以及每种语言声明的操作。这个检查不会启动 parser、编译器、模型或语言服务器；普通的 `files`、`content`、`outline` 和关系查询也不会加载无关提供方。清单会给出实际声明的能力、提供方身份、证据类型和前置条件；运行时是否就绪只在真正打开所选操作时核验。
+使用 `mode: "capabilities"` 和项目根目录，可以获取紧凑的文件语言清单。JavaScript、TypeScript 和 TSX 支持 AST 结构、角色、outline、静态 imports 和关联测试候选；Go 支持 AST 结构和角色；Python 支持基于缩进的有界 outline。Swift 和其他语言仍可使用普通内容搜索、文件发现和源码 inspect。能力清单不会启动 parser 或 Concept 模型。
 
-JavaScript、TypeScript 和 TSX 提供语法结构、imports、tests 以及 TypeScript language service 关系能力。Go 提供语法结构和角色分析；在存在有效 Go 工程和 `gopls` 可执行文件时，可追踪 callers/callees。Python 提供有边界的语法 outline，并通过包内 Pyright language server 按需提供条件式编译器关系能力（server 实际声明并返回时支持 definitions、references、callers、callees 和 trace）。Swift 在 SourceKit-LSP 能够接纳并建立目标 Swift 工程索引时，提供 outline、definitions、references、implementations、callers、callees 和 trace。不可用或不支持的操作会在能力结果中明确表示，不会伪装成空的成功搜索。
+2.1.0 移除语言服务导航：`definitions`、`references`、`implementations`、`callers`、`callees`、`dependencies`、`dependents`、`trace` 和 `impact`。这些模式会明确报错，不会以文本搜索伪装精确导航。插件不再启动 Pyright、SourceKit-LSP、gopls 或 TypeScript language service；TypeScript 仅作为开发期类型检查工具。
 
-### 在有界证据内追踪调用关系
+### 校验已保存的源码证据
 
-使用 `mode: "trace"`，并传入 `relation: "callers"` 或 `"callees"`、源码 `path`、从 1 开始的 `line`，以及可选的 `symbol` 或 UTF-16 `column`。提供方会在有界的广度优先遍历中追踪 TypeScript、Go 或 Python 的静态关系；Swift 在被接纳的工程索引就绪时使用 SourceKit-LSP 追踪 callers/callees。`glob`、`exclude` 和 `hidden` 会在提供方接纳源码清单时实际生效，并保留在返回的 scope 中。`depth`、`maxNodes`、`maxEdges` 和 `maxExpansions` 都是跨续探请求累计的限制；如果触及限制或遇到无法解析的关系，partial 结果会写明原因。编译器或语法证据说明源码关系，不证明运行时分发。Swift 索引证据会在发布前重新校验，过期或覆盖不完整时保持 partial。
-
-追踪页面使用不可变的 `cursor`。如果前沿还有工作，响应还会给出独立的 `exploreCursor`；请复制完整返回的 `nextRequest` 来扩展追踪。续探会创建新的分析版本，不会改写之前的页面。结构化关系详情会保留请求的 scope 和 comparison target，并把覆盖状态（`complete` 或 `partial`）与源码新鲜度（`current`、`stale` 或 `unknown`）分开记录。使用 `mode: "validate"` 加上保存的 trace 或 analysis cursor，可以把保留的源码、配置、清单和其他证据依赖与当前工作区比较。校验会独立报告 `current`、`stale` 或 `unknown`，同时保留原始的 complete 或 partial 覆盖状态；partial 快照通过新鲜校验也不会被宣称为完整搜索。文件系统变更提示只是尽力而为的通知，最终新鲜度由权威校验决定。
+使用 `mode: "validate"` 加普通搜索或 analysis 的 `cursor`，可以按需传入 `matchIndex` 选择单项证据。校验将已保留源码与当前工作区或固定 Git 对象比较，报告 `current`、`stale` 或 `unknown`，并保留原搜索的不完整覆盖状态。结构化信息位于 `details.validation` 和 `details.analysis.validation`；旧关系图字段和 trace cursor 不再支持。校验按需读取源码，不启动后台监听；它验证已保存证据，不证明搜索后没有新增匹配文件。
 
 ### 按文件时间缩小范围，也可以看代码结构
 
 工作区搜索支持用 Unix 毫秒时间戳传入 `modifiedAfter` 和 `modifiedBefore`。下界包含、上界不包含，因此可以准确表示一个时间窗口，不必改动搜索关键词。内容搜索和文件名搜索使用同一过滤条件；无法核验文件元数据时会明确报告证据不完整，不会静默当作命中。
 
-对文件路径使用 `mode: "outline"` 可以查看有边界的符号范围。JavaScript、TypeScript 和 TSX 使用语法提供方；Python 使用基于缩进的类、函数和方法 outline；Swift 在工程和索引前置条件满足时使用 SourceKit-LSP。Python 和语法提供方的 outline 适合定位后续要看的范围，但不宣称编译器绑定、运行时调用关系或测试覆盖；Swift outline 能力取决于被接纳的 SourceKit-LSP 工程。`mode: "tests"` 目前支持 JavaScript 和 TypeScript 的关联测试候选；Python 和其他语言会明确返回不支持结果，并带上可用能力信息。
+对具体的 JS/TS/TSX 或 Python 文件使用 `mode: "outline"`，可以查看有界符号范围。JS/TS/TSX 使用 ast-grep，Python 使用基于缩进的类、函数和方法范围；它们不证明编译器绑定、运行时调用或测试覆盖。`mode: "tests"` 提供 JS/TS/TSX 关联测试候选，不支持的语言操作会明确报错。Swift 源码可使用普通搜索和 `inspect`。
 
 可读正文会保持精简；每项证据的范围、计数、覆盖状态和继续请求仍保留在结构化 `details` 中，客户端无需为了拿到这些字段再次搜索。
 
@@ -75,13 +73,13 @@ JavaScript、TypeScript 和 TSX 提供语法结构、imports、tests 以及 Type
 - “按这个 Unix 毫秒时间戳之后修改过的文件搜索。”
 - “这句话我可能记得不准确，把精确和语义证据一起找出来。”
 - “列出这个 Python 文件里的类和函数，再打开需要看的方法。”
-- “追踪这个函数两跳以内的调用方；我改完配置后再校验已保存的证据。”
+- “搜索这个函数名并查看相关源码；我修改文件后，再校验已保存的证据。”
 
 插件提供文件位置和实际文本，帮助 Agent 根据原文回答，也方便你回到资料中核对。
 
 ## 安装
 
-MCP 需要 Node.js 22.19+；Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun 1.4+。安装包通过固定版本的 `@vscode/ripgrep` 安装对应平台的 ripgrep 二进制，无需系统 `rg`、Shell 函数或额外设置 `PATH`。Python 语义导航使用包内固定版本的 Pyright language server，不要求全局安装 Python 语言服务器。安装时请保留可选依赖。禁用安装脚本也能安装 ripgrep，搜索过程不会下载可执行文件。
+MCP 需要 Node.js 22.19+；Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun 1.4+。安装包通过固定版本的 `@vscode/ripgrep` 安装对应平台的 ripgrep 二进制，无需系统 `rg`、Shell 函数或额外设置 `PATH`。安装时请保留可选依赖。禁用安装脚本也能安装 ripgrep，搜索过程不会下载可执行文件。
 
 如需使用自己的 ripgrep，在 MCP 服务或 Pi 进程的环境变量中设置 `BAOER_SIGNAL_GREP_RG_PATH` 为可执行文件的绝对路径（例如 `/opt/homebrew/bin/rg`），然后重启宿主。该设置统一作用于内容、文件名和 Git 源文件搜索，支持路径中的空格；不支持别名、Shell 函数、相对路径或 `~` 展开。配置无效时明确报错，不会另选程序。对应平台的依赖缺失或不可用时，请保留可选依赖重新安装，或配置自己的二进制。依赖故障期间原生搜索策略仍然生效；如果需要在修复安装期间关闭策略，请使用下文的宿主插件控制入口。
 

@@ -24,7 +24,7 @@ import {
   verifyConceptModel,
 } from "./concept-model.js";
 import { installConceptModel } from "./concept-setup.js";
-import { rpcRecord } from "./owned-json-rpc.js";
+import { isRecordValue } from "./record-value.js";
 
 const CACHE_IO_CONCURRENCY = 64;
 
@@ -71,7 +71,7 @@ async function requestFromStdin(): Promise<{ query: string; passages: string[] }
   }
   const request: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   if (
-    !rpcRecord(request) ||
+    !isRecordValue(request) ||
     typeof request.query !== "string" ||
     request.query.length === 0 ||
     request.query.length > 256 ||

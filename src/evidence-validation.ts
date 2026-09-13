@@ -2,7 +2,7 @@ import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
 import { abortError, CursorError, SignalGrepError } from "./errors.js";
-import { relationshipRecheck } from "./evidence-validity.js";
+import { evidenceRecheck } from "./evidence-validity.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { sameSourceRevision, sourceRevisionFromStats } from "./source.js";
 import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js";
@@ -11,15 +11,15 @@ import { SnapshotStore } from "./snapshot-store.js";
 import type { AnalysisItem } from "./analysis-types.js";
 import type { SearchRequest, SearchScopeDetails, SearchSnapshot, SourceRevision } from "./types.js";
 import type {
-  RelationshipCoverageStatus,
-  RelationshipComparisonTarget,
-  RelationshipRecheck,
-  RelationshipSourceScope,
-  RelationshipSourceStatus,
-} from "./relationship-types.js";
+  EvidenceCoverageStatus,
+  EvidenceComparisonTarget,
+  EvidenceRecheck,
+  EvidenceSourceScope,
+  EvidenceSourceStatus,
+} from "./validation-types.js";
 import { MAX_STRUCTURE_FILES } from "./analysis-limits.js";
 
-export type EvidenceComparisonTarget = RelationshipComparisonTarget;
+export type { EvidenceComparisonTarget } from "./validation-types.js";
 
 export interface SavedEvidenceValidationOptions {
   cursor: string;
@@ -33,13 +33,13 @@ export interface SavedEvidenceValidationOptions {
 }
 
 export interface SavedEvidenceValidationResult {
-  scope: RelationshipSourceScope;
-  sources: readonly RelationshipSourceStatus[];
-  coverage: RelationshipCoverageStatus;
+  scope: EvidenceSourceScope;
+  sources: readonly EvidenceSourceStatus[];
+  coverage: EvidenceCoverageStatus;
   storedPartial: boolean;
   reasons: readonly string[];
   comparisonTarget: EvidenceComparisonTarget;
-  recheck: RelationshipRecheck;
+  recheck: EvidenceRecheck;
 }
 
 interface ValidationTarget {
@@ -50,12 +50,12 @@ interface ValidationTarget {
 }
 
 interface ClassifiedFailure {
-  status: RelationshipSourceStatus["status"];
+  status: EvidenceSourceStatus["status"];
   reason: string;
   budgetReached?: boolean;
 }
 
-interface ValidationStatus extends RelationshipSourceStatus {
+interface ValidationStatus extends EvidenceSourceStatus {
   budgetReached?: boolean;
 }
 
@@ -188,11 +188,11 @@ function addUniqueTarget(
 function analysisTargets(
   items: readonly AnalysisItem[],
   matchIndex: number | undefined,
-): { targets: ValidationTarget[]; missing: RelationshipSourceStatus[] } {
+): { targets: ValidationTarget[]; missing: EvidenceSourceStatus[] } {
   const selected = selectedIndex(matchIndex, items.length, "analysis item");
   const selectedItems = selected === undefined ? items : [items[selected - 1]!];
   const targets: ValidationTarget[] = [];
-  const missing: RelationshipSourceStatus[] = [];
+  const missing: EvidenceSourceStatus[] = [];
   const seen = new Set<string>();
   for (const item of selectedItems) {
     const reference = item.source;
@@ -221,14 +221,14 @@ function analysisTargets(
 function snapshotTargets(
   snapshot: SearchSnapshot,
   matchIndex: number | undefined,
-): { targets: ValidationTarget[]; missing: RelationshipSourceStatus[] } {
+): { targets: ValidationTarget[]; missing: EvidenceSourceStatus[] } {
   const selected = selectedIndex(matchIndex, snapshot.matches.length, "search match");
   const selectedPaths =
     selected === undefined
       ? [...snapshot.sourceRevisions.keys()]
       : [snapshot.matches[selected - 1]!.absolutePath];
   const targets: ValidationTarget[] = [];
-  const missing: RelationshipSourceStatus[] = [];
+  const missing: EvidenceSourceStatus[] = [];
   const seen = new Set<string>();
   for (const path of selectedPaths) {
     const revision = snapshot.sourceRevisions.get(path);
@@ -259,7 +259,7 @@ async function validateSnapshotTarget(
   cwd: string,
   policy: SearchPathPolicy,
   signal?: AbortSignal,
-): Promise<RelationshipSourceStatus> {
+): Promise<EvidenceSourceStatus> {
   if (!target.revision) throw new Error("Snapshot validation target omitted its revision");
   try {
     const absolute = resolve(cwd, target.path);
@@ -347,7 +347,7 @@ async function validateAnalysisTarget(
 }
 
 function comparisonTarget(
-  sources: readonly RelationshipSourceStatus[],
+  sources: readonly EvidenceSourceStatus[],
   hasUnscopedUnknown: boolean,
 ): EvidenceComparisonTarget {
   const hasGit = sources.some((source) => source.expected?.origin.kind === "git");
@@ -361,7 +361,7 @@ function evidenceScope(
   cwd: string,
   scope: SearchScopeDetails | undefined,
   request: SearchRequest | undefined,
-): RelationshipSourceScope {
+): EvidenceSourceScope {
   const path = scope?.path ?? request?.expandedFromPath ?? request?.path ?? ".";
   const include = scope?.glob ?? request?.glob;
   const exclude = scope?.exclude ?? request?.exclude;
@@ -378,12 +378,12 @@ function evidenceScope(
 export async function validateSavedEvidence(
   options: SavedEvidenceValidationOptions,
 ): Promise<SavedEvidenceValidationResult> {
-  let scope: RelationshipSourceScope = { root: resolve(options.cwd) };
+  let scope: EvidenceSourceScope = { root: resolve(options.cwd) };
   const reasons: string[] = [];
   let storedPartial = false;
   let targets: ValidationTarget[];
-  let sources: RelationshipSourceStatus[];
-  const missing: RelationshipSourceStatus[] = [];
+  let sources: EvidenceSourceStatus[];
+  const missing: EvidenceSourceStatus[] = [];
   const isAnalysis = options.cursor.includes(".analysis.");
 
   if (isAnalysis) {
@@ -448,11 +448,11 @@ export async function validateSavedEvidence(
 
   if (sources.length === 0) reasons.push("No retained source evidence could be validated");
   const uniqueReasons = [...new Set(reasons)];
-  const coverage: RelationshipCoverageStatus =
+  const coverage: EvidenceCoverageStatus =
     storedPartial || sources.length === 0 || sources.some((source) => source.status === "unknown")
       ? "partial"
       : "complete";
-  const recheck = relationshipRecheck(sources, [], [], uniqueReasons, coverage);
+  const recheck = evidenceRecheck(sources, uniqueReasons, coverage);
   return {
     scope,
     sources,

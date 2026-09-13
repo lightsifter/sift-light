@@ -1,7 +1,7 @@
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
 import type { SearchScopeDetails } from "./types.js";
-import type { RelationshipPublicDetails } from "./relationship-types.js";
+import type { ValidationDetails } from "./validation-types.js";
 import type { ConceptSourceSummary } from "./concept-source-generation.js";
 
 export type CoverageStatus = "complete" | "partial" | "skipped" | "not-applicable";
@@ -31,13 +31,6 @@ export interface AnalysisDetails {
     | "concept"
     | "hybrid"
     | "structure"
-    | "definitions"
-    | "references"
-    | "implementations"
-    | "callers"
-    | "callees"
-    | "dependencies"
-    | "dependents"
     | "files"
     | "roles"
     | "file-and"
@@ -47,8 +40,6 @@ export interface AnalysisDetails {
     | "imports"
     | "tests"
     | "any-of"
-    | "impact"
-    | "trace"
     | "validate";
   unit:
     | "occurrences"
@@ -57,8 +48,7 @@ export interface AnalysisDetails {
     | "symbols"
     | "relationships"
     | "test-candidates"
-    | "evidence-items"
-    | "impact-candidates";
+    | "evidence-items";
   totalItems: number;
   returnedItems: number;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SignalGrepInput })[];
@@ -82,7 +72,7 @@ export interface AnalysisDetails {
     execution: "single" | "bounded-parallel";
   };
   coverage?: Record<string, CoverageStatus>;
-  relationship?: RelationshipPublicDetails;
+  validation?: ValidationDetails;
   stats?: {
     inferencePeakRssBytes?: number;
     passagesRanked?: number;
@@ -120,7 +110,5 @@ export interface AnalysisResultSet {
   coverage?: Record<string, CoverageStatus>;
   stats?: AnalysisDetails["stats"];
   sourceGeneration?: ConceptSourceSummary;
-  /** Public provider, freshness and coverage metadata for semantic navigation. */
-  relationship?: RelationshipPublicDetails;
   redact?: boolean;
 }

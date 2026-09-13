@@ -1,23 +1,8 @@
 import { extname } from "node:path";
-import type { RelationshipOperation } from "./relationship-types.js";
 
 export type LanguageId = "javascript" | "typescript" | "tsx" | "go" | "python" | "swift";
 
-export type LanguageCapability =
-  | "outline"
-  | "structure"
-  | "roles"
-  | "imports"
-  | "tests"
-  | "impact"
-  | "definitions"
-  | "references"
-  | "implementations"
-  | "callers"
-  | "callees"
-  | "dependencies"
-  | "dependents"
-  | "trace";
+export type LanguageCapability = "outline" | "structure" | "roles" | "imports" | "tests";
 
 export type CapabilityEvidence = "text" | "syntax" | "compiler" | "external" | "model";
 export type CapabilityAvailability = "implemented" | "conditional" | "unavailable";
@@ -30,14 +15,10 @@ export interface LanguageCapabilitySpec {
   readonly provider: string;
   readonly providerKind: CapabilityProviderKind;
   readonly evidence: CapabilityEvidence;
-  /** Some operations combine compiler-confirmed and candidate evidence. */
-  readonly certainty?: "verified" | "mixed";
   readonly availability: CapabilityAvailability;
   /** Runtime parser/compiler/model resource activation, not JavaScript module import timing. */
   readonly load: "lazy";
   readonly prerequisites?: readonly string[];
-  /** Provider operations used by relationship trace, independent of public mode names. */
-  readonly relationshipOperations?: readonly RelationshipOperation[];
 }
 
 export interface LanguageCapabilityDescriptor {
@@ -105,45 +86,6 @@ const TYPESCRIPT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
     availability: "implemented",
     load: "lazy",
   },
-  {
-    id: "impact.mixed",
-    name: "impact",
-    provider: "TypeScript language service + ast-grep",
-    providerKind: "builtin",
-    evidence: "compiler",
-    certainty: "mixed",
-    availability: "implemented",
-    load: "lazy",
-  },
-  ...(
-    [
-      "definitions",
-      "references",
-      "implementations",
-      "callers",
-      "callees",
-      "dependencies",
-      "dependents",
-    ] as const
-  ).map((name): LanguageCapabilitySpec => ({
-    id: `typescript.compiler.${name}`,
-    name,
-    provider: "TypeScript language service relationship provider",
-    providerKind: "builtin",
-    evidence: "compiler",
-    availability: "implemented",
-    load: "lazy",
-  })),
-  {
-    id: "typescript.relationship.trace",
-    name: "trace",
-    provider: "TypeScript language service relationship provider",
-    providerKind: "builtin",
-    evidence: "compiler",
-    availability: "implemented",
-    load: "lazy",
-    relationshipOperations: ["callers", "callees"],
-  },
 ];
 
 const GO_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
@@ -165,17 +107,6 @@ const GO_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
     availability: "implemented",
     load: "lazy",
   },
-  {
-    id: "gopls.trace",
-    name: "trace",
-    provider: "gopls",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["gopls executable and a valid Go workspace"],
-    relationshipOperations: ["callers", "callees"],
-  },
 ];
 
 const PYTHON_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
@@ -187,65 +118,6 @@ const PYTHON_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
     evidence: "syntax",
     availability: "implemented",
     load: "lazy",
-  },
-  ...(["definitions", "references", "callers", "callees"] as const).map(
-    (name): LanguageCapabilitySpec => ({
-      id: `pyright-python.${name}`,
-      name,
-      provider: "pyright-python",
-      providerKind: "external",
-      evidence: "compiler",
-      availability: "conditional",
-      load: "lazy",
-      prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
-    }),
-  ),
-  {
-    id: "pyright-python.trace",
-    name: "trace",
-    provider: "pyright-python",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
-    relationshipOperations: ["callers", "callees"],
-  },
-];
-
-const SWIFT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
-  {
-    id: "sourcekit-lsp.outline",
-    name: "outline",
-    provider: "sourcekit-lsp-swift",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
-  },
-  ...(["definitions", "references", "implementations", "callers", "callees"] as const).map(
-    (name): LanguageCapabilitySpec => ({
-      id: `sourcekit-lsp.${name}`,
-      name,
-      provider: "sourcekit-lsp-swift",
-      providerKind: "external",
-      evidence: "compiler",
-      availability: "conditional",
-      load: "lazy",
-      prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
-    }),
-  ),
-  {
-    id: "sourcekit-lsp.trace",
-    name: "trace",
-    provider: "sourcekit-lsp-swift",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
-    relationshipOperations: ["callers", "callees"],
   },
 ];
 
@@ -267,7 +139,7 @@ export const DEFAULT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilityDescripto
   },
   { language: "go", extensions: [".go"], capabilities: GO_LANGUAGE_CAPABILITIES },
   { language: "python", extensions: [".py"], capabilities: PYTHON_LANGUAGE_CAPABILITIES },
-  { language: "swift", extensions: [".swift"], capabilities: SWIFT_LANGUAGE_CAPABILITIES },
+  { language: "swift", extensions: [".swift"], capabilities: [] },
 ];
 
 export const DEFAULT_NEUTRAL_CAPABILITIES: readonly NeutralCapabilitySpec[] = [

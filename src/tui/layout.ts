@@ -1,4 +1,3 @@
-import { isSemanticMode } from "../semantic-protocol.js";
 import type { Theme as PiTheme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { SignalGrepLocale } from "../config.js";
@@ -31,7 +30,6 @@ interface TuiCopy {
   files: string;
   finalPage: string;
   inspect: string;
-  impact: string;
   inspectBlocked: string;
   matches: string;
   matchesTitle: string;
@@ -77,7 +75,6 @@ const COPY = {
     files: "files",
     finalPage: "final page",
     inspect: "INSPECT",
-    impact: "IMPACT",
     inspectBlocked: "Current source was not mixed with retained evidence.",
     matches: "matches",
     matchesTitle: "MATCHES",
@@ -129,7 +126,6 @@ const COPY = {
     files: "个文件",
     finalPage: "最后一页",
     inspect: "源码检查",
-    impact: "影响证据",
     inspectBlocked: "未将当前源码与快照证据混合展示。",
     matches: "处匹配",
     matchesTitle: "匹配结果",
@@ -467,18 +463,6 @@ function inspectCall(input: SignalGrepInput, copy: TuiCopy, theme: Theme): CallV
   };
 }
 
-function impactCall(input: SignalGrepInput, copy: TuiCopy, theme: Theme): CallView {
-  const target = input.cursor
-    ? `${copy.retainedMatch} #${String(input.matchIndex ?? "?")}`
-    : input.symbol
-      ? `${safeLabel(input.path ?? "?")} · ${safeLabel(input.symbol)}`
-      : `${safeLabel(input.path ?? "?")}:${String(input.line ?? "?")}`;
-  return {
-    primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", copy.impact)} ${theme.fg("muted", target)}`,
-    secondary: [],
-  };
-}
-
 function renderInspectBatch(
   presentation: InspectBatchPresentation,
   copy: TuiCopy,
@@ -565,10 +549,11 @@ function searchCall(input: SignalGrepInput, theme: Theme): CallView {
 
 function callView(input: SignalGrepInput, copy: TuiCopy, theme: Theme): CallView {
   if (input.mode === "inspect") return inspectCall(input, copy, theme);
-  if (input.mode === "impact") return impactCall(input, copy, theme);
   if (input.cursor) return continuationCall(input, copy, theme);
   if (
-    isSemanticMode(input.mode) ||
+    input.mode === "outline" ||
+    input.mode === "imports" ||
+    input.mode === "tests" ||
     input.mode === "files" ||
     input.mode === "concept" ||
     input.mode === "hybrid" ||
@@ -578,7 +563,7 @@ function callView(input: SignalGrepInput, copy: TuiCopy, theme: Theme): CallView
       primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", safeLabel(input.mode))} ${theme.fg("muted", safeLabel(input.query ?? input.pattern ?? input.symbol ?? input.path ?? "."))}`,
       secondary: [
         safeLabel(input.path ?? "."),
-        ...(input.line === undefined ? [] : [`${String(input.line)}:${String(input.column ?? 1)}`]),
+        ...(input.line === undefined ? [] : [String(input.line)]),
       ],
     };
   }

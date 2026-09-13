@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/mcp.ts
-import { randomUUID as randomUUID11 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 import { createServer } from "node:http";
 import { URL as URL2 } from "node:url";
 // package.json
@@ -94,9 +94,7 @@ var package_default = {
     "@huggingface/transformers": "3.8.1",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@vscode/ripgrep": "1.18.0",
-    pyright: "1.1.414",
     typebox: "1.3.19",
-    typescript: "7.0.2",
     "web-tree-sitter": "0.25.10",
     zod: "4.5.4"
   },
@@ -109,7 +107,8 @@ var package_default = {
     oxlint: "^1.80.0",
     "oxlint-tsgolint": "^7.0.2001",
     "tree-sitter-bash": "0.25.1",
-    "tree-sitter-powershell": "0.26.4"
+    "tree-sitter-powershell": "0.26.4",
+    typescript: "7.0.2"
   },
   peerDependencies: {
     "@earendil-works/pi-ai": "*",
@@ -232,7 +231,7 @@ function distinctNextRequest(details, analysis) {
 }
 function compactMcpModelText(result) {
   const analysis = result.details.analysis;
-  if (!analysis)
+  if (!analysis || analysis.kind === "validate")
     return result.text;
   const header = compactHeader(result.details, analysis);
   const inspect = compactInspectInstruction(analysis);
@@ -301,256 +300,6 @@ var MAX_PATTERN_CHARACTERS = 64 * 1024;
 var MAX_FILE_FILTER_ITEMS = 64;
 var MAX_SOURCE_REVISION_CONCURRENCY = 16;
 var MAX_SOURCE_REVISION_FILES = 50000;
-
-// src/errors.ts
-class SignalGrepError extends Error {
-  constructor(message, options) {
-    super(message, options);
-    this.name = "SignalGrepError";
-  }
-}
-
-class ConceptUnavailableError extends SignalGrepError {
-  constructor(message, options) {
-    super(message, options);
-    this.name = "ConceptUnavailableError";
-  }
-}
-
-class RipgrepInputError extends SignalGrepError {
-  code;
-  guidance;
-  details;
-  constructor(code, message, guidance) {
-    super(`${message} ${guidance}`);
-    this.name = "RipgrepInputError";
-    this.code = code;
-    this.guidance = guidance;
-    this.details = {
-      code,
-      issues: [
-        {
-          field: code === "E_REGEX_INVALID" ? "pattern" : "path",
-          reason: guidance
-        }
-      ],
-      recovery: { action: "manual", reason: guidance }
-    };
-  }
-}
-
-class CursorError extends SignalGrepError {
-  code;
-  constructor(message, code = "E_CURSOR_MALFORMED") {
-    super(`${code}: ${message}`);
-    this.name = "CursorError";
-    this.code = code;
-  }
-}
-function abortError() {
-  const error = new Error("Operation aborted");
-  error.name = "AbortError";
-  return error;
-}
-
-// src/evidence-validity.ts
-function aggregateRelationshipValidity(sources) {
-  if (sources.some((source) => source.status === "stale"))
-    return "stale";
-  if (sources.length === 0 || sources.some((source) => source.status === "unknown"))
-    return "unknown";
-  return "current";
-}
-function relationshipCoverage(sources, reasons = [], status = sources.length > 0 ? "complete" : "not-applicable") {
-  return {
-    status,
-    freshness: aggregateRelationshipValidity(sources),
-    sources: [...sources],
-    reasons: [...new Set(reasons)]
-  };
-}
-function relationshipRecheck(sources, affectedNodeKeys = [], affectedEdgeKeys = [], reasons = [], coverage = sources.length > 0 ? "complete" : "not-applicable") {
-  return {
-    validity: aggregateRelationshipValidity(sources),
-    coverage,
-    sources: [...sources],
-    affectedNodeKeys: [...new Set(affectedNodeKeys)],
-    affectedEdgeKeys: [...new Set(affectedEdgeKeys)],
-    reasons: [...new Set(reasons)]
-  };
-}
-
-// src/relationship-types.ts
-function relationshipNodeKey(node) {
-  const identity = node.identity;
-  return JSON.stringify([
-    identity.providerId,
-    identity.analysisViewId,
-    identity.sourceScope,
-    identity.localKey
-  ]);
-}
-function relationshipEdgeKey(edge) {
-  return edge.edgeKey;
-}
-
-// src/relationship-explorer.ts
-var DEFAULT_RELATIONSHIP_TRACE_BUDGET = {
-  maxDepth: 3,
-  maxNodes: 200,
-  maxEdges: 400,
-  maxExpansions: 200
-};
-var RELATIONSHIP_TRACE_LIMITS = {
-  maxDepth: { minimum: 1, maximum: 8 },
-  maxNodes: { minimum: 1, maximum: 2000 },
-  maxEdges: { minimum: 1, maximum: 4000 },
-  maxExpansions: { minimum: 1, maximum: 2000 }
-};
-function validateBudget(budget) {
-  for (const [name, value] of Object.entries(budget)) {
-    if (!Number.isSafeInteger(value) || value < 1)
-      throw new SignalGrepError(`Relationship ${name} must be a positive integer`);
-  }
-}
-function resolvedRoot(root) {
-  if (!root)
-    throw new SignalGrepError("Relationship trace root was not resolved");
-  if ("identity" in root)
-    return root;
-  if (root.status !== "resolved" || !root.node)
-    throw new SignalGrepError(`Relationship target could not be resolved: ${root.reasons.join("; ")}`);
-  return root.node;
-}
-function mergeDependencies(expansions) {
-  const status = expansions.flatMap((expansion) => expansion.coverage.sources);
-  return [...new Map(status.map((item) => [`${item.role}:${item.path}`, item])).values()];
-}
-
-class RelationshipExplorer {
-  async start(view, request) {
-    validateBudget(request.budget);
-    if (request.signal?.aborted)
-      throw abortError();
-    const root = resolvedRoot(request.root);
-    const state = {
-      scope: request.scope ?? view.sourceScope,
-      operation: request.operation,
-      budget: { ...request.budget },
-      nodes: [root],
-      edges: [],
-      unresolved: [],
-      frontier: [{ node: root, depth: 0 }],
-      expanded: [],
-      reasons: [],
-      coverage: relationshipCoverage([], [], "not-applicable"),
-      depthReached: 0,
-      expansions: 0,
-      truncated: false
-    };
-    return this.continue(view, state, request.signal);
-  }
-  async continue(view, previous, signal, options = {}) {
-    const budget = {
-      ...previous.budget,
-      maxDepth: previous.budget.maxDepth + (options.extendDepth ?? 0)
-    };
-    validateBudget(budget);
-    if (signal?.aborted)
-      throw abortError();
-    const nodes = new Map(previous.nodes.map((node) => [relationshipNodeKey(node), node]));
-    const edges = new Map(previous.edges.map((edge) => [relationshipEdgeKey(edge), edge]));
-    const expanded = new Set(previous.expanded);
-    const frontier = previous.frontier.map((item) => ({ ...item }));
-    const unresolved = [...previous.unresolved];
-    const reasons = [...previous.reasons];
-    const expansions = previous.expansions;
-    let usedExpansions = expansions;
-    let depthReached = previous.depthReached;
-    let truncated = false;
-    const expansionFacts = [];
-    while (frontier.length > 0) {
-      if (signal?.aborted)
-        throw abortError();
-      const current = frontier.shift();
-      if (!current)
-        break;
-      if (current.depth >= budget.maxDepth) {
-        frontier.unshift(current);
-        truncated = true;
-        break;
-      }
-      const key = `${relationshipNodeKey(current.node)}\x00${previous.operation}`;
-      if (expanded.has(key))
-        continue;
-      if (usedExpansions >= budget.maxExpansions) {
-        frontier.unshift(current);
-        truncated = true;
-        break;
-      }
-      usedExpansions += 1;
-      expanded.add(key);
-      const expansion = await view.expand(current.node, previous.operation, signal);
-      expansionFacts.push(expansion);
-      depthReached = Math.max(depthReached, current.depth + 1);
-      for (const item of expansion.unresolved)
-        unresolved.push(item);
-      for (const edge of expansion.edges) {
-        if (edges.has(edge.edgeKey))
-          continue;
-        const missingNodeKeys = [edge.from, edge.to].map(relationshipNodeKey).filter((missingKey) => !nodes.has(missingKey));
-        if (edges.size >= budget.maxEdges || nodes.size + new Set(missingNodeKeys).size > budget.maxNodes) {
-          truncated = true;
-          reasons.push(edges.size >= budget.maxEdges ? "Relationship edge budget reached; remaining edges were not retained and cannot be continued" : "Relationship node budget reached; remaining edges were not retained and cannot be continued");
-          frontier.length = 0;
-          break;
-        }
-        edges.set(edge.edgeKey, edge);
-        for (const node of [edge.from, edge.to]) {
-          const nodeKey = relationshipNodeKey(node);
-          if (!nodes.has(nodeKey)) {
-            nodes.set(nodeKey, node);
-          }
-          if (!expanded.has(`${nodeKey}\x00${previous.operation}`))
-            frontier.push({ node, depth: current.depth + 1 });
-        }
-      }
-      if (nodes.size >= budget.maxNodes || edges.size >= budget.maxEdges) {
-        truncated = true;
-        frontier.length = 0;
-        reasons.push("Relationship traversal reached its retained node/edge budget");
-        break;
-      }
-    }
-    const previousSources = previous.coverage.sources;
-    const sources = [
-      ...new Map([...previousSources, ...mergeDependencies(expansionFacts)].map((source) => [
-        `${source.role}:${source.path}`,
-        source
-      ])).values()
-    ];
-    const allReasons = [...new Set([...previous.coverage.reasons, ...reasons])];
-    const freshness = expansionFacts.length === 0 ? "unknown" : aggregateRelationshipValidity(sources);
-    const coverage = relationshipCoverage(sources, allReasons, truncated || unresolved.length > 0 ? "partial" : "complete");
-    coverage.freshness = freshness;
-    return {
-      scope: previous.scope,
-      operation: previous.operation,
-      budget,
-      nodes: [...nodes.values()],
-      edges: [...edges.values()],
-      unresolved,
-      frontier,
-      expanded: [...expanded],
-      reasons: allReasons,
-      coverage,
-      depthReached,
-      expansions: usedExpansions,
-      truncated,
-      status: truncated || unresolved.length > 0 ? "partial" : "complete"
-    };
-  }
-}
 
 // src/redaction.ts
 var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
@@ -641,6 +390,57 @@ function redactSignalGrepResult(result) {
       redactionApplied: true
     }
   };
+}
+
+// src/errors.ts
+class SignalGrepError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "SignalGrepError";
+  }
+}
+
+class ConceptUnavailableError extends SignalGrepError {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "ConceptUnavailableError";
+  }
+}
+
+class RipgrepInputError extends SignalGrepError {
+  code;
+  guidance;
+  details;
+  constructor(code, message, guidance) {
+    super(`${message} ${guidance}`);
+    this.name = "RipgrepInputError";
+    this.code = code;
+    this.guidance = guidance;
+    this.details = {
+      code,
+      issues: [
+        {
+          field: code === "E_REGEX_INVALID" ? "pattern" : "path",
+          reason: guidance
+        }
+      ],
+      recovery: { action: "manual", reason: guidance }
+    };
+  }
+}
+
+class CursorError extends SignalGrepError {
+  code;
+  constructor(message, code = "E_CURSOR_MALFORMED") {
+    super(`${code}: ${message}`);
+    this.name = "CursorError";
+    this.code = code;
+  }
+}
+function abortError() {
+  const error = new Error("Operation aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 // src/request-contract-error.ts
@@ -751,43 +551,6 @@ var TYPESCRIPT_LANGUAGE_CAPABILITIES = [
     evidence: "syntax",
     availability: "implemented",
     load: "lazy"
-  },
-  {
-    id: "impact.mixed",
-    name: "impact",
-    provider: "TypeScript language service + ast-grep",
-    providerKind: "builtin",
-    evidence: "compiler",
-    certainty: "mixed",
-    availability: "implemented",
-    load: "lazy"
-  },
-  ...[
-    "definitions",
-    "references",
-    "implementations",
-    "callers",
-    "callees",
-    "dependencies",
-    "dependents"
-  ].map((name) => ({
-    id: `typescript.compiler.${name}`,
-    name,
-    provider: "TypeScript language service relationship provider",
-    providerKind: "builtin",
-    evidence: "compiler",
-    availability: "implemented",
-    load: "lazy"
-  })),
-  {
-    id: "typescript.relationship.trace",
-    name: "trace",
-    provider: "TypeScript language service relationship provider",
-    providerKind: "builtin",
-    evidence: "compiler",
-    availability: "implemented",
-    load: "lazy",
-    relationshipOperations: ["callers", "callees"]
   }
 ];
 var GO_LANGUAGE_CAPABILITIES = [
@@ -808,17 +571,6 @@ var GO_LANGUAGE_CAPABILITIES = [
     evidence: "syntax",
     availability: "implemented",
     load: "lazy"
-  },
-  {
-    id: "gopls.trace",
-    name: "trace",
-    provider: "gopls",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["gopls executable and a valid Go workspace"],
-    relationshipOperations: ["callers", "callees"]
   }
 ];
 var PYTHON_LANGUAGE_CAPABILITIES = [
@@ -830,60 +582,6 @@ var PYTHON_LANGUAGE_CAPABILITIES = [
     evidence: "syntax",
     availability: "implemented",
     load: "lazy"
-  },
-  ...["definitions", "references", "callers", "callees"].map((name) => ({
-    id: `pyright-python.${name}`,
-    name,
-    provider: "pyright-python",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["bundled Pyright language server and an admitted Python workspace"]
-  })),
-  {
-    id: "pyright-python.trace",
-    name: "trace",
-    provider: "pyright-python",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
-    relationshipOperations: ["callers", "callees"]
-  }
-];
-var SWIFT_LANGUAGE_CAPABILITIES = [
-  {
-    id: "sourcekit-lsp.outline",
-    name: "outline",
-    provider: "sourcekit-lsp-swift",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"]
-  },
-  ...["definitions", "references", "implementations", "callers", "callees"].map((name) => ({
-    id: `sourcekit-lsp.${name}`,
-    name,
-    provider: "sourcekit-lsp-swift",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"]
-  })),
-  {
-    id: "sourcekit-lsp.trace",
-    name: "trace",
-    provider: "sourcekit-lsp-swift",
-    providerKind: "external",
-    evidence: "compiler",
-    availability: "conditional",
-    load: "lazy",
-    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
-    relationshipOperations: ["callers", "callees"]
   }
 ];
 var DEFAULT_LANGUAGE_CAPABILITIES = [
@@ -904,7 +602,7 @@ var DEFAULT_LANGUAGE_CAPABILITIES = [
   },
   { language: "go", extensions: [".go"], capabilities: GO_LANGUAGE_CAPABILITIES },
   { language: "python", extensions: [".py"], capabilities: PYTHON_LANGUAGE_CAPABILITIES },
-  { language: "swift", extensions: [".swift"], capabilities: SWIFT_LANGUAGE_CAPABILITIES }
+  { language: "swift", extensions: [".swift"], capabilities: [] }
 ];
 var DEFAULT_NEUTRAL_CAPABILITIES = [
   {
@@ -967,19 +665,10 @@ var SIGNAL_GREP_MODES = [
   "outline",
   "imports",
   "tests",
-  "impact",
   "files",
   "structure",
   "concept",
   "hybrid",
-  "definitions",
-  "references",
-  "implementations",
-  "callers",
-  "callees",
-  "dependencies",
-  "dependents",
-  "trace",
   "validate",
   "capabilities",
   "await",
@@ -1037,35 +726,10 @@ var MODE_FIELDS_BY_MODE = {
     "matchIndex",
     "maxFilesToParse"
   ],
-  impact: [...commonFields, ...sourceFilters, "path", "line", "symbol", "cursor", "matchIndex"],
   files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
   concept: [...commonFields, "query", ...sourceFilters],
   hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit"],
-  definitions: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
-  references: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
-  implementations: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
-  callers: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
-  callees: [...commonFields, "path", "line", "column", "symbol", "maxFilesToParse"],
-  dependencies: [...commonFields, "path"],
-  dependents: [...commonFields, "path"],
-  trace: [
-    ...commonFields,
-    ...sourceFilters,
-    "path",
-    "line",
-    "column",
-    "symbol",
-    "relation",
-    "depth",
-    "maxNodes",
-    "maxEdges",
-    "maxExpansions",
-    "maxFilesToParse",
-    "cursor",
-    "exploreCursor",
-    "matchIndex"
-  ],
   validate: [...commonFields, "cursor", "matchIndex"],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
@@ -1087,8 +751,6 @@ var MODE_SUMMARY_MODES = [
   "hybrid",
   "inspect",
   "outline",
-  "references",
-  "trace",
   "capabilities",
   "await",
   "cancel"
@@ -1126,7 +788,7 @@ var REQUEST_USAGE_GUIDANCE = [
   `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => `${field}=${fieldGuidance(field)}`).join("; ")}`,
   `variants: ${VARIANT_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
   `budgets: ${BUDGET_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
-  `selectors: inspect=${modeFieldSummary("inspect")}; references=${modeFieldSummary("references")}; hybrid=${modeFieldSummary("hybrid")}; files=${modeFieldSummary("files")}; capabilities=${modeFieldSummary("capabilities")}`,
+  `selectors: inspect=${modeFieldSummary("inspect")}; hybrid=${modeFieldSummary("hybrid")}; files=${modeFieldSummary("files")}; capabilities=${modeFieldSummary("capabilities")}`,
   "use only the advertised names: exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODEL_USAGE_GUIDANCE = [
@@ -1135,16 +797,16 @@ var MODEL_USAGE_GUIDANCE = [
   "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
   `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
   "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
-  "Swift outline/navigation needs SourceKit-LSP; Go trace needs gopls and a valid workspace; bounded evidence",
-  `selectors: inspect={${modeFields("inspect").join(",")}}; references={${modeFields("references").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
+  "outline supports JS/TS/TSX and bounded Python syntax; imports/tests are static candidates for JS/TS/TSX",
+  `selectors: inspect={${modeFields("inspect").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
   "exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODE_CONTRACT_DESCRIPTION = [
   `fields: ${MODE_FIELD_SUMMARY}`,
   `rules: ${GUIDANCE_FIELDS.map((field) => `${field} — ${fieldGuidance(field)}`).join("; ")}`,
-  "inspect uses cursor+matchIndex or explicit targets; references and other semantic navigation use path+line+column or an unambiguous symbol",
+  "inspect uses cursor+matchIndex or explicit targets; imports/tests report static syntax candidates",
   "capabilities performs a bounded names-only project inventory and reports per-language modes with lazy loading; it does not start a parser, compiler, model or language server",
-  "outline follows declared capabilities; Swift needs SourceKit-LSP; unavailable languages appear in capabilities",
+  "outline follows declared syntax capabilities; unavailable languages appear in capabilities",
   "there are no exact, any-of or max_results fields; use literal, anyOf or limit",
   "context 0–20 is never clamped"
 ].join("; ");
@@ -1307,43 +969,6 @@ function selectorIssuesFor(input, mode) {
     }
     return issues;
   }
-  if (mode === "impact") {
-    if (input.cursor !== undefined) {
-      const issues = [];
-      if (!Number.isSafeInteger(input.matchIndex))
-        issues.push({ field: "matchIndex", reason: "snapshot impact requires cursor+matchIndex" });
-      for (const field of ["path", "line", "symbol"])
-        if (input[field] !== undefined)
-          issues.push({ field, reason: "snapshot impact cursor cannot combine a direct selector" });
-      return issues;
-    }
-    if (typeof input.path !== "string" || input.line === undefined && input.symbol === undefined)
-      return [{ field: "path", reason: "direct impact requires path and line or symbol" }];
-    return [];
-  }
-  if (mode === "definitions" || mode === "references" || mode === "implementations" || mode === "callers" || mode === "callees") {
-    if (typeof input.path !== "string" || !(Number.isSafeInteger(input.line) && Number.isSafeInteger(input.column)) && typeof input.symbol !== "string")
-      return [
-        {
-          field: "path",
-          reason: "semantic navigation requires path and line+column, or an unambiguous symbol"
-        }
-      ];
-    return [];
-  }
-  if (mode === "trace" && input.cursor === undefined && input.exploreCursor === undefined) {
-    const issues = [];
-    if (input.relation !== "callers" && input.relation !== "callees")
-      issues.push({
-        field: "relation",
-        reason: "mode=trace requires relation=callers or relation=callees"
-      });
-    if (typeof input.path !== "string")
-      issues.push({ field: "path", reason: "mode=trace requires path" });
-    if (!Number.isSafeInteger(input.line))
-      issues.push({ field: "line", reason: "mode=trace requires line" });
-    return issues;
-  }
   if (mode === "validate" && typeof input.cursor !== "string")
     return [{ field: "cursor", reason: "mode=validate requires a saved evidence cursor" }];
   return [];
@@ -1365,27 +990,7 @@ function validateValueRanges(input) {
     ["context", 0, MAX_CONTEXT_LINES],
     ["limit", 1, MAX_PAGE_SIZE],
     ["conceptLimit", 1, MAX_HYBRID_CONCEPT_LIMIT],
-    ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES],
-    [
-      "depth",
-      RELATIONSHIP_TRACE_LIMITS.maxDepth.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxDepth.maximum
-    ],
-    [
-      "maxNodes",
-      RELATIONSHIP_TRACE_LIMITS.maxNodes.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxNodes.maximum
-    ],
-    [
-      "maxEdges",
-      RELATIONSHIP_TRACE_LIMITS.maxEdges.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxEdges.maximum
-    ],
-    [
-      "maxExpansions",
-      RELATIONSHIP_TRACE_LIMITS.maxExpansions.minimum,
-      RELATIONSHIP_TRACE_LIMITS.maxExpansions.maximum
-    ]
+    ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES]
   ];
   for (const [field, minimum, maximum] of integerRanges) {
     const value = input[field];
@@ -1458,15 +1063,6 @@ function validateRequestContract(input) {
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof raw.cursor === "string" && raw.cursor.trim().length > 0 && !raw.cursor.includes(".analysis")) {
     allowed.clear();
     for (const field of ["mode", "cursor", "path", "paths", "redact"])
-      allowed.add(field);
-  }
-  if (mode === "trace" && raw.exploreCursor !== undefined) {
-    allowed.clear();
-    for (const field of ["mode", "exploreCursor", "redact"])
-      allowed.add(field);
-  } else if (mode === "trace" && typeof raw.cursor === "string" && raw.cursor.startsWith("relationship.")) {
-    allowed.clear();
-    for (const field of ["mode", "cursor", "matchIndex", "redact"])
       allowed.add(field);
   }
   const allowedNames = new Set(allowed);
@@ -2904,7 +2500,7 @@ function createCtagsStructureProvider(options = {}) {
 }
 
 // src/service.ts
-import { createHash as createHash9 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 
 // src/analysis-evidence.ts
 function sourceEvidence(document, range) {
@@ -2943,276 +2539,6 @@ function rangeEvidence(document, range) {
     excerptRange: { start: range.start, end: document.toByteOffset(end) },
     excerptTruncated: end < rangeEnd
   };
-}
-
-// src/semantic-sources.ts
-import { pathToFileURL } from "node:url";
-import { realpath as realpath3 } from "node:fs/promises";
-import { resolve as resolve6 } from "node:path";
-async function semanticSources(cwd, documents) {
-  const known = new Map;
-  const policy = new SearchPathPolicy(cwd);
-  for (const document of documents) {
-    const absolute = resolve6(cwd, document.path);
-    known.set(absolute, document);
-    known.set(await realpath3(absolute), document);
-  }
-  return async (path) => {
-    const absolute = resolve6(cwd, path);
-    policy.assertPath(absolute);
-    const direct = known.get(absolute);
-    if (direct)
-      return direct;
-    try {
-      return known.get(await realpath3(absolute));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
-        return;
-      throw error;
-    }
-  };
-}
-async function semanticUri(cwd, path) {
-  return pathToFileURL(await realpath3(resolve6(cwd, path))).href;
-}
-
-// src/impact-bindings.ts
-import { resolve as resolve7 } from "node:path";
-
-// src/semantic-protocol.ts
-import { fileURLToPath } from "node:url";
-
-// src/owned-json-rpc.ts
-var MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
-var MAX_RPC_TOTAL_BYTES = 64 * 1024 * 1024;
-function rpcRecord(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-class JsonRpcChannel {
-  #stdin;
-  #pending = new Map;
-  #onRequest;
-  #nextId = 0;
-  #closed = false;
-  #inputEnded = false;
-  constructor(stdin, onRequest) {
-    this.#stdin = stdin;
-    this.#onRequest = onRequest;
-  }
-  async#send(message) {
-    if (this.#closed)
-      throw new SignalGrepError("Language-service connection closed");
-    const body = Buffer.from(JSON.stringify(message));
-    if (body.length > MAX_RPC_FRAME_BYTES)
-      throw new SignalGrepError("Language-service request exceeds the frame budget");
-    const frame = Buffer.concat([
-      Buffer.from(`Content-Length: ${String(body.length)}\r
-\r
-`),
-      body
-    ]);
-    await new Promise((resolve, reject) => {
-      this.#stdin.write(frame, (error) => error ? reject(error) : resolve());
-    });
-  }
-  async request(method, params) {
-    if (this.#pending.size >= 32)
-      throw new SignalGrepError("Language-service request concurrency exceeded");
-    const id = ++this.#nextId;
-    const deferred = Promise.withResolvers();
-    this.#pending.set(id, deferred);
-    try {
-      const [, response] = await Promise.all([
-        this.#send({ jsonrpc: "2.0", id, method, params }),
-        deferred.promise
-      ]);
-      return response;
-    } finally {
-      this.#pending.delete(id);
-    }
-  }
-  notify(method, params) {
-    return this.#send({ jsonrpc: "2.0", method, ...params === undefined ? {} : { params } });
-  }
-  async accept(value) {
-    if (!rpcRecord(value) || value.jsonrpc !== "2.0")
-      throw new SignalGrepError("Invalid language-service JSON-RPC message");
-    if (typeof value.method === "string") {
-      if (this.#inputEnded)
-        return;
-      if (value.id === undefined)
-        return;
-      if (typeof value.id !== "number" && typeof value.id !== "string")
-        throw new SignalGrepError("Invalid language-service request id");
-      const result = this.#onRequest(value.method, value.params);
-      await this.#send({ jsonrpc: "2.0", id: value.id, result });
-      return;
-    }
-    if (typeof value.id !== "number")
-      throw new SignalGrepError("Invalid language-service response id");
-    const pending = this.#pending.get(value.id);
-    if (!pending)
-      throw new SignalGrepError("Unexpected language-service response id");
-    if (value.error !== undefined) {
-      if (!rpcRecord(value.error) || typeof value.error.message !== "string")
-        throw new SignalGrepError("Invalid language-service error");
-      pending.reject(new SignalGrepError(`Language service: ${value.error.message}`));
-    } else if ("result" in value)
-      pending.resolve(value.result);
-    else
-      throw new SignalGrepError("Language-service response omitted its result");
-  }
-  endInput() {
-    if (this.#inputEnded)
-      return;
-    if (this.#pending.size)
-      throw new Error("Cannot end JSON-RPC input with pending requests");
-    this.#inputEnded = true;
-    this.#stdin.end();
-  }
-  close() {
-    this.#closed = true;
-    for (const pending of this.#pending.values())
-      pending.reject(new SignalGrepError("Language service closed before responding"));
-    this.#pending.clear();
-  }
-}
-async function readMessages(stdout, channel) {
-  let buffered = Buffer.alloc(0);
-  let total = 0;
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  try {
-    for await (const chunk of stdout) {
-      total += chunk.byteLength;
-      if (total > MAX_RPC_TOTAL_BYTES)
-        throw new SignalGrepError("Language-service output exceeds the 64 MiB protocol budget");
-      buffered = Buffer.concat([buffered, chunk]);
-      while (buffered.length) {
-        const boundary = buffered.indexOf(`\r
-\r
-`);
-        if (boundary < 0) {
-          if (buffered.length > 8192)
-            throw new SignalGrepError("Language-service header exceeds the framing budget");
-          break;
-        }
-        if (boundary > 8192)
-          throw new SignalGrepError("Language-service header exceeds the framing budget");
-        const headers = buffered.subarray(0, boundary).toString("ascii");
-        const fields = [...headers.matchAll(/^Content-Length:\s*(\d+)\s*$/gim)];
-        if (fields.length !== 1)
-          throw new SignalGrepError("Invalid language-service frame header");
-        const length = Number(fields[0]?.[1]);
-        if (!Number.isSafeInteger(length) || length < 0 || length > MAX_RPC_FRAME_BYTES)
-          throw new SignalGrepError("Language-service frame exceeds the 16 MiB limit");
-        const end = boundary + 4 + length;
-        if (buffered.length < end)
-          break;
-        const value = JSON.parse(decoder.decode(buffered.subarray(boundary + 4, end)));
-        buffered = buffered.subarray(end);
-        await channel.accept(value);
-      }
-    }
-    if (buffered.length)
-      throw new SignalGrepError("Language service closed with an incomplete frame");
-  } finally {
-    channel.close();
-  }
-}
-async function openOwnedJsonRpc(options, onRequest) {
-  const ready = Promise.withResolvers();
-  const termination = new AbortController;
-  let settled = false;
-  const signal = AbortSignal.any([options.signal, termination.signal]);
-  const completion = runOwnedProcess({ ...options, signal, interactive: true }, async (stdout, stdin) => {
-    if (!stdin) {
-      const error = new SignalGrepError("Missing interactive language-service stdin");
-      if (!settled)
-        ready.reject(error);
-      throw error;
-    }
-    const channel = new JsonRpcChannel(stdin, onRequest);
-    if (!settled) {
-      settled = true;
-      ready.resolve(channel);
-    }
-    await readMessages(stdout, channel);
-  });
-  completion.catch((error) => {
-    if (!settled) {
-      settled = true;
-      ready.reject(error);
-    }
-  });
-  let channel;
-  try {
-    channel = await ready.promise;
-  } catch (error) {
-    await completion.catch(() => {
-      return;
-    });
-    throw error;
-  }
-  return { channel, completion, abort: () => termination.abort() };
-}
-
-// src/semantic-protocol.ts
-var SEMANTIC_MODES = [
-  "definitions",
-  "references",
-  "implementations",
-  "callers",
-  "callees",
-  "dependencies",
-  "dependents"
-];
-function isSemanticMode(mode) {
-  return SEMANTIC_MODES.some((candidate) => candidate === mode);
-}
-function readPosition(value) {
-  if (!rpcRecord(value) || typeof value.line !== "number" || !Number.isSafeInteger(value.line) || value.line < 0 || typeof value.character !== "number" || !Number.isSafeInteger(value.character) || value.character < 0)
-    throw new SignalGrepError("Invalid compiler source position");
-  return { line: value.line, character: value.character };
-}
-function lspRange(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("Invalid compiler source range");
-  const start = readPosition(value.start), end = readPosition(value.end);
-  if (end.line < start.line || end.line === start.line && end.character < start.character)
-    throw new SignalGrepError("Reversed compiler source range");
-  return { start, end };
-}
-function semanticLocation(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("Invalid compiler location");
-  const uri = value.targetUri ?? value.uri;
-  if (typeof uri !== "string" || !uri.startsWith("file:"))
-    throw new SignalGrepError("Compiler returned a non-file location");
-  return {
-    path: fileURLToPath(uri),
-    range: lspRange(value.targetSelectionRange ?? value.selectionRange ?? value.range)
-  };
-}
-function locations(value) {
-  if (value === null)
-    return [];
-  return (Array.isArray(value) ? value : [value]).map(semanticLocation);
-}
-function byteAt(document, position) {
-  const line = document.lineRange(position.line + 1);
-  const character = document.toCharacterOffset(line.start) + position.character;
-  const end = document.toCharacterOffset(line.end);
-  if (character > end || position.line + 1 < document.lineStarts.length && character === end)
-    throw new SignalGrepError("Compiler column is outside the source line");
-  return document.toByteOffset(character);
-}
-function byteRange(document, range) {
-  return { start: byteAt(document, range.start), end: byteAt(document, range.end) };
-}
-function lspPosition(document, character) {
-  const value = document.positionAt(document.toByteOffset(character));
-  return { line: value.line - 1, character: value.column - 1 };
 }
 
 // src/owned-task-queue.ts
@@ -3256,187 +2582,43 @@ class OwnedTaskQueue {
   }
 }
 
-// src/typescript-client.ts
-import { createRequire } from "node:module";
-import { dirname, join as join2 } from "node:path";
-var compilerQueue = new OwnedTaskQueue;
-var TYPESCRIPT_QUERY_TIMEOUT_MS = 20000;
-var preferences = {
-  disableAutomaticTypeAcquisition: true,
-  tsserver: { automaticTypeAcquisition: { enabled: false } },
-  implicitProjectConfig: { checkJs: true, allowJs: true, typeAcquisition: { enabled: false } },
-  preferences: { includePackageJsonAutoImports: "off" }
-};
-function serverRequest(method, params) {
-  if (method === "workspace/configuration") {
-    if (!rpcRecord(params) || !Array.isArray(params.items))
-      throw new SignalGrepError("Invalid language-service configuration request");
-    return params.items.map(() => preferences);
-  }
-  if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
-    return null;
-  if (method === "workspace/applyEdit")
-    return { applied: false, failureReason: "Search is read-only" };
-  throw new SignalGrepError(`Unsupported language-service client request: ${method}`);
-}
-function executablePath() {
-  const packageName = `@typescript/typescript-${process.platform}-${process.arch}`;
-  try {
-    const metadata = createRequire(import.meta.url).resolve(`${packageName}/package.json`);
-    return join2(dirname(metadata), "lib", process.platform === "win32" ? "tsc.exe" : "tsc");
-  } catch (error) {
-    throw new SignalGrepError(`TypeScript semantic provider is unavailable for ${process.platform}/${process.arch}; reinstall with optional dependencies enabled`, { cause: error });
-  }
-}
-function languageId(path) {
-  if (/\.tsx$/i.test(path))
-    return "typescriptreact";
-  if (/\.jsx$/i.test(path))
-    return "javascriptreact";
-  return /\.[cm]?ts$/i.test(path) ? "typescript" : "javascript";
-}
-async function initializeTypeScriptSession(cwd, sourceCwd, documents, channel, signal) {
-  if (signal.aborted)
-    throw abortError();
-  const initialized = await channel.request("initialize", {
-    processId: process.pid,
-    rootUri: await semanticUri(cwd, "."),
-    capabilities: {
-      workspace: {
-        configuration: true,
-        didChangeWatchedFiles: { dynamicRegistration: true }
-      },
-      textDocument: {
-        definition: { linkSupport: true },
-        implementation: { linkSupport: true },
-        callHierarchy: {}
-      },
-      general: { positionEncodings: ["utf-16"] }
-    },
-    initializationOptions: { runExternalCode: false, disablePushDiagnostics: true }
-  });
-  if (!rpcRecord(initialized) || !rpcRecord(initialized.capabilities))
-    throw new SignalGrepError("Language service omitted its capabilities");
-  await channel.notify("initialized", {});
-  await channel.notify("workspace/didChangeConfiguration", {
-    settings: { "js/ts": preferences, typescript: preferences, javascript: preferences }
-  });
-  for (const document of documents) {
-    if (signal.aborted)
-      throw abortError();
-    const uri = await semanticUri(sourceCwd, document.path);
-    await channel.notify("textDocument/didOpen", {
-      textDocument: {
-        uri,
-        languageId: languageId(document.path),
-        version: 1,
-        text: document.text
-      }
-    });
-  }
-  return initialized.capabilities;
-}
-async function withTypeScript(cwd, documents, operation, parent, sourceCwd = cwd) {
-  const session = await openTypeScriptSession(cwd, documents, parent, sourceCwd);
-  try {
-    return await operation(session.channel, session.capabilities);
-  } finally {
-    await session.close();
-  }
-}
-async function openTypeScriptSession(cwd, documents, parent, sourceCwd = cwd) {
-  const release = await compilerQueue.acquire(parent);
-  let released = false;
-  const releaseOnce = () => {
-    if (released)
-      return;
-    released = true;
-    release();
-  };
-  const deadline = new AbortController;
-  const signal = parent ? AbortSignal.any([parent, deadline.signal]) : deadline.signal;
-  let deadlineTriggered = false;
-  const timer = setTimeout(() => {
-    deadlineTriggered = true;
-    deadline.abort();
-  }, TYPESCRIPT_QUERY_TIMEOUT_MS);
-  let handedOff = false;
-  try {
-    const executable = executablePath();
-    const session = await openOwnedJsonRpc({
-      executable,
-      args: ["--lsp", "--stdio"],
-      cwd,
-      signal,
-      env: { ...process.env, PATH: dirname(executable), GOMEMLIMIT: "256MiB" }
-    }, serverRequest);
-    let capabilities;
-    try {
-      capabilities = await initializeTypeScriptSession(cwd, sourceCwd, documents, session.channel, signal);
-    } catch (error) {
-      deadline.abort();
-      clearTimeout(timer);
-      session.channel.close();
-      await session.completion.catch(() => {
-        return;
-      });
-      releaseOnce();
-      throw error;
-    }
-    let closePromise;
-    session.completion.finally(() => {
-      clearTimeout(timer);
-      releaseOnce();
-    }).catch(() => {
-      return;
-    });
-    handedOff = true;
-    return {
-      channel: session.channel,
-      capabilities,
-      completion: session.completion,
-      close() {
-        if (!closePromise)
-          closePromise = closeSession();
-        return closePromise;
-      }
-    };
-    async function closeSession() {
-      let shutdownAcknowledged = false;
-      try {
-        await session.channel.request("shutdown", undefined);
-        shutdownAcknowledged = true;
-        session.channel.endInput();
-        const result = await session.completion;
-        if (result.code !== 0 && !(shutdownAcknowledged && result.code === 1))
-          throw new SignalGrepError(`TypeScript language service failed (${String(result.code)}): ${result.stderr}`);
-      } catch (error) {
-        deadline.abort();
-        session.channel.close();
-        await session.completion.catch(() => {
-          return;
-        });
-        throw error;
-      } finally {
-        clearTimeout(timer);
-        releaseOnce();
-      }
-    }
-  } catch (error) {
-    if (!handedOff)
-      clearTimeout(timer);
-    releaseOnce();
-    if (parent?.aborted)
-      throw abortError();
-    if (deadlineTriggered)
-      throw new SignalGrepError(`TypeScript semantic view exceeded the ${String(TYPESCRIPT_QUERY_TIMEOUT_MS)} ms deadline`);
-    throw error;
-  }
-}
-
-// src/syntax.ts
-import { dirname as dirname2 } from "node:path";
+// src/concept-search.ts
+import { dirname as dirname3 } from "node:path";
+import { join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { StringDecoder } from "node:string_decoder";
+import { mkdir as mkdir2 } from "node:fs/promises";
+import { rm as rm2 } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+
+// src/concept-model.ts
+import { homedir as homedir2 } from "node:os";
+import { join as join2, resolve as resolve6 } from "node:path";
+var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
+var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
+var MAX_CONCEPT_CHARS = 1000;
+var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
+var CONCEPT_CACHE_VERSION = 1;
+var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
+var CONCEPT_TIMEOUT_MS = 10 * 60000;
+var MIN_CONCEPT_TIMEOUT_MS = 1000;
+var MAX_CONCEPT_TIMEOUT_MS = 60 * 60000;
+var CONCEPT_TIMEOUT_ENV = "BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS";
+var MAX_CONCEPT_WORKER_INPUT_BYTES = 64 * 1024 * 1024;
+var MAX_CONCEPT_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024;
+function conceptCacheDirectory() {
+  return resolve6(process.env.SIGNAL_GREP_MODEL_DIR ?? join2(homedir2(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+}
+function resolveConceptTimeoutMs(environment = process.env) {
+  const raw = environment[CONCEPT_TIMEOUT_ENV];
+  if (raw === undefined || raw === "")
+    return CONCEPT_TIMEOUT_MS;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < MIN_CONCEPT_TIMEOUT_MS || value > MAX_CONCEPT_TIMEOUT_MS) {
+    throw new SignalGrepError(`${CONCEPT_TIMEOUT_ENV} must be an integer from ${String(MIN_CONCEPT_TIMEOUT_MS)} through ${String(MAX_CONCEPT_TIMEOUT_MS)}`);
+  }
+  return value;
+}
 
 // src/script-runtime.ts
 function scriptRuntimeEnvironment() {
@@ -3446,6 +2628,1287 @@ function scriptRuntimeEnvironment() {
     env.BUN_BE_BUN = "1";
   return env;
 }
+
+// src/record-value.ts
+function isRecordValue(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// src/request.ts
+function list(value) {
+  if (value === undefined)
+    return [];
+  return (Array.isArray(value) ? value : [value]).filter((item) => item.length > 0);
+}
+function validateText(value, field, maxCharacters, singleLine = false) {
+  if (!value.isWellFormed() || /\0/.test(value) || singleLine && /[\r\n]/.test(value))
+    throw new SignalGrepError(`${field} must be well-formed text without NUL or line breaks`);
+  if (value.length > maxCharacters)
+    throw new SignalGrepError(`${field} is too long (maximum ${String(maxCharacters)} characters); use a shorter value or a narrower working directory`);
+}
+function validateSearchPath(value, field = "path") {
+  validateText(value.replace(/^@/, ""), field, MAX_PATH_CHARACTERS, true);
+}
+function validateRawSearchInput(input) {
+  if (input.pattern !== undefined)
+    validateText(input.pattern, "pattern", MAX_PATTERN_CHARACTERS);
+  if (input.path !== undefined) {
+    validateSearchPath(input.path);
+  }
+  for (const [field, value] of [
+    ["glob", input.glob],
+    ["exclude", input.exclude]
+  ]) {
+    const values = list(value);
+    if (values.length > MAX_FILE_FILTER_ITEMS)
+      throw new SignalGrepError(`${field} accepts at most ${String(MAX_FILE_FILTER_ITEMS)} entries`);
+    values.forEach((item) => validateText(item, field, MAX_PATH_CHARACTERS, true));
+  }
+  for (const [field, value] of [
+    ["modifiedAfter", input.modifiedAfter],
+    ["modifiedBefore", input.modifiedBefore]
+  ]) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0))
+      throw new SignalGrepError(`${field} must be a non-negative Unix timestamp in milliseconds`);
+  }
+  if (input.modifiedAfter !== undefined && input.modifiedBefore !== undefined && input.modifiedAfter > input.modifiedBefore)
+    throw new SignalGrepError("modifiedAfter must be earlier than or equal to modifiedBefore");
+}
+function boundedInteger(value, fallback, minimum, maximum, field) {
+  const candidate = value ?? fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new SignalGrepError(`${field} must be an integer from ${String(minimum)} through ${String(maximum)}`);
+  }
+  return candidate;
+}
+function normalizeRequest(input) {
+  validateRawSearchInput(input);
+  if (input.scope !== undefined && input.scope !== "strict" && input.scope !== "expand")
+    throw new SignalGrepError("scope must be strict or expand");
+  const pattern = input.pattern;
+  if (pattern === undefined) {
+    throw new SignalGrepError("pattern is required when cursor is not provided");
+  }
+  const path = input.path?.replace(/^@/, "");
+  return {
+    pattern,
+    ...path ? { path } : {},
+    glob: list(input.glob),
+    exclude: list(input.exclude),
+    literal: input.literal ?? false,
+    ...input.ignoreCase === undefined ? {} : { ignoreCase: input.ignoreCase },
+    hidden: input.hidden ?? true,
+    context: boundedInteger(input.context, 0, 0, MAX_CONTEXT_LINES, "context"),
+    pageSize: boundedInteger(input.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE, "limit"),
+    redact: input.redact ?? false,
+    ...input.modifiedAfter !== undefined ? { modifiedAfterMs: input.modifiedAfter } : {},
+    ...input.modifiedBefore !== undefined ? { modifiedBeforeMs: input.modifiedBefore } : {},
+    ...input.scope !== undefined ? { scope: input.scope } : {},
+    ...input.wholeWord !== undefined ? { wholeWord: input.wholeWord } : {}
+  };
+}
+
+// src/concept-source-generation.ts
+import { createHash as createHash3 } from "node:crypto";
+
+// src/source-access.ts
+import { extname as extname2, resolve as resolve11 } from "node:path";
+
+// src/historical-paths.ts
+import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { constants as constants2 } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join as join3, parse, relative as relative4, resolve as resolve8 } from "node:path";
+
+// src/workspace-files.ts
+import { relative as relative3, resolve as resolve7, sep as sep2 } from "node:path";
+class EnumerationLimit extends Error {
+}
+function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
+  const absolute = resolve7(cwd, path);
+  policy.assertPath(absolute);
+  const local = relative3(resolve7(cwd), absolute);
+  if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
+    throw new SignalGrepError("Git internals are excluded from source candidates");
+  return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
+}
+async function listWorkspaceFiles(cwd, signal, options = {}) {
+  const absolutePath = resolve7(cwd, options.path ?? ".");
+  const policy = new SearchPathPolicy(cwd);
+  const searchPath = await policy.resolveSearchTarget(absolutePath);
+  const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
+    throw new SignalGrepError("Candidate file limit must be a positive integer");
+  const paths = new Set;
+  const reasons = new Set;
+  let coverageIssue;
+  let bytes = 0;
+  try {
+    const result = await runOwnedProcess({
+      executable: await resolveRipgrepExecutable(),
+      args: [
+        "--no-config",
+        "--files",
+        "--null",
+        ...options.ignore === false ? ["--no-ignore"] : [],
+        ...options.ignoreParents === false ? ["--no-ignore-parent"] : [],
+        ...fileScopeArguments({
+          hidden: options.hidden ?? true,
+          glob: options.glob ?? [],
+          exclude: options.exclude ?? []
+        }),
+        ...policy.ripgrepGlobArguments(searchPath),
+        "--",
+        searchPath
+      ],
+      cwd,
+      ...signal ? { signal } : {}
+    }, async (stdout) => {
+      let pending = Buffer.alloc(0);
+      for await (const chunk of stdout) {
+        if (signal?.aborted)
+          throw abortError();
+        bytes += chunk.byteLength;
+        if (bytes > MAX_PROTOCOL_LINE_BYTES)
+          throw new EnumerationLimit(`Candidate enumeration exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
+        pending = Buffer.concat([pending, chunk]);
+        let delimiter = pending.indexOf(0);
+        while (delimiter >= 0) {
+          const raw = pending.subarray(0, delimiter);
+          const decoded = raw.toString("utf8");
+          if (!Buffer.from(decoded).equals(raw)) {
+            reasons.add("Some candidate paths are not valid UTF-8");
+            coverageIssue ??= "invalid-path";
+          } else {
+            const local = workspaceRelativePath(cwd, decoded, policy);
+            if (!paths.has(local) && paths.size >= maxFiles)
+              throw new EnumerationLimit(`Candidate enumeration reached the ${String(maxFiles)} file limit`);
+            paths.add(local);
+          }
+          pending = pending.subarray(delimiter + 1);
+          delimiter = pending.indexOf(0);
+        }
+      }
+      if (pending.length > 0)
+        throw new SignalGrepError("Candidate enumeration ended without a NUL delimiter");
+    });
+    const diagnostics = classifyRipgrepDiagnostics(result.stderr);
+    if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
+      throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
+    if (diagnostics.unreadable.length > 0) {
+      reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
+      coverageIssue = "unreadable";
+    }
+    if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
+      throw new SignalGrepError(result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`);
+  } catch (error) {
+    if (!(error instanceof EnumerationLimit))
+      throw error;
+    reasons.add(error.message);
+    coverageIssue = "enumeration-limit";
+  }
+  return {
+    paths: [...paths].toSorted(),
+    partial: reasons.size > 0,
+    reasons: [...reasons],
+    ...coverageIssue ? { coverageIssue } : {}
+  };
+}
+
+// src/historical-paths.ts
+function partitionPaths(paths) {
+  const groups = [];
+  for (const path of paths) {
+    const group = groups.find((candidate) => !candidate.some((other) => path.startsWith(`${other}/`) || other.startsWith(`${path}/`)));
+    if (group)
+      group.push(path);
+    else
+      groups.push([path]);
+  }
+  return groups;
+}
+function relevantDirectories(cwd, paths) {
+  const directories = new Set;
+  for (const path of [cwd, ...paths.map((sourcePath) => dirname(resolve8(cwd, sourcePath)))]) {
+    let current = path;
+    for (;; ) {
+      directories.add(current);
+      const parent = dirname(current);
+      if (current === parent)
+        break;
+      current = parent;
+    }
+  }
+  return [...directories];
+}
+async function filterHistoricalPaths(cwd, paths, request, signal) {
+  if (!isPathInsideCwd(resolve8(cwd, request.path ?? "."), cwd)) {
+    throw new SignalGrepError("Historical path filtering requires a path inside cwd");
+  }
+  const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
+  const candidates = paths.filter((path) => selectedPath.length === 0 || path === selectedPath || path.startsWith(`${selectedPath}/`));
+  const reasons = new Set;
+  if (candidates.length > MAX_STRUCTURE_FILES)
+    reasons.add(`Historical path filtering reached the ${String(MAX_STRUCTURE_FILES)} candidate limit`);
+  const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
+  if (bounded.length === 0)
+    return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
+  const root = await mkdtemp(join3(tmpdir(), "baoer_signal_grep-paths-"));
+  const absoluteCwd = resolve8(cwd);
+  const volumeRoot = parse(absoluteCwd).root;
+  const ignoreFiles = [];
+  let ignoreBytesRead = 0;
+  try {
+    for (const directory of relevantDirectories(absoluteCwd, bounded)) {
+      if (isPathInsideCwd(directory, absoluteCwd))
+        await assertExistingPathInsideCwd(directory, absoluteCwd);
+      for (const name of [".ignore", ".rgignore"]) {
+        if (signal?.aborted)
+          throw abortError();
+        const path = join3(directory, name);
+        let discovered = false;
+        try {
+          const before = await lstat(path);
+          discovered = true;
+          if (!before.isFile())
+            throw new SignalGrepError("Current ignore rules are not regular files; historical path filtering is unavailable");
+          if (before.size > MAX_SOURCE_FILE_BYTES || ignoreBytesRead + before.size > MAX_STRUCTURE_BYTES)
+            throw new SignalGrepError("Current ignore rules exceed the source read budget");
+          const handle = await open(path, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0));
+          let bytes;
+          try {
+            if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
+              throw new SignalGrepError("Current ignore rules changed before reading");
+            const buffer = Buffer.alloc(before.size + 1);
+            let used = 0;
+            while (used < buffer.length) {
+              if (signal?.aborted)
+                throw abortError();
+              const chunk = await handle.read(buffer, used, Math.min(64 * 1024, buffer.length - used), null);
+              if (chunk.bytesRead === 0)
+                break;
+              used += chunk.bytesRead;
+            }
+            bytes = buffer.subarray(0, used);
+            const after = await lstat(path);
+            if (used !== before.size || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after)) || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
+              throw new SignalGrepError("Current ignore rules changed during historical path filtering");
+          } finally {
+            await handle.close();
+          }
+          ignoreBytesRead += bytes.length;
+          ignoreFiles.push({ local: relative4(volumeRoot, path), bytes });
+        } catch (error) {
+          if (!(error instanceof Error && ("code" in error) && error.code === "ENOENT"))
+            throw error;
+          if (discovered)
+            throw new SignalGrepError("Current ignore rules disappeared during historical path filtering");
+        }
+      }
+    }
+    if (ignoreFiles.length === 0 && request.glob.length === 0 && request.exclude.length === 0 && request.hidden) {
+      return { paths: bounded, partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead };
+    }
+    const visible = new Set;
+    for (const [index, group] of partitionPaths(bounded).entries()) {
+      const tree = join3(root, String(index));
+      const target = join3(tree, relative4(volumeRoot, absoluteCwd));
+      await mkdir(target, { recursive: true });
+      for (const path of group) {
+        const safe = workspaceRelativePath(absoluteCwd, path);
+        const placeholder = resolve8(target, safe);
+        await mkdir(dirname(placeholder), { recursive: true });
+        await writeFile(placeholder, "");
+      }
+      for (const ignore of ignoreFiles) {
+        const destination = join3(tree, ignore.local);
+        await mkdir(dirname(destination), { recursive: true });
+        await writeFile(destination, ignore.bytes);
+      }
+      const privacy = await listWorkspaceFiles(tree, signal, { ignoreParents: false });
+      const prefix = `${relative4(tree, target).split("\\").join("/")}/`;
+      const allowed = new Set(privacy.paths.filter((path) => path.startsWith(prefix)).map((path) => path.slice(prefix.length)));
+      const scoped = await listWorkspaceFiles(target, signal, {
+        glob: request.glob,
+        exclude: request.exclude,
+        hidden: request.hidden,
+        ignore: false
+      });
+      for (const reason of [...privacy.reasons, ...scoped.reasons])
+        reasons.add(reason);
+      const included = new Set(group);
+      for (const path of scoped.paths)
+        if (included.has(path) && allowed.has(path))
+          visible.add(path);
+    }
+    return {
+      paths: [...visible].toSorted(),
+      partial: reasons.size > 0,
+      reasons: [...reasons],
+      ignoreBytesRead
+    };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+// src/git-diff.ts
+import { setImmediate } from "node:timers/promises";
+class GitDiffLimitError extends SignalGrepError {
+}
+
+class GitDiffBudget {
+  work = 0;
+  maxWork;
+  signal;
+  constructor(maxWork = MAX_GIT_DIFF_WORK, signal) {
+    this.maxWork = maxWork;
+    this.signal = signal;
+  }
+  tick() {
+    if (this.signal?.aborted)
+      throw abortError();
+    this.work += 1;
+    if (this.work > this.maxWork) {
+      throw new GitDiffLimitError(`Git line comparison exceeds the ${String(this.maxWork)} step limit`);
+    }
+    return this.work % 4096 === 0;
+  }
+}
+async function sourceLines(content, budget) {
+  const lines = [];
+  for (let start = 0;start < content.length; ) {
+    if (budget.tick())
+      await setImmediate();
+    const newline = content.indexOf(10, start);
+    const end = newline === -1 ? content.length : newline + 1;
+    lines.push(content.toString("latin1", start, end));
+    start = end;
+  }
+  return lines;
+}
+function sourceLineCount(content) {
+  if (content.length === 0)
+    return 0;
+  let count = content[content.length - 1] === 10 ? 0 : 1;
+  for (const byte of content)
+    if (byte === 10)
+      count += 1;
+  return count;
+}
+function diagonal(vector, distance, k) {
+  return vector[k + distance + 1] ?? -1;
+}
+function prependLine(ranges, line) {
+  const last = ranges.at(-1);
+  if (last && last.startLine === line + 1)
+    last.startLine = line;
+  else
+    ranges.push({ startLine: line, endLine: line });
+}
+function reconstruct(trace, oldLength, newLength, prefix) {
+  let x = oldLength;
+  let y = newLength;
+  const oldRanges = [];
+  const newRanges = [];
+  for (let distance = trace.length - 1;distance > 0; distance -= 1) {
+    const previous = trace[distance - 1];
+    if (!previous)
+      throw new Error("Missing Git line comparison trace");
+    const k = x - y;
+    const previousK = k === -distance || k !== distance && diagonal(previous, distance - 1, k - 1) < diagonal(previous, distance - 1, k + 1) ? k + 1 : k - 1;
+    const previousX = diagonal(previous, distance - 1, previousK);
+    const previousY = previousX - previousK;
+    while (x > previousX && y > previousY) {
+      x -= 1;
+      y -= 1;
+    }
+    if (x === previousX) {
+      prependLine(newRanges, prefix + y);
+      y -= 1;
+    } else {
+      prependLine(oldRanges, prefix + x);
+      x -= 1;
+    }
+  }
+  return { oldRanges: oldRanges.toReversed(), newRanges: newRanges.toReversed() };
+}
+async function changedLineRanges(oldContent, newContent, budget = new GitDiffBudget) {
+  if (budget.signal?.aborted)
+    throw abortError();
+  if (oldContent.equals(newContent))
+    return { oldRanges: [], newRanges: [] };
+  const oldLines = await sourceLines(oldContent, budget);
+  const newLines = await sourceLines(newContent, budget);
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
+    if (budget.tick())
+      await setImmediate();
+    prefix += 1;
+  }
+  let oldEnd = oldLines.length;
+  let newEnd = newLines.length;
+  while (oldEnd > prefix && newEnd > prefix && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
+    if (budget.tick())
+      await setImmediate();
+    oldEnd -= 1;
+    newEnd -= 1;
+  }
+  const n = oldEnd - prefix;
+  const m = newEnd - prefix;
+  if (n === 0 || m === 0) {
+    return {
+      oldRanges: n === 0 ? [] : [{ startLine: prefix + 1, endLine: oldEnd }],
+      newRanges: m === 0 ? [] : [{ startLine: prefix + 1, endLine: newEnd }]
+    };
+  }
+  const trace = [];
+  for (let distance = 0;distance <= n + m; distance += 1) {
+    const current = new Int32Array(2 * distance + 3).fill(-1);
+    const previous = trace[distance - 1];
+    for (let k = -distance;k <= distance; k += 2) {
+      if (budget.tick())
+        await setImmediate();
+      let x = 0;
+      if (previous) {
+        x = k === -distance || k !== distance && diagonal(previous, distance - 1, k - 1) < diagonal(previous, distance - 1, k + 1) ? diagonal(previous, distance - 1, k + 1) : diagonal(previous, distance - 1, k - 1) + 1;
+      }
+      let y = x - k;
+      while (x < n && y < m && oldLines[prefix + x] === newLines[prefix + y]) {
+        if (budget.tick())
+          await setImmediate();
+        x += 1;
+        y += 1;
+      }
+      current[k + distance + 1] = x;
+      if (x >= n && y >= m) {
+        trace.push(current);
+        return reconstruct(trace, n, m, prefix);
+      }
+    }
+    trace.push(current);
+  }
+  throw new Error("Git line comparison did not produce an edit script");
+}
+async function sourceSimilarity(oldContent, newContent, budget) {
+  if (oldContent.equals(newContent))
+    return 100;
+  const maximum = Math.max(oldContent.length, newContent.length);
+  if (maximum === 0 || Math.min(oldContent.length, newContent.length) / maximum < 0.5)
+    return 0;
+  const counts = new Map;
+  for (const line of await sourceLines(oldContent, budget))
+    counts.set(line, (counts.get(line) ?? 0) + 1);
+  let commonBytes = 0;
+  for (const line of await sourceLines(newContent, budget)) {
+    const remaining = counts.get(line) ?? 0;
+    if (remaining === 0)
+      continue;
+    counts.set(line, remaining - 1);
+    commonBytes += line.length;
+  }
+  return Math.min(99, Math.floor(100 * commonBytes / maximum));
+}
+
+// src/git-repository.ts
+import { createHash } from "node:crypto";
+import { constants as constants3 } from "node:fs";
+import { lstat as lstat2, open as open2 } from "node:fs/promises";
+import { isAbsolute as isAbsolute5, relative as relative5, resolve as resolve9, sep as sep3 } from "node:path";
+
+// src/git-process.ts
+var GIT_READ_ARGUMENTS = [
+  "--no-pager",
+  "--no-replace-objects",
+  "--no-optional-locks",
+  "-c",
+  "core.fsmonitor=false",
+  "-c",
+  "core.untrackedCache=false",
+  "-c",
+  "submodule.recurse=false"
+];
+var MINIMUM_NO_LAZY_FETCH_VERSION = [2, 45, 0];
+var gitCapabilities = new Map;
+function gitReadEnvironment() {
+  return {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_"))),
+    GIT_CONFIG_COUNT: "0",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PROTOCOL_FROM_USER: "0",
+    LC_ALL: "C"
+  };
+}
+function supportsNoLazyFetch(version) {
+  const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(version.trim());
+  if (!match)
+    throw new SignalGrepError("Git returned an unrecognized version string");
+  const actual = [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+  for (let index = 0;index < MINIMUM_NO_LAZY_FETCH_VERSION.length; index += 1) {
+    const difference = (actual[index] ?? 0) - (MINIMUM_NO_LAZY_FETCH_VERSION[index] ?? 0);
+    if (difference !== 0)
+      return difference > 0;
+  }
+  return true;
+}
+async function gitReadArguments(executable, cwd, signal) {
+  const capabilityKey = `${executable}\x00${process.env.PATH ?? ""}`;
+  let supports = gitCapabilities.get(capabilityKey);
+  if (supports === undefined) {
+    const versionChunks = [];
+    const version = await runOwnedProcess({
+      executable,
+      args: ["--version"],
+      cwd,
+      env: gitReadEnvironment(),
+      ...signal ? { signal } : {}
+    }, async (stdout) => {
+      for await (const chunk of stdout)
+        versionChunks.push(Buffer.from(chunk));
+    });
+    if (version.code !== 0)
+      throw new SignalGrepError("Unable to determine the Git version");
+    supports = supportsNoLazyFetch(Buffer.concat(versionChunks).toString("utf8"));
+    gitCapabilities.set(capabilityKey, supports);
+  }
+  if (supports) {
+    return [...GIT_READ_ARGUMENTS, "--no-lazy-fetch"];
+  }
+  const partial = await runOwnedProcess({
+    executable,
+    args: [
+      ...GIT_READ_ARGUMENTS,
+      "config",
+      "--local",
+      "--get-regexp",
+      "^(extensions\\.partialClone|remote\\..*\\.promisor)$"
+    ],
+    cwd,
+    env: gitReadEnvironment(),
+    ...signal ? { signal } : {}
+  }, async (stdout) => {
+    for await (const chunk of stdout) {}
+  });
+  if (partial.code === 0) {
+    throw new SignalGrepError("Git 2.45 or newer is required for non-fetching reads from a partial/promisor clone");
+  }
+  if (partial.code !== 1) {
+    throw new SignalGrepError("Unable to verify whether this older Git repository is partial");
+  }
+  return [...GIT_READ_ARGUMENTS];
+}
+async function runGitRead(cwd, command, args, options = {}) {
+  const chunks = [];
+  if (options.input && options.input.byteLength > MAX_PROTOCOL_LINE_BYTES) {
+    throw new SignalGrepError(`Git input exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
+  }
+  let bytes = 0;
+  const maxBytes = options.maxBytes ?? MAX_PROTOCOL_LINE_BYTES;
+  const result = await runOwnedProcess({
+    executable: options.executable ?? "git",
+    args: [
+      ...await gitReadArguments(options.executable ?? "git", cwd, options.signal),
+      ...command === "ls-tree" ? ["--literal-pathspecs"] : [],
+      command,
+      ...args
+    ],
+    cwd,
+    env: gitReadEnvironment(),
+    ...options.signal ? { signal: options.signal } : {},
+    ...options.input ? { input: options.input } : {}
+  }, async (stdout) => {
+    for await (const chunk of stdout) {
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) {
+        throw new SignalGrepError(`Git ${command} output exceeds the ${String(maxBytes)} byte limit`);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+  });
+  if (result.code === null || !(options.allowedCodes ?? [0]).includes(result.code)) {
+    throw new SignalGrepError(`Git ${command} failed: ${result.stderr.trim() || `exit ${String(result.code)}`}`);
+  }
+  return { output: Buffer.concat(chunks), code: result.code };
+}
+function decodeGitPath(bytes) {
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value, "utf8").equals(bytes)) {
+    throw new SignalGrepError("Git path is not valid UTF-8; path-based source access is unavailable");
+  }
+  return value;
+}
+function splitGitRecords(output) {
+  if (output.length === 0)
+    return [];
+  if (output[output.length - 1] !== 0) {
+    throw new SignalGrepError("Git names protocol ended without a NUL delimiter");
+  }
+  const records = [];
+  let offset = 0;
+  for (let delimiter = output.indexOf(0);delimiter !== -1; delimiter = output.indexOf(0, offset)) {
+    records.push(output.subarray(offset, delimiter));
+    offset = delimiter + 1;
+  }
+  return records;
+}
+
+// src/git-repository.ts
+async function verifyWorktreeRevision(cwd, path, expected) {
+  try {
+    const current = await lstat2(resolve9(cwd, path));
+    await assertExistingPathInsideCwd(resolve9(cwd, path), cwd);
+    if (current.isFile() && sameSourceRevision(sourceRevisionFromStats(current), expected))
+      return;
+  } catch (error) {
+    if (!(error instanceof Error && ("code" in error) && error.code === "ENOENT"))
+      throw error;
+  }
+  throw new SignalGrepError("Working source changed during Git comparison; retry a new search");
+}
+function gitPath(cwd, path) {
+  if (path.length === 0 || path.includes("\x00"))
+    throw new SignalGrepError("Git source path is invalid");
+  const absolute = resolve9(cwd, path);
+  const local = relative5(resolve9(cwd), absolute).split(sep3).join("/");
+  if (!isPathInsideCwd(absolute, cwd) || local.split("/").some((part) => part.toLowerCase() === ".git")) {
+    throw new SignalGrepError("Git source path must stay within the working directory and outside .git");
+  }
+  return local;
+}
+async function resolveGitCommit(cwd, ref, signal) {
+  if (ref.trim().length === 0 || ref.length > 1024 || ref.includes("\x00")) {
+    throw new SignalGrepError("Git commit reference must be a nonempty bounded string");
+  }
+  const { output } = await runGitRead(cwd, "rev-parse", ["--verify", "--end-of-options", `${ref}^{commit}`], {
+    ...signal ? { signal } : {},
+    maxBytes: 128
+  });
+  const commit = output.toString("ascii").trim();
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit))
+    throw new SignalGrepError("Git returned an invalid commit identity");
+  return commit;
+}
+async function resolveGitRepository(cwd, signal) {
+  const { output } = await runGitRead(cwd, "rev-parse", ["--show-toplevel"], signal ? { signal, maxBytes: 4096 } : { maxBytes: 4096 });
+  const root = decodeGitPath(output).replace(/\r?\n$/, "");
+  if (!isAbsolute5(root))
+    throw new SignalGrepError("Git returned an invalid repository root");
+  return resolve9(root);
+}
+async function findGitRepository(cwd, signal) {
+  try {
+    return await resolveGitRepository(cwd, signal);
+  } catch (error) {
+    if (error instanceof SignalGrepError && error.message.includes("not a git repository")) {
+      return;
+    }
+    throw error;
+  }
+}
+async function readGitTree(cwd, commit, signal, path) {
+  const { output } = await runGitRead(cwd, "ls-tree", ["-r", "-z", "-l", commit, ...path ? ["--", gitPath(cwd, path)] : []], signal ? { signal } : {});
+  const entries = new Map;
+  for (const record of splitGitRecords(output)) {
+    if (entries.size === MAX_SOURCE_REVISION_FILES)
+      return { entries, limited: true };
+    const tab = record.indexOf(9);
+    const header = record.subarray(0, tab).toString("ascii").trim().split(/\s+/);
+    const [mode, type, blob, size] = header;
+    if (tab < 0 || !mode || !blob || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(blob) || !["blob", "commit"].includes(type ?? "")) {
+      throw new SignalGrepError("Git tree returned an invalid raw object entry");
+    }
+    const local = gitPath(cwd, decodeGitPath(record.subarray(tab + 1)));
+    const byteSize = type === "commit" ? 0 : Number(size);
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0)
+      throw new SignalGrepError("Git tree returned an invalid blob size");
+    entries.set(local, { path: local, mode, blob, size: byteSize });
+  }
+  return { entries, limited: false };
+}
+async function worktreeNames(cwd, signal) {
+  const { output } = await runGitRead(cwd, "ls-files", ["-z", "--cached", "--others", "--exclude-standard"], signal ? { signal } : {});
+  const paths = new Set;
+  for (const record of splitGitRecords(output)) {
+    if (paths.size === MAX_SOURCE_REVISION_FILES)
+      return { paths: [...paths], limited: true };
+    paths.add(gitPath(cwd, decodeGitPath(record)));
+  }
+  return { paths: [...paths], limited: false };
+}
+async function visibleGitPaths(cwd, paths, signal, includePath) {
+  const result = [];
+  for (let start = 0;start < paths.length; start += 128) {
+    const batch = paths.slice(start, start + 128);
+    const { output } = await runGitRead(cwd, "check-ignore", ["--no-index", "-z", "--stdin"], {
+      input: Buffer.from(`${batch.map((path) => `./${path}`).join("\x00")}\x00`),
+      allowedCodes: [0, 1],
+      ...signal ? { signal } : {}
+    });
+    const ignored = new Set(splitGitRecords(output).map((record) => gitPath(cwd, decodeGitPath(record))));
+    for (const path of batch) {
+      if (signal?.aborted)
+        throw abortError();
+      if (!ignored.has(path) && (!includePath || await includePath(path)))
+        result.push(path);
+    }
+  }
+  return result;
+}
+function limitedSource(path, mode, reason) {
+  return { path, mode, sourceStatus: "unavailable", reason };
+}
+async function readGitBlob(cwd, commit, entry, budget, signal) {
+  const { path, mode, blob, size } = entry;
+  if (mode === "120000" || mode === "160000") {
+    return {
+      path,
+      mode,
+      sourceStatus: mode === "120000" ? "symlink" : "submodule",
+      reason: "Symlink and submodule contents are not followed"
+    };
+  }
+  if (size > MAX_SOURCE_FILE_BYTES)
+    return limitedSource(path, mode, `Source exceeds the ${String(MAX_SOURCE_FILE_BYTES)} byte file limit`);
+  if (budget.bytes + size > budget.maxBytes)
+    return limitedSource(path, mode, `Source reads exceed the ${String(budget.maxBytes)} byte request limit`);
+  const { output } = await runGitRead(cwd, "cat-file", ["blob", blob], {
+    maxBytes: size,
+    ...signal ? { signal } : {}
+  });
+  budget.bytes += output.length;
+  if (output.length !== size)
+    throw new SignalGrepError("Git blob size does not match its immutable tree entry");
+  const verifiedBlob = createHash(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
+  if (verifiedBlob !== blob)
+    throw new SignalGrepError("Git blob bytes do not match their immutable object identity");
+  return {
+    path,
+    mode,
+    sourceStatus: output.includes(0) ? "binary" : "available",
+    ...output.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content: output },
+    origin: { kind: "git", commit, blob },
+    contentHash: createHash("sha256").update(output).digest("hex")
+  };
+}
+async function readWorktreeSource(cwd, path, budget, signal) {
+  const absolute = resolve9(cwd, path);
+  if (signal?.aborted)
+    throw abortError();
+  let discovered = false;
+  try {
+    const before = await lstat2(absolute);
+    discovered = true;
+    if (before.isSymbolicLink())
+      return {
+        path,
+        mode: "120000",
+        sourceStatus: "symlink",
+        reason: "Symlink source is not followed"
+      };
+    if (!before.isFile())
+      return {
+        path,
+        mode: "160000",
+        sourceStatus: before.isDirectory() ? "submodule" : "unavailable",
+        reason: "Non-regular source is not read"
+      };
+    const mode = (before.mode & 73) === 0 ? "100644" : "100755";
+    if (before.size > MAX_SOURCE_FILE_BYTES)
+      return limitedSource(path, mode, `Source exceeds the ${String(MAX_SOURCE_FILE_BYTES)} byte file limit`);
+    if (budget.bytes + before.size > budget.maxBytes)
+      return limitedSource(path, mode, `Source reads exceed the ${String(budget.maxBytes)} byte request limit`);
+    await assertExistingPathInsideCwd(absolute, cwd);
+    const handle = await open2(absolute, constants3.O_RDONLY | (constants3.O_NOFOLLOW ?? 0));
+    try {
+      if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
+        throw new SignalGrepError("Working source changed before reading");
+      const buffer = Buffer.alloc(before.size + 1);
+      let bytes = 0;
+      while (bytes < buffer.length) {
+        if (signal?.aborted)
+          throw abortError();
+        const { bytesRead } = await handle.read(buffer, bytes, Math.min(64 * 1024, buffer.length - bytes), null);
+        if (bytesRead === 0)
+          break;
+        bytes += bytesRead;
+      }
+      budget.bytes += bytes;
+      const after = await lstat2(absolute);
+      await assertExistingPathInsideCwd(absolute, cwd);
+      if (bytes !== before.size || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after)) || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat()))) {
+        throw new SignalGrepError("Working source changed while reading; Git ranges and source cannot be mixed");
+      }
+      const content = buffer.subarray(0, bytes);
+      return {
+        path,
+        mode,
+        sourceStatus: content.includes(0) ? "binary" : "available",
+        ...content.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content },
+        origin: {
+          kind: "worktree",
+          revision: sourceRevisionFromStats(after),
+          contentHash: createHash("sha256").update(content).digest("hex")
+        },
+        contentHash: createHash("sha256").update(content).digest("hex")
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (error instanceof Error && "code" in error) {
+      if (error.code === "ENOENT") {
+        if (discovered)
+          throw new SignalGrepError("Working source disappeared while reading; retry a new search");
+        return { path, mode: "000000", sourceStatus: "absent" };
+      }
+      if (["EACCES", "EPERM", "ELOOP", "ENOTDIR"].includes(String(error.code)))
+        return limitedSource(path, "000000", `Source unavailable: ${String(error.code)}`);
+    }
+    throw error;
+  }
+}
+
+// src/git-source.ts
+import { setImmediate as setImmediate2 } from "node:timers/promises";
+function absent(path) {
+  return { path, mode: "000000", sourceStatus: "absent" };
+}
+function sameContents(left, right) {
+  return left.contentHash !== undefined && left.contentHash === right.contentHash;
+}
+function wholeFile(content) {
+  const lines = sourceLineCount(content);
+  return lines === 0 ? [] : [{ startLine: 1, endLine: lines }];
+}
+function validateLimit(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1)
+    throw new SignalGrepError(`${label} must be a positive integer`);
+  return value;
+}
+function rememberBest(best, pair, score) {
+  const previous = best.get(pair);
+  if (!previous || score > previous.score)
+    best.set(pair, { score, count: 1 });
+  else if (score === previous.score)
+    previous.count += 1;
+}
+async function pairRenames(pairs, budget, reasons) {
+  const removed = pairs.filter((pair) => pair.new.sourceStatus === "absent" && pair.old.content);
+  const added = pairs.filter((pair) => pair.old.sourceStatus === "absent" && pair.new.content);
+  const scores = [];
+  const bestOld = new Map;
+  const bestNew = new Map;
+  try {
+    for (const oldPair of removed) {
+      for (const newPair of added) {
+        if (!oldPair.old.content || !newPair.new.content)
+          continue;
+        if (budget.tick())
+          await setImmediate2();
+        const score = sameContents(oldPair.old, newPair.new) ? 100 : await sourceSimilarity(oldPair.old.content, newPair.new.content, budget);
+        if (score >= 50) {
+          scores.push({ oldPair, newPair, score });
+          rememberBest(bestOld, oldPair, score);
+          rememberBest(bestNew, newPair, score);
+        }
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof GitDiffLimitError))
+      throw error;
+    reasons.add(error.message);
+    reasons.add("Rename comparison is incomplete; unpaired additions/deletions remain explicit");
+    return pairs;
+  }
+  const consumed = new Set;
+  const renamed = [];
+  for (const entry of scores) {
+    const oldBest = bestOld.get(entry.oldPair);
+    const newBest = bestNew.get(entry.newPair);
+    if (oldBest?.score !== entry.score || newBest?.score !== entry.score || oldBest.count !== 1 || newBest.count !== 1)
+      continue;
+    consumed.add(entry.oldPair);
+    consumed.add(entry.newPair);
+    renamed.push({
+      old: entry.oldPair.old,
+      new: entry.newPair.new,
+      rename: {
+        method: entry.score === 100 ? "identical-content" : "line-similarity",
+        similarity: entry.score
+      }
+    });
+  }
+  if (scores.some((entry) => !consumed.has(entry.oldPair) && !consumed.has(entry.newPair))) {
+    reasons.add("Ambiguous rename candidates remain separate additions/deletions");
+  }
+  return [...pairs.filter((pair) => !consumed.has(pair)), ...renamed];
+}
+async function renderPair(pair, request, budget, reasons) {
+  const selected = request.side === "old" ? pair.old : pair.new;
+  const oldExists = pair.old.sourceStatus !== "absent";
+  const newExists = pair.new.sourceStatus !== "absent";
+  let changedRanges = [];
+  let rangeReason;
+  if (selected.content) {
+    try {
+      if (!oldExists || !newExists)
+        changedRanges = wholeFile(selected.content);
+      else if (pair.old.content && pair.new.content) {
+        const diff = await changedLineRanges(pair.old.content, pair.new.content, budget);
+        changedRanges = request.side === "old" ? diff.oldRanges : diff.newRanges;
+      } else {
+        rangeReason = "Changed lines unavailable because the opposite source cannot be compared as raw text";
+      }
+    } catch (error) {
+      if (!(error instanceof GitDiffLimitError))
+        throw error;
+      rangeReason = error.message;
+    }
+  }
+  if (rangeReason)
+    reasons.add(rangeReason);
+  for (const source of [pair.old, pair.new]) {
+    if (source.sourceStatus === "unavailable")
+      reasons.add(source.reason ?? "Source unavailable");
+  }
+  const unsupported = [pair.old, pair.new].some((source) => ["unavailable", "symlink", "submodule"].includes(source.sourceStatus));
+  const change = pair.rename ? "renamed" : !oldExists ? "added" : !newExists ? "deleted" : unsupported ? "unknown" : "modified";
+  const reason = selected.reason ?? rangeReason;
+  return {
+    path: selected.sourceStatus === "absent" ? request.side === "old" ? pair.new.path : pair.old.path : selected.path,
+    ...oldExists ? { oldPath: pair.old.path } : {},
+    ...newExists ? { newPath: pair.new.path } : {},
+    change,
+    sourceStatus: selected.sourceStatus,
+    ...selected.content ? { content: selected.content } : {},
+    ...selected.contentHash ? { contentHash: selected.contentHash } : {},
+    ...selected.origin ? { origin: selected.origin } : {},
+    changedRanges,
+    ranges: request.scope === "files" && selected.content ? wholeFile(selected.content) : changedRanges,
+    ...reason ? { reason } : {},
+    ...pair.rename ? { rename: pair.rename } : {}
+  };
+}
+async function readGitChanges(cwd, request, signal, options = {}) {
+  if (!["files", "lines"].includes(request.scope) || !["new", "old"].includes(request.side))
+    throw new SignalGrepError("Invalid Git scope or side");
+  if (request.target !== undefined && request.base === undefined)
+    throw new SignalGrepError("Git commit comparison requires an explicit base and target");
+  const maxFiles = validateLimit(options.maxFiles ?? MAX_STRUCTURE_FILES, "Git file limit");
+  const maxBytes = validateLimit(options.maxBytes ?? MAX_STRUCTURE_BYTES, "Git byte limit");
+  const maxDiffWork = validateLimit(options.maxDiffWork ?? MAX_GIT_DIFF_WORK, "Git diff work limit");
+  const base = await resolveGitCommit(cwd, request.base ?? "HEAD", signal);
+  const target = request.target === undefined ? undefined : await resolveGitCommit(cwd, request.target, signal);
+  const oldTree = await readGitTree(cwd, base, signal);
+  const newTree = target ? await readGitTree(cwd, target, signal) : undefined;
+  const diskNames = target ? undefined : await worktreeNames(cwd, signal);
+  const reasons = new Set;
+  if (oldTree.limited || newTree?.limited || diskNames?.limited)
+    reasons.add("Git candidate metadata limit reached");
+  const candidates = [
+    ...new Set([...oldTree.entries.keys(), ...newTree?.entries.keys() ?? diskNames?.paths ?? []])
+  ].filter((path) => {
+    if (!target)
+      return true;
+    const oldEntry = oldTree.entries.get(path);
+    const newEntry = newTree?.entries.get(path);
+    return !oldEntry || !newEntry || oldEntry.blob !== newEntry.blob || oldEntry.mode !== newEntry.mode;
+  }).toSorted();
+  let visible = await visibleGitPaths(cwd, candidates, signal, options.includePath);
+  let filterBytes = 0;
+  if (options.filterPaths) {
+    const allowed = new Set(visible);
+    const filtered = await options.filterPaths(visible);
+    visible = filtered.paths;
+    filterBytes = filtered.bytesRead ?? 0;
+    if (!Number.isSafeInteger(filterBytes) || filterBytes < 0 || filterBytes > maxBytes)
+      throw new SignalGrepError("Git path filtering exceeded its shared source read budget");
+    if (visible.some((path) => !allowed.has(path)))
+      throw new SignalGrepError("Git path filter expanded the authorized candidate set");
+    visible = [...new Set(visible)];
+  }
+  const readBudget = { bytes: filterBytes, maxBytes };
+  const diffBudget = new GitDiffBudget(maxDiffWork, signal);
+  const pairs = [];
+  let filesRead = 0;
+  let omittedFiles = 0;
+  for (const path of visible) {
+    if (signal?.aborted)
+      throw abortError();
+    const oldEntry = oldTree.entries.get(path);
+    const newEntry = newTree?.entries.get(path);
+    if (filesRead >= maxFiles || readBudget.bytes >= maxBytes) {
+      omittedFiles += 1;
+      continue;
+    }
+    filesRead += 1;
+    const oldSource = oldEntry ? await readGitBlob(cwd, base, oldEntry, readBudget, signal) : absent(path);
+    const newSource = target ? newEntry ? await readGitBlob(cwd, target, newEntry, readBudget, signal) : absent(path) : await readWorktreeSource(cwd, path, readBudget, signal);
+    if (oldSource.sourceStatus === "absent" && newSource.sourceStatus === "absent")
+      continue;
+    if (sameContents(oldSource, newSource) && (process.platform === "win32" || oldSource.mode === newSource.mode))
+      continue;
+    pairs.push({ old: oldSource, new: newSource });
+  }
+  if (omittedFiles > 0)
+    reasons.add(`Git read limits omitted ${String(omittedFiles)} candidate files (${String(maxFiles)} files / ${String(maxBytes)} bytes)`);
+  const paired = await pairRenames(pairs, diffBudget, reasons);
+  const files = [];
+  for (const pair of paired)
+    files.push(await renderPair(pair, request, diffBudget, reasons));
+  for (const pair of paired) {
+    if (pair.new.origin?.kind !== "worktree")
+      continue;
+    await verifyWorktreeRevision(cwd, pair.new.path, pair.new.origin.revision);
+  }
+  return {
+    base,
+    target: target ?? "worktree",
+    scope: request.scope,
+    side: request.side,
+    files: files.toSorted((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0),
+    partial: reasons.size > 0,
+    reasons: [...reasons],
+    filesRead,
+    bytesRead: readBudget.bytes,
+    diffWork: diffBudget.work,
+    omittedFiles
+  };
+}
+async function readGitSource(cwd, identity, signal, options = {}) {
+  const path = gitPath(cwd, identity.path);
+  if (!(await visibleGitPaths(cwd, [path], signal, options.includePath)).includes(path))
+    throw new SignalGrepError("Git source is excluded by current workspace privacy or path rules");
+  const selected = await filterHistoricalPaths(cwd, [path], { glob: [], exclude: [], hidden: true }, signal);
+  if (selected.partial || !selected.paths.includes(path))
+    throw new SignalGrepError("Git source is excluded or unverified by current .ignore/.rgignore rules");
+  const commit = await resolveGitCommit(cwd, identity.commit, signal);
+  const tree = await readGitTree(cwd, commit, signal, path);
+  const entry = tree.entries.get(path);
+  if (!entry)
+    throw new SignalGrepError("Git source path does not exist in the requested commit");
+  if (identity.blob !== undefined && identity.blob !== entry.blob)
+    throw new SignalGrepError("Git source blob does not match its commit and path");
+  return readGitBlob(cwd, commit, entry, { bytes: selected.ignoreBytesRead, maxBytes: options.maxBytes ?? MAX_STRUCTURE_BYTES }, signal);
+}
+
+// src/source-document.ts
+import { isUtf8 } from "node:buffer";
+import { createHash as createHash2 } from "node:crypto";
+import { open as open3, realpath as realpath3 } from "node:fs/promises";
+import { relative as relative6, resolve as resolve10 } from "node:path";
+class SourceDocumentError extends SignalGrepError {
+  reason;
+  constructor(reason, message) {
+    super(message);
+    this.reason = reason;
+    this.name = "SourceDocumentError";
+  }
+}
+function contentHash(bytes) {
+  return createHash2("sha256").update(bytes).digest("hex");
+}
+
+class SourceDocument {
+  reference;
+  bytes;
+  text;
+  utf8;
+  lineStarts = [0];
+  #byteOffsets;
+  constructor(reference, bytes) {
+    this.reference = reference;
+    this.bytes = bytes;
+    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+      throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
+    }
+    this.utf8 = isUtf8(bytes);
+    this.text = bytes.toString("utf8");
+    for (let index = bytes.indexOf(10);index >= 0; index = bytes.indexOf(10, index + 1)) {
+      this.lineStarts.push(index + 1);
+    }
+  }
+  get path() {
+    return this.reference.path;
+  }
+  toByteOffset(character) {
+    this.#requireUtf8();
+    if (!Number.isSafeInteger(character) || character < 0 || character > this.text.length) {
+      throw new SignalGrepError("Source character offset is outside the document");
+    }
+    const code = this.text.charCodeAt(character);
+    if (code >= 56320 && code <= 57343) {
+      throw new SignalGrepError("Source character offset splits a Unicode character");
+    }
+    const value = this.#offsets()[character];
+    if (value === undefined)
+      throw new Error("Missing source offset");
+    return value;
+  }
+  toCharacterOffset(byte) {
+    this.#requireUtf8();
+    this.checkRange({ start: byte, end: byte });
+    const offsets = this.#offsets();
+    let low = 0;
+    let high = offsets.length - 1;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      const value = offsets[middle];
+      if (value === undefined)
+        throw new Error("Missing source offset");
+      if (value < byte)
+        low = middle + 1;
+      else
+        high = middle;
+    }
+    if (offsets[low] !== byte) {
+      throw new SignalGrepError("Source byte offset splits a Unicode character");
+    }
+    return low;
+  }
+  lineAt(byte) {
+    this.checkRange({ start: byte, end: byte });
+    let low = 0;
+    let high = this.lineStarts.length;
+    while (low + 1 < high) {
+      const middle = Math.floor((low + high) / 2);
+      const start = this.lineStarts[middle];
+      if (start === undefined)
+        throw new Error("Missing source line");
+      if (start <= byte)
+        low = middle;
+      else
+        high = middle;
+    }
+    return low + 1;
+  }
+  positionAt(byte) {
+    const line = this.lineAt(byte);
+    const start = this.lineStarts[line - 1];
+    if (start === undefined)
+      throw new Error("Missing source line");
+    return {
+      line,
+      column: this.toCharacterOffset(byte) - this.toCharacterOffset(start) + 1
+    };
+  }
+  lineRange(startLine, endLine = startLine) {
+    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || startLine > this.lineStarts.length) {
+      throw new SignalGrepError("Source line range is outside the document");
+    }
+    const start = this.lineStarts[startLine - 1];
+    if (start === undefined)
+      throw new Error("Missing source line");
+    return { start, end: this.lineStarts[endLine] ?? this.bytes.length };
+  }
+  slice(range) {
+    this.#requireUtf8();
+    this.checkRange(range);
+    this.toCharacterOffset(range.start);
+    this.toCharacterOffset(range.end);
+    return this.bytes.subarray(range.start, range.end).toString("utf8");
+  }
+  checkRange(range) {
+    if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < 0 || range.end < range.start || range.end > this.bytes.length) {
+      throw new SignalGrepError("Source byte range is outside the document");
+    }
+  }
+  #requireUtf8() {
+    if (!this.utf8) {
+      throw new SourceDocumentError("encoding", "Source is not losslessly representable as UTF-8");
+    }
+  }
+  #offsets() {
+    if (this.#byteOffsets)
+      return this.#byteOffsets;
+    const offsets = new Uint32Array(this.text.length + 1);
+    let character = 0;
+    let byte = 0;
+    for (const point of this.text) {
+      offsets[character] = byte;
+      if (point.length === 2)
+        offsets[character + 1] = byte;
+      character += point.length;
+      byte += Buffer.byteLength(point);
+    }
+    offsets[character] = byte;
+    this.#byteOffsets = offsets;
+    return offsets;
+  }
+}
+async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = MAX_SOURCE_FILE_BYTES) {
+  if (signal?.aborted)
+    throw abortError();
+  if (expected?.kind === "git") {
+    throw new SignalGrepError("A Git source reference cannot be read from the worktree");
+  }
+  const absolute = resolve10(cwd, path);
+  const [canonical, canonicalCwd] = await Promise.all([
+    new SearchPathPolicy(cwd).resolveExistingPath(absolute),
+    realpath3(cwd)
+  ]);
+  if (!canonical)
+    throw new SourceDocumentError("source-unavailable", "Source is unavailable");
+  const before = await getSourceRevision(absolute);
+  if (!before)
+    throw new SourceDocumentError("source-unavailable", "Source is unavailable");
+  if (expected && !sameSourceRevision(before, expected.revision)) {
+    throw new SourceDocumentError("source-changed", "Source changed; start a new inspection");
+  }
+  if (before.size > Math.min(MAX_SOURCE_FILE_BYTES, readBudget)) {
+    throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
+  }
+  if (signal?.aborted)
+    throw abortError();
+  const handle = await open3(canonical, "r");
+  let bytes;
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) {
+      throw new SourceDocumentError("source-unavailable", "Source must be a regular file");
+    }
+    if (!sameSourceRevision(before, sourceRevisionFromStats(metadata))) {
+      throw new SourceDocumentError("source-changed", "Source was replaced before reading");
+    }
+    const buffer = Buffer.alloc(before.size);
+    let used = 0;
+    while (used < buffer.length) {
+      if (signal?.aborted)
+        throw abortError();
+      const read = await handle.read(buffer, used, buffer.length - used, used);
+      if (read.bytesRead === 0)
+        break;
+      used += read.bytesRead;
+    }
+    if (used !== before.size) {
+      throw new SourceDocumentError("source-changed", "Source changed during reading");
+    }
+    bytes = buffer.subarray(0, used);
+  } finally {
+    await handle.close();
+  }
+  const [after, finalPath] = await Promise.all([getSourceRevision(absolute), realpath3(absolute)]);
+  if (!after || canonical !== finalPath || !sameSourceRevision(before, after)) {
+    throw new SourceDocumentError("source-changed", "Source changed during reading");
+  }
+  if (signal?.aborted)
+    throw abortError();
+  const hash = contentHash(bytes);
+  if (expected && expected.contentHash !== hash) {
+    throw new SourceDocumentError("source-changed", "Source content changed; start a new inspection");
+  }
+  return new SourceDocument({
+    path: isPathInsideCwd(canonical, canonicalCwd) ? relative6(canonicalCwd, canonical).replaceAll("\\", "/") : canonical.replaceAll("\\", "/"),
+    origin: { kind: "worktree", revision: after, contentHash: hash }
+  }, bytes);
+}
+
+// src/syntax.ts
+import { dirname as dirname2 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // src/syntax-tree.ts
 function syntaxField(analysis, node, field) {
@@ -3868,11 +4331,6 @@ function deriveSyntaxFacts(tree, language, text) {
   roles.sort((a, b) => a.start - b.start || a.end - b.end || a.role.localeCompare(b.role));
   return { symbols, roles };
 }
-function classifySyntaxRange(analysis, start, end) {
-  if (analysis.status !== "ok" || start < 0 || end < start)
-    return [];
-  return analysis.roles.filter((role) => role.start <= start && end <= role.end && start < role.end);
-}
 
 // src/syntax.ts
 function syntaxLanguage(path) {
@@ -3965,8 +4423,8 @@ async function parseSyntax(path, text, signal, pattern) {
       diagnostics: [{ kind: "invalid-unicode", start: 0, end: text.length }]
     };
   }
-  const worker = fileURLToPath2(new URL("./syntax-worker.mjs", import.meta.url));
-  const config = fileURLToPath2(new URL("./syntax-worker.toml", import.meta.url));
+  const worker = fileURLToPath(new URL("./syntax-worker.mjs", import.meta.url));
+  const config = fileURLToPath(new URL("./syntax-worker.toml", import.meta.url));
   const args = process.versions.bun ? [`--config=${config}`, "--no-env-file", "--no-macros", "--no-install", worker] : [worker];
   const env = scriptRuntimeEnvironment();
   const controller = new AbortController;
@@ -4035,1374 +4493,6 @@ async function parseSyntax(path, text, signal, pattern) {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
   }
-}
-
-// src/impact-bindings.ts
-async function bindImpactCandidates(target, files, occurrences, access) {
-  const syntax = await access.syntax(target.document);
-  const name = syntax.nodes.find((node) => node.start >= target.symbol.start && node.end <= target.symbol.end && target.document.text.slice(node.start, node.end) === target.symbol.name && node.kind.endsWith("identifier"));
-  if (!name)
-    throw new SignalGrepError("Impact compiler target has no exact identifier position");
-  const documents = new Map(files.filter((file) => file.document.utf8 && ["javascript", "typescript", "tsx"].includes(syntaxLanguage(file.document.path) ?? "")).map((file) => [resolve7(access.cwd, file.document.path), file.document]));
-  documents.set(resolve7(access.cwd, target.document.path), target.document);
-  const sourceAt = await semanticSources(access.cwd, documents.values());
-  const references = await withTypeScript(access.cwd, [...documents.values()], async (channel) => locations(await channel.request("textDocument/references", {
-    textDocument: { uri: await semanticUri(access.cwd, target.document.path) },
-    position: lspPosition(target.document, name.start),
-    context: { includeDeclaration: true }
-  })), access.signal);
-  const retained = new Map(occurrences.map((item) => [
-    `${resolve7(access.cwd, item.path)}:${String(item.range?.start)}:${String(item.range?.end)}`,
-    item
-  ]));
-  let bound = 0;
-  for (const reference of references) {
-    const document = await sourceAt(reference.path);
-    if (!document)
-      continue;
-    const range = byteRange(document, reference.range);
-    const key = `${resolve7(access.cwd, document.path)}:${String(range.start)}:${String(range.end)}`;
-    const existing = retained.get(key);
-    const line = document.lineAt(range.start);
-    const evidence = sourceEvidence(document, range);
-    const item = existing ?? {
-      path: document.path,
-      line,
-      source: document.reference,
-      range,
-      excerpt: evidence.excerpt
-    };
-    retained.set(key, {
-      ...item,
-      label: "Compiler-bound impact reference (static; runtime dispatch unproven)",
-      details: {
-        ...existing?.details,
-        excerptRange: evidence.excerptRange,
-        excerptTruncated: evidence.excerptTruncated,
-        kind: existing ? "impact-occurrence" : "impact-reference",
-        binding: "typescript-compiler",
-        bindingScope: "verified-candidate-documents",
-        certainty: "static",
-        score: 100,
-        rankingReason: "compiler reference to the selected symbol"
-      }
-    });
-    bound += 1;
-  }
-  for (const document of documents.values()) {
-    await access.refresh(document.path, document.reference);
-  }
-  return { items: [...retained.values()], bound };
-}
-
-// src/concept-search.ts
-import { dirname as dirname4 } from "node:path";
-import { join as join5 } from "node:path";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
-import { StringDecoder } from "node:string_decoder";
-import { mkdir as mkdir2 } from "node:fs/promises";
-import { rm as rm2 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-
-// src/concept-model.ts
-import { homedir as homedir2 } from "node:os";
-import { join as join3, resolve as resolve8 } from "node:path";
-var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
-var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
-var MAX_CONCEPT_CHARS = 1000;
-var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
-var CONCEPT_CACHE_VERSION = 1;
-var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
-var CONCEPT_TIMEOUT_MS = 10 * 60000;
-var MIN_CONCEPT_TIMEOUT_MS = 1000;
-var MAX_CONCEPT_TIMEOUT_MS = 60 * 60000;
-var CONCEPT_TIMEOUT_ENV = "BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS";
-var MAX_CONCEPT_WORKER_INPUT_BYTES = 64 * 1024 * 1024;
-var MAX_CONCEPT_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024;
-function conceptCacheDirectory() {
-  return resolve8(process.env.SIGNAL_GREP_MODEL_DIR ?? join3(homedir2(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
-}
-function resolveConceptTimeoutMs(environment = process.env) {
-  const raw = environment[CONCEPT_TIMEOUT_ENV];
-  if (raw === undefined || raw === "")
-    return CONCEPT_TIMEOUT_MS;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value < MIN_CONCEPT_TIMEOUT_MS || value > MAX_CONCEPT_TIMEOUT_MS) {
-    throw new SignalGrepError(`${CONCEPT_TIMEOUT_ENV} must be an integer from ${String(MIN_CONCEPT_TIMEOUT_MS)} through ${String(MAX_CONCEPT_TIMEOUT_MS)}`);
-  }
-  return value;
-}
-
-// src/request.ts
-function list(value) {
-  if (value === undefined)
-    return [];
-  return (Array.isArray(value) ? value : [value]).filter((item) => item.length > 0);
-}
-function validateText(value, field, maxCharacters, singleLine = false) {
-  if (!value.isWellFormed() || /\0/.test(value) || singleLine && /[\r\n]/.test(value))
-    throw new SignalGrepError(`${field} must be well-formed text without NUL or line breaks`);
-  if (value.length > maxCharacters)
-    throw new SignalGrepError(`${field} is too long (maximum ${String(maxCharacters)} characters); use a shorter value or a narrower working directory`);
-}
-function validateSearchPath(value, field = "path") {
-  validateText(value.replace(/^@/, ""), field, MAX_PATH_CHARACTERS, true);
-}
-function validateRawSearchInput(input) {
-  if (input.pattern !== undefined)
-    validateText(input.pattern, "pattern", MAX_PATTERN_CHARACTERS);
-  if (input.path !== undefined) {
-    validateSearchPath(input.path);
-  }
-  for (const [field, value] of [
-    ["glob", input.glob],
-    ["exclude", input.exclude]
-  ]) {
-    const values = list(value);
-    if (values.length > MAX_FILE_FILTER_ITEMS)
-      throw new SignalGrepError(`${field} accepts at most ${String(MAX_FILE_FILTER_ITEMS)} entries`);
-    values.forEach((item) => validateText(item, field, MAX_PATH_CHARACTERS, true));
-  }
-  for (const [field, value] of [
-    ["modifiedAfter", input.modifiedAfter],
-    ["modifiedBefore", input.modifiedBefore]
-  ]) {
-    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0))
-      throw new SignalGrepError(`${field} must be a non-negative Unix timestamp in milliseconds`);
-  }
-  if (input.modifiedAfter !== undefined && input.modifiedBefore !== undefined && input.modifiedAfter > input.modifiedBefore)
-    throw new SignalGrepError("modifiedAfter must be earlier than or equal to modifiedBefore");
-}
-function boundedInteger(value, fallback, minimum, maximum, field) {
-  const candidate = value ?? fallback;
-  if (!Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
-    throw new SignalGrepError(`${field} must be an integer from ${String(minimum)} through ${String(maximum)}`);
-  }
-  return candidate;
-}
-function normalizeRequest(input) {
-  validateRawSearchInput(input);
-  if (input.scope !== undefined && input.scope !== "strict" && input.scope !== "expand")
-    throw new SignalGrepError("scope must be strict or expand");
-  const pattern = input.pattern;
-  if (pattern === undefined) {
-    throw new SignalGrepError("pattern is required when cursor is not provided");
-  }
-  const path = input.path?.replace(/^@/, "");
-  return {
-    pattern,
-    ...path ? { path } : {},
-    glob: list(input.glob),
-    exclude: list(input.exclude),
-    literal: input.literal ?? false,
-    ...input.ignoreCase === undefined ? {} : { ignoreCase: input.ignoreCase },
-    hidden: input.hidden ?? true,
-    context: boundedInteger(input.context, 0, 0, MAX_CONTEXT_LINES, "context"),
-    pageSize: boundedInteger(input.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE, "limit"),
-    redact: input.redact ?? false,
-    ...input.modifiedAfter !== undefined ? { modifiedAfterMs: input.modifiedAfter } : {},
-    ...input.modifiedBefore !== undefined ? { modifiedBeforeMs: input.modifiedBefore } : {},
-    ...input.scope !== undefined ? { scope: input.scope } : {},
-    ...input.wholeWord !== undefined ? { wholeWord: input.wholeWord } : {}
-  };
-}
-
-// src/concept-source-generation.ts
-import { createHash as createHash3 } from "node:crypto";
-
-// src/source-access.ts
-import { extname as extname2, resolve as resolve13 } from "node:path";
-
-// src/historical-paths.ts
-import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
-import { constants as constants2 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname as dirname3, join as join4, parse, relative as relative4, resolve as resolve10 } from "node:path";
-
-// src/workspace-files.ts
-import { relative as relative3, resolve as resolve9, sep as sep2 } from "node:path";
-class EnumerationLimit extends Error {
-}
-function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
-  const absolute = resolve9(cwd, path);
-  policy.assertPath(absolute);
-  const local = relative3(resolve9(cwd), absolute);
-  if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
-    throw new SignalGrepError("Git internals are excluded from source candidates");
-  return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
-}
-async function listWorkspaceFiles(cwd, signal, options = {}) {
-  const absolutePath = resolve9(cwd, options.path ?? ".");
-  const policy = new SearchPathPolicy(cwd);
-  const searchPath = await policy.resolveSearchTarget(absolutePath);
-  const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
-  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
-    throw new SignalGrepError("Candidate file limit must be a positive integer");
-  const paths = new Set;
-  const reasons = new Set;
-  let coverageIssue;
-  let bytes = 0;
-  try {
-    const result = await runOwnedProcess({
-      executable: await resolveRipgrepExecutable(),
-      args: [
-        "--no-config",
-        "--files",
-        "--null",
-        ...options.ignore === false ? ["--no-ignore"] : [],
-        ...options.ignoreParents === false ? ["--no-ignore-parent"] : [],
-        ...fileScopeArguments({
-          hidden: options.hidden ?? true,
-          glob: options.glob ?? [],
-          exclude: options.exclude ?? []
-        }),
-        ...policy.ripgrepGlobArguments(searchPath),
-        "--",
-        searchPath
-      ],
-      cwd,
-      ...signal ? { signal } : {}
-    }, async (stdout) => {
-      let pending = Buffer.alloc(0);
-      for await (const chunk of stdout) {
-        if (signal?.aborted)
-          throw abortError();
-        bytes += chunk.byteLength;
-        if (bytes > MAX_PROTOCOL_LINE_BYTES)
-          throw new EnumerationLimit(`Candidate enumeration exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
-        pending = Buffer.concat([pending, chunk]);
-        let delimiter = pending.indexOf(0);
-        while (delimiter >= 0) {
-          const raw = pending.subarray(0, delimiter);
-          const decoded = raw.toString("utf8");
-          if (!Buffer.from(decoded).equals(raw)) {
-            reasons.add("Some candidate paths are not valid UTF-8");
-            coverageIssue ??= "invalid-path";
-          } else {
-            const local = workspaceRelativePath(cwd, decoded, policy);
-            if (!paths.has(local) && paths.size >= maxFiles)
-              throw new EnumerationLimit(`Candidate enumeration reached the ${String(maxFiles)} file limit`);
-            paths.add(local);
-          }
-          pending = pending.subarray(delimiter + 1);
-          delimiter = pending.indexOf(0);
-        }
-      }
-      if (pending.length > 0)
-        throw new SignalGrepError("Candidate enumeration ended without a NUL delimiter");
-    });
-    const diagnostics = classifyRipgrepDiagnostics(result.stderr);
-    if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
-      throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
-    if (diagnostics.unreadable.length > 0) {
-      reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
-      coverageIssue = "unreadable";
-    }
-    if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
-      throw new SignalGrepError(result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`);
-  } catch (error) {
-    if (!(error instanceof EnumerationLimit))
-      throw error;
-    reasons.add(error.message);
-    coverageIssue = "enumeration-limit";
-  }
-  return {
-    paths: [...paths].toSorted(),
-    partial: reasons.size > 0,
-    reasons: [...reasons],
-    ...coverageIssue ? { coverageIssue } : {}
-  };
-}
-
-// src/historical-paths.ts
-function partitionPaths(paths) {
-  const groups = [];
-  for (const path of paths) {
-    const group = groups.find((candidate) => !candidate.some((other) => path.startsWith(`${other}/`) || other.startsWith(`${path}/`)));
-    if (group)
-      group.push(path);
-    else
-      groups.push([path]);
-  }
-  return groups;
-}
-function relevantDirectories(cwd, paths) {
-  const directories = new Set;
-  for (const path of [cwd, ...paths.map((sourcePath) => dirname3(resolve10(cwd, sourcePath)))]) {
-    let current = path;
-    for (;; ) {
-      directories.add(current);
-      const parent = dirname3(current);
-      if (current === parent)
-        break;
-      current = parent;
-    }
-  }
-  return [...directories];
-}
-async function filterHistoricalPaths(cwd, paths, request, signal) {
-  if (!isPathInsideCwd(resolve10(cwd, request.path ?? "."), cwd)) {
-    throw new SignalGrepError("Historical path filtering requires a path inside cwd");
-  }
-  const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
-  const candidates = paths.filter((path) => selectedPath.length === 0 || path === selectedPath || path.startsWith(`${selectedPath}/`));
-  const reasons = new Set;
-  if (candidates.length > MAX_STRUCTURE_FILES)
-    reasons.add(`Historical path filtering reached the ${String(MAX_STRUCTURE_FILES)} candidate limit`);
-  const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
-  if (bounded.length === 0)
-    return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
-  const root = await mkdtemp(join4(tmpdir(), "baoer_signal_grep-paths-"));
-  const absoluteCwd = resolve10(cwd);
-  const volumeRoot = parse(absoluteCwd).root;
-  const ignoreFiles = [];
-  let ignoreBytesRead = 0;
-  try {
-    for (const directory of relevantDirectories(absoluteCwd, bounded)) {
-      if (isPathInsideCwd(directory, absoluteCwd))
-        await assertExistingPathInsideCwd(directory, absoluteCwd);
-      for (const name of [".ignore", ".rgignore"]) {
-        if (signal?.aborted)
-          throw abortError();
-        const path = join4(directory, name);
-        let discovered = false;
-        try {
-          const before = await lstat(path);
-          discovered = true;
-          if (!before.isFile())
-            throw new SignalGrepError("Current ignore rules are not regular files; historical path filtering is unavailable");
-          if (before.size > MAX_SOURCE_FILE_BYTES || ignoreBytesRead + before.size > MAX_STRUCTURE_BYTES)
-            throw new SignalGrepError("Current ignore rules exceed the source read budget");
-          const handle = await open(path, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0));
-          let bytes;
-          try {
-            if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
-              throw new SignalGrepError("Current ignore rules changed before reading");
-            const buffer = Buffer.alloc(before.size + 1);
-            let used = 0;
-            while (used < buffer.length) {
-              if (signal?.aborted)
-                throw abortError();
-              const chunk = await handle.read(buffer, used, Math.min(64 * 1024, buffer.length - used), null);
-              if (chunk.bytesRead === 0)
-                break;
-              used += chunk.bytesRead;
-            }
-            bytes = buffer.subarray(0, used);
-            const after = await lstat(path);
-            if (used !== before.size || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after)) || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
-              throw new SignalGrepError("Current ignore rules changed during historical path filtering");
-          } finally {
-            await handle.close();
-          }
-          ignoreBytesRead += bytes.length;
-          ignoreFiles.push({ local: relative4(volumeRoot, path), bytes });
-        } catch (error) {
-          if (!(error instanceof Error && ("code" in error) && error.code === "ENOENT"))
-            throw error;
-          if (discovered)
-            throw new SignalGrepError("Current ignore rules disappeared during historical path filtering");
-        }
-      }
-    }
-    if (ignoreFiles.length === 0 && request.glob.length === 0 && request.exclude.length === 0 && request.hidden) {
-      return { paths: bounded, partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead };
-    }
-    const visible = new Set;
-    for (const [index, group] of partitionPaths(bounded).entries()) {
-      const tree = join4(root, String(index));
-      const target = join4(tree, relative4(volumeRoot, absoluteCwd));
-      await mkdir(target, { recursive: true });
-      for (const path of group) {
-        const safe = workspaceRelativePath(absoluteCwd, path);
-        const placeholder = resolve10(target, safe);
-        await mkdir(dirname3(placeholder), { recursive: true });
-        await writeFile(placeholder, "");
-      }
-      for (const ignore of ignoreFiles) {
-        const destination = join4(tree, ignore.local);
-        await mkdir(dirname3(destination), { recursive: true });
-        await writeFile(destination, ignore.bytes);
-      }
-      const privacy = await listWorkspaceFiles(tree, signal, { ignoreParents: false });
-      const prefix = `${relative4(tree, target).split("\\").join("/")}/`;
-      const allowed = new Set(privacy.paths.filter((path) => path.startsWith(prefix)).map((path) => path.slice(prefix.length)));
-      const scoped = await listWorkspaceFiles(target, signal, {
-        glob: request.glob,
-        exclude: request.exclude,
-        hidden: request.hidden,
-        ignore: false
-      });
-      for (const reason of [...privacy.reasons, ...scoped.reasons])
-        reasons.add(reason);
-      const included = new Set(group);
-      for (const path of scoped.paths)
-        if (included.has(path) && allowed.has(path))
-          visible.add(path);
-    }
-    return {
-      paths: [...visible].toSorted(),
-      partial: reasons.size > 0,
-      reasons: [...reasons],
-      ignoreBytesRead
-    };
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-}
-
-// src/git-diff.ts
-import { setImmediate } from "node:timers/promises";
-class GitDiffLimitError extends SignalGrepError {
-}
-
-class GitDiffBudget {
-  work = 0;
-  maxWork;
-  signal;
-  constructor(maxWork = MAX_GIT_DIFF_WORK, signal) {
-    this.maxWork = maxWork;
-    this.signal = signal;
-  }
-  tick() {
-    if (this.signal?.aborted)
-      throw abortError();
-    this.work += 1;
-    if (this.work > this.maxWork) {
-      throw new GitDiffLimitError(`Git line comparison exceeds the ${String(this.maxWork)} step limit`);
-    }
-    return this.work % 4096 === 0;
-  }
-}
-async function sourceLines(content, budget) {
-  const lines = [];
-  for (let start = 0;start < content.length; ) {
-    if (budget.tick())
-      await setImmediate();
-    const newline = content.indexOf(10, start);
-    const end = newline === -1 ? content.length : newline + 1;
-    lines.push(content.toString("latin1", start, end));
-    start = end;
-  }
-  return lines;
-}
-function sourceLineCount(content) {
-  if (content.length === 0)
-    return 0;
-  let count = content[content.length - 1] === 10 ? 0 : 1;
-  for (const byte of content)
-    if (byte === 10)
-      count += 1;
-  return count;
-}
-function diagonal(vector, distance, k) {
-  return vector[k + distance + 1] ?? -1;
-}
-function prependLine(ranges, line) {
-  const last = ranges.at(-1);
-  if (last && last.startLine === line + 1)
-    last.startLine = line;
-  else
-    ranges.push({ startLine: line, endLine: line });
-}
-function reconstruct(trace, oldLength, newLength, prefix) {
-  let x = oldLength;
-  let y = newLength;
-  const oldRanges = [];
-  const newRanges = [];
-  for (let distance = trace.length - 1;distance > 0; distance -= 1) {
-    const previous = trace[distance - 1];
-    if (!previous)
-      throw new Error("Missing Git line comparison trace");
-    const k = x - y;
-    const previousK = k === -distance || k !== distance && diagonal(previous, distance - 1, k - 1) < diagonal(previous, distance - 1, k + 1) ? k + 1 : k - 1;
-    const previousX = diagonal(previous, distance - 1, previousK);
-    const previousY = previousX - previousK;
-    while (x > previousX && y > previousY) {
-      x -= 1;
-      y -= 1;
-    }
-    if (x === previousX) {
-      prependLine(newRanges, prefix + y);
-      y -= 1;
-    } else {
-      prependLine(oldRanges, prefix + x);
-      x -= 1;
-    }
-  }
-  return { oldRanges: oldRanges.toReversed(), newRanges: newRanges.toReversed() };
-}
-async function changedLineRanges(oldContent, newContent, budget = new GitDiffBudget) {
-  if (budget.signal?.aborted)
-    throw abortError();
-  if (oldContent.equals(newContent))
-    return { oldRanges: [], newRanges: [] };
-  const oldLines = await sourceLines(oldContent, budget);
-  const newLines = await sourceLines(newContent, budget);
-  let prefix = 0;
-  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
-    if (budget.tick())
-      await setImmediate();
-    prefix += 1;
-  }
-  let oldEnd = oldLines.length;
-  let newEnd = newLines.length;
-  while (oldEnd > prefix && newEnd > prefix && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
-    if (budget.tick())
-      await setImmediate();
-    oldEnd -= 1;
-    newEnd -= 1;
-  }
-  const n = oldEnd - prefix;
-  const m = newEnd - prefix;
-  if (n === 0 || m === 0) {
-    return {
-      oldRanges: n === 0 ? [] : [{ startLine: prefix + 1, endLine: oldEnd }],
-      newRanges: m === 0 ? [] : [{ startLine: prefix + 1, endLine: newEnd }]
-    };
-  }
-  const trace = [];
-  for (let distance = 0;distance <= n + m; distance += 1) {
-    const current = new Int32Array(2 * distance + 3).fill(-1);
-    const previous = trace[distance - 1];
-    for (let k = -distance;k <= distance; k += 2) {
-      if (budget.tick())
-        await setImmediate();
-      let x = 0;
-      if (previous) {
-        x = k === -distance || k !== distance && diagonal(previous, distance - 1, k - 1) < diagonal(previous, distance - 1, k + 1) ? diagonal(previous, distance - 1, k + 1) : diagonal(previous, distance - 1, k - 1) + 1;
-      }
-      let y = x - k;
-      while (x < n && y < m && oldLines[prefix + x] === newLines[prefix + y]) {
-        if (budget.tick())
-          await setImmediate();
-        x += 1;
-        y += 1;
-      }
-      current[k + distance + 1] = x;
-      if (x >= n && y >= m) {
-        trace.push(current);
-        return reconstruct(trace, n, m, prefix);
-      }
-    }
-    trace.push(current);
-  }
-  throw new Error("Git line comparison did not produce an edit script");
-}
-async function sourceSimilarity(oldContent, newContent, budget) {
-  if (oldContent.equals(newContent))
-    return 100;
-  const maximum = Math.max(oldContent.length, newContent.length);
-  if (maximum === 0 || Math.min(oldContent.length, newContent.length) / maximum < 0.5)
-    return 0;
-  const counts = new Map;
-  for (const line of await sourceLines(oldContent, budget))
-    counts.set(line, (counts.get(line) ?? 0) + 1);
-  let commonBytes = 0;
-  for (const line of await sourceLines(newContent, budget)) {
-    const remaining = counts.get(line) ?? 0;
-    if (remaining === 0)
-      continue;
-    counts.set(line, remaining - 1);
-    commonBytes += line.length;
-  }
-  return Math.min(99, Math.floor(100 * commonBytes / maximum));
-}
-
-// src/git-repository.ts
-import { createHash } from "node:crypto";
-import { constants as constants3 } from "node:fs";
-import { lstat as lstat2, open as open2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute5, relative as relative5, resolve as resolve11, sep as sep3 } from "node:path";
-
-// src/git-process.ts
-var GIT_READ_ARGUMENTS = [
-  "--no-pager",
-  "--no-replace-objects",
-  "--no-optional-locks",
-  "-c",
-  "core.fsmonitor=false",
-  "-c",
-  "core.untrackedCache=false",
-  "-c",
-  "submodule.recurse=false"
-];
-var MINIMUM_NO_LAZY_FETCH_VERSION = [2, 45, 0];
-var gitCapabilities = new Map;
-function gitReadEnvironment() {
-  return {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_"))),
-    GIT_CONFIG_COUNT: "0",
-    GIT_NO_LAZY_FETCH: "1",
-    GIT_NO_REPLACE_OBJECTS: "1",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_PROTOCOL_FROM_USER: "0",
-    LC_ALL: "C"
-  };
-}
-function supportsNoLazyFetch(version) {
-  const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(version.trim());
-  if (!match)
-    throw new SignalGrepError("Git returned an unrecognized version string");
-  const actual = [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
-  for (let index = 0;index < MINIMUM_NO_LAZY_FETCH_VERSION.length; index += 1) {
-    const difference = (actual[index] ?? 0) - (MINIMUM_NO_LAZY_FETCH_VERSION[index] ?? 0);
-    if (difference !== 0)
-      return difference > 0;
-  }
-  return true;
-}
-async function gitReadArguments(executable, cwd, signal) {
-  const capabilityKey = `${executable}\x00${process.env.PATH ?? ""}`;
-  let supports = gitCapabilities.get(capabilityKey);
-  if (supports === undefined) {
-    const versionChunks = [];
-    const version = await runOwnedProcess({
-      executable,
-      args: ["--version"],
-      cwd,
-      env: gitReadEnvironment(),
-      ...signal ? { signal } : {}
-    }, async (stdout) => {
-      for await (const chunk of stdout)
-        versionChunks.push(Buffer.from(chunk));
-    });
-    if (version.code !== 0)
-      throw new SignalGrepError("Unable to determine the Git version");
-    supports = supportsNoLazyFetch(Buffer.concat(versionChunks).toString("utf8"));
-    gitCapabilities.set(capabilityKey, supports);
-  }
-  if (supports) {
-    return [...GIT_READ_ARGUMENTS, "--no-lazy-fetch"];
-  }
-  const partial = await runOwnedProcess({
-    executable,
-    args: [
-      ...GIT_READ_ARGUMENTS,
-      "config",
-      "--local",
-      "--get-regexp",
-      "^(extensions\\.partialClone|remote\\..*\\.promisor)$"
-    ],
-    cwd,
-    env: gitReadEnvironment(),
-    ...signal ? { signal } : {}
-  }, async (stdout) => {
-    for await (const chunk of stdout) {}
-  });
-  if (partial.code === 0) {
-    throw new SignalGrepError("Git 2.45 or newer is required for non-fetching reads from a partial/promisor clone");
-  }
-  if (partial.code !== 1) {
-    throw new SignalGrepError("Unable to verify whether this older Git repository is partial");
-  }
-  return [...GIT_READ_ARGUMENTS];
-}
-async function runGitRead(cwd, command, args, options = {}) {
-  const chunks = [];
-  if (options.input && options.input.byteLength > MAX_PROTOCOL_LINE_BYTES) {
-    throw new SignalGrepError(`Git input exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
-  }
-  let bytes = 0;
-  const maxBytes = options.maxBytes ?? MAX_PROTOCOL_LINE_BYTES;
-  const result = await runOwnedProcess({
-    executable: options.executable ?? "git",
-    args: [
-      ...await gitReadArguments(options.executable ?? "git", cwd, options.signal),
-      ...command === "ls-tree" ? ["--literal-pathspecs"] : [],
-      command,
-      ...args
-    ],
-    cwd,
-    env: gitReadEnvironment(),
-    ...options.signal ? { signal: options.signal } : {},
-    ...options.input ? { input: options.input } : {}
-  }, async (stdout) => {
-    for await (const chunk of stdout) {
-      bytes += chunk.byteLength;
-      if (bytes > maxBytes) {
-        throw new SignalGrepError(`Git ${command} output exceeds the ${String(maxBytes)} byte limit`);
-      }
-      chunks.push(Buffer.from(chunk));
-    }
-  });
-  if (result.code === null || !(options.allowedCodes ?? [0]).includes(result.code)) {
-    throw new SignalGrepError(`Git ${command} failed: ${result.stderr.trim() || `exit ${String(result.code)}`}`);
-  }
-  return { output: Buffer.concat(chunks), code: result.code };
-}
-function decodeGitPath(bytes) {
-  const value = bytes.toString("utf8");
-  if (!Buffer.from(value, "utf8").equals(bytes)) {
-    throw new SignalGrepError("Git path is not valid UTF-8; path-based source access is unavailable");
-  }
-  return value;
-}
-function splitGitRecords(output) {
-  if (output.length === 0)
-    return [];
-  if (output[output.length - 1] !== 0) {
-    throw new SignalGrepError("Git names protocol ended without a NUL delimiter");
-  }
-  const records = [];
-  let offset = 0;
-  for (let delimiter = output.indexOf(0);delimiter !== -1; delimiter = output.indexOf(0, offset)) {
-    records.push(output.subarray(offset, delimiter));
-    offset = delimiter + 1;
-  }
-  return records;
-}
-
-// src/git-repository.ts
-async function verifyWorktreeRevision(cwd, path, expected) {
-  try {
-    const current = await lstat2(resolve11(cwd, path));
-    await assertExistingPathInsideCwd(resolve11(cwd, path), cwd);
-    if (current.isFile() && sameSourceRevision(sourceRevisionFromStats(current), expected))
-      return;
-  } catch (error) {
-    if (!(error instanceof Error && ("code" in error) && error.code === "ENOENT"))
-      throw error;
-  }
-  throw new SignalGrepError("Working source changed during Git comparison; retry a new search");
-}
-function gitPath(cwd, path) {
-  if (path.length === 0 || path.includes("\x00"))
-    throw new SignalGrepError("Git source path is invalid");
-  const absolute = resolve11(cwd, path);
-  const local = relative5(resolve11(cwd), absolute).split(sep3).join("/");
-  if (!isPathInsideCwd(absolute, cwd) || local.split("/").some((part) => part.toLowerCase() === ".git")) {
-    throw new SignalGrepError("Git source path must stay within the working directory and outside .git");
-  }
-  return local;
-}
-async function resolveGitCommit(cwd, ref, signal) {
-  if (ref.trim().length === 0 || ref.length > 1024 || ref.includes("\x00")) {
-    throw new SignalGrepError("Git commit reference must be a nonempty bounded string");
-  }
-  const { output } = await runGitRead(cwd, "rev-parse", ["--verify", "--end-of-options", `${ref}^{commit}`], {
-    ...signal ? { signal } : {},
-    maxBytes: 128
-  });
-  const commit = output.toString("ascii").trim();
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit))
-    throw new SignalGrepError("Git returned an invalid commit identity");
-  return commit;
-}
-async function resolveGitRepository(cwd, signal) {
-  const { output } = await runGitRead(cwd, "rev-parse", ["--show-toplevel"], signal ? { signal, maxBytes: 4096 } : { maxBytes: 4096 });
-  const root = decodeGitPath(output).replace(/\r?\n$/, "");
-  if (!isAbsolute5(root))
-    throw new SignalGrepError("Git returned an invalid repository root");
-  return resolve11(root);
-}
-async function findGitRepository(cwd, signal) {
-  try {
-    return await resolveGitRepository(cwd, signal);
-  } catch (error) {
-    if (error instanceof SignalGrepError && error.message.includes("not a git repository")) {
-      return;
-    }
-    throw error;
-  }
-}
-async function readGitTree(cwd, commit, signal, path) {
-  const { output } = await runGitRead(cwd, "ls-tree", ["-r", "-z", "-l", commit, ...path ? ["--", gitPath(cwd, path)] : []], signal ? { signal } : {});
-  const entries = new Map;
-  for (const record of splitGitRecords(output)) {
-    if (entries.size === MAX_SOURCE_REVISION_FILES)
-      return { entries, limited: true };
-    const tab = record.indexOf(9);
-    const header = record.subarray(0, tab).toString("ascii").trim().split(/\s+/);
-    const [mode, type, blob, size] = header;
-    if (tab < 0 || !mode || !blob || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(blob) || !["blob", "commit"].includes(type ?? "")) {
-      throw new SignalGrepError("Git tree returned an invalid raw object entry");
-    }
-    const local = gitPath(cwd, decodeGitPath(record.subarray(tab + 1)));
-    const byteSize = type === "commit" ? 0 : Number(size);
-    if (!Number.isSafeInteger(byteSize) || byteSize < 0)
-      throw new SignalGrepError("Git tree returned an invalid blob size");
-    entries.set(local, { path: local, mode, blob, size: byteSize });
-  }
-  return { entries, limited: false };
-}
-async function worktreeNames(cwd, signal) {
-  const { output } = await runGitRead(cwd, "ls-files", ["-z", "--cached", "--others", "--exclude-standard"], signal ? { signal } : {});
-  const paths = new Set;
-  for (const record of splitGitRecords(output)) {
-    if (paths.size === MAX_SOURCE_REVISION_FILES)
-      return { paths: [...paths], limited: true };
-    paths.add(gitPath(cwd, decodeGitPath(record)));
-  }
-  return { paths: [...paths], limited: false };
-}
-async function visibleGitPaths(cwd, paths, signal, includePath) {
-  const result = [];
-  for (let start = 0;start < paths.length; start += 128) {
-    const batch = paths.slice(start, start + 128);
-    const { output } = await runGitRead(cwd, "check-ignore", ["--no-index", "-z", "--stdin"], {
-      input: Buffer.from(`${batch.map((path) => `./${path}`).join("\x00")}\x00`),
-      allowedCodes: [0, 1],
-      ...signal ? { signal } : {}
-    });
-    const ignored = new Set(splitGitRecords(output).map((record) => gitPath(cwd, decodeGitPath(record))));
-    for (const path of batch) {
-      if (signal?.aborted)
-        throw abortError();
-      if (!ignored.has(path) && (!includePath || await includePath(path)))
-        result.push(path);
-    }
-  }
-  return result;
-}
-function limitedSource(path, mode, reason) {
-  return { path, mode, sourceStatus: "unavailable", reason };
-}
-async function readGitBlob(cwd, commit, entry, budget, signal) {
-  const { path, mode, blob, size } = entry;
-  if (mode === "120000" || mode === "160000") {
-    return {
-      path,
-      mode,
-      sourceStatus: mode === "120000" ? "symlink" : "submodule",
-      reason: "Symlink and submodule contents are not followed"
-    };
-  }
-  if (size > MAX_SOURCE_FILE_BYTES)
-    return limitedSource(path, mode, `Source exceeds the ${String(MAX_SOURCE_FILE_BYTES)} byte file limit`);
-  if (budget.bytes + size > budget.maxBytes)
-    return limitedSource(path, mode, `Source reads exceed the ${String(budget.maxBytes)} byte request limit`);
-  const { output } = await runGitRead(cwd, "cat-file", ["blob", blob], {
-    maxBytes: size,
-    ...signal ? { signal } : {}
-  });
-  budget.bytes += output.length;
-  if (output.length !== size)
-    throw new SignalGrepError("Git blob size does not match its immutable tree entry");
-  const verifiedBlob = createHash(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
-  if (verifiedBlob !== blob)
-    throw new SignalGrepError("Git blob bytes do not match their immutable object identity");
-  return {
-    path,
-    mode,
-    sourceStatus: output.includes(0) ? "binary" : "available",
-    ...output.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content: output },
-    origin: { kind: "git", commit, blob },
-    contentHash: createHash("sha256").update(output).digest("hex")
-  };
-}
-async function readWorktreeSource(cwd, path, budget, signal) {
-  const absolute = resolve11(cwd, path);
-  if (signal?.aborted)
-    throw abortError();
-  let discovered = false;
-  try {
-    const before = await lstat2(absolute);
-    discovered = true;
-    if (before.isSymbolicLink())
-      return {
-        path,
-        mode: "120000",
-        sourceStatus: "symlink",
-        reason: "Symlink source is not followed"
-      };
-    if (!before.isFile())
-      return {
-        path,
-        mode: "160000",
-        sourceStatus: before.isDirectory() ? "submodule" : "unavailable",
-        reason: "Non-regular source is not read"
-      };
-    const mode = (before.mode & 73) === 0 ? "100644" : "100755";
-    if (before.size > MAX_SOURCE_FILE_BYTES)
-      return limitedSource(path, mode, `Source exceeds the ${String(MAX_SOURCE_FILE_BYTES)} byte file limit`);
-    if (budget.bytes + before.size > budget.maxBytes)
-      return limitedSource(path, mode, `Source reads exceed the ${String(budget.maxBytes)} byte request limit`);
-    await assertExistingPathInsideCwd(absolute, cwd);
-    const handle = await open2(absolute, constants3.O_RDONLY | (constants3.O_NOFOLLOW ?? 0));
-    try {
-      if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
-        throw new SignalGrepError("Working source changed before reading");
-      const buffer = Buffer.alloc(before.size + 1);
-      let bytes = 0;
-      while (bytes < buffer.length) {
-        if (signal?.aborted)
-          throw abortError();
-        const { bytesRead } = await handle.read(buffer, bytes, Math.min(64 * 1024, buffer.length - bytes), null);
-        if (bytesRead === 0)
-          break;
-        bytes += bytesRead;
-      }
-      budget.bytes += bytes;
-      const after = await lstat2(absolute);
-      await assertExistingPathInsideCwd(absolute, cwd);
-      if (bytes !== before.size || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after)) || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat()))) {
-        throw new SignalGrepError("Working source changed while reading; Git ranges and source cannot be mixed");
-      }
-      const content = buffer.subarray(0, bytes);
-      return {
-        path,
-        mode,
-        sourceStatus: content.includes(0) ? "binary" : "available",
-        ...content.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content },
-        origin: {
-          kind: "worktree",
-          revision: sourceRevisionFromStats(after),
-          contentHash: createHash("sha256").update(content).digest("hex")
-        },
-        contentHash: createHash("sha256").update(content).digest("hex")
-      };
-    } finally {
-      await handle.close();
-    }
-  } catch (error) {
-    if (error instanceof Error && "code" in error) {
-      if (error.code === "ENOENT") {
-        if (discovered)
-          throw new SignalGrepError("Working source disappeared while reading; retry a new search");
-        return { path, mode: "000000", sourceStatus: "absent" };
-      }
-      if (["EACCES", "EPERM", "ELOOP", "ENOTDIR"].includes(String(error.code)))
-        return limitedSource(path, "000000", `Source unavailable: ${String(error.code)}`);
-    }
-    throw error;
-  }
-}
-
-// src/git-source.ts
-import { setImmediate as setImmediate2 } from "node:timers/promises";
-function absent(path) {
-  return { path, mode: "000000", sourceStatus: "absent" };
-}
-function sameContents(left, right) {
-  return left.contentHash !== undefined && left.contentHash === right.contentHash;
-}
-function wholeFile(content) {
-  const lines = sourceLineCount(content);
-  return lines === 0 ? [] : [{ startLine: 1, endLine: lines }];
-}
-function validateLimit(value, label) {
-  if (!Number.isSafeInteger(value) || value < 1)
-    throw new SignalGrepError(`${label} must be a positive integer`);
-  return value;
-}
-function rememberBest(best, pair, score) {
-  const previous = best.get(pair);
-  if (!previous || score > previous.score)
-    best.set(pair, { score, count: 1 });
-  else if (score === previous.score)
-    previous.count += 1;
-}
-async function pairRenames(pairs, budget, reasons) {
-  const removed = pairs.filter((pair) => pair.new.sourceStatus === "absent" && pair.old.content);
-  const added = pairs.filter((pair) => pair.old.sourceStatus === "absent" && pair.new.content);
-  const scores = [];
-  const bestOld = new Map;
-  const bestNew = new Map;
-  try {
-    for (const oldPair of removed) {
-      for (const newPair of added) {
-        if (!oldPair.old.content || !newPair.new.content)
-          continue;
-        if (budget.tick())
-          await setImmediate2();
-        const score = sameContents(oldPair.old, newPair.new) ? 100 : await sourceSimilarity(oldPair.old.content, newPair.new.content, budget);
-        if (score >= 50) {
-          scores.push({ oldPair, newPair, score });
-          rememberBest(bestOld, oldPair, score);
-          rememberBest(bestNew, newPair, score);
-        }
-      }
-    }
-  } catch (error) {
-    if (!(error instanceof GitDiffLimitError))
-      throw error;
-    reasons.add(error.message);
-    reasons.add("Rename comparison is incomplete; unpaired additions/deletions remain explicit");
-    return pairs;
-  }
-  const consumed = new Set;
-  const renamed = [];
-  for (const entry of scores) {
-    const oldBest = bestOld.get(entry.oldPair);
-    const newBest = bestNew.get(entry.newPair);
-    if (oldBest?.score !== entry.score || newBest?.score !== entry.score || oldBest.count !== 1 || newBest.count !== 1)
-      continue;
-    consumed.add(entry.oldPair);
-    consumed.add(entry.newPair);
-    renamed.push({
-      old: entry.oldPair.old,
-      new: entry.newPair.new,
-      rename: {
-        method: entry.score === 100 ? "identical-content" : "line-similarity",
-        similarity: entry.score
-      }
-    });
-  }
-  if (scores.some((entry) => !consumed.has(entry.oldPair) && !consumed.has(entry.newPair))) {
-    reasons.add("Ambiguous rename candidates remain separate additions/deletions");
-  }
-  return [...pairs.filter((pair) => !consumed.has(pair)), ...renamed];
-}
-async function renderPair(pair, request, budget, reasons) {
-  const selected = request.side === "old" ? pair.old : pair.new;
-  const oldExists = pair.old.sourceStatus !== "absent";
-  const newExists = pair.new.sourceStatus !== "absent";
-  let changedRanges = [];
-  let rangeReason;
-  if (selected.content) {
-    try {
-      if (!oldExists || !newExists)
-        changedRanges = wholeFile(selected.content);
-      else if (pair.old.content && pair.new.content) {
-        const diff = await changedLineRanges(pair.old.content, pair.new.content, budget);
-        changedRanges = request.side === "old" ? diff.oldRanges : diff.newRanges;
-      } else {
-        rangeReason = "Changed lines unavailable because the opposite source cannot be compared as raw text";
-      }
-    } catch (error) {
-      if (!(error instanceof GitDiffLimitError))
-        throw error;
-      rangeReason = error.message;
-    }
-  }
-  if (rangeReason)
-    reasons.add(rangeReason);
-  for (const source of [pair.old, pair.new]) {
-    if (source.sourceStatus === "unavailable")
-      reasons.add(source.reason ?? "Source unavailable");
-  }
-  const unsupported = [pair.old, pair.new].some((source) => ["unavailable", "symlink", "submodule"].includes(source.sourceStatus));
-  const change = pair.rename ? "renamed" : !oldExists ? "added" : !newExists ? "deleted" : unsupported ? "unknown" : "modified";
-  const reason = selected.reason ?? rangeReason;
-  return {
-    path: selected.sourceStatus === "absent" ? request.side === "old" ? pair.new.path : pair.old.path : selected.path,
-    ...oldExists ? { oldPath: pair.old.path } : {},
-    ...newExists ? { newPath: pair.new.path } : {},
-    change,
-    sourceStatus: selected.sourceStatus,
-    ...selected.content ? { content: selected.content } : {},
-    ...selected.contentHash ? { contentHash: selected.contentHash } : {},
-    ...selected.origin ? { origin: selected.origin } : {},
-    changedRanges,
-    ranges: request.scope === "files" && selected.content ? wholeFile(selected.content) : changedRanges,
-    ...reason ? { reason } : {},
-    ...pair.rename ? { rename: pair.rename } : {}
-  };
-}
-async function readGitChanges(cwd, request, signal, options = {}) {
-  if (!["files", "lines"].includes(request.scope) || !["new", "old"].includes(request.side))
-    throw new SignalGrepError("Invalid Git scope or side");
-  if (request.target !== undefined && request.base === undefined)
-    throw new SignalGrepError("Git commit comparison requires an explicit base and target");
-  const maxFiles = validateLimit(options.maxFiles ?? MAX_STRUCTURE_FILES, "Git file limit");
-  const maxBytes = validateLimit(options.maxBytes ?? MAX_STRUCTURE_BYTES, "Git byte limit");
-  const maxDiffWork = validateLimit(options.maxDiffWork ?? MAX_GIT_DIFF_WORK, "Git diff work limit");
-  const base = await resolveGitCommit(cwd, request.base ?? "HEAD", signal);
-  const target = request.target === undefined ? undefined : await resolveGitCommit(cwd, request.target, signal);
-  const oldTree = await readGitTree(cwd, base, signal);
-  const newTree = target ? await readGitTree(cwd, target, signal) : undefined;
-  const diskNames = target ? undefined : await worktreeNames(cwd, signal);
-  const reasons = new Set;
-  if (oldTree.limited || newTree?.limited || diskNames?.limited)
-    reasons.add("Git candidate metadata limit reached");
-  const candidates = [
-    ...new Set([...oldTree.entries.keys(), ...newTree?.entries.keys() ?? diskNames?.paths ?? []])
-  ].filter((path) => {
-    if (!target)
-      return true;
-    const oldEntry = oldTree.entries.get(path);
-    const newEntry = newTree?.entries.get(path);
-    return !oldEntry || !newEntry || oldEntry.blob !== newEntry.blob || oldEntry.mode !== newEntry.mode;
-  }).toSorted();
-  let visible = await visibleGitPaths(cwd, candidates, signal, options.includePath);
-  let filterBytes = 0;
-  if (options.filterPaths) {
-    const allowed = new Set(visible);
-    const filtered = await options.filterPaths(visible);
-    visible = filtered.paths;
-    filterBytes = filtered.bytesRead ?? 0;
-    if (!Number.isSafeInteger(filterBytes) || filterBytes < 0 || filterBytes > maxBytes)
-      throw new SignalGrepError("Git path filtering exceeded its shared source read budget");
-    if (visible.some((path) => !allowed.has(path)))
-      throw new SignalGrepError("Git path filter expanded the authorized candidate set");
-    visible = [...new Set(visible)];
-  }
-  const readBudget = { bytes: filterBytes, maxBytes };
-  const diffBudget = new GitDiffBudget(maxDiffWork, signal);
-  const pairs = [];
-  let filesRead = 0;
-  let omittedFiles = 0;
-  for (const path of visible) {
-    if (signal?.aborted)
-      throw abortError();
-    const oldEntry = oldTree.entries.get(path);
-    const newEntry = newTree?.entries.get(path);
-    if (filesRead >= maxFiles || readBudget.bytes >= maxBytes) {
-      omittedFiles += 1;
-      continue;
-    }
-    filesRead += 1;
-    const oldSource = oldEntry ? await readGitBlob(cwd, base, oldEntry, readBudget, signal) : absent(path);
-    const newSource = target ? newEntry ? await readGitBlob(cwd, target, newEntry, readBudget, signal) : absent(path) : await readWorktreeSource(cwd, path, readBudget, signal);
-    if (oldSource.sourceStatus === "absent" && newSource.sourceStatus === "absent")
-      continue;
-    if (sameContents(oldSource, newSource) && (process.platform === "win32" || oldSource.mode === newSource.mode))
-      continue;
-    pairs.push({ old: oldSource, new: newSource });
-  }
-  if (omittedFiles > 0)
-    reasons.add(`Git read limits omitted ${String(omittedFiles)} candidate files (${String(maxFiles)} files / ${String(maxBytes)} bytes)`);
-  const paired = await pairRenames(pairs, diffBudget, reasons);
-  const files = [];
-  for (const pair of paired)
-    files.push(await renderPair(pair, request, diffBudget, reasons));
-  for (const pair of paired) {
-    if (pair.new.origin?.kind !== "worktree")
-      continue;
-    await verifyWorktreeRevision(cwd, pair.new.path, pair.new.origin.revision);
-  }
-  return {
-    base,
-    target: target ?? "worktree",
-    scope: request.scope,
-    side: request.side,
-    files: files.toSorted((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0),
-    partial: reasons.size > 0,
-    reasons: [...reasons],
-    filesRead,
-    bytesRead: readBudget.bytes,
-    diffWork: diffBudget.work,
-    omittedFiles
-  };
-}
-async function readGitSource(cwd, identity, signal, options = {}) {
-  const path = gitPath(cwd, identity.path);
-  if (!(await visibleGitPaths(cwd, [path], signal, options.includePath)).includes(path))
-    throw new SignalGrepError("Git source is excluded by current workspace privacy or path rules");
-  const selected = await filterHistoricalPaths(cwd, [path], { glob: [], exclude: [], hidden: true }, signal);
-  if (selected.partial || !selected.paths.includes(path))
-    throw new SignalGrepError("Git source is excluded or unverified by current .ignore/.rgignore rules");
-  const commit = await resolveGitCommit(cwd, identity.commit, signal);
-  const tree = await readGitTree(cwd, commit, signal, path);
-  const entry = tree.entries.get(path);
-  if (!entry)
-    throw new SignalGrepError("Git source path does not exist in the requested commit");
-  if (identity.blob !== undefined && identity.blob !== entry.blob)
-    throw new SignalGrepError("Git source blob does not match its commit and path");
-  return readGitBlob(cwd, commit, entry, { bytes: selected.ignoreBytesRead, maxBytes: options.maxBytes ?? MAX_STRUCTURE_BYTES }, signal);
-}
-
-// src/source-document.ts
-import { isUtf8 } from "node:buffer";
-import { createHash as createHash2 } from "node:crypto";
-import { open as open3, realpath as realpath4 } from "node:fs/promises";
-import { relative as relative6, resolve as resolve12 } from "node:path";
-class SourceDocumentError extends SignalGrepError {
-  reason;
-  constructor(reason, message) {
-    super(message);
-    this.reason = reason;
-    this.name = "SourceDocumentError";
-  }
-}
-function contentHash(bytes) {
-  return createHash2("sha256").update(bytes).digest("hex");
-}
-
-class SourceDocument {
-  reference;
-  bytes;
-  text;
-  utf8;
-  lineStarts = [0];
-  #byteOffsets;
-  constructor(reference, bytes) {
-    this.reference = reference;
-    this.bytes = bytes;
-    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
-      throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
-    }
-    this.utf8 = isUtf8(bytes);
-    this.text = bytes.toString("utf8");
-    for (let index = bytes.indexOf(10);index >= 0; index = bytes.indexOf(10, index + 1)) {
-      this.lineStarts.push(index + 1);
-    }
-  }
-  get path() {
-    return this.reference.path;
-  }
-  toByteOffset(character) {
-    this.#requireUtf8();
-    if (!Number.isSafeInteger(character) || character < 0 || character > this.text.length) {
-      throw new SignalGrepError("Source character offset is outside the document");
-    }
-    const code = this.text.charCodeAt(character);
-    if (code >= 56320 && code <= 57343) {
-      throw new SignalGrepError("Source character offset splits a Unicode character");
-    }
-    const value = this.#offsets()[character];
-    if (value === undefined)
-      throw new Error("Missing source offset");
-    return value;
-  }
-  toCharacterOffset(byte) {
-    this.#requireUtf8();
-    this.checkRange({ start: byte, end: byte });
-    const offsets = this.#offsets();
-    let low = 0;
-    let high = offsets.length - 1;
-    while (low < high) {
-      const middle = Math.floor((low + high) / 2);
-      const value = offsets[middle];
-      if (value === undefined)
-        throw new Error("Missing source offset");
-      if (value < byte)
-        low = middle + 1;
-      else
-        high = middle;
-    }
-    if (offsets[low] !== byte) {
-      throw new SignalGrepError("Source byte offset splits a Unicode character");
-    }
-    return low;
-  }
-  lineAt(byte) {
-    this.checkRange({ start: byte, end: byte });
-    let low = 0;
-    let high = this.lineStarts.length;
-    while (low + 1 < high) {
-      const middle = Math.floor((low + high) / 2);
-      const start = this.lineStarts[middle];
-      if (start === undefined)
-        throw new Error("Missing source line");
-      if (start <= byte)
-        low = middle;
-      else
-        high = middle;
-    }
-    return low + 1;
-  }
-  positionAt(byte) {
-    const line = this.lineAt(byte);
-    const start = this.lineStarts[line - 1];
-    if (start === undefined)
-      throw new Error("Missing source line");
-    return {
-      line,
-      column: this.toCharacterOffset(byte) - this.toCharacterOffset(start) + 1
-    };
-  }
-  lineRange(startLine, endLine = startLine) {
-    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || startLine > this.lineStarts.length) {
-      throw new SignalGrepError("Source line range is outside the document");
-    }
-    const start = this.lineStarts[startLine - 1];
-    if (start === undefined)
-      throw new Error("Missing source line");
-    return { start, end: this.lineStarts[endLine] ?? this.bytes.length };
-  }
-  slice(range) {
-    this.#requireUtf8();
-    this.checkRange(range);
-    this.toCharacterOffset(range.start);
-    this.toCharacterOffset(range.end);
-    return this.bytes.subarray(range.start, range.end).toString("utf8");
-  }
-  checkRange(range) {
-    if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < 0 || range.end < range.start || range.end > this.bytes.length) {
-      throw new SignalGrepError("Source byte range is outside the document");
-    }
-  }
-  #requireUtf8() {
-    if (!this.utf8) {
-      throw new SourceDocumentError("encoding", "Source is not losslessly representable as UTF-8");
-    }
-  }
-  #offsets() {
-    if (this.#byteOffsets)
-      return this.#byteOffsets;
-    const offsets = new Uint32Array(this.text.length + 1);
-    let character = 0;
-    let byte = 0;
-    for (const point of this.text) {
-      offsets[character] = byte;
-      if (point.length === 2)
-        offsets[character + 1] = byte;
-      character += point.length;
-      byte += Buffer.byteLength(point);
-    }
-    offsets[character] = byte;
-    this.#byteOffsets = offsets;
-    return offsets;
-  }
-}
-async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = MAX_SOURCE_FILE_BYTES) {
-  if (signal?.aborted)
-    throw abortError();
-  if (expected?.kind === "git") {
-    throw new SignalGrepError("A Git source reference cannot be read from the worktree");
-  }
-  const absolute = resolve12(cwd, path);
-  const [canonical, canonicalCwd] = await Promise.all([
-    new SearchPathPolicy(cwd).resolveExistingPath(absolute),
-    realpath4(cwd)
-  ]);
-  if (!canonical)
-    throw new SourceDocumentError("source-unavailable", "Source is unavailable");
-  const before = await getSourceRevision(absolute);
-  if (!before)
-    throw new SourceDocumentError("source-unavailable", "Source is unavailable");
-  if (expected && !sameSourceRevision(before, expected.revision)) {
-    throw new SourceDocumentError("source-changed", "Source changed; start a new inspection");
-  }
-  if (before.size > Math.min(MAX_SOURCE_FILE_BYTES, readBudget)) {
-    throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
-  }
-  if (signal?.aborted)
-    throw abortError();
-  const handle = await open3(canonical, "r");
-  let bytes;
-  try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile()) {
-      throw new SourceDocumentError("source-unavailable", "Source must be a regular file");
-    }
-    if (!sameSourceRevision(before, sourceRevisionFromStats(metadata))) {
-      throw new SourceDocumentError("source-changed", "Source was replaced before reading");
-    }
-    const buffer = Buffer.alloc(before.size);
-    let used = 0;
-    while (used < buffer.length) {
-      if (signal?.aborted)
-        throw abortError();
-      const read = await handle.read(buffer, used, buffer.length - used, used);
-      if (read.bytesRead === 0)
-        break;
-      used += read.bytesRead;
-    }
-    if (used !== before.size) {
-      throw new SourceDocumentError("source-changed", "Source changed during reading");
-    }
-    bytes = buffer.subarray(0, used);
-  } finally {
-    await handle.close();
-  }
-  const [after, finalPath] = await Promise.all([getSourceRevision(absolute), realpath4(absolute)]);
-  if (!after || canonical !== finalPath || !sameSourceRevision(before, after)) {
-    throw new SourceDocumentError("source-changed", "Source changed during reading");
-  }
-  if (signal?.aborted)
-    throw abortError();
-  const hash = contentHash(bytes);
-  if (expected && expected.contentHash !== hash) {
-    throw new SourceDocumentError("source-changed", "Source content changed; start a new inspection");
-  }
-  return new SourceDocument({
-    path: isPathInsideCwd(canonical, canonicalCwd) ? relative6(canonicalCwd, canonical).replaceAll("\\", "/") : canonical.replaceAll("\\", "/"),
-    origin: { kind: "worktree", revision: after, contentHash: hash }
-  }, bytes);
 }
 
 // src/source-access.ts
@@ -5516,10 +4606,10 @@ class SourceAccess {
   async load(path, expected) {
     if (this.signal?.aborted)
       throw abortError();
-    if (expected && resolve13(this.cwd, expected.path) !== resolve13(this.cwd, path)) {
+    if (expected && resolve11(this.cwd, expected.path) !== resolve11(this.cwd, path)) {
       throw new SignalGrepError("Source reference path does not match the requested file");
     }
-    const key = JSON.stringify([resolve13(this.cwd, path), expected?.origin]);
+    const key = JSON.stringify([resolve11(this.cwd, path), expected?.origin]);
     const existing = this.#documents.get(key);
     if (existing)
       return existing;
@@ -5551,7 +4641,7 @@ class SourceAccess {
     if (remaining <= 0)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     if (expected?.origin.kind !== "git") {
-      const metadata = await getSourceRevision(resolve13(this.cwd, path));
+      const metadata = await getSourceRevision(resolve11(this.cwd, path));
       if (metadata && metadata.size > remaining)
         throw new SourceBudgetError("Next source exceeds the remaining 32 MiB structural read budget");
     }
@@ -5806,10 +4896,10 @@ function passage(document, start) {
   };
 }
 async function similarities(query, passages, parent, onProgress) {
-  const worker = fileURLToPath3(new URL("./concept-worker.mjs", import.meta.url));
-  const config = fileURLToPath3(new URL("./syntax-worker.toml", import.meta.url));
+  const worker = fileURLToPath2(new URL("./concept-worker.mjs", import.meta.url));
+  const config = fileURLToPath2(new URL("./syntax-worker.toml", import.meta.url));
   const env = scriptRuntimeEnvironment();
-  const stagingRoot = join5(conceptCacheDirectory(), ".staging", randomUUID());
+  const stagingRoot = join4(conceptCacheDirectory(), ".staging", randomUUID());
   await mkdir2(stagingRoot, { recursive: true });
   let bytes = 0;
   let lineBuffer = "";
@@ -5827,7 +4917,7 @@ async function similarities(query, passages, parent, onProgress) {
         worker,
         "--infer"
       ] : [worker, "--infer"],
-      cwd: dirname4(worker),
+      cwd: dirname3(worker),
       env: { ...env, SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
       ...parent ? { signal: parent } : {},
       input: Buffer.from(JSON.stringify({
@@ -5850,7 +4940,7 @@ async function similarities(query, passages, parent, onProgress) {
           if (!line)
             continue;
           const parsed = JSON.parse(line);
-          if (!rpcRecord(parsed) || typeof parsed.type !== "string")
+          if (!isRecordValue(parsed) || typeof parsed.type !== "string")
             throw new SignalGrepError("Invalid concept worker progress response");
           if (parsed.type === "progress") {
             if (sawFinal)
@@ -5883,7 +4973,7 @@ async function similarities(query, passages, parent, onProgress) {
     lineBuffer += decoder.end();
     if (lineBuffer.trim()) {
       const parsed = JSON.parse(lineBuffer.trim());
-      if (!rpcRecord(parsed) || parsed.type !== "result")
+      if (!isRecordValue(parsed) || parsed.type !== "result")
         throw new SignalGrepError("Concept worker did not return a result record");
       if (sawFinal)
         throw new SignalGrepError("Concept worker emitted more than one result");
@@ -5891,7 +4981,7 @@ async function similarities(query, passages, parent, onProgress) {
       sawFinal = true;
     }
     const value = finalValue;
-    if (!rpcRecord(value) || !Array.isArray(value.scores) || value.scores.length !== passages.length || value.scores.some((score) => typeof score !== "number" || !Number.isFinite(score)) || typeof value.cacheHits !== "number" || !Number.isSafeInteger(value.cacheHits) || value.cacheHits < 0 || typeof value.cacheMisses !== "number" || !Number.isSafeInteger(value.cacheMisses) || value.cacheMisses < 0 || typeof value.cacheMaxBytes !== "number" || !Number.isSafeInteger(value.cacheMaxBytes) || value.cacheMaxBytes <= 0 || value.cacheBytes !== undefined && (typeof value.cacheBytes !== "number" || !Number.isSafeInteger(value.cacheBytes) || value.cacheBytes < 0) || typeof value.windowsRanked !== "number" || !Number.isSafeInteger(value.windowsRanked) || value.windowsRanked < passages.length || !Array.isArray(value.warnings) || value.warnings.some((warning) => typeof warning !== "string") || typeof value.peakRssBytes !== "number" || !Number.isFinite(value.peakRssBytes) || value.peakRssBytes < 0)
+    if (!isRecordValue(value) || !Array.isArray(value.scores) || value.scores.length !== passages.length || value.scores.some((score) => typeof score !== "number" || !Number.isFinite(score)) || typeof value.cacheHits !== "number" || !Number.isSafeInteger(value.cacheHits) || value.cacheHits < 0 || typeof value.cacheMisses !== "number" || !Number.isSafeInteger(value.cacheMisses) || value.cacheMisses < 0 || typeof value.cacheMaxBytes !== "number" || !Number.isSafeInteger(value.cacheMaxBytes) || value.cacheMaxBytes <= 0 || value.cacheBytes !== undefined && (typeof value.cacheBytes !== "number" || !Number.isSafeInteger(value.cacheBytes) || value.cacheBytes < 0) || typeof value.windowsRanked !== "number" || !Number.isSafeInteger(value.windowsRanked) || value.windowsRanked < passages.length || !Array.isArray(value.warnings) || value.warnings.some((warning) => typeof warning !== "string") || typeof value.peakRssBytes !== "number" || !Number.isFinite(value.peakRssBytes) || value.peakRssBytes < 0)
       throw new SignalGrepError("Invalid concept inference response");
     return {
       scores: value.scores.filter((score) => typeof score === "number"),
@@ -6156,7 +5246,7 @@ async function structuralSearch(input, access) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname9, extname as extname3, resolve as resolve37 } from "node:path";
+import { dirname as dirname4, extname as extname3, resolve as resolve20 } from "node:path";
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -6288,7 +5378,7 @@ class AnalysisStore {
       this.#rememberExpired(id);
     this.#items.clear();
   }
-  create(result, summarize, retentionPriority) {
+  create(result, summarize) {
     this.#expire();
     const bounded = {
       ...result,
@@ -6297,7 +5387,7 @@ class AnalysisStore {
       coverage: { ...result.coverage, retention: "complete" }
     };
     let bytes = Buffer.byteLength(JSON.stringify(bounded));
-    const candidates = result.items.map((item, index) => ({ item, index })).toSorted((left, right) => (retentionPriority?.(left.item) ?? 0) - (retentionPriority?.(right.item) ?? 0) || left.index - right.index);
+    const candidates = result.items.map((item, index) => ({ item, index }));
     const retainedIndices = [];
     const rebuildItems = () => {
       const retained = new Set(retainedIndices);
@@ -6473,7 +5563,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
       text,
       details: {
         version: 1,
-        mode: isSemanticMode(result.kind) || result.kind === "concept" || result.kind === "hybrid" || result.kind === "structure" || result.kind === "files" || result.kind === "outline" || result.kind === "imports" || result.kind === "tests" || result.kind === "impact" ? result.kind : "matches",
+        mode: result.kind === "concept" || result.kind === "hybrid" || result.kind === "structure" || result.kind === "files" || result.kind === "outline" || result.kind === "imports" || result.kind === "tests" ? result.kind : "matches",
         status: result.partial ? "partial" : "complete",
         snapshotComplete: !result.partial,
         totalMatches: result.items.length,
@@ -6502,10 +5592,8 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...result.coverage ? { coverage: result.coverage } : {},
           ...result.stats ? { stats: result.stats } : {},
           ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
-          ...result.relationship ? { relationship: result.relationship } : {},
           ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}
         },
-        ...result.relationship ? { relationship: result.relationship } : {},
         ...result.scope ? { scope: result.scope } : {},
         ...result.redact ? { redactionRequested: true } : {}
       }
@@ -6535,97 +5623,8 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
   }
 }
 
-// src/project-root.ts
-import { readdir, realpath as realpath5 } from "node:fs/promises";
-import { dirname as dirname5, relative as relative7, resolve as resolve14 } from "node:path";
-var TYPESCRIPT_CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/i;
-function isMissingPath(error) {
-  return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
-}
-async function projectConfig(directory, signal) {
-  if (signal?.aborted)
-    throw abortError();
-  try {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const files = entries.filter((entry) => entry.isFile() || entry.isSymbolicLink());
-    if (files.some((entry) => TYPESCRIPT_CONFIG_FILE.test(entry.name)))
-      return "typescript";
-    if (files.some((entry) => entry.name.toLowerCase() === "package.json"))
-      return "package";
-    return;
-  } catch (error) {
-    if (isMissingPath(error))
-      return;
-    throw error;
-  }
-}
-async function gitRootWithinCwd(cwd, gitRoot) {
-  const absoluteCwd = resolve14(cwd);
-  const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath5(absoluteCwd),
-    realpath5(gitRoot)
-  ]);
-  if (!isPathInsideCwd(canonicalRoot, canonicalCwd))
-    return;
-  return resolve14(absoluteCwd, relative7(canonicalCwd, canonicalRoot));
-}
-async function resolveSemanticProjectRoot(cwd, targetPath, signal) {
-  const absoluteCwd = resolve14(cwd);
-  const absoluteTarget = resolve14(absoluteCwd, targetPath);
-  if (!isPathInsideCwd(absoluteTarget, absoluteCwd))
-    return absoluteCwd;
-  const targetDirectory = dirname5(absoluteTarget);
-  const gitRoot = await findGitRepository(targetDirectory, signal);
-  if (gitRoot) {
-    const localGitRoot = await gitRootWithinCwd(absoluteCwd, gitRoot);
-    if (localGitRoot)
-      return localGitRoot;
-  }
-  let packageRoot;
-  let current = targetDirectory;
-  while (isPathInsideCwd(current, absoluteCwd)) {
-    const marker = await projectConfig(current, signal);
-    if (marker === "typescript")
-      return current;
-    if (marker === "package" && packageRoot === undefined)
-      packageRoot = current;
-    if (current === absoluteCwd)
-      break;
-    const parent = dirname5(current);
-    if (parent === current || !isPathInsideCwd(parent, absoluteCwd))
-      break;
-    current = parent;
-  }
-  return packageRoot ?? targetDirectory;
-}
-async function resolveRelationshipProjectRoot(cwd, targetPath, language, signal) {
-  const absoluteCwd = resolve14(cwd);
-  const absoluteTarget = resolve14(absoluteCwd, targetPath);
-  const markers = language === "go" ? new Set(["go.mod", "go.work"]) : new Set(["Package.swift"]);
-  let current = dirname5(absoluteTarget);
-  while (isPathInsideCwd(current, absoluteCwd)) {
-    if (signal?.aborted)
-      throw abortError();
-    try {
-      const entries = await readdir(current, { withFileTypes: true });
-      if (entries.some((entry) => markers.has(entry.name)))
-        return current;
-    } catch (error) {
-      if (!isMissingPath(error))
-        throw error;
-    }
-    if (current === absoluteCwd)
-      break;
-    const parent = dirname5(current);
-    if (parent === current || !isPathInsideCwd(parent, absoluteCwd))
-      break;
-    current = parent;
-  }
-  return dirname5(absoluteTarget);
-}
-
 // src/inspect.ts
-import { resolve as resolve15 } from "node:path";
+import { resolve as resolve12 } from "node:path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -6652,7 +5651,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SignalGrepError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve15(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve12(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -6674,7 +5673,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve16 } from "node:path";
+import { resolve as resolve13 } from "node:path";
 class CandidateLimit extends SignalGrepError {
 }
 function record2(value) {
@@ -6839,7 +5838,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve16(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve13(options.cwd, options.request.path), options.cwd)) {
     throw new SignalGrepError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -6896,8 +5895,8 @@ async function collectEvidenceCandidates(options) {
 
 // src/import-model.ts
 import { posix } from "node:path";
-import { realpath as realpath6 } from "node:fs/promises";
-import { relative as relative8, resolve as resolve17 } from "node:path";
+import { realpath as realpath4 } from "node:fs/promises";
+import { relative as relative7, resolve as resolve14 } from "node:path";
 class NavigationFailure extends Error {
   reason;
   constructor(reason) {
@@ -7271,14 +6270,14 @@ class NavigationContext {
       for (const reason of listed.reasons)
         this.reasons.add(reason);
     const paths = new Set;
-    const canonicalCwd = await realpath6(this.host.cwd).catch(() => {
+    const canonicalCwd = await realpath4(this.host.cwd).catch(() => {
       return;
     });
     const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map((path) => this.host.normalizePath?.(path) ?? navigationPath(path));
     const canonicalPaths = await Promise.all(normalizedPaths.map(async (normalized) => {
       try {
-        const target = await realpath6(resolve17(this.host.cwd, normalized));
-        const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative8(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
+        const target = await realpath4(resolve14(this.host.cwd, normalized));
+        const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative7(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
         return [normalized, canonical];
       } catch {
         return [normalized, normalized];
@@ -8234,315 +7233,6 @@ async function findRelatedTests(host, input, options = {}) {
   };
 }
 
-// src/impact-target.ts
-function lineBounds(document, symbol) {
-  const start = document.lineAt(document.toByteOffset(symbol.start));
-  const byteEnd = document.toByteOffset(symbol.end);
-  const end = document.lineAt(Math.max(document.toByteOffset(symbol.start), byteEnd - 1));
-  return { start, end };
-}
-function stableName(name) {
-  return name !== "default" && !name.startsWith("<anonymous");
-}
-var OVERLOAD_OWNERS = new Set([
-  "program",
-  "statement_block",
-  "class_body",
-  "interface_body",
-  "object"
-]);
-function overloadOwner(syntax, symbol) {
-  let current = symbol.node;
-  while (current !== null) {
-    const node = syntax.nodes[current];
-    if (!node)
-      return;
-    if (OVERLOAD_OWNERS.has(node.kind))
-      return current;
-    current = node.parent;
-  }
-  return;
-}
-function isOverloadSignature(implementation, candidate) {
-  if (candidate.hasBody)
-    return false;
-  if (implementation.kind === "function_declaration" || implementation.kind === "generator_function_declaration")
-    return candidate.kind === "function_signature";
-  if (implementation.kind === "method_definition" || implementation.kind === "method_declaration")
-    return candidate.kind === "method_signature";
-  return false;
-}
-function selectImpactTarget(document, syntax, input) {
-  if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-    throw new SignalGrepError("Impact target line must be a positive integer");
-  if (input.symbol !== undefined && !input.symbol.trim())
-    throw new SignalGrepError("Impact target symbol must be nonempty");
-  if (syntax.status !== "ok" || syntax.language !== "javascript" && syntax.language !== "typescript" && syntax.language !== "tsx")
-    throw new SignalGrepError(`Impact requires reliable JS/TS/TSX syntax (${syntax.language ?? "unsupported"}: ${syntax.status})`);
-  const candidates = syntax.symbols.filter((candidate) => {
-    if (input.symbol !== undefined && candidate.name !== input.symbol)
-      return false;
-    if (input.line === undefined)
-      return true;
-    const bounds = lineBounds(document, candidate);
-    return bounds.start <= input.line && input.line <= bounds.end;
-  });
-  let selected;
-  if (input.line !== undefined) {
-    const ordered = candidates.toSorted((left, right) => left.end - left.start - (right.end - right.start) || left.start - right.start);
-    selected = ordered[0];
-    if (selected && ordered[1] && ordered[1].end - ordered[1].start === selected.end - selected.start)
-      throw new SignalGrepError("Impact target is ambiguous at this line; include a unique symbol");
-  } else if (candidates.length === 1) {
-    selected = candidates[0];
-  } else if (candidates.length > 1) {
-    const implemented = candidates.filter((candidate) => candidate.hasBody);
-    const implementation = implemented[0];
-    const owner = implementation ? overloadOwner(syntax, implementation) : undefined;
-    if (implemented.length === 1 && implementation && owner !== undefined && candidates.every((candidate) => candidate === implementation || isOverloadSignature(implementation, candidate) && overloadOwner(syntax, candidate) === owner))
-      selected = implementation;
-  }
-  if (!selected)
-    throw new SignalGrepError(candidates.length > 1 ? "Impact target symbol is ambiguous; include its source line" : "Impact target does not identify a source symbol");
-  if (!stableName(selected.name))
-    throw new SignalGrepError("Impact target has no stable source binding name");
-  const range = {
-    start: document.toByteOffset(selected.start),
-    end: document.toByteOffset(selected.end)
-  };
-  const signatureEnd = selected.bodyStart ?? selected.end;
-  const signature = document.text.slice(selected.start, Math.min(signatureEnd, selected.start + 600));
-  return {
-    document,
-    symbol: selected,
-    item: {
-      path: document.path,
-      line: document.lineAt(range.start),
-      label: `Impact target: ${selected.scope ? `${selected.scope}.` : ""}${selected.name}`,
-      excerpt: signature,
-      source: document.reference,
-      range,
-      details: {
-        kind: "impact-target",
-        name: selected.name,
-        syntaxKind: selected.kind,
-        scope: selected.scope ?? "<module>",
-        hasBody: selected.hasBody,
-        exported: selected.exported,
-        signatureTruncated: signatureEnd - selected.start > 600
-      }
-    }
-  };
-}
-
-// src/evidence-ranking.ts
-function rankEvidence(items, priority) {
-  const tiers = new Map;
-  const ordered = items.toSorted((a, b) => priority(a) - priority(b) || a.path.localeCompare(b.path) || a.line - b.line || (a.range?.start ?? 0) - (b.range?.start ?? 0));
-  for (const item of ordered) {
-    const score = priority(item);
-    let files = tiers.get(score);
-    if (!files) {
-      files = new Map;
-      tiers.set(score, files);
-    }
-    let entries = files.get(item.path);
-    if (!entries) {
-      entries = [];
-      files.set(item.path, entries);
-    }
-    entries.push(item);
-  }
-  const result = [];
-  for (const files of tiers.values()) {
-    const groups = [...files.values()];
-    const depth = Math.max(0, ...groups.map((group) => group.length));
-    for (let index = 0;index < depth; index += 1)
-      for (const group of groups) {
-        const item = group[index];
-        if (item)
-          result.push({
-            ...item,
-            details: {
-              ...item.details,
-              rankingOrder: "evidence tier, then round-robin files, then source position"
-            }
-          });
-      }
-  }
-  return result;
-}
-
-// src/impact-analysis.ts
-var CATEGORY_ORDER = [
-  "declaration",
-  "import",
-  "export",
-  "call",
-  "code",
-  "comment",
-  "string",
-  "jsx-text",
-  "unknown",
-  "unclassified"
-];
-var TEST_ORDER = new Map([
-  ["test-use", 5],
-  ["test-case", 6],
-  ["test-relation", 7]
-]);
-function primaryCategory(roles) {
-  for (const category of CATEGORY_ORDER) {
-    if (category !== "unclassified" && roles.some((role) => role.role === category))
-      return category;
-  }
-  return "unknown";
-}
-function roleDetails(roles, document) {
-  return roles.map((role) => ({
-    role: role.role,
-    certainty: role.certainty,
-    subkind: role.subkind,
-    range: {
-      start: document.toByteOffset(role.start),
-      end: document.toByteOffset(role.end)
-    }
-  }));
-}
-function occurrenceItem(file, range, target, category, roles) {
-  const match = file.document.utf8 ? sourceEvidence(file.document, range) : undefined;
-  return {
-    path: file.document.path,
-    line: file.document.lineAt(range.start),
-    label: `Exact same-spelling candidate (${category}; binding unproven)`,
-    ...match ? { excerpt: match.excerpt } : {},
-    source: file.document.reference,
-    range,
-    details: {
-      kind: "impact-occurrence",
-      impactCategory: category,
-      binding: "unproven",
-      score: category === "call" || category === "declaration" ? 70 : category === "comment" || category === "string" ? 20 : 40,
-      rankingReason: `exact spelling with ${category} syntax; binding unproven`,
-      target: {
-        path: target.document.path,
-        name: target.symbol.name,
-        range: target.item.range
-      },
-      roles: roleDetails(roles, file.document),
-      ...match ? {
-        excerptRange: match.excerptRange,
-        excerptTruncated: match.excerptTruncated
-      } : {}
-    }
-  };
-}
-async function classifyImpactOccurrences(files, target, owner) {
-  const items = [];
-  const reasons = new Set;
-  const process2 = async (index) => {
-    const file = files[index];
-    if (!file)
-      return;
-    const language = syntaxLanguage(file.document.path);
-    let classified = false;
-    let syntax;
-    if (language && file.document.utf8) {
-      try {
-        syntax = await owner.syntax(file.document);
-        classified = syntax.status === "ok";
-        if (!classified)
-          reasons.add(`${file.document.path}: syntax ${syntax.status}; exact occurrences remain unclassified`);
-      } finally {
-        owner.releaseSyntax(file.document);
-      }
-    } else if (language) {
-      reasons.add(`${file.document.path}: syntax classification requires lossless UTF-8 source; exact occurrences remain unclassified`);
-    }
-    const seen = new Set;
-    for (const range of file.occurrences) {
-      const key = `${String(range.start)}:${String(range.end)}`;
-      if (seen.has(key))
-        continue;
-      seen.add(key);
-      const roles = classified && syntax ? classifySyntaxRange(syntax, file.document.toCharacterOffset(range.start), file.document.toCharacterOffset(range.end)) : [];
-      const category = classified ? primaryCategory(roles) : "unclassified";
-      items.push(occurrenceItem(file, range, target, category, roles));
-    }
-    await process2(index + 1);
-  };
-  await process2(0);
-  return { items, partial: reasons.size > 0, reasons: [...reasons] };
-}
-function itemOrder(item) {
-  if (item.details?.kind === "impact-target")
-    return -1;
-  if (item.details?.binding === "typescript-compiler")
-    return -0.5;
-  if (item.details?.kind === "impact-occurrence") {
-    const category = item.details.impactCategory;
-    const index = CATEGORY_ORDER.findIndex((value) => value === category);
-    if (index < 5)
-      return index;
-    return index + 3;
-  }
-  return TEST_ORDER.get(String(item.details?.kind)) ?? 13;
-}
-function mergeImpactItems(target, occurrences, tests) {
-  const stableTests = tests.map((item) => {
-    if (!item.details)
-      return item;
-    const details = { ...item.details };
-    if (details.kind === "test-use")
-      delete details.caseIndex;
-    if (details.kind === "test-case")
-      delete details.relationItems;
-    return { ...item, details };
-  });
-  return rankEvidence([target, ...occurrences, ...stableTests], itemOrder);
-}
-function impactRetentionPriority(item) {
-  return item.details?.kind === "impact-target" || item.details?.kind === "impact-occurrence" || item.details?.kind === "impact-reference" ? 0 : 1;
-}
-function impactRetentionExhausted(items) {
-  if (items.length >= MAX_ANALYSIS_RESULTS)
-    return true;
-  const bytes = items.reduce((total, item) => total + Buffer.byteLength(JSON.stringify(item)) + 1, 0);
-  return bytes >= MAX_ANALYSIS_STORAGE_BYTES - ANALYSIS_METADATA_RESERVE_BYTES;
-}
-function retainedImpactCounts(items) {
-  const counts = {
-    targets: 0,
-    compilerBoundReferences: 0,
-    additionalAliasReferences: 0,
-    retainedExactOccurrences: 0,
-    testUses: 0,
-    testCases: 0,
-    testRelations: 0
-  };
-  for (const item of items) {
-    const kind = item.details?.kind;
-    if (item.details?.binding === "typescript-compiler")
-      counts.compilerBoundReferences = (counts.compilerBoundReferences ?? 0) + 1;
-    if (kind === "impact-reference")
-      counts.additionalAliasReferences = (counts.additionalAliasReferences ?? 0) + 1;
-    if (kind === "impact-target")
-      counts.targets = (counts.targets ?? 0) + 1;
-    else if (kind === "impact-occurrence") {
-      counts.retainedExactOccurrences = (counts.retainedExactOccurrences ?? 0) + 1;
-      const category = item.details?.impactCategory;
-      if (typeof category === "string")
-        counts[category] = (counts[category] ?? 0) + 1;
-    } else if (kind === "test-use")
-      counts.testUses = (counts.testUses ?? 0) + 1;
-    else if (kind === "test-case")
-      counts.testCases = (counts.testCases ?? 0) + 1;
-    else if (kind === "test-relation")
-      counts.testRelations = (counts.testRelations ?? 0) + 1;
-  }
-  return { counts };
-}
-
 // src/literal-search.ts
 function escapeRegexLiteral(term) {
   return term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8654,10 +7344,10 @@ async function runOwnedParallel(start, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative9, resolve as resolve19, sep as sep4 } from "node:path";
+import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve16, sep as sep4 } from "node:path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve18 } from "node:path";
+import { resolve as resolve15 } from "node:path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -8668,7 +7358,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve18(cwd, path));
+      const revision = await getSourceRevision(resolve15(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -8729,9 +7419,9 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve19(cwd, root);
-  const absolutePath = resolve19(cwd, path);
-  const scoped = relative9(absoluteRoot, absolutePath).split(sep4).join("/");
+  const absoluteRoot = resolve16(cwd, root);
+  const absolutePath = resolve16(cwd, path);
+  const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
 async function discoverFiles(input, cwd, signal) {
@@ -8988,7 +7678,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve20 } from "node:path";
+import { resolve as resolve17 } from "node:path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -9057,7 +7747,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document.utf8 && structure && document.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve20(access.cwd, target.path),
+      absolutePath: resolve17(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document.reference.origin.revision
@@ -9275,7 +7965,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve20(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve17(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -9369,8 +8059,27 @@ async function continueSource(cursor, access, continuations) {
 }
 
 // src/evidence-validation.ts
-import { realpath as realpath7, stat as stat3 } from "node:fs/promises";
-import { resolve as resolve21 } from "node:path";
+import { realpath as realpath5, stat as stat3 } from "node:fs/promises";
+import { resolve as resolve18 } from "node:path";
+
+// src/evidence-validity.ts
+function aggregateEvidenceValidity(sources) {
+  if (sources.some((source) => source.status === "stale"))
+    return "stale";
+  if (sources.length === 0 || sources.some((source) => source.status === "unknown"))
+    return "unknown";
+  return "current";
+}
+function evidenceRecheck(sources, reasons = [], coverage = sources.length > 0 ? "complete" : "not-applicable") {
+  return {
+    validity: aggregateEvidenceValidity(sources),
+    coverage,
+    sources: [...sources],
+    reasons: [...new Set(reasons)]
+  };
+}
+
+// src/evidence-validation.ts
 function isAbort(error, signal) {
   return signal?.aborted === true || error instanceof Error && error.name === "AbortError";
 }
@@ -9384,14 +8093,14 @@ function policyFailure(error) {
   return error instanceof SignalGrepError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
 }
 async function confirmWorktreeState(path, cwd, signal) {
-  const absolute = resolve21(cwd, path);
+  const absolute = resolve18(cwd, path);
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
     const before = await stat3(absolute);
-    const beforeCanonical = await realpath7(absolute);
+    const beforeCanonical = await realpath5(absolute);
     const after = await stat3(absolute);
-    const afterCanonical = await realpath7(absolute);
+    const afterCanonical = await realpath5(absolute);
     if (!before.isFile() || !after.isFile()) {
       return { status: "stale", reason: "Source is no longer a regular file" };
     }
@@ -9526,7 +8235,7 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
   if (!target.revision)
     throw new Error("Snapshot validation target omitted its revision");
   try {
-    const absolute = resolve21(cwd, target.path);
+    const absolute = resolve18(cwd, target.path);
     const canonical = await policy.resolveExistingPath(absolute);
     if (!canonical) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
@@ -9535,7 +8244,7 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
     const before = await stat3(absolute);
     const beforeCanonical = canonical;
     const after = await stat3(absolute);
-    const afterCanonical = await realpath7(absolute);
+    const afterCanonical = await realpath5(absolute);
     if (!before.isFile() || !after.isFile()) {
       return {
         path: target.path,
@@ -9618,14 +8327,14 @@ function evidenceScope(cwd, scope, request) {
   const exclude = scope?.exclude ?? request?.exclude;
   const hidden = scope?.hidden ?? request?.hidden;
   return {
-    root: resolve21(cwd, path),
+    root: resolve18(cwd, path),
     ...include && include.length > 0 ? { include: [...include] } : {},
     ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
     ...hidden === undefined ? {} : { hidden }
   };
 }
 async function validateSavedEvidence(options) {
-  let scope = { root: resolve21(options.cwd) };
+  let scope = { root: resolve18(options.cwd) };
   const reasons = [];
   let storedPartial = false;
   let targets;
@@ -9698,7 +8407,7 @@ async function validateSavedEvidence(options) {
     reasons.push("No retained source evidence could be validated");
   const uniqueReasons = [...new Set(reasons)];
   const coverage = storedPartial || sources.length === 0 || sources.some((source) => source.status === "unknown") ? "partial" : "complete";
-  const recheck = relationshipRecheck(sources, [], [], uniqueReasons, coverage);
+  const recheck = evidenceRecheck(sources, uniqueReasons, coverage);
   return {
     scope,
     sources,
@@ -10190,7 +8899,7 @@ function parsePythonOutline(document) {
 }
 
 // src/hybrid-search.ts
-import { resolve as resolve22 } from "node:path";
+import { resolve as resolve19 } from "node:path";
 class HybridSourceChangedError extends ConceptSourceChangedError {
   constructor(message = "Hybrid source changed while exact and concept evidence were being merged") {
     super(message);
@@ -10250,12 +8959,12 @@ function absoluteOccurrenceRanges(document, line, match) {
 async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
-  const generatedDocuments = new Map(generation.documents.map((document) => [resolve22(access.cwd, document.path), document]));
+  const generatedDocuments = new Map(generation.documents.map((document) => [resolve19(access.cwd, document.path), document]));
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const generated = generatedDocuments.get(resolve22(access.cwd, match.absolutePath));
+      const generated = generatedDocuments.get(resolve19(access.cwd, match.absolutePath));
       const document = generated ?? await access.load(match.absolutePath);
       const expected = scan.sourceRevisions.get(match.absolutePath);
       if (!expected) {
@@ -10422,13 +9131,12 @@ function retainedHybridCounts(original, items) {
   return { ...original, literalItemsRetained, conceptItemsRetained };
 }
 
-// src/relationship-output.ts
-import { createHash as createHash4 } from "node:crypto";
+// src/validation-output.ts
 function sourceItem(status, index) {
   return {
     path: status.path,
-    line: index + 1,
-    label: `${status.role} source ${status.status}`,
+    line: 1,
+    label: `source ${status.status}`,
     details: {
       role: status.role,
       status: status.status,
@@ -10451,109 +9159,7 @@ function publicSourceStatus(status) {
 function sourceStatusRank(status) {
   return status === "stale" ? 0 : status === "unknown" ? 1 : 2;
 }
-function dependencyKey(dependency) {
-  return JSON.stringify([
-    dependency.path,
-    dependency.role,
-    dependency.fingerprint ?? null,
-    dependency.exists ?? null,
-    dependency.reason ?? null
-  ]);
-}
-function publicEdgeKey(edge) {
-  return createHash4("sha256").update(edge.edgeKey).digest("hex").slice(0, 20);
-}
-function publicNodeKey(node) {
-  return createHash4("sha256").update(JSON.stringify(node.identity)).digest("hex").slice(0, 20);
-}
-function displayName(value) {
-  const limit = 96;
-  if (value.length <= limit)
-    return { value, truncated: false };
-  return { value: `${value.slice(0, limit - 1)}…`, truncated: true };
-}
-function dependencyTable(edges) {
-  const ids = new Map;
-  const table = [];
-  for (const dependency of edges.flatMap((edge) => edge.dependencies).filter((item) => item.role !== "source")) {
-    const key = dependencyKey(dependency);
-    if (ids.has(key))
-      continue;
-    const id = table.length;
-    ids.set(key, id);
-    table.push({
-      id,
-      path: dependency.path,
-      role: dependency.role,
-      ...dependency.fingerprint ? { fingerprint: dependency.fingerprint } : {},
-      ...dependency.exists === undefined ? {} : { exists: dependency.exists },
-      ...dependency.reason ? { reason: dependency.reason } : {}
-    });
-  }
-  return { table, ids };
-}
-function evidenceKey(evidence) {
-  return JSON.stringify([
-    evidence.reason,
-    evidence.level,
-    evidence.basis,
-    evidence.providerBasis ?? null
-  ]);
-}
-var MAX_PUBLIC_CHANGE_HINT_BYTES = 4096;
-var MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES = 2048;
-function evidenceTable(edges) {
-  const ids = new Map;
-  const table = [];
-  for (const evidence of edges.flatMap((edge) => edge.evidence)) {
-    const key = evidenceKey(evidence);
-    if (ids.has(key))
-      continue;
-    const id = table.length;
-    ids.set(key, id);
-    table.push({
-      id,
-      reason: evidence.reason,
-      level: evidence.level,
-      basis: evidence.basis,
-      ...evidence.providerBasis ? { providerBasis: evidence.providerBasis } : {}
-    });
-  }
-  return { table, ids };
-}
-function edgeItem(edge, index, dependencyIds, evidenceIds) {
-  const nodeSummary = (node) => ({
-    key: publicNodeKey(node),
-    name: displayName(node.name).value,
-    ...displayName(node.name).truncated ? { nameTruncated: true } : {}
-  });
-  const fromName = displayName(edge.from.name);
-  const toName = displayName(edge.to.name);
-  return {
-    path: edge.to.path,
-    line: edge.to.start.line,
-    label: `${edge.operation}: ${fromName.value} → ${toName.value}`,
-    range: edge.to.range,
-    index,
-    details: {
-      edgeKey: publicEdgeKey(edge),
-      operation: edge.operation,
-      from: nodeSummary(edge.from),
-      to: nodeSummary(edge.to),
-      ...edge.callSite ? {
-        callSite: {
-          path: edge.callSite.path,
-          line: edge.callSite.start.line
-        }
-      } : {},
-      evidence: edge.evidence.map((evidence) => evidenceIds.get(evidenceKey(evidence)) ?? -1),
-      confidence: edge.confidence,
-      dependencies: edge.dependencies.filter((dependency) => dependency.role !== "source").map((dependency) => dependencyIds.get(dependencyKey(dependency)) ?? -1),
-      index
-    }
-  };
-}
-function publicRelationshipDetails(scope, sources, values) {
+function publicValidationDetails(scope, sources, values) {
   const ordered = [...sources].toSorted((left, right) => {
     return sourceStatusRank(left.status) - sourceStatusRank(right.status) || left.path.localeCompare(right.path);
   });
@@ -10576,47 +9182,6 @@ function publicRelationshipDetails(scope, sources, values) {
     ...values
   };
 }
-function publicChangeHints(hints) {
-  if (hints.length === 0)
-    return { items: undefined, omitted: 0 };
-  const candidates = hints.toSorted((left, right) => left.observedAt - right.observedAt).slice(-32);
-  const visible = [];
-  let bytes = 2;
-  for (let index = candidates.length - 1;index >= 0; index -= 1) {
-    const hint = candidates[index];
-    if (!hint)
-      continue;
-    const value = {
-      path: hint.path,
-      role: hint.role,
-      observedAt: hint.observedAt
-    };
-    if (hint.reason)
-      value.reason = hint.reason;
-    const valueBytes = Buffer.byteLength(JSON.stringify(value));
-    if (valueBytes > MAX_PUBLIC_CHANGE_HINT_ITEM_BYTES || bytes + valueBytes > MAX_PUBLIC_CHANGE_HINT_BYTES)
-      continue;
-    visible.push(value);
-    bytes += valueBytes;
-  }
-  return {
-    items: visible.length > 0 ? visible.toReversed() : undefined,
-    omitted: hints.length - visible.length
-  };
-}
-function changeHintText(hints) {
-  if (hints.length === 0)
-    return "";
-  const visible = hints.slice(-4).map((hint) => `${hint.role} ${displayName(hint.path).value}`).join(", ");
-  const suffix = hints.length > 4 ? `; ${String(hints.length - 4)} more retained` : "";
-  return ` Change hints: ${visible}${suffix}.`;
-}
-function watchHealthText(health) {
-  if (!health)
-    return "";
-  const reasons = health.reasons.length ? ` ${health.reasons.slice(0, 2).join(" ")}` : "";
-  return ` Watch health: ${health.status}; ${String(health.retainedHints)} hint(s) retained, ${String(health.droppedHints)} dropped.${reasons}`;
-}
 function base(mode, status, total, files, returned = total) {
   return {
     version: 1,
@@ -10629,4842 +9194,45 @@ function base(mode, status, total, files, returned = total) {
     snapshotComplete: status === "complete"
   };
 }
-function traceResult(stored, page, scope, input, changeHints = [], watchHealth) {
-  const state = stored.state;
-  const paths = new Set(state.edges.flatMap((edge) => [edge.from.path, edge.to.path]));
-  const dependencies = dependencyTable(page.items);
-  const evidence = evidenceTable(page.items);
-  const hintProjection = publicChangeHints(changeHints);
-  const relationship = publicRelationshipDetails(scope, state.coverage.sources, {
-    operation: state.operation,
-    ...state.nodes[0] ? {
-      providerId: state.nodes[0].identity.providerId,
-      analysisViewId: state.nodes[0].identity.analysisViewId
-    } : {},
-    freshness: state.coverage.freshness,
-    coverage: state.coverage.status,
-    comparisonTarget: "current-worktree",
-    truncation: { truncated: state.truncated, reasons: state.reasons },
-    depth: state.budget.maxDepth,
-    depthReached: state.depthReached,
-    expansions: state.expansions,
-    dependencyTable: dependencies.table,
-    evidenceTable: evidence.table,
-    ...hintProjection.items ? { changeHints: hintProjection.items } : {},
-    ...hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {},
-    ...watchHealth ? { watchHealth } : {}
-  });
-  const status = state.status === "complete" && state.coverage.freshness === "current" ? "complete" : "partial";
-  const details = base("trace", status, page.totalItems, paths.size, page.items.length);
-  const analysis = {
-    kind: "trace",
-    unit: "relationships",
-    totalItems: page.totalItems,
-    returnedItems: page.items.length,
-    items: page.items.map((edge, index) => edgeItem(edge, page.offset + index + 1, dependencies.ids, evidence.ids)),
-    reasons: [...state.reasons],
-    relationship
-  };
-  const pageRequest = page.nextCursor ? { mode: "trace", cursor: page.nextCursor } : undefined;
-  const exploreRequest = stored.exploreCursor ? { mode: "trace", exploreCursor: stored.exploreCursor } : undefined;
-  const nextRequest = pageRequest ?? (page.totalItems <= page.items.length ? exploreRequest : undefined);
-  const visibleSources = [...relationship.checked, ...relationship.unchecked];
-  const sourceText = visibleSources.length ? ` Sources: ${visibleSources.map((source) => `${source.status} ${source.path}`).join(", ")}${relationship.sourceOmitted ? `; ${String(relationship.sourceOmitted)} source(s) omitted from this page` : ""}.` : " Sources: none recorded (freshness is unknown until evidence is checked).";
-  const edgeText = page.items.length ? ` Edges: ${page.items.map((edge, index) => `${String(page.offset + index + 1)}. ${displayName(edge.from.name).value} → ${displayName(edge.to.name).value} (${edge.to.path}:${String(edge.to.start.line)})`).join("; ")}.` : " Edges: none retained on this page.";
-  const reasonText = state.reasons.length ? ` ${state.reasons.join(" ")}` : "";
-  const requestText = nextRequest ? ` Next request: ${JSON.stringify(nextRequest)}` : exploreRequest ? ` Explore request: ${JSON.stringify(exploreRequest)}` : "";
-  const text = `Static ${state.operation} trace retained ${String(page.totalItems)} relationship(s); returned ${String(page.items.length)} on this page; depth ${String(state.depthReached)}/${String(state.budget.maxDepth)}.${edgeText}${sourceText}${reasonText}${changeHintText(changeHints)}${watchHealthText(watchHealth)}${requestText}`;
-  return {
-    text,
-    details: {
-      ...details,
-      cursor: stored.cursor,
-      ...nextRequest ? { nextRequest } : {},
-      ...exploreRequest ? { exploreRequest } : {},
-      analysis,
-      relationship,
-      ...stored.exploreCursor ? { exploreCursor: stored.exploreCursor } : {}
-    }
-  };
-}
-function validationResult(state, cursor, recheck, checkInterval, comparisonTarget, changeHints = [], watchHealth) {
-  const status = state.status === "partial" || recheck.validity !== "current" ? "partial" : "complete";
-  const coverage = state.coverage.status === "partial" || recheck.coverage === "partial" ? "partial" : recheck.coverage;
+function validationResult(state, cursor, checkInterval) {
+  const { recheck, comparisonTarget, coverage } = state;
+  const status = state.storedPartial || coverage === "partial" || recheck.validity !== "current" ? "partial" : "complete";
   const reasons = [...new Set([...state.reasons ?? [], ...recheck.reasons])];
-  const hintProjection = publicChangeHints(changeHints);
-  const relationship = publicRelationshipDetails(state.scope, recheck.sources, {
+  const validation = publicValidationDetails(state.scope, recheck.sources, {
     comparisonTarget,
     freshness: recheck.validity,
     coverage,
-    truncation: { truncated: state.truncated ?? false, reasons },
-    affectedNodeKeys: recheck.affectedNodeKeys,
-    affectedEdgeKeys: (state.edges ?? []).filter((edge) => recheck.affectedEdgeKeys.includes(edge.edgeKey)).map(publicEdgeKey),
-    checkInterval,
-    ...hintProjection.items ? { changeHints: hintProjection.items } : {},
-    ...hintProjection.omitted > 0 ? { changeHintOmitted: hintProjection.omitted } : {},
-    ...watchHealth ? { watchHealth } : {}
+    truncation: { truncated: state.storedPartial, reasons },
+    checkInterval
   });
   const analysis = {
     kind: "validate",
     unit: "evidence-items",
     totalItems: recheck.sources.length,
-    returnedItems: relationship.checked.length + relationship.unchecked.length,
-    items: [...relationship.checked, ...relationship.unchecked].map((source, index) => Object.assign(sourceItem(source, index), { index })),
+    returnedItems: validation.checked.length + validation.unchecked.length,
+    items: [...validation.checked, ...validation.unchecked].map((source, index) => Object.assign(sourceItem(source, index + 1), { index: index + 1 })),
     reasons,
-    relationship
+    validation
   };
   const details = {
-    ...base("validate", status, relationship.checked.length + relationship.unchecked.length, new Set(recheck.sources.map((source) => source.path)).size, recheck.sources.length),
+    ...base("validate", status, recheck.sources.length, new Set(recheck.sources.map((source) => source.path)).size, validation.checked.length + validation.unchecked.length),
     cursor,
     analysis,
-    relationship
+    validation
   };
+  const sourceRows = [...validation.checked, ...validation.unchecked].map((source, index) => `#${String(index + 1)} ${JSON.stringify(source.path)}: ${source.status}${source.reason ? ` (${source.reason})` : ""}`);
   return {
-    text: `Relationship validation is ${recheck.validity}; checked ${String(relationship.checked.length)} source(s), ${String(relationship.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}.${relationship.sourceOmitted ? ` ${String(relationship.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${changeHintText(changeHints)}${watchHealthText(watchHealth)}`,
+    text: `Evidence validation is ${recheck.validity}; checked ${String(validation.checked.length)} source(s), ${String(validation.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}.${validation.sourceOmitted ? ` ${String(validation.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${sourceRows.length ? `
+${sourceRows.join(`
+`)}` : ""}`,
     details
   };
 }
 
-// src/relationship-service.ts
-import { resolve as resolve34 } from "node:path";
-
-// src/change-awareness.ts
-import { statSync, watch } from "node:fs";
-import { dirname as dirname6, relative as relative10, resolve as resolve23 } from "node:path";
-var DEFAULT_MAX_SOURCES = 1024;
-var DEFAULT_MAX_HINTS = 1024;
-var MAX_HEALTH_REASONS = 32;
-function errorCode(error) {
-  if (error === null || typeof error !== "object" || !("code" in error))
-    return;
-  const code = error.code;
-  return typeof code === "string" ? code : undefined;
-}
-function watcherFailureReason(error, recursive) {
-  const code = errorCode(error);
-  return `${recursive ? "recursive " : ""}filesystem watcher failed${code === undefined ? "" : ` (${code})`}`;
-}
-function sourceUnavailableReason(error) {
-  const code = errorCode(error);
-  return `relationship watcher source is unavailable${code === undefined ? "" : ` (${code})`}`;
-}
-function isInsideOrEqual(root, candidate) {
-  const value = relative10(root, candidate);
-  const separator = process.platform === "win32" ? "\\" : "/";
-  return value === "" || value !== ".." && !value.startsWith(`..${separator}`);
-}
-function isRecursiveUnsupported(error) {
-  return errorCode(error) === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
-}
-
-class RelationshipChangeAwareness {
-  #dirty = new Map;
-  #listeners = new Set;
-  #groups = new Map;
-  #subscriptions = new Map;
-  #healthReasons = new Set;
-  #maxSources = DEFAULT_MAX_SOURCES;
-  #maxHints = DEFAULT_MAX_HINTS;
-  #nextToken = 0;
-  #droppedHints = 0;
-  #watcherErrors = 0;
-  #partialStarts = 0;
-  #closed = false;
-  markDirty(path, role = "source", reason, observedAt = Date.now()) {
-    const hint = {
-      path,
-      role,
-      observedAt,
-      ...reason === undefined ? {} : { reason }
-    };
-    this.#dirty.set(resolve23(path), { ...hint, path: resolve23(path) });
-    this.#trimHints();
-    for (const listener of this.#listeners) {
-      try {
-        listener(hint);
-      } catch {
-        this.#rememberHealthReason("change listener failed");
-      }
-    }
-    return hint;
-  }
-  start(paths, options = {}) {
-    if (this.#closed)
-      throw new Error("Relationship watcher is closed");
-    const requestedMaxSources = options.maxSources ?? this.#maxSources;
-    if (!Number.isSafeInteger(requestedMaxSources) || requestedMaxSources < 1)
-      throw new Error("Relationship watcher source limit must be a positive integer");
-    const requestedMaxHints = options.maxHints ?? this.#maxHints;
-    if (!Number.isSafeInteger(requestedMaxHints) || requestedMaxHints < 1)
-      throw new Error("Relationship watcher hint limit must be a positive integer");
-    if (requestedMaxSources < this.#subscriptions.size)
-      throw new Error(`Relationship watcher source limit is below active subscriptions (${String(this.#subscriptions.size)})`);
-    this.#maxSources = Math.min(this.#maxSources, requestedMaxSources);
-    const uniquePaths = new Set(paths.map((path) => resolve23(path)));
-    if (this.#subscriptions.size + uniquePaths.size > this.#maxSources)
-      throw new Error(`Relationship watcher source limit exceeded (${String(this.#maxSources)})`);
-    this.#maxHints = Math.min(this.#maxHints, requestedMaxHints);
-    this.#trimHints();
-    const recursive = options.recursive ?? false;
-    const role = options.role ?? "source";
-    const tokens = [];
-    try {
-      for (const path of uniquePaths)
-        tokens.push(this.#addSubscription(path, role, recursive));
-    } catch (error) {
-      this.#partialStarts += 1;
-      this.#rememberHealthReason("watcher start was rolled back after a resource failure");
-      const cleanupErrors = [];
-      for (const token of tokens.toReversed()) {
-        try {
-          this.#releaseToken(token);
-        } catch (cleanupError) {
-          cleanupErrors.push(cleanupError);
-        }
-      }
-      if (cleanupErrors.length)
-        throw new AggregateError([error, ...cleanupErrors], "Relationship watcher start failed and cleanup was incomplete", { cause: error });
-      throw error;
-    }
-    let stopped = false;
-    return () => {
-      if (stopped)
-        return;
-      stopped = true;
-      const errors = [];
-      for (const token of tokens) {
-        try {
-          this.#releaseToken(token);
-        } catch (error) {
-          errors.push(error);
-        }
-      }
-      if (errors.length)
-        throw new AggregateError(errors, "Relationship watcher stop failed");
-    };
-  }
-  stop(path) {
-    const tokenList = path === undefined ? [...this.#subscriptions.keys()] : (() => {
-      const token = [...this.#subscriptions.values()].find((subscription) => subscription.path === resolve23(path))?.token;
-      return token === undefined ? [] : [token];
-    })();
-    const errors = [];
-    for (const token of tokenList) {
-      try {
-        this.#releaseToken(token);
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    if (errors.length)
-      throw new AggregateError(errors, "Relationship watcher stop failed");
-  }
-  close() {
-    let failure;
-    try {
-      this.stop();
-    } catch (error) {
-      failure = error;
-    } finally {
-      this.#listeners.clear();
-      this.#dirty.clear();
-      this.#closed = true;
-    }
-    if (failure)
-      throw failure;
-  }
-  subscribe(listener) {
-    if (this.#closed)
-      throw new Error("Relationship watcher is closed");
-    this.#listeners.add(listener);
-    let subscribed = true;
-    return () => {
-      if (!subscribed)
-        return;
-      subscribed = false;
-      this.#listeners.delete(listener);
-    };
-  }
-  dirty(path) {
-    if (path !== undefined) {
-      const hint = this.#dirty.get(resolve23(path));
-      return hint === undefined ? [] : [hint];
-    }
-    return [...this.#dirty.values()];
-  }
-  clear(path) {
-    if (path === undefined)
-      this.#dirty.clear();
-    else
-      this.#dirty.delete(resolve23(path));
-  }
-  clearAll() {
-    this.#dirty.clear();
-  }
-  health() {
-    const reasons = [...this.#healthReasons];
-    const status = this.#closed ? "closed" : reasons.length ? "degraded" : this.#subscriptions.size ? "healthy" : "unknown";
-    return {
-      status,
-      activeSources: this.#subscriptions.size,
-      activeWatchers: [...this.#groups.values()].filter((group) => group.watcher !== undefined).length,
-      maxSources: this.#maxSources,
-      retainedHints: this.#dirty.size,
-      maxHints: this.#maxHints,
-      overflowed: this.#droppedHints > 0,
-      droppedHints: this.#droppedHints,
-      watcherErrors: this.#watcherErrors,
-      partialStarts: this.#partialStarts,
-      reasons
-    };
-  }
-  #rememberHealthReason(reason) {
-    if (this.#healthReasons.size < MAX_HEALTH_REASONS)
-      this.#healthReasons.add(reason);
-    else
-      this.#healthReasons.add("additional watcher health issues occurred");
-  }
-  #trimHints() {
-    while (this.#dirty.size > this.#maxHints) {
-      const oldest = this.#dirty.keys().next().value;
-      if (oldest === undefined)
-        break;
-      this.#dirty.delete(oldest);
-      this.#droppedHints += 1;
-      this.#rememberHealthReason("dirty hint retention overflow");
-    }
-  }
-  #addSubscription(path, role, recursive) {
-    let sourceStats;
-    try {
-      sourceStats = statSync(path, { throwIfNoEntry: false });
-    } catch (error) {
-      throw new Error(sourceUnavailableReason(error), { cause: error });
-    }
-    const parent = dirname6(path);
-    let parentStats;
-    try {
-      parentStats = statSync(parent, { throwIfNoEntry: false });
-    } catch (error) {
-      throw new Error(sourceUnavailableReason(error), { cause: error });
-    }
-    if (!parentStats?.isDirectory())
-      throw new Error(sourceUnavailableReason(new Error("parent directory is unavailable")));
-    if (!sourceStats && recursive)
-      this.#rememberHealthReason("recursive source is absent; only parent replacement events are watched");
-    const specs = sourceStats?.isDirectory() && recursive ? [{ root: path, recursive: true }] : [{ root: parent, recursive: false }];
-    const groupKeys = [];
-    const createdGroups = [];
-    try {
-      for (const spec of specs) {
-        const key = `${spec.root}\x00${spec.recursive ? "recursive" : "direct"}`;
-        let group = this.#groups.get(key);
-        if (!group) {
-          group = {
-            key,
-            root: spec.root,
-            recursive: spec.recursive,
-            subscriptions: new Map,
-            watchRecursive: spec.recursive,
-            watcher: undefined
-          };
-          this.#groups.set(key, group);
-          createdGroups.push(group);
-        }
-        if (!group.watcher)
-          group.watcher = this.#openWatcher(group);
-        groupKeys.push(key);
-      }
-    } catch (error) {
-      for (const group of createdGroups) {
-        if (group.subscriptions.size !== 0)
-          continue;
-        this.#groups.delete(group.key);
-        group.watcher?.close();
-        group.watcher = undefined;
-      }
-      throw new Error(sourceUnavailableReason(error), { cause: error });
-    }
-    const token = ++this.#nextToken;
-    const subscription = {
-      token,
-      path,
-      role,
-      directory: sourceStats?.isDirectory() ?? recursive,
-      recursive,
-      groupKeys
-    };
-    for (const key of groupKeys) {
-      const group = this.#groups.get(key);
-      if (!group)
-        throw new Error("Relationship watcher group was not created");
-      group.subscriptions.set(token, subscription);
-    }
-    this.#subscriptions.set(token, subscription);
-    return token;
-  }
-  #openWatcher(group) {
-    const onChange = (_event, name) => {
-      const changed = name === null ? undefined : resolve23(group.root, typeof name === "string" ? name : name.toString());
-      for (const subscription of group.subscriptions.values()) {
-        if (changed === undefined) {
-          this.markDirty(subscription.path, subscription.role, "filesystem change");
-        } else if (changed === subscription.path || group.watchRecursive && subscription.directory && subscription.recursive && isInsideOrEqual(subscription.path, changed)) {
-          this.markDirty(changed, subscription.role, "filesystem change");
-          if (changed === subscription.path && subscription.directory && subscription.recursive)
-            this.#refreshDirectoryGroup(subscription);
-        }
-      }
-    };
-    let watcher;
-    try {
-      watcher = watch(group.root, { recursive: group.recursive }, onChange);
-      group.watchRecursive = group.recursive;
-    } catch (error) {
-      if (!group.recursive || !isRecursiveUnsupported(error))
-        throw error;
-      this.#rememberHealthReason(watcherFailureReason(error, true));
-      watcher = watch(group.root, { recursive: false }, onChange);
-      group.watchRecursive = false;
-    }
-    watcher.on("error", (error) => {
-      this.#watcherErrors += 1;
-      this.#rememberHealthReason(watcherFailureReason(error, group.recursive));
-      if (group.watcher !== watcher)
-        return;
-      group.watcher = undefined;
-      try {
-        watcher.close();
-      } catch {
-        this.#rememberHealthReason("filesystem watcher close failed");
-      }
-    });
-    watcher.on("close", () => {
-      if (group.watcher !== watcher)
-        return;
-      group.watcher = undefined;
-      if (group.subscriptions.size)
-        this.#rememberHealthReason("filesystem watcher closed while subscriptions remained");
-    });
-    return watcher;
-  }
-  #refreshDirectoryGroup(subscription) {
-    const key = subscription.groupKeys.find((groupKey) => this.#groups.get(groupKey)?.recursive);
-    if (key === undefined)
-      return;
-    const group = this.#groups.get(key);
-    if (!group || group.watcher)
-      return;
-    let stats;
-    try {
-      stats = statSync(subscription.path, { throwIfNoEntry: false });
-    } catch {
-      this.#rememberHealthReason("directory watcher refresh could not inspect the source");
-      return;
-    }
-    if (!stats?.isDirectory())
-      return;
-    try {
-      group.watcher = this.#openWatcher(group);
-    } catch (error) {
-      this.#rememberHealthReason(watcherFailureReason(error, true));
-    }
-  }
-  #releaseToken(token) {
-    const subscription = this.#subscriptions.get(token);
-    if (!subscription)
-      return;
-    this.#subscriptions.delete(token);
-    for (const groupKey of subscription.groupKeys) {
-      const group = this.#groups.get(groupKey);
-      if (!group)
-        continue;
-      group.subscriptions.delete(token);
-      if (group.subscriptions.size !== 0)
-        continue;
-      this.#groups.delete(group.key);
-      const watcher = group.watcher;
-      group.watcher = undefined;
-      watcher?.close();
-    }
-  }
-}
-
-// src/relationship-store.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
-var PAGE_SIZE = 30;
-var DEFAULT_TTL_MS = 60000;
-var DEFAULT_MAX_ENTRIES = 32;
-var DEFAULT_MAX_STATES = 128;
-var DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
-
-class RelationshipChangedError extends SignalGrepError {
-  validity;
-  constructor(validity, message) {
-    super(message);
-    this.name = "RelationshipChangedError";
-    this.validity = validity;
-  }
-}
-function cursorParts(cursor) {
-  const match = /^relationship\.([a-f0-9-]+)\.(page|explore)\.([0-9a-z]+)\.([0-9a-z]+)$/.exec(cursor);
-  if (!match)
-    throw new SignalGrepError("Invalid relationship cursor");
-  const version = Number.parseInt(match[3] ?? "", 36);
-  const offset = Number.parseInt(match[4] ?? "", 36);
-  if (!Number.isSafeInteger(version) || version < 0 || version.toString(36) !== match[3] || !Number.isSafeInteger(offset) || offset < 0 || offset.toString(36) !== match[4])
-    throw new SignalGrepError("Invalid relationship cursor offset");
-  const kind = match[2];
-  if (kind !== "page" && kind !== "explore")
-    throw new SignalGrepError("Invalid relationship cursor kind");
-  return { id: match[1] ?? "", kind, version, offset };
-}
-function pageCursor(id, version, offset) {
-  return `relationship.${id}.page.${version.toString(36)}.${offset.toString(36)}`;
-}
-function exploreCursor(id, version) {
-  return `relationship.${id}.explore.${version.toString(36)}.0`;
-}
-function referenceKey(value) {
-  return JSON.stringify(value);
-}
-function compareCaptured(captured, current) {
-  const actual = new Map(current.sources.map((source) => [`${source.role}:${source.path}`, source]));
-  const statuses = [...captured.coverage.sources].map((expected) => {
-    const found = actual.get(`${expected.role}:${expected.path}`);
-    if (!found) {
-      const wasPresent = expected.expected !== undefined || expected.current !== undefined;
-      return Object.assign({}, expected, {
-        status: wasPresent ? "stale" : "unknown",
-        reason: wasPresent ? "Captured dependency is no longer present" : "Dependency could not be rechecked"
-      });
-    }
-    const expectedReference = expected.expected ?? expected.current;
-    const currentReference = found.current ?? found.expected;
-    if (expectedReference && currentReference && referenceKey(expectedReference) !== referenceKey(currentReference))
-      return Object.assign({}, found, {
-        status: "stale",
-        expected: expectedReference,
-        reason: "Captured dependency revision changed"
-      });
-    return found;
-  });
-  const reasons = [
-    ...new Set([
-      ...current.reasons,
-      ...statuses.filter((source) => source.reason).map((source) => `${source.path}: ${source.reason}`)
-    ])
-  ];
-  return relationshipRecheck(statuses, current.affectedNodeKeys, current.affectedEdgeKeys, reasons, aggregateRelationshipValidity(statuses) === "current" ? current.coverage : "partial");
-}
-function rootViewId(request) {
-  const root = request.root ? "identity" in request.root ? request.root : request.root.node : undefined;
-  return root?.identity.analysisViewId;
-}
-
-class RelationshipStore {
-  #entries = new Map;
-  #locks = new Map;
-  #active = new Set;
-  #explorer;
-  #pageSize;
-  #ttlMs;
-  #maxEntries;
-  #maxStates;
-  #maxBytes;
-  #stateCount = 0;
-  #bytes = 0;
-  #generation = 0;
-  #closed = false;
-  constructor(explorer = new RelationshipExplorer, pageSize = PAGE_SIZE, options = {}) {
-    if (!Number.isSafeInteger(pageSize) || pageSize < 1)
-      throw new SignalGrepError("Relationship page size must be positive");
-    this.#explorer = explorer;
-    this.#pageSize = pageSize;
-    this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
-    this.#maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
-    this.#maxStates = options.maxStates ?? DEFAULT_MAX_STATES;
-    this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-    if (![this.#ttlMs, this.#maxEntries, this.#maxStates, this.#maxBytes].every((value) => Number.isSafeInteger(value) && value >= 1))
-      throw new SignalGrepError("Invalid relationship store bounds");
-  }
-  async create(factory, request, prepare) {
-    this.assertOpen();
-    const generation = this.#generation;
-    let effectiveRequest = request;
-    const state = await this.#withView(factory, request.signal, rootViewId(request), async (view) => {
-      const before = await view.recheck(request.signal);
-      this.assertCurrent(before);
-      effectiveRequest = prepare ? await prepare(view) : request;
-      const explored = await this.#explorer.start(view, effectiveRequest);
-      const after = await view.recheck(request.signal);
-      this.assertCurrent(after);
-      return explored;
-    });
-    if (generation !== this.#generation)
-      throw new SignalGrepError("Relationship store was cleared during the operation");
-    const bytes = Buffer.byteLength(JSON.stringify(state));
-    if (bytes > this.#maxBytes)
-      throw new SignalGrepError("Relationship snapshot exceeds the storage byte limit");
-    this.#expire();
-    const id = randomUUID4();
-    const entry = {
-      id,
-      factory,
-      request: effectiveRequest,
-      currentVersion: 0,
-      states: new Map([[0, state]]),
-      touched: Date.now(),
-      bytes,
-      active: 0
-    };
-    this.#entries.set(id, entry);
-    this.#stateCount += 1;
-    this.#bytes += bytes;
-    this.#evict(id);
-    if (!this.#entries.has(id))
-      throw new SignalGrepError("Relationship snapshot was evicted before it could be returned");
-    return this.#stored(entry, state, 0);
-  }
-  page(cursor, limit = this.#pageSize) {
-    this.assertOpen();
-    if (!Number.isSafeInteger(limit) || limit < 1)
-      throw new SignalGrepError("Relationship page limit must be positive");
-    this.#expire();
-    const parts = cursorParts(cursor);
-    if (parts.kind !== "page")
-      throw new SignalGrepError("Relationship exploration cursor cannot page results");
-    const entry = this.#entry(parts.id);
-    const state = entry.states.get(parts.version);
-    if (!state)
-      throw new SignalGrepError("Relationship page was evicted; start the trace again");
-    if (parts.offset > state.edges.length)
-      throw new SignalGrepError("Relationship page offset is beyond the snapshot");
-    entry.touched = Date.now();
-    const items = state.edges.slice(parts.offset, parts.offset + limit);
-    const nextOffset = parts.offset + items.length;
-    const nextCursor = nextOffset < state.edges.length ? pageCursor(entry.id, parts.version, nextOffset) : undefined;
-    const continuation = this.#continuation(entry, parts.version);
-    return {
-      items,
-      offset: parts.offset,
-      totalItems: state.edges.length,
-      cursor,
-      ...nextCursor ? { nextCursor } : {},
-      ...continuation ? { exploreCursor: continuation } : {}
-    };
-  }
-  snapshot(cursor) {
-    this.assertOpen();
-    this.#expire();
-    const parts = cursorParts(cursor);
-    const entry = this.#entry(parts.id);
-    const state = entry.states.get(parts.version);
-    if (!state)
-      throw new SignalGrepError("Relationship snapshot was evicted");
-    entry.touched = Date.now();
-    return state;
-  }
-  async continue(exploreCursorValue, signal) {
-    this.assertOpen();
-    const parts = cursorParts(exploreCursorValue);
-    if (parts.kind !== "explore")
-      throw new SignalGrepError("Relationship page cursor cannot explore");
-    const generation = this.#generation;
-    return this.#locked(parts.id, async (entry) => {
-      const previous = entry.states.get(parts.version);
-      if (!previous)
-        throw new SignalGrepError("Relationship exploration snapshot was evicted");
-      if (parts.version !== entry.currentVersion)
-        throw new SignalGrepError("Relationship exploration cursor is superseded by a newer snapshot");
-      if (previous.frontier.length === 0)
-        return this.#stored(entry, previous, entry.currentVersion);
-      const state = await this.#withView(entry.factory, signal, rootViewId(entry.request), async (view) => {
-        const before = compareCaptured(previous, await view.recheck(signal));
-        this.assertCurrent(before);
-        const next = await this.#explorer.continue(view, previous, signal, { extendDepth: 1 });
-        const after = compareCaptured(previous, await view.recheck(signal));
-        this.assertCurrent(after);
-        return next;
-      });
-      if (this.#generation !== generation)
-        throw new SignalGrepError("Relationship store was cleared during the operation");
-      const bytes = Buffer.byteLength(JSON.stringify(state));
-      if (bytes > this.#maxBytes)
-        throw new SignalGrepError("Relationship continuation exceeds the storage byte limit");
-      const version = entry.currentVersion + 1;
-      entry.currentVersion = version;
-      entry.states.set(version, state);
-      entry.bytes += bytes;
-      this.#stateCount += 1;
-      this.#bytes += bytes;
-      entry.touched = Date.now();
-      this.#evict(entry.id);
-      if (!this.#entries.has(entry.id))
-        throw new SignalGrepError("Relationship continuation was evicted before it could be returned");
-      return this.#stored(entry, state, version);
-    });
-  }
-  async validate(cursor, signal) {
-    this.assertOpen();
-    const parts = cursorParts(cursor);
-    const entry = this.#entry(parts.id);
-    if (!entry.states.has(parts.version))
-      throw new SignalGrepError("Relationship evidence snapshot was evicted");
-    entry.touched = Date.now();
-    const state = entry.states.get(parts.version);
-    if (!state)
-      throw new SignalGrepError("Relationship evidence snapshot was evicted");
-    const generation = this.#generation;
-    const result = await this.#withView(entry.factory, signal, rootViewId(entry.request), async (view) => compareCaptured(state, await view.recheck(signal)));
-    if (generation !== this.#generation)
-      throw new SignalGrepError("Relationship store was cleared during the operation");
-    return result;
-  }
-  clear() {
-    this.#generation += 1;
-    this.#entries.clear();
-    this.#stateCount = 0;
-    this.#bytes = 0;
-  }
-  async close() {
-    this.#closed = true;
-    this.#generation += 1;
-    await Promise.allSettled(this.#active);
-    this.#entries.clear();
-    this.#locks.clear();
-    this.#stateCount = 0;
-    this.#bytes = 0;
-  }
-  async#locked(id, operation) {
-    const previous = this.#locks.get(id) ?? Promise.resolve();
-    const done = Promise.withResolvers();
-    const chain = previous.then(() => done.promise);
-    this.#locks.set(id, chain);
-    await previous;
-    const entry = this.#entries.get(id);
-    if (!entry)
-      throw new SignalGrepError("Relationship exploration was not found or has expired");
-    entry.active += 1;
-    const marker = Promise.withResolvers();
-    this.#active.add(marker.promise);
-    try {
-      return await operation(entry);
-    } finally {
-      entry.active -= 1;
-      done.resolve();
-      marker.resolve();
-      this.#active.delete(marker.promise);
-      if (this.#locks.get(id) === chain)
-        this.#locks.delete(id);
-    }
-  }
-  async#withView(factory, signal, analysisViewId, operation) {
-    const marker = Promise.withResolvers();
-    this.#active.add(marker.promise);
-    let view;
-    try {
-      view = await factory.open(signal, analysisViewId);
-      return await operation(view);
-    } finally {
-      try {
-        if (view)
-          await view.close();
-      } finally {
-        marker.resolve();
-        this.#active.delete(marker.promise);
-      }
-    }
-  }
-  #stored(entry, state, version) {
-    const continuation = this.#continuation(entry, version);
-    return {
-      state,
-      cursor: pageCursor(entry.id, version, 0),
-      ...continuation ? { exploreCursor: continuation } : {}
-    };
-  }
-  #continuation(entry, version) {
-    const state = entry.states.get(version);
-    return state && state.frontier.length > 0 && state.coverage.freshness === "current" ? exploreCursor(entry.id, version) : undefined;
-  }
-  #entry(id) {
-    const entry = this.#entries.get(id);
-    if (!entry)
-      throw new SignalGrepError("Relationship result was not found or has expired");
-    return entry;
-  }
-  #expire() {
-    const cutoff = Date.now() - this.#ttlMs;
-    for (const [id, entry] of this.#entries)
-      if (entry.active === 0 && entry.touched < cutoff)
-        this.#drop(id, entry);
-  }
-  #evict(preserveId) {
-    while (this.#entries.size > this.#maxEntries || this.#stateCount > this.#maxStates || this.#bytes > this.#maxBytes) {
-      const oldest = [...this.#entries.values()].filter((entry) => entry.active === 0 && entry.id !== preserveId).toSorted((left, right) => left.touched - right.touched)[0];
-      if (!oldest)
-        break;
-      this.#drop(oldest.id, oldest);
-    }
-  }
-  #drop(id, entry) {
-    if (!this.#entries.delete(id))
-      return;
-    this.#stateCount -= entry.states.size;
-    this.#bytes -= entry.bytes;
-  }
-  assertCurrent(recheck) {
-    if (recheck.validity !== "current")
-      throw new RelationshipChangedError(recheck.validity, `Relationship evidence is ${recheck.validity}; the operation was not published`);
-  }
-  assertOpen() {
-    if (this.#closed)
-      throw new SignalGrepError("Relationship store is closed");
-  }
-}
-
-// src/go-semantic-provider.ts
-import { createHash as createHash5, randomUUID as randomUUID5 } from "node:crypto";
-import { delimiter, dirname as dirname7, isAbsolute as isAbsolute6, resolve as resolve24 } from "node:path";
-import { fileURLToPath as fileURLToPath4 } from "node:url";
-var GO_SEMANTIC_QUERY_TIMEOUT_MS = 20000;
-var GO_SEMANTIC_PROVIDER_ID = "gopls";
-var goSource = /\.go$/i;
-var goManifest = /(?:^|\/)(?:go\.mod|go\.work|go\.sum)$/i;
-var goTextDocument = /(?:\.go|(?:^|\/)(?:go\.mod|go\.work))$/i;
-var GO_ENVIRONMENT_PATH = "go:environment";
-var GO_INVENTORY_PATH = "go:inventory";
-var GO_ENVIRONMENT_KEYS = [
-  "GO111MODULE",
-  "GOOS",
-  "GOARCH",
-  "GOARM",
-  "GO386",
-  "GOEXPERIMENT",
-  "CGO_ENABLED",
-  "GOFLAGS",
-  "GOMOD",
-  "GOWORK",
-  "GOWASM",
-  "GOMODCACHE",
-  "GOPRIVATE",
-  "GONOPROXY",
-  "GONOSUMDB",
-  "PATH"
-];
-var providerQueue = new OwnedTaskQueue;
-function executablePath2() {
-  const configured = process.env.BAOER_SIGNAL_GREP_GOPLS_PATH?.trim();
-  if (!configured)
-    return "gopls";
-  if (!isAbsolute6(configured))
-    throw new SignalGrepError("BAOER_SIGNAL_GREP_GOPLS_PATH must be an absolute executable path");
-  return configured;
-}
-function environment(executable) {
-  const path = process.env.PATH ?? "";
-  const executableDirectory = isAbsolute6(executable) ? dirname7(executable) : undefined;
-  const configuredFlags = process.env.GOFLAGS?.trim() ?? "";
-  const modFlag = configuredFlags.match(/(?:^|\s)-mod=(\S+)/)?.[1];
-  if (modFlag !== undefined && modFlag !== "readonly")
-    throw new SignalGrepError(`GOFLAGS requests -mod=${modFlag}; Go relationship search requires -mod=readonly`);
-  return {
-    ...process.env,
-    ...executableDirectory ? { PATH: `${executableDirectory}${delimiter}${path}` } : {},
-    GOTOOLCHAIN: "local",
-    GOPROXY: "off",
-    GOSUMDB: "off",
-    GOFLAGS: configuredFlags ? `${configuredFlags} -mod=readonly` : "-mod=readonly"
-  };
-}
-function configurationFingerprint(executable) {
-  const values = {
-    executable,
-    GOTOOLCHAIN: "local",
-    GOPROXY: "off",
-    GOSUMDB: "off"
-  };
-  for (const key of GO_ENVIRONMENT_KEYS)
-    values[key] = process.env[key] ?? "";
-  return createHash5("sha256").update(JSON.stringify(values)).digest("hex");
-}
-function isAdmittedGoFile(path) {
-  return goSource.test(path) || goManifest.test(path);
-}
-function documentRole(path) {
-  return goManifest.test(path) ? "manifest" : "source";
-}
-function languageId2(path) {
-  return goSource.test(path) ? "go" : "go.mod";
-}
-function fileUri(value) {
-  if (typeof value !== "string" || !value.startsWith("file:"))
-    throw new SignalGrepError("gopls returned a non-file URI");
-  return value;
-}
-function uriPath(uri) {
-  try {
-    return fileURLToPath4(uri);
-  } catch (error) {
-    throw new SignalGrepError("gopls returned an invalid file URI", { cause: error });
-  }
-}
-function readNode2(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("gopls returned an invalid navigation item");
-  const record = value;
-  const uri = fileUri(record.uri ?? record.targetUri);
-  const range = lspRange(record.range ?? record.targetRange ?? record.selectionRange);
-  const selectionRange = lspRange(record.selectionRange ?? record.targetSelectionRange ?? range);
-  return {
-    id: `${uri}:${String(selectionRange.start.line)}:${String(selectionRange.start.character)}:${String(selectionRange.end.line)}:${String(selectionRange.end.character)}`,
-    path: uriPath(uri),
-    uri,
-    range,
-    selectionRange,
-    ...typeof record.name === "string" && record.name.length > 0 ? { name: record.name } : {},
-    ...typeof record.kind === "number" && Number.isSafeInteger(record.kind) ? { kind: record.kind } : {}
-  };
-}
-function readLocations(value) {
-  if (value === null)
-    return [];
-  return (Array.isArray(value) ? value : [value]).map((item) => readNode2(item));
-}
-function readCallRanges(value) {
-  if (!Array.isArray(value))
-    return;
-  return value.map((range) => lspRange(range));
-}
-function positionOf(node) {
-  return node.selectionRange.start;
-}
-function sourceLocation(document, range) {
-  return {
-    path: document.path,
-    range: byteRange(document, range),
-    start: { line: range.start.line + 1, column: range.start.character + 1 },
-    end: { line: range.end.line + 1, column: range.end.character + 1 },
-    source: document.reference
-  };
-}
-function symbolPosition(document, value, name) {
-  if (value.selectionRange !== undefined)
-    return lspRange(value.selectionRange).start;
-  const location = rpcRecord(value.location) ? value.location : undefined;
-  if (!location || location.range === undefined)
-    return;
-  const range = lspRange(location.range);
-  const bytes = byteRange(document, range);
-  const offset = document.slice(bytes).indexOf(name);
-  if (offset < 0)
-    return;
-  return lspPosition(document, document.toCharacterOffset(bytes.start) + offset);
-}
-function documentDependency(document) {
-  return {
-    path: document.path,
-    role: documentRole(document.path),
-    reference: document.reference,
-    exists: true
-  };
-}
-function environmentDependency(fingerprint) {
-  return { path: GO_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
-}
-function evidence(reason) {
-  return { reason, level: "compiler", basis: "semantic", providerBasis: GO_SEMANTIC_PROVIDER_ID };
-}
-function operationMethod(operation) {
-  switch (operation) {
-    case "definitions":
-      return "textDocument/definition";
-    case "references":
-      return "textDocument/references";
-    case "implementations":
-      return "textDocument/implementation";
-    case "callers":
-    case "callees":
-      return "textDocument/prepareCallHierarchy";
-    default:
-      throw new SignalGrepError("Unsupported Go relationship operation");
-  }
-}
-function relationReason(operation) {
-  if (operation === "callers" || operation === "callees")
-    return "gopls static call hierarchy; dynamic calls are excluded and runtime dispatch is unproven";
-  return "gopls compiler-bound navigation in the active Go build configuration";
-}
-function operationUnresolved(operation, reason) {
-  return { operation, reason, confidence: "unknown" };
-}
-
-class GoRelationshipView {
-  providerId = GO_SEMANTIC_PROVIDER_ID;
-  analysisViewId;
-  sourceScope;
-  #channel;
-  #completion;
-  #cwd;
-  #source;
-  #signal;
-  #configurationFingerprint;
-  #inventory;
-  #documents;
-  #openReasons;
-  #initialCoveragePartial;
-  #nodePaths = new Map;
-  #edgePaths = new Map;
-  #closed = false;
-  #closePromise;
-  constructor(options, channel, completion, documents, openReasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, clearTimeout2) {
-    this.analysisViewId = options.analysisViewId ?? randomUUID5();
-    this.sourceScope = options.scope;
-    this.#cwd = options.cwd;
-    this.#source = options.source;
-    this.#signal = signal;
-    this.#configurationFingerprint = configurationFingerprint(executable);
-    this.#inventory = inventory;
-    this.#channel = channel;
-    this.#completion = completion;
-    this.#documents = documents;
-    this.#openReasons = [...openReasons, `gopls executable: ${executable}`];
-    this.#initialCoveragePartial = initialCoveragePartial;
-    this.#releaseQueue = releaseQueue;
-    this.#clearTimeout = clearTimeout2;
-  }
-  #releaseQueue;
-  #clearTimeout;
-  async resolveNode(input, signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const document = this.#documents.get(resolve24(this.#cwd, input.path));
-    if (!document)
-      return {
-        status: "unsupported",
-        reasons: ["Go target is outside admitted provider source"],
-        dependencies: []
-      };
-    const position = await this.position(document, input);
-    const params = { textDocument: { uri: await semanticUri(this.#cwd, document.path) }, position };
-    const prepared = await this.#channel.request("textDocument/prepareCallHierarchy", params);
-    const candidates = Array.isArray(prepared) ? prepared.map(readNode2) : [];
-    if (candidates.length > 1 && input.column === undefined)
-      return {
-        status: "ambiguous",
-        candidates: candidates.map((candidate) => this.node(candidate, document)),
-        reasons: ["gopls returned multiple call hierarchy items; include a column"],
-        dependencies: [
-          documentDependency(document),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    let selected = candidates[0];
-    if (!selected) {
-      const definitions = readLocations(await this.#channel.request("textDocument/definition", params));
-      selected = definitions[0];
-    }
-    if (!selected)
-      return {
-        status: "unknown",
-        reasons: ["gopls returned no definition or call hierarchy item"],
-        dependencies: [
-          documentDependency(document),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    const target = this.#documents.get(resolve24(this.#cwd, selected.path));
-    if (!target)
-      return {
-        status: "unknown",
-        reasons: ["gopls resolved outside admitted provider source"],
-        dependencies: [
-          documentDependency(document),
-          environmentDependency(this.#configurationFingerprint)
-        ]
-      };
-    return {
-      status: "resolved",
-      node: this.node(selected, target),
-      reasons: [],
-      dependencies: [
-        documentDependency(document),
-        documentDependency(target),
-        environmentDependency(this.#configurationFingerprint)
-      ]
-    };
-  }
-  async expand(node, operation, signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const internal = this.internalNode(node);
-    const document = this.#documents.get(resolve24(this.#cwd, internal.path));
-    if (!document)
-      return {
-        edges: [],
-        nodes: [],
-        unresolved: [
-          operationUnresolved(operation, "Node source is outside admitted provider source")
-        ],
-        dependencies: [],
-        coverage: {
-          status: "partial",
-          freshness: "unknown",
-          sources: [],
-          reasons: ["Node source is outside admitted provider source"]
-        }
-      };
-    const params = {
-      textDocument: { uri: await semanticUri(this.#cwd, document.path) },
-      position: positionOf(internal)
-    };
-    const goEdges = [];
-    const unresolved = [];
-    if (operation === "callers" || operation === "callees") {
-      const prepared = await this.#channel.request(operationMethod(operation), params);
-      if (!Array.isArray(prepared))
-        unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
-      else {
-        for (const item of prepared) {
-          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-          const calls = await this.#channel.request(method, { item });
-          if (!Array.isArray(calls)) {
-            unresolved.push(operationUnresolved(operation, "gopls returned an invalid call hierarchy"));
-            continue;
-          }
-          for (const call of calls) {
-            if (!rpcRecord(call)) {
-              unresolved.push(operationUnresolved(operation, "gopls returned an invalid call edge"));
-              continue;
-            }
-            const record = call;
-            try {
-              const endpoint = readNode2(operation === "callers" ? record.from : record.to);
-              const callRanges = readCallRanges(record.fromRanges);
-              goEdges.push({
-                operation,
-                from: operation === "callers" ? endpoint : internal,
-                to: operation === "callers" ? internal : endpoint,
-                ...callRanges ? { callRanges } : {}
-              });
-            } catch (error) {
-              unresolved.push(operationUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
-            }
-          }
-        }
-      }
-    } else {
-      const value = await this.#channel.request(operationMethod(operation), {
-        ...params,
-        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
-      });
-      const candidates = readLocations(value);
-      for (const candidate of candidates)
-        goEdges.push({ operation, from: internal, to: candidate });
-    }
-    const nodes = [];
-    const edges = [];
-    for (const edge of goEdges) {
-      const from = this.convertNode(edge.from, unresolved, operation);
-      const to = this.convertNode(edge.to, unresolved, operation);
-      if (!from || !to)
-        continue;
-      nodes.push(from, to);
-      const callRanges = edge.callRanges?.length ? edge.callRanges : [undefined];
-      for (const [index, range] of callRanges.entries()) {
-        const callSite = range ? this.callSite(edge, range) : undefined;
-        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
-        const edgePaths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
-        this.#edgePaths.set(edgeKey, edgePaths);
-        edges.push({
-          edgeKey,
-          operation,
-          from,
-          to,
-          ...callSite ? { callSite } : {},
-          evidence: [evidence(relationReason(operation))],
-          confidence: "verified-static",
-          dependencies: [...edgePaths].map((path) => documentDependency(this.#documents.get(resolve24(this.#cwd, path)) ?? document)).concat(environmentDependency(this.#configurationFingerprint))
-        });
-      }
-    }
-    const uniqueNodes = [...new Map(nodes.map((item) => [item.identity.localKey, item])).values()];
-    const reasons = [...this.#openReasons, relationReason(operation)];
-    return {
-      edges,
-      nodes: uniqueNodes,
-      unresolved,
-      dependencies: [
-        documentDependency(document),
-        environmentDependency(this.#configurationFingerprint)
-      ],
-      coverage: {
-        status: this.#initialCoveragePartial || unresolved.length ? "partial" : "complete",
-        freshness: "current",
-        sources: this.currentSourceStatuses(),
-        reasons: [...new Set(reasons)]
-      }
-    };
-  }
-  async recheck(signal) {
-    this.assertOpen();
-    if (signal?.aborted)
-      throw abortError();
-    const sources = [];
-    const reasons = [];
-    for (const document of this.#documents.values()) {
-      try {
-        await this.#source.refresh(document.path, document.reference);
-        sources.push(this.sourceStatus(document, "current"));
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : "source recheck failed";
-        sources.push(this.sourceStatus(document, "stale", reason));
-        reasons.push(`${document.path}: ${reason}`);
-      }
-    }
-    let configurationReason;
-    let currentConfigurationFingerprint;
-    try {
-      const executable = executablePath2();
-      environment(executable);
-      currentConfigurationFingerprint = configurationFingerprint(executable);
-    } catch (error) {
-      configurationReason = error instanceof Error ? error.message : "Go build configuration is invalid";
-    }
-    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.#configurationFingerprint;
-    sources.push({
-      path: GO_ENVIRONMENT_PATH,
-      role: "config",
-      status: configurationChanged ? "stale" : "current",
-      ...configurationReason ? { reason: configurationReason } : configurationChanged ? { reason: "Go build environment or gopls executable changed during relationship query" } : {}
-    });
-    if (configurationChanged)
-      reasons.push(configurationReason ?? "Go build environment or gopls executable changed during relationship query");
-    const inventory = await listWorkspaceFiles(this.#cwd, this.#signal, {
-      path: this.sourceScope.root,
-      glob: [...this.sourceScope.include ?? []],
-      exclude: [...this.sourceScope.exclude ?? []],
-      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden }
-    });
-    const currentInventory = new Set(inventory.paths.filter(isAdmittedGoFile));
-    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
-    if (inventoryChanged || inventory.partial) {
-      reasons.push(inventoryChanged ? "Go source/config inventory changed during relationship query; retry" : inventory.reasons.join("; "));
-      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
-        sources.push({
-          path,
-          role: documentRole(path),
-          status: "stale",
-          reason: "source removed during query"
-        });
-      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
-        sources.push({
-          path,
-          role: documentRole(path),
-          status: "stale",
-          reason: "source added during query; retry"
-        });
-      if (inventory.partial)
-        sources.push({
-          path: GO_INVENTORY_PATH,
-          role: "metadata",
-          status: "unknown",
-          reason: inventory.reasons.join("; ") || "Go source/config inventory is incomplete"
-        });
-    }
-    const stalePaths = new Set(sources.filter((source) => source.status === "stale").map((source) => source.path));
-    const inventoryUnknown = sources.some((source) => source.path === GO_INVENTORY_PATH && source.status === "unknown");
-    const sourceUnknown = sources.some((source) => source.status === "unknown");
-    const configurationStale = sources.some((source) => source.path === GO_ENVIRONMENT_PATH && source.status !== "current");
-    return {
-      validity: stalePaths.size ? "stale" : sourceUnknown ? "unknown" : "current",
-      coverage: this.#initialCoveragePartial || stalePaths.size || sourceUnknown ? "partial" : "complete",
-      sources,
-      affectedNodeKeys: configurationStale || inventoryUnknown ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => sources.some((source) => source.path === path && source.status !== "current")).map(([key]) => key),
-      affectedEdgeKeys: configurationStale || inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([key]) => key),
-      reasons: [...new Set(reasons)]
-    };
-  }
-  close() {
-    if (!this.#closePromise)
-      this.#closePromise = this.closeOnce();
-    return this.#closePromise;
-  }
-  async closeOnce() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    try {
-      await this.#channel.request("shutdown", undefined);
-      await this.#channel.notify("exit");
-      this.#channel.endInput();
-      const result = await this.#completion;
-      if (result.code !== 0)
-        throw new SignalGrepError(`gopls process failed (${String(result.code)}): ${result.stderr}`);
-    } catch (error) {
-      this.#channel.close();
-      await this.#completion.catch(() => {
-        return;
-      });
-      throw error;
-    } finally {
-      this.#clearTimeout();
-      this.#releaseQueue();
-    }
-  }
-  async position(document, input) {
-    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-      throw new SignalGrepError("Go semantic target line must be one-based");
-    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
-      throw new SignalGrepError("Go semantic target column must be one-based");
-    if (input.column !== undefined) {
-      if (input.line === undefined)
-        throw new SignalGrepError("Go semantic column requires a line");
-      return { line: input.line - 1, character: input.column - 1 };
-    }
-    if (!input.symbol)
-      throw new SignalGrepError("Go semantic target requires a column or symbol");
-    const symbolName = input.symbol;
-    const symbols = await this.#channel.request("textDocument/documentSymbol", {
-      textDocument: { uri: await semanticUri(this.#cwd, document.path) }
-    });
-    const found = [];
-    const visit = (value) => {
-      if (!value || typeof value !== "object" || Array.isArray(value))
-        return;
-      if (!rpcRecord(value))
-        return;
-      const record = value;
-      const position = symbolPosition(document, record, symbolName);
-      if (record.name === symbolName && position) {
-        if (input.line === undefined || position.line + 1 === input.line)
-          found.push(position);
-      }
-      if (Array.isArray(record.children))
-        for (const child of record.children)
-          visit(child);
-    };
-    if (Array.isArray(symbols))
-      for (const symbol of symbols)
-        visit(symbol);
-    if (found.length !== 1)
-      throw new SignalGrepError(found.length ? "Go semantic target symbol is ambiguous" : "Go semantic target symbol is absent");
-    const position = found[0];
-    if (!position)
-      throw new SignalGrepError("Go semantic target symbol is absent");
-    return position;
-  }
-  node(internal, document) {
-    const range = byteRange(document, internal.range);
-    const selection = byteRange(document, internal.selectionRange);
-    const localKey = `${document.path}:${String(selection.start)}:${String(selection.end)}`;
-    this.#nodePaths.set(localKey, document.path);
-    return {
-      identity: {
-        providerId: GO_SEMANTIC_PROVIDER_ID,
-        analysisViewId: this.analysisViewId,
-        sourceScope: this.sourceScope.root,
-        localKey
-      },
-      path: document.path,
-      name: internal.name ?? document.path,
-      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
-      range,
-      start: {
-        line: internal.selectionRange.start.line + 1,
-        column: internal.selectionRange.start.character + 1
-      },
-      end: {
-        line: internal.selectionRange.end.line + 1,
-        column: internal.selectionRange.end.character + 1
-      },
-      source: document.reference,
-      evidence: [evidence("gopls compiler-bound Go navigation result")]
-    };
-  }
-  convertNode(internal, unresolved, operation) {
-    const document = this.#documents.get(resolve24(this.#cwd, internal.path));
-    if (!document) {
-      unresolved.push(operationUnresolved(operation, "gopls result is outside admitted Go source"));
-      return;
-    }
-    return this.node(internal, document);
-  }
-  callSite(edge, range) {
-    const document = this.#documents.get(resolve24(this.#cwd, edge.from.path));
-    return document ? sourceLocation(document, range) : undefined;
-  }
-  sourceStatus(document, status, reason) {
-    return {
-      path: document.path,
-      role: documentRole(document.path),
-      status,
-      expected: document.reference,
-      ...reason ? { reason } : {}
-    };
-  }
-  currentSourceStatuses() {
-    return [
-      ...[...this.#documents.values()].map((document) => this.sourceStatus(document, "current")),
-      { path: GO_ENVIRONMENT_PATH, role: "config", status: "current" }
-    ];
-  }
-  internalNode(node) {
-    const document = this.#documents.get(resolve24(this.#cwd, node.path));
-    if (!document)
-      throw new SignalGrepError("Relationship node is outside this Go view");
-    const start = { line: node.start.line - 1, character: node.start.column - 1 };
-    const end = {
-      line: (node.end?.line ?? node.start.line) - 1,
-      character: (node.end?.column ?? node.start.column) - 1
-    };
-    return {
-      id: node.identity.localKey,
-      path: document.path,
-      uri: "",
-      range: { start, end },
-      selectionRange: { start, end },
-      name: node.name
-    };
-  }
-  assertOpen() {
-    if (this.#closed)
-      throw new SignalGrepError("Go relationship view is closed");
-  }
-}
-var goSemanticProvider = {
-  providerId: GO_SEMANTIC_PROVIDER_ID,
-  async open(options) {
-    const releaseQueue = await providerQueue.acquire(options.signal);
-    try {
-      const files = await listWorkspaceFiles(options.cwd, options.signal, {
-        path: options.scope.root,
-        glob: [...options.scope.include ?? []],
-        exclude: [...options.scope.exclude ?? []],
-        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
-        ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
-      });
-      const documents = new Map;
-      const reasons = [...files.reasons];
-      let initialCoveragePartial = files.partial;
-      for (const path of files.paths.filter(isAdmittedGoFile)) {
-        if (options.signal.aborted)
-          throw abortError();
-        try {
-          const document = await options.source.load(path);
-          if (!document.utf8) {
-            reasons.push(`${path}: source is not lossless UTF-8`);
-            initialCoveragePartial = true;
-            continue;
-          }
-          documents.set(resolve24(options.cwd, path), document);
-        } catch (error) {
-          reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
-          initialCoveragePartial = true;
-        }
-      }
-      if (documents.size === 0)
-        throw new SignalGrepError("Go semantic provider found no admitted Go source");
-      const executable = executablePath2();
-      const deadline = new AbortController;
-      const signal = AbortSignal.any([options.signal, deadline.signal]);
-      const timer = setTimeout(() => deadline.abort(), GO_SEMANTIC_QUERY_TIMEOUT_MS);
-      let owned;
-      try {
-        owned = await openOwnedJsonRpc({
-          executable,
-          args: ["serve"],
-          cwd: resolve24(options.cwd, options.scope.root),
-          signal,
-          env: environment(executable)
-        }, (method, params) => {
-          if (method === "workspace/configuration") {
-            if (!rpcRecord(params) || !Array.isArray(params.items))
-              throw new SignalGrepError("Invalid gopls configuration request");
-            return params.items.map(() => ({}));
-          }
-          if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
-            return null;
-          if (method === "workspace/applyEdit")
-            return { applied: false, failureReason: "Relationship search is read-only" };
-          throw new SignalGrepError(`Unsupported gopls client request: ${method}`);
-        });
-        const initialize = await owned.channel.request("initialize", {
-          processId: process.pid,
-          rootUri: await semanticUri(options.cwd, options.scope.root),
-          workspaceFolders: [
-            { uri: await semanticUri(options.cwd, options.scope.root), name: options.scope.root }
-          ],
-          capabilities: {
-            workspace: { workspaceFolders: true, configuration: true },
-            textDocument: {
-              definition: { linkSupport: true },
-              references: {},
-              implementation: { linkSupport: true },
-              callHierarchy: {}
-            },
-            general: { positionEncodings: ["utf-16"] }
-          },
-          initializationOptions: {}
-        });
-        if (!initialize || typeof initialize !== "object" || Array.isArray(initialize) || !("capabilities" in initialize))
-          throw new SignalGrepError("gopls initialize omitted capabilities");
-        await owned.channel.notify("initialized", {});
-        for (const document of documents.values()) {
-          if (!goTextDocument.test(document.path))
-            continue;
-          const uri = await semanticUri(options.cwd, document.path);
-          await owned.channel.notify("textDocument/didOpen", {
-            textDocument: {
-              uri,
-              languageId: languageId2(document.path),
-              version: 1,
-              text: document.text
-            }
-          });
-        }
-        const inventory = new Set(files.paths.filter(isAdmittedGoFile));
-        return new GoRelationshipView(options, owned.channel, owned.completion, documents, reasons, initialCoveragePartial, executable, signal, inventory, releaseQueue, () => clearTimeout(timer));
-      } catch (error) {
-        deadline.abort();
-        clearTimeout(timer);
-        releaseQueue();
-        if (owned) {
-          owned.channel.close();
-          await owned.completion.catch(() => {
-            return;
-          });
-        }
-        throw error;
-      }
-    } catch (error) {
-      releaseQueue();
-      throw error;
-    }
-  }
-};
-
-// src/typescript-relationship-provider.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
-import { resolve as resolve26 } from "node:path";
-import { pathToFileURL as pathToFileURL2 } from "node:url";
-
-// src/semantic-project.ts
-import { resolve as resolve25 } from "node:path";
-import { stat as stat4 } from "node:fs/promises";
-var semanticMetadataPath = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|package\.json)$/;
-function semanticWorkspacePaths(files) {
-  return files.paths.filter((path) => {
-    const language = syntaxLanguage(path);
-    return language !== undefined && language !== "go" || semanticMetadataPath.test(path);
-  }).toSorted((left, right) => left.localeCompare(right));
-}
-async function semanticProject(access, targetPath, allowDirectoryTarget = false, filters = {}) {
-  let requestedTarget = targetPath;
-  if (allowDirectoryTarget) {
-    try {
-      if ((await stat4(resolve25(access.cwd, targetPath))).isDirectory())
-        requestedTarget = resolve25(targetPath, "__relationship_target__.ts");
-    } catch {}
-  }
-  const root = await resolveSemanticProjectRoot(access.cwd, requestedTarget, access.signal);
-  const workspaceFilters = {
-    ...filters.glob === undefined ? {} : { glob: [...filters.glob] },
-    ...filters.exclude === undefined ? {} : { exclude: [...filters.exclude] },
-    ...filters.hidden === undefined ? {} : { hidden: filters.hidden }
-  };
-  const files = await listWorkspaceFiles(access.cwd, access.signal, {
-    path: root,
-    ...workspaceFilters
-  });
-  const trackedPaths = semanticWorkspacePaths(files);
-  const paths = files.paths.filter((path) => {
-    const language = syntaxLanguage(path);
-    return language && language !== "go";
-  });
-  const metadataPaths = files.paths.filter((path) => semanticMetadataPath.test(path));
-  let target = resolve25(access.cwd, targetPath);
-  if (allowDirectoryTarget) {
-    try {
-      if ((await stat4(target)).isDirectory()) {
-        const first = paths.find((path) => resolve25(access.cwd, path).startsWith(`${target}/`));
-        if (first)
-          target = resolve25(access.cwd, first);
-      }
-    } catch {}
-  }
-  if (!paths.some((path) => resolve25(access.cwd, path) === target))
-    throw new SignalGrepError("Semantic target must be an admitted JS/TS workspace file under current ignore rules");
-  paths.sort((a, b) => Number(resolve25(access.cwd, b) === target) - Number(resolve25(access.cwd, a) === target) || a.localeCompare(b));
-  const documents = new Map;
-  const reasons = [...files.reasons];
-  const metadata = [];
-  for (const path of [...paths, ...metadataPaths]) {
-    try {
-      const document = await access.load(path);
-      if (!document.utf8)
-        throw new SourceDocumentError("encoding", `Non-UTF-8 semantic source: ${path}`);
-      if (paths.includes(path))
-        documents.set(resolve25(access.cwd, path), document);
-      else
-        metadata.push(document);
-    } catch (error) {
-      if (error instanceof SourceBudgetError) {
-        reasons.push(error.message);
-        break;
-      }
-      if (!(error instanceof SourceDocumentError))
-        throw error;
-      reasons.push(`${path}: ${error.message}`);
-    }
-  }
-  const primary = documents.get(target);
-  if (!primary)
-    throw new SignalGrepError("Semantic target could not be read within the source budget");
-  const recheckInventory = async () => {
-    const after = await listWorkspaceFiles(access.cwd, access.signal, {
-      path: root,
-      ...workspaceFilters
-    });
-    if (JSON.stringify(semanticWorkspacePaths(after)) !== JSON.stringify(trackedPaths))
-      throw new SignalGrepError("Workspace file set changed during semantic query; retry");
-  };
-  const recheck = async () => {
-    for (const document of [...documents.values(), ...metadata]) {
-      if (document.reference.origin.kind !== "worktree")
-        throw new Error("Expected worktree semantic source");
-      await access.refresh(document.path, document.reference);
-    }
-    await recheckInventory();
-  };
-  const result = {
-    kind: "references",
-    unit: "relationships",
-    items: [],
-    partial: reasons.length > 0,
-    reasons,
-    filesRead: access.filesRead,
-    bytesRead: access.bytesRead,
-    coverage: {
-      admittedSources: reasons.length ? "partial" : "complete",
-      runtimeDispatch: "not-applicable"
-    },
-    stats: { filesEnumerated: paths.length, filesSkipped: paths.length - documents.size }
-  };
-  return { documents, metadata, primary, result, recheck, recheckInventory, root, trackedPaths };
-}
-
-// src/typescript-relationship-provider.ts
-var TYPESCRIPT_PROVIDER_ID = "typescript";
-function record3(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : undefined;
-}
-function callItem(value) {
-  const item = record3(value);
-  if (!item || typeof item.name !== "string" || typeof item.kind !== "string" && typeof item.kind !== "number")
-    return;
-  const uri = typeof item.uri === "string" ? item.uri : undefined;
-  const rangeValue = item.range;
-  const selectionValue = item.selectionRange ?? rangeValue;
-  if (!uri || !rangeValue || !selectionValue)
-    return;
-  return {
-    ...item,
-    name: item.name,
-    kind: item.kind,
-    uri,
-    range: lspRange(rangeValue),
-    selectionRange: lspRange(selectionValue)
-  };
-}
-function sourceRange(document, range) {
-  const bytes = byteRange(document, range);
-  return {
-    path: document.path,
-    range: bytes,
-    start: document.positionAt(bytes.start),
-    end: document.positionAt(bytes.end),
-    source: document.reference
-  };
-}
-function symbolAt(document, symbol) {
-  return sourceRange(document, {
-    start: lspPosition(document, symbol.start),
-    end: lspPosition(document, symbol.end)
-  });
-}
-function lspAtByte(document, byte) {
-  const position = document.positionAt(byte);
-  return { line: position.line - 1, character: position.column - 1 };
-}
-function operationMethod2(operation) {
-  return operation === "definitions" ? "textDocument/definition" : operation === "implementations" ? "textDocument/implementation" : "textDocument/references";
-}
-function operationEvidence(operation) {
-  return {
-    level: "compiler",
-    basis: "semantic",
-    providerBasis: "typescript-language-service",
-    reason: `TypeScript language service ${operation} result; static binding does not prove runtime dispatch`
-  };
-}
-function dependencies(documents, metadata) {
-  return [
-    ...documents.map((document) => ({
-      path: document.path,
-      role: "source",
-      reference: document.reference
-    })),
-    ...metadata.map((document) => ({
-      path: document.path,
-      role: /(?:^|\/)package\.json$/iu.test(document.path) ? "manifest" : "config",
-      reference: document.reference
-    }))
-  ];
-}
-function currentStatuses(dependenciesList, status, reason) {
-  return dependenciesList.map((dependency) => ({
-    path: dependency.path,
-    role: dependency.role,
-    status,
-    ...dependency.reference ? { expected: dependency.reference } : {},
-    ...reason === undefined ? {} : { reason }
-  }));
-}
-function inputPosition(document, input) {
-  if (input.line === undefined)
-    throw new SignalGrepError("Semantic symbol selection requires an exact line or column");
-  if (!Number.isSafeInteger(input.line) || input.line < 1)
-    throw new SignalGrepError("Semantic line must be a positive integer");
-  const line = document.lineRange(input.line);
-  if (input.column === undefined)
-    return document.toCharacterOffset(line.start);
-  if (!Number.isSafeInteger(input.column) || input.column < 1)
-    throw new SignalGrepError("Semantic column must be a positive integer");
-  const position = document.toCharacterOffset(line.start) + input.column - 1;
-  document.toByteOffset(position);
-  return position;
-}
-function candidatesFor(document, syntax, input) {
-  const character = input.line === undefined ? undefined : inputPosition(document, input);
-  return syntax.symbols.filter((candidate) => {
-    const line = document.lineAt(document.toByteOffset(candidate.start));
-    const bySymbol = input.symbol === undefined || candidate.name === input.symbol;
-    const byLine = input.line === undefined || line === input.line;
-    const byCharacter = input.column === undefined || character !== undefined && candidate.start <= character && character <= candidate.end;
-    return bySymbol && byLine && byCharacter && candidate.hasBody;
-  });
-}
-
-class TypeScriptRelationshipView {
-  providerId = TYPESCRIPT_PROVIDER_ID;
-  analysisViewId;
-  sourceScope;
-  #access;
-  #documents;
-  #cwd;
-  #projectRecheck;
-  #sourceAt;
-  #dependencies;
-  #nodes = new Map;
-  #edges = new Map;
-  #closed = false;
-  constructor(options, access, documents, metadata, projectRecheck, sourceAt) {
-    this.analysisViewId = options.analysisViewId ?? randomUUID6();
-    this.sourceScope = options.scope;
-    this.#cwd = options.cwd;
-    this.#access = access;
-    this.#documents = documents;
-    this.#projectRecheck = projectRecheck;
-    this.#sourceAt = sourceAt;
-    this.#dependencies = dependencies(documents, metadata);
-  }
-  #query(operation) {
-    return withTypeScript(this.#cwd, this.#documents, async (channel) => operation(channel), this.#access.signal, this.#cwd);
-  }
-  #assertOpen(signal) {
-    if (this.#closed)
-      throw new SignalGrepError("Relationship analysis view is closed");
-    if (signal?.aborted || this.#access.signal?.aborted)
-      throw abortError();
-  }
-  #node(document, location, name) {
-    const node = {
-      identity: {
-        providerId: this.providerId,
-        analysisViewId: this.analysisViewId,
-        sourceScope: JSON.stringify(this.sourceScope),
-        localKey: `${document.path}:${location.range.start}:${location.range.end}:${name}`
-      },
-      path: document.path,
-      name,
-      kind: "function",
-      range: location.range,
-      start: location.start,
-      ...location.end ? { end: location.end } : {},
-      source: document.reference,
-      evidence: [operationEvidence("references")]
-    };
-    this.#nodes.set(relationshipNodeKey(node), node);
-    return node;
-  }
-  async resolveNode(input, signal) {
-    this.#assertOpen(signal);
-    const document = await this.#sourceAt(input.path);
-    if (!document) {
-      return {
-        status: "unknown",
-        reasons: [`Semantic source is outside the admitted TypeScript project: ${input.path}`],
-        dependencies: [{ path: input.path, role: "source", reason: "source-not-admitted" }]
-      };
-    }
-    const syntax = await this.#access.syntax(document);
-    if (syntax.status !== "ok") {
-      return {
-        status: "unsupported",
-        reasons: [`Cannot resolve a TypeScript symbol because syntax is ${syntax.status}`],
-        dependencies: this.#dependencies
-      };
-    }
-    const candidates = candidatesFor(document, syntax, input);
-    if (candidates.length !== 1) {
-      return {
-        status: candidates.length === 0 ? "unknown" : "ambiguous",
-        ...candidates.length ? {
-          candidates: candidates.map((candidate) => this.#node(document, symbolAt(document, candidate), candidate.name))
-        } : {},
-        reasons: [
-          `Semantic target is ${candidates.length === 0 ? "absent" : "ambiguous"}; supply an exact line and UTF-16 column`
-        ],
-        dependencies: this.#dependencies
-      };
-    }
-    const candidate = candidates[0];
-    if (!candidate)
-      throw new Error("Missing semantic candidate");
-    let location = symbolAt(document, candidate);
-    let nodeDocument = document;
-    let name = candidate.name;
-    try {
-      const prepared = await this.#query((channel) => channel.request("textDocument/prepareCallHierarchy", {
-        textDocument: { uri: pathToFileURL2(resolve26(this.#cwd, document.path)).href },
-        position: lspPosition(document, candidate.start)
-      }));
-      if (Array.isArray(prepared)) {
-        const preparedItems = prepared.map(callItem).filter((item) => item !== undefined);
-        const selected = preparedItems.find((item) => item.selectionRange.start.line <= document.lineAt(candidate.start) - 1 && item.selectionRange.end.line >= document.lineAt(candidate.start) - 1) ?? preparedItems[0];
-        if (selected) {
-          const selectedLocation = semanticLocation({
-            targetUri: selected.uri,
-            targetSelectionRange: selected.selectionRange
-          });
-          const selectedDocument = await this.#sourceAt(selectedLocation.path);
-          if (selectedDocument) {
-            location = sourceRange(selectedDocument, selectedLocation.range);
-            nodeDocument = selectedDocument;
-            name = selected.name;
-          }
-        }
-      }
-    } catch (error) {
-      if (error instanceof SignalGrepError && error.message.includes("Invalid TypeScript"))
-        throw error;
-    }
-    return {
-      status: "resolved",
-      node: this.#node(nodeDocument, location, name),
-      reasons: [],
-      dependencies: this.#dependencies
-    };
-  }
-  async expand(node, operation, signal) {
-    this.#assertOpen(signal);
-    const document = await this.#sourceAt(node.path);
-    if (!document)
-      return {
-        edges: [],
-        nodes: [],
-        unresolved: [
-          {
-            operation,
-            reason: `Source is no longer admitted: ${node.path}`,
-            confidence: "unknown"
-          }
-        ],
-        dependencies: this.#dependencies,
-        coverage: {
-          status: "partial",
-          freshness: "unknown",
-          sources: currentStatuses(this.#dependencies, "unknown", "source-not-admitted"),
-          reasons: [`Source is no longer admitted: ${node.path}`]
-        }
-      };
-    const textDocument = {
-      uri: await this.#uri(document),
-      position: lspAtByte(document, node.range.start)
-    };
-    const edges = [];
-    const nodes = [];
-    const unresolved = [];
-    if (operation === "callers" || operation === "callees") {
-      const prepared = await this.#query((channel) => channel.request("textDocument/prepareCallHierarchy", {
-        textDocument,
-        position: textDocument.position
-      }));
-      if (prepared === null) {
-        unresolved.push({
-          operation,
-          reason: "Compiler did not provide call hierarchy for this symbol",
-          confidence: "unknown"
-        });
-      } else if (!Array.isArray(prepared)) {
-        throw new SignalGrepError("Invalid TypeScript call hierarchy response");
-      } else {
-        for (const value of prepared) {
-          const item = callItem(value);
-          if (!item)
-            throw new SignalGrepError("Invalid TypeScript call hierarchy item");
-          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-          const response = await this.#query((channel) => channel.request(method, { item }));
-          if (response === null)
-            continue;
-          if (!Array.isArray(response))
-            throw new SignalGrepError("Invalid TypeScript call relationship response");
-          for (const raw of response) {
-            const call = record3(raw);
-            if (!call)
-              throw new SignalGrepError("Invalid TypeScript call relationship");
-            const from = record3(call.from);
-            const to = record3(call.to);
-            const sourceValue = operation === "callers" ? from : to;
-            if (!sourceValue)
-              continue;
-            const location = semanticLocation(sourceValue);
-            const targetDocument = await this.#sourceAt(location.path);
-            if (!targetDocument) {
-              unresolved.push({
-                operation,
-                reason: `Compiler location is outside admitted sources: ${location.path}`,
-                confidence: "unknown"
-              });
-              continue;
-            }
-            const targetLocation = sourceRange(targetDocument, location.range);
-            const related = this.#node(targetDocument, targetLocation, targetDocument.slice(targetLocation.range));
-            nodes.push(related);
-            const fromNode = operation === "callers" ? related : node;
-            const toNode = operation === "callers" ? node : related;
-            const callerDocument = await this.#sourceAt(from?.uri ? semanticLocation(from).path : document.path);
-            const ranges = Array.isArray(call.fromRanges) ? call.fromRanges : [];
-            for (const rawRange of ranges.length ? ranges : [undefined]) {
-              const callSite = rawRange === undefined || !callerDocument ? undefined : sourceRange(callerDocument, lspRange(rawRange));
-              edges.push({
-                edgeKey: JSON.stringify([
-                  operation,
-                  relationshipNodeKey(fromNode),
-                  relationshipNodeKey(toNode),
-                  callSite?.range ?? targetLocation.range
-                ]),
-                operation,
-                from: fromNode,
-                to: toNode,
-                ...callSite ? { callSite } : {},
-                evidence: [operationEvidence(operation)],
-                confidence: "verified-static",
-                dependencies: this.#dependencies
-              });
-            }
-          }
-        }
-      }
-    } else {
-      const response = await this.#query((channel) => channel.request(operationMethod2(operation), {
-        textDocument,
-        position: textDocument.position,
-        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
-      }));
-      for (const location of locations(response)) {
-        const targetDocument = await this.#sourceAt(location.path);
-        if (!targetDocument) {
-          unresolved.push({
-            operation,
-            source: {
-              path: location.path,
-              range: { start: 0, end: 0 },
-              start: { line: 1, column: 1 }
-            },
-            reason: `Compiler location is outside admitted sources: ${location.path}`,
-            confidence: "unknown"
-          });
-          continue;
-        }
-        const targetLocation = sourceRange(targetDocument, location.range);
-        const related = this.#node(targetDocument, targetLocation, targetDocument.slice(targetLocation.range));
-        nodes.push(related);
-        edges.push({
-          edgeKey: JSON.stringify([
-            operation,
-            relationshipNodeKey(node),
-            relationshipNodeKey(related),
-            targetLocation.range
-          ]),
-          operation,
-          from: operation === "definitions" || operation === "implementations" ? node : related,
-          to: operation === "definitions" || operation === "implementations" ? related : node,
-          evidence: [operationEvidence(operation)],
-          confidence: "verified-static",
-          dependencies: this.#dependencies
-        });
-      }
-    }
-    const uniqueEdges = [...new Map(edges.map((edge) => [edge.edgeKey, edge])).values()];
-    const uniqueNodes = [
-      ...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()
-    ];
-    for (const edge of uniqueEdges)
-      this.#edges.set(edge.edgeKey, edge);
-    const reasons = unresolved.map((item) => item.reason);
-    const freshness = uniqueEdges.length || unresolved.length ? "current" : "unknown";
-    return {
-      edges: uniqueEdges,
-      nodes: uniqueNodes,
-      unresolved,
-      dependencies: this.#dependencies,
-      coverage: {
-        status: unresolved.length ? "partial" : "complete",
-        freshness,
-        sources: currentStatuses(this.#dependencies, freshness),
-        reasons
-      }
-    };
-  }
-  async recheck(signal) {
-    this.#assertOpen(signal);
-    const statuses = [];
-    const affectedPaths = new Set;
-    for (const dependency of this.#dependencies) {
-      this.#assertOpen(signal);
-      if (!dependency.reference) {
-        statuses.push({
-          path: dependency.path,
-          role: dependency.role,
-          status: "unknown",
-          reason: "Missing captured source reference"
-        });
-        continue;
-      }
-      try {
-        const refreshed = await this.#access.refresh(dependency.path, dependency.reference);
-        statuses.push({
-          path: dependency.path,
-          role: dependency.role,
-          status: "current",
-          expected: dependency.reference,
-          current: refreshed.reference
-        });
-      } catch (error) {
-        if (error instanceof SourceDocumentError) {
-          const status = error.reason === "source-changed" ? "stale" : "unknown";
-          statuses.push({
-            path: dependency.path,
-            role: dependency.role,
-            status,
-            expected: dependency.reference,
-            reason: error.message
-          });
-          if (status === "stale")
-            affectedPaths.add(dependency.path);
-          continue;
-        }
-        throw error;
-      }
-    }
-    try {
-      await this.#projectRecheck();
-    } catch (error) {
-      if (error instanceof SignalGrepError && error.message.includes("Workspace file set changed")) {
-        for (const dependency of this.#dependencies) {
-          const current = statuses.find((status) => status.path === dependency.path);
-          if (current?.status === "current") {
-            current.status = "stale";
-            current.reason = "Workspace file inventory changed during recheck";
-            affectedPaths.add(current.path);
-          }
-        }
-      } else
-        throw error;
-    }
-    const affectedNodeKeys = [...this.#nodes.values()].filter((node) => affectedPaths.has(node.path)).map(relationshipNodeKey);
-    const affectedEdgeKeys = [...this.#edges.values()].filter((edge) => affectedPaths.has(edge.from.path) || affectedPaths.has(edge.to.path)).map((edge) => edge.edgeKey);
-    const reasons = statuses.filter((status) => status.reason).map((status) => `${status.path}: ${status.reason}`);
-    return relationshipRecheck(statuses, affectedNodeKeys, affectedEdgeKeys, reasons, statuses.some((status) => status.status !== "current") ? "partial" : "complete");
-  }
-  async close() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-  }
-  async#uri(document) {
-    const path = resolve26(this.#cwd, document.path);
-    return pathToFileURL2(path).href;
-  }
-}
-function createTypeScriptRelationshipProvider(access) {
-  return {
-    providerId: TYPESCRIPT_PROVIDER_ID,
-    async open(options) {
-      if (options.cwd !== access.cwd)
-        throw new SignalGrepError("TypeScript provider cwd does not match SourceAccess");
-      const project = await semanticProject(access, options.scope.root, true, {
-        ...options.scope.include ? { glob: [...options.scope.include] } : {},
-        ...options.scope.exclude ? { exclude: [...options.scope.exclude] } : {},
-        ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden }
-      });
-      const documents = [...project.documents.values()];
-      const sourceAt = await semanticSources(options.cwd, documents);
-      return new TypeScriptRelationshipView(options, access, documents, project.metadata, project.recheckInventory, sourceAt);
-    }
-  };
-}
-
-// src/swift-relationship-provider.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
-import { resolve as resolve30 } from "node:path";
-
-// src/swift-source-context.ts
-import { realpathSync } from "node:fs";
-import { resolve as resolve28 } from "node:path";
-
-// src/swift-sourcekit-protocol.ts
-import { createHash as createHash6 } from "node:crypto";
-import { readFile as readFile2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute7, resolve as resolve27 } from "node:path";
-import { fileURLToPath as fileURLToPath5, pathToFileURL as pathToFileURL3 } from "node:url";
-var SWIFT_SEMANTIC_PROVIDER_ID = "sourcekit-lsp-swift";
-var SWIFT_SEMANTIC_QUERY_TIMEOUT_MS = 60000;
-var SWIFT_TOOLCHAIN_PATH = "swift:sourcekit-lsp";
-var swiftSource = /\.swift$/iu;
-function executablePath3() {
-  const configured = process.env.BAOER_SIGNAL_GREP_SOURCEKIT_LSP_PATH?.trim();
-  if (!configured)
-    return "sourcekit-lsp";
-  if (!isAbsolute7(configured))
-    throw new SignalGrepError("BAOER_SIGNAL_GREP_SOURCEKIT_LSP_PATH must be absolute");
-  return configured;
-}
-function sourcePath(uri) {
-  if (typeof uri !== "string" || !uri.startsWith("file:"))
-    throw new SignalGrepError("SourceKit-LSP returned a non-file URI");
-  try {
-    return fileURLToPath5(uri);
-  } catch (error) {
-    throw new SignalGrepError("SourceKit-LSP returned an invalid file URI", { cause: error });
-  }
-}
-function sourceUri(cwd, path) {
-  return pathToFileURL3(resolve27(cwd, path)).href;
-}
-function sourceDocumentDependency(document) {
-  return { path: document.path, role: "source", reference: document.reference, exists: true };
-}
-function toolchainDependency(fingerprint) {
-  return { path: SWIFT_TOOLCHAIN_PATH, role: "config", fingerprint, exists: true };
-}
-function sourceLocation2(document, range) {
-  const rangeBytes = byteRange(document, range);
-  return {
-    path: document.path,
-    range: rangeBytes,
-    start: document.positionAt(rangeBytes.start),
-    end: document.positionAt(rangeBytes.end),
-    source: document.reference
-  };
-}
-function evidence2(reason) {
-  return {
-    reason,
-    level: "compiler",
-    basis: "semantic",
-    providerBasis: SWIFT_SEMANTIC_PROVIDER_ID
-  };
-}
-function operationMethod3(operation) {
-  switch (operation) {
-    case "definitions":
-      return "textDocument/definition";
-    case "references":
-      return "textDocument/references";
-    case "implementations":
-      return "textDocument/implementation";
-    default:
-      throw new SignalGrepError("Unsupported Swift LSP operation: " + operation);
-  }
-}
-function relationReason2(operation) {
-  if (operation === "callers" || operation === "callees")
-    return "SourceKit-LSP indexed call hierarchy; dynamic dispatch is not runtime proof";
-  return "SourceKit-LSP compiler-bound " + operation + " result";
-}
-function operationUnresolved2(operation, reason) {
-  return { operation, reason, confidence: "unknown" };
-}
-function recordString(value, key) {
-  return rpcRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
-}
-function recordNumber(value, key) {
-  return rpcRecord(value) && typeof value[key] === "number" && Number.isSafeInteger(value[key]) ? value[key] : undefined;
-}
-function readSwiftNode(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("Invalid SourceKit-LSP navigation item");
-  const uri = recordString(value, "uri") ?? recordString(value, "targetUri");
-  if (!uri)
-    throw new SignalGrepError("SourceKit-LSP navigation item has no URI");
-  const range = lspRange(value.range ?? value.targetRange ?? value.selectionRange);
-  const selectionRange = lspRange(value.selectionRange ?? value.targetSelectionRange ?? range);
-  const name = recordString(value, "name");
-  const kind = recordNumber(value, "kind");
-  return {
-    id: uri + ":" + String(selectionRange.start.line) + ":" + String(selectionRange.start.character) + ":" + String(selectionRange.end.line) + ":" + String(selectionRange.end.character),
-    path: sourcePath(uri),
-    uri,
-    range,
-    selectionRange,
-    ...name ? { name } : {},
-    ...kind === undefined ? {} : { kind }
-  };
-}
-function readLocations2(value) {
-  if (value === null)
-    return [];
-  return (Array.isArray(value) ? value : [value]).map(readSwiftNode);
-}
-function readCallRanges2(value) {
-  if (!Array.isArray(value))
-    return;
-  return value.map((range) => lspRange(range));
-}
-function readOutlineItem(value) {
-  if (!rpcRecord(value) || typeof value.name !== "string")
-    throw new SignalGrepError("Invalid SourceKit-LSP document symbol");
-  const range = lspRange(value.range);
-  const selectionRange = lspRange(value.selectionRange ?? value.range);
-  const kind = recordNumber(value, "kind");
-  if (kind === undefined)
-    throw new SignalGrepError("SourceKit-LSP document symbol has no kind");
-  const children = value.children ?? [];
-  if (!Array.isArray(children))
-    throw new SignalGrepError("Invalid SourceKit-LSP document symbol children");
-  return { name: value.name, kind, range, selectionRange, children: children.map(readOutlineItem) };
-}
-function readSwiftOutline(value) {
-  if (!Array.isArray(value))
-    throw new SignalGrepError("Invalid SourceKit-LSP document symbols");
-  return value.map(readOutlineItem);
-}
-function readCapabilities(value) {
-  if (!rpcRecord(value) || !rpcRecord(value.capabilities))
-    throw new SignalGrepError("SourceKit-LSP initialize response has no capabilities");
-  const capabilities = value.capabilities;
-  const has = (key) => capabilities[key] !== undefined && capabilities[key] !== false;
-  const advertised = [];
-  if (has("definitionProvider"))
-    advertised.push("definitions");
-  if (has("referencesProvider"))
-    advertised.push("references");
-  if (has("implementationProvider"))
-    advertised.push("implementations");
-  if (has("callHierarchyProvider"))
-    advertised.push("callers", "callees");
-  const experimental = rpcRecord(capabilities.experimental) ? Object.keys(capabilities.experimental).toSorted() : [];
-  const reasons = [];
-  if (advertised.some((operation) => ["references", "callers", "callees"].includes(operation)))
-    reasons.push("Index-backed operations require workspace synchronize(index=true)");
-  return {
-    outline: has("documentSymbolProvider"),
-    advertised: [...new Set(advertised)],
-    experimental,
-    indexBarrier: "unknown",
-    reasons
-  };
-}
-function configurationFingerprint2(executable, workspaceFingerprint) {
-  return createHash6("sha256").update(JSON.stringify({
-    executable,
-    backgroundIndexing: "request-dependent",
-    swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] },
-    workspaceFingerprint
-  })).digest("hex");
-}
-async function readSwiftWorkspaceConfiguration(cwd, root) {
-  const path = resolve27(cwd, root, ".sourcekit-lsp", "config.json");
-  let text;
-  try {
-    text = await readFile2(path, "utf8");
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return {
-        path,
-        fingerprint: "absent",
-        initializationOptions: {
-          backgroundIndexing: false,
-          swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] }
-        }
-      };
-    }
-    throw new SignalGrepError("Unable to read the Swift workspace SourceKit-LSP configuration", {
-      cause: error
-    });
-  }
-  let value;
-  try {
-    value = JSON.parse(text);
-  } catch (error) {
-    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration is not valid JSON", {
-      cause: error
-    });
-  }
-  if (!rpcRecord(value))
-    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration must be an object");
-  const swiftPM = rpcRecord(value.swiftPM) ? value.swiftPM : undefined;
-  if (value.backgroundIndexing === true)
-    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration enables backgroundIndexing; relationship indexing requires explicit preparation");
-  if (swiftPM?.forceResolvedVersions === false)
-    throw new SignalGrepError("Swift workspace SourceKit-LSP configuration disables forceResolvedVersions; dependency resolution is not locked");
-  if (swiftPM?.extraArguments !== undefined) {
-    if (!Array.isArray(swiftPM.extraArguments) || !swiftPM.extraArguments.every((item) => typeof item === "string") || !swiftPM.extraArguments.includes("--skip-update"))
-      throw new SignalGrepError("Swift workspace SourceKit-LSP extraArguments must include --skip-update");
-  }
-  return {
-    path,
-    fingerprint: createHash6("sha256").update(text).digest("hex"),
-    initializationOptions: {
-      backgroundIndexing: false,
-      swiftPM: { forceResolvedVersions: true, extraArguments: ["--skip-update"] }
-    }
-  };
-}
-function isAdmittedSwiftFile(path) {
-  return swiftSource.test(path);
-}
-function documentRole2(path) {
-  return /(?:^|\/)Package\.swift$/iu.test(path) ? "manifest" : "source";
-}
-function sourceStatus(document, status, reason) {
-  return {
-    path: document.path,
-    role: documentRole2(document.path),
-    status,
-    expected: document.reference,
-    ...reason ? { reason } : {}
-  };
-}
-function currentSourceStatuses(documents, fingerprint) {
-  return [
-    ...[...documents].map((document) => sourceStatus(document, "current")),
-    { path: SWIFT_TOOLCHAIN_PATH, role: "config", status: "current", reason: fingerprint }
-  ];
-}
-function positionOf2(node) {
-  return node.selectionRange.start;
-}
-function sourceKitRequestCapabilities() {
-  return {
-    general: { positionEncodings: ["utf-16"] },
-    workspace: { workspaceFolders: true, configuration: true },
-    textDocument: {
-      definition: { linkSupport: true },
-      references: {},
-      implementation: { linkSupport: true },
-      documentSymbol: {},
-      callHierarchy: {}
-    },
-    experimental: {
-      "sourcekit/isIndexing": { supported: true },
-      "sourceKit/_isIndexing": { supported: true },
-      "sourcekit/workspace/synchronize": { supported: true },
-      "workspace/synchronize": { supported: true },
-      "sourcekit/workspace/triggerReindex": { supported: true },
-      "workspace/triggerReindex": { supported: true }
-    }
-  };
-}
-function isIndexBacked(operation) {
-  return operation === "references" || operation === "callers" || operation === "callees";
-}
-
-// src/swift-source-context.ts
-function isRecoverableSourceReadFailure(error) {
-  return error instanceof SourceDocumentError || error instanceof SourceBudgetError;
-}
-
-class SwiftSourceContext {
-  cwd;
-  scope;
-  signal;
-  source;
-  documents;
-  inventory;
-  initialReasons;
-  initialCoveragePartial;
-  configurationFingerprint;
-  workspaceConfiguration;
-  constructor(options) {
-    this.cwd = options.cwd;
-    this.scope = options.scope;
-    this.signal = options.signal;
-    this.source = options.source;
-    this.documents = options.documents;
-    this.inventory = options.inventory;
-    this.initialReasons = options.initialReasons;
-    this.initialCoveragePartial = options.initialCoveragePartial;
-    this.workspaceConfiguration = options.workspaceConfiguration;
-    this.configurationFingerprint = configurationFingerprint2(executablePath3(), options.workspaceConfiguration.fingerprint);
-  }
-  static async open(options) {
-    const files = await listWorkspaceFiles(options.cwd, options.signal, {
-      path: options.scope.root,
-      glob: [...options.scope.include ?? []],
-      exclude: [...options.scope.exclude ?? []],
-      ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
-      ...options.limits?.maxFiles === undefined ? {} : { maxFiles: options.limits.maxFiles }
-    });
-    const workspaceConfiguration = await readSwiftWorkspaceConfiguration(options.cwd, options.scope.root);
-    const documents = new Map;
-    const reasons = [...files.reasons];
-    let partial = files.partial;
-    const inventory = new Set(files.paths.filter(isAdmittedSwiftFile));
-    for (const path of inventory) {
-      if (options.signal.aborted)
-        throw abortError();
-      try {
-        const document = await options.source.load(path);
-        if (!document.utf8) {
-          reasons.push(path + ": source is not lossless UTF-8");
-          partial = true;
-          continue;
-        }
-        documents.set(resolve28(options.cwd, path), document);
-      } catch (error) {
-        if (options.signal.aborted || error instanceof Error && error.name === "AbortError")
-          throw abortError();
-        if (!isRecoverableSourceReadFailure(error))
-          throw error;
-        reasons.push(path + ": " + (error instanceof Error ? error.message : "source unavailable"));
-        partial = true;
-      }
-    }
-    if (documents.size === 0)
-      throw new SignalGrepError("Swift semantic provider found no admitted Swift source");
-    return new SwiftSourceContext({
-      cwd: options.cwd,
-      scope: options.scope,
-      signal: options.signal,
-      source: options.source,
-      documents,
-      inventory,
-      initialReasons: reasons,
-      initialCoveragePartial: partial,
-      workspaceConfiguration
-    });
-  }
-  documentForPath(path) {
-    const direct = this.documents.get(resolve28(this.cwd, path));
-    if (direct)
-      return direct;
-    let requested;
-    try {
-      requested = realpathSync(resolve28(this.cwd, path));
-    } catch {
-      return;
-    }
-    for (const [key, document] of this.documents) {
-      try {
-        if (realpathSync(key) === requested)
-          return document;
-      } catch {}
-    }
-    return;
-  }
-  async recheck() {
-    const statuses = [];
-    const reasons = [];
-    const stalePaths = new Set;
-    for (const document of this.documents.values()) {
-      try {
-        await this.source.refresh(document.path, document.reference);
-        statuses.push(sourceStatus(document, "current"));
-      } catch (error) {
-        if (this.signal.aborted || error instanceof Error && error.name === "AbortError")
-          throw abortError();
-        if (!isRecoverableSourceReadFailure(error))
-          throw error;
-        const reason = error instanceof Error ? error.message : "Swift source recheck failed";
-        statuses.push(sourceStatus(document, "stale", reason));
-        reasons.push(document.path + ": " + reason);
-        stalePaths.add(document.path);
-      }
-    }
-    const inventory = await listWorkspaceFiles(this.cwd, this.signal, {
-      path: this.scope.root,
-      glob: [...this.scope.include ?? []],
-      exclude: [...this.scope.exclude ?? []],
-      ...this.scope.hidden === undefined ? {} : { hidden: this.scope.hidden }
-    });
-    const currentInventory = new Set(inventory.paths.filter(isAdmittedSwiftFile));
-    const inventoryChanged = currentInventory.size !== this.inventory.size || [...currentInventory].some((path) => !this.inventory.has(path));
-    if (inventoryChanged || inventory.partial) {
-      reasons.push(inventoryChanged ? "Swift source inventory changed during relationship query; retry" : inventory.reasons.join("; "));
-      for (const path of [...this.inventory].filter((item) => !currentInventory.has(item))) {
-        statuses.push({
-          path,
-          role: documentRole2(path),
-          status: "stale",
-          reason: "source removed during query"
-        });
-        stalePaths.add(path);
-      }
-      for (const path of [...currentInventory].filter((item) => !this.inventory.has(item))) {
-        statuses.push({
-          path,
-          role: documentRole2(path),
-          status: "stale",
-          reason: "source added during query; retry"
-        });
-        stalePaths.add(path);
-      }
-    }
-    let currentConfigurationFingerprint;
-    let configurationReason;
-    try {
-      const workspaceConfiguration = await readSwiftWorkspaceConfiguration(this.cwd, this.scope.root);
-      currentConfigurationFingerprint = configurationFingerprint2(executablePath3(), workspaceConfiguration.fingerprint);
-    } catch (error) {
-      configurationReason = error instanceof Error ? error.message : "Swift toolchain configuration is invalid";
-    }
-    const configurationChanged = configurationReason !== undefined || currentConfigurationFingerprint !== this.configurationFingerprint;
-    if (configurationChanged)
-      reasons.push(configurationReason ?? "Swift executable or SourceKit-LSP initialization configuration changed during relationship query");
-    statuses.push({
-      path: SWIFT_TOOLCHAIN_PATH,
-      role: "config",
-      status: configurationChanged ? "stale" : "current",
-      reason: configurationReason ?? currentConfigurationFingerprint ?? this.configurationFingerprint
-    });
-    const inventoryUnknown = inventory.partial;
-    const invalidated = stalePaths.size > 0 || configurationChanged;
-    return {
-      validity: invalidated ? "stale" : inventoryUnknown ? "unknown" : "current",
-      coverage: this.initialCoveragePartial || invalidated || inventoryUnknown ? "partial" : "complete",
-      sources: statuses,
-      reasons,
-      stalePaths,
-      configurationChanged,
-      inventoryUnknown
-    };
-  }
-}
-
-// src/swift-sourcekit-session.ts
-import { resolve as resolve29 } from "node:path";
-class SwiftSourceKitSession {
-  #cwd;
-  #scope;
-  #signal;
-  #workspaceConfiguration;
-  #channel;
-  #completion;
-  #abortProcess;
-  #runtimeCapabilities;
-  #openedUris = new Set;
-  #backgroundIndexingEnabled = false;
-  #indexSynchronized = false;
-  #closed = false;
-  constructor(options) {
-    this.#cwd = options.cwd;
-    this.#scope = options.scope;
-    this.#signal = options.signal;
-    this.#workspaceConfiguration = options.workspaceConfiguration;
-  }
-  async channel(indexRequired = false) {
-    return this.#ensureClient(indexRequired);
-  }
-  async requireOperationCapability(operation) {
-    const capabilities = this.#runtimeCapabilities ?? (await this.#ensureClient(isIndexBacked(operation)), this.#runtimeCapabilities);
-    if (!capabilities?.advertised.includes(operation))
-      throw new SignalGrepError("SourceKit-LSP did not advertise Swift operation: " + operation);
-  }
-  async requireOutlineCapability() {
-    const capabilities = this.#runtimeCapabilities ?? (await this.#ensureClient(), this.#runtimeCapabilities);
-    if (!capabilities?.outline)
-      throw new SignalGrepError("SourceKit-LSP did not advertise documentSymbolProvider");
-  }
-  async openDocument(document, indexRequired = false) {
-    const channel = await this.#ensureClient(indexRequired);
-    const uri = sourceUri(this.#cwd, document.path);
-    if (this.#openedUris.has(uri))
-      return;
-    await channel.notify("textDocument/didOpen", {
-      textDocument: { uri, languageId: "swift", version: 1, text: document.text }
-    });
-    await channel.notify("textDocument/didChange", {
-      textDocument: { uri, version: 2 },
-      contentChanges: [{ text: document.text }]
-    });
-    this.#openedUris.add(uri);
-  }
-  async synchronizeIndex(documents) {
-    if (this.#indexSynchronized)
-      return;
-    const channel = await this.#ensureClient(true);
-    for (const document of documents) {
-      await this.openDocument(document, true);
-    }
-    try {
-      await channel.request("sourcekit/workspace/triggerReindex", {});
-    } catch (error) {
-      if (!(error instanceof SignalGrepError) || !/method not found/iu.test(error.message))
-        throw error;
-      await channel.request("workspace/triggerReindex", {});
-    }
-    try {
-      await channel.request("sourcekit/workspace/synchronize", { index: true });
-    } catch (error) {
-      if (!(error instanceof SignalGrepError) || !/method not found/iu.test(error.message))
-        throw error;
-      await channel.request("workspace/synchronize", { index: true });
-    }
-    this.#indexSynchronized = true;
-    if (this.#runtimeCapabilities)
-      this.#runtimeCapabilities.indexBarrier = "verified";
-  }
-  invalidateIndex() {
-    this.#indexSynchronized = false;
-  }
-  async close() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    try {
-      if (this.#channel && this.#completion)
-        await this.#gracefulClose();
-    } catch (error) {
-      await this.#stopClient();
-      if (this.#signal.aborted)
-        throw abortError();
-      throw error;
-    }
-  }
-  async#ensureClient(indexRequired = false) {
-    if (this.#closed)
-      throw new SignalGrepError("Swift SourceKit-LSP session is closed");
-    if (this.#channel && indexRequired && !this.#backgroundIndexingEnabled)
-      await this.#restartClientForIndex();
-    if (this.#channel)
-      return this.#channel;
-    const executable = executablePath3();
-    let owned;
-    try {
-      owned = await openOwnedJsonRpc({
-        executable,
-        args: [],
-        cwd: resolve29(this.#cwd, this.#scope.root),
-        signal: this.#signal,
-        env: process.env
-      }, (method, params) => this.clientRequest(method, params));
-      const initialize = await owned.channel.request("initialize", {
-        processId: process.pid,
-        rootUri: sourceUri(this.#cwd, this.#scope.root),
-        workspaceFolders: [
-          {
-            uri: sourceUri(this.#cwd, this.#scope.root),
-            name: this.#scope.root
-          }
-        ],
-        capabilities: sourceKitRequestCapabilities(),
-        initializationOptions: {
-          ...this.#workspaceConfiguration.initializationOptions,
-          backgroundIndexing: indexRequired
-        }
-      });
-      this.#runtimeCapabilities = readCapabilities(initialize);
-      await owned.channel.notify("initialized", {});
-      this.#channel = owned.channel;
-      this.#completion = owned.completion;
-      this.#abortProcess = () => owned?.abort();
-      this.#backgroundIndexingEnabled = indexRequired;
-      return owned.channel;
-    } catch (error) {
-      owned?.abort();
-      await owned?.completion.catch(() => {
-        return;
-      });
-      if (this.#signal.aborted)
-        throw abortError();
-      throw error;
-    }
-  }
-  async#restartClientForIndex() {
-    await this.#stopClient();
-    this.#runtimeCapabilities = undefined;
-    this.#openedUris.clear();
-    this.#indexSynchronized = false;
-  }
-  async#stopClient() {
-    const channel = this.#channel;
-    const completion = this.#completion;
-    const abortProcess = this.#abortProcess;
-    this.#channel = undefined;
-    this.#completion = undefined;
-    this.#abortProcess = undefined;
-    if (!channel)
-      return;
-    channel.close();
-    abortProcess?.();
-    await completion?.catch(() => {
-      return;
-    });
-  }
-  async#gracefulClose() {
-    const channel = this.#channel;
-    const completion = this.#completion;
-    if (!channel || !completion)
-      return;
-    let onAbort;
-    const aborted = new Promise((_, reject) => {
-      onAbort = () => reject(abortError());
-      if (this.#signal.aborted)
-        onAbort();
-      else
-        this.#signal.addEventListener("abort", onAbort, { once: true });
-    });
-    try {
-      await Promise.race([channel.request("shutdown", {}), aborted]);
-      await Promise.race([channel.notify("exit", {}), aborted]);
-      channel.endInput();
-      const result = await Promise.race([completion, aborted]);
-      if (result.code !== 0)
-        throw new SignalGrepError("SourceKit-LSP process failed (" + String(result.code) + "): " + result.stderr);
-    } finally {
-      if (onAbort)
-        this.#signal.removeEventListener("abort", onAbort);
-    }
-  }
-  clientRequest(method, params) {
-    if (method === "workspace/configuration") {
-      if (!rpcRecord(params) || !Array.isArray(params.items))
-        throw new SignalGrepError("Invalid SourceKit-LSP workspace/configuration request");
-      return params.items.map(() => ({}));
-    }
-    if (method === "workspace/workspaceFolders")
-      return [{ uri: sourceUri(this.#cwd, this.#scope.root), name: this.#scope.root }];
-    if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create")
-      return null;
-    if (method === "workspace/applyEdit")
-      return { applied: false, failureReason: "Swift relationship provider is read-only" };
-    throw new SignalGrepError("Unsupported SourceKit-LSP client request: " + method);
-  }
-}
-
-// src/swift-relationship-provider.ts
-var providerQueue2 = new OwnedTaskQueue;
-
-class SwiftRelationshipView {
-  providerId = SWIFT_SEMANTIC_PROVIDER_ID;
-  analysisViewId;
-  sourceScope;
-  #cwd;
-  #signal;
-  #context;
-  #configurationFingerprint;
-  #releaseQueue;
-  #clearTimeout;
-  #nodes = new Map;
-  #edgePaths = new Map;
-  #session;
-  #closed = false;
-  #closePromise;
-  constructor(options, context, releaseQueue, clearTimeout2) {
-    this.analysisViewId = options.analysisViewId ?? randomUUID7();
-    this.sourceScope = options.scope;
-    this.#cwd = options.cwd;
-    this.#signal = options.signal;
-    this.#context = context;
-    this.#configurationFingerprint = context.configurationFingerprint;
-    this.#session = new SwiftSourceKitSession({
-      cwd: context.cwd,
-      scope: context.scope,
-      signal: context.signal,
-      workspaceConfiguration: context.workspaceConfiguration
-    });
-    this.#releaseQueue = releaseQueue;
-    this.#clearTimeout = clearTimeout2;
-  }
-  async#position(document, input) {
-    if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-      throw new SignalGrepError("Swift semantic target line must be one-based");
-    if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
-      throw new SignalGrepError("Swift semantic target column must be one-based");
-    if (input.column !== undefined) {
-      if (input.line === undefined)
-        throw new SignalGrepError("Swift semantic column requires a line");
-      return { line: input.line - 1, character: input.column - 1 };
-    }
-    if (!input.symbol)
-      throw new SignalGrepError("Swift semantic target requires a column or symbol");
-    const outline = await this.#rawOutline(document.path);
-    const matches = [];
-    const visit = (items) => {
-      for (const item of items) {
-        if (item.name === input.symbol && (input.line === undefined || item.selectionRange.start.line + 1 === input.line))
-          matches.push(item);
-        visit(item.children);
-      }
-    };
-    visit(outline);
-    if (matches.length !== 1)
-      throw new SignalGrepError(matches.length ? "Swift semantic target symbol is ambiguous" : "Swift semantic target symbol is absent");
-    const match = matches[0];
-    if (!match)
-      throw new SignalGrepError("Swift semantic target symbol is absent");
-    return match.selectionRange.start;
-  }
-  async#rawOutline(path) {
-    const document = this.#context.documents.get(resolve30(this.#cwd, path));
-    if (!document)
-      throw new SignalGrepError("Swift outline target is outside admitted source");
-    await this.#session.requireOutlineCapability();
-    await this.#session.openDocument(document);
-    const response = await (await this.#session.channel()).request("textDocument/documentSymbol", {
-      textDocument: { uri: sourceUri(this.#cwd, document.path) }
-    });
-    return readSwiftOutline(response);
-  }
-  async outline(path) {
-    const document = this.#context.documents.get(resolve30(this.#cwd, path));
-    if (!document)
-      throw new SignalGrepError("Swift outline target is outside admitted source");
-    const convert = (item) => {
-      const range = byteRange(document, item.range);
-      const selection = byteRange(document, item.selectionRange);
-      return {
-        path: document.path,
-        name: item.name,
-        kind: String(item.kind),
-        range,
-        start: document.positionAt(selection.start),
-        end: document.positionAt(selection.end),
-        source: document.reference,
-        children: item.children.map(convert)
-      };
-    };
-    return (await this.#rawOutline(path)).map(convert);
-  }
-  async resolveNode(input, signal) {
-    this.assertOpen(signal);
-    const document = this.#context.documentForPath(input.path);
-    if (!document)
-      return {
-        status: "unsupported",
-        reasons: ["Swift target is outside admitted provider source"],
-        dependencies: []
-      };
-    let position;
-    try {
-      position = await this.#position(document, input);
-    } catch (error) {
-      if (error instanceof SignalGrepError && /ambiguous/iu.test(error.message))
-        return {
-          status: "ambiguous",
-          reasons: [error.message],
-          dependencies: [
-            sourceDocumentDependency(document),
-            toolchainDependency(this.#configurationFingerprint)
-          ]
-        };
-      if (error instanceof SignalGrepError && /absent/iu.test(error.message))
-        return {
-          status: "unknown",
-          reasons: [error.message],
-          dependencies: [
-            sourceDocumentDependency(document),
-            toolchainDependency(this.#configurationFingerprint)
-          ]
-        };
-      throw error;
-    }
-    await this.#session.openDocument(document);
-    const channel = await this.#session.channel();
-    await this.#session.requireOperationCapability("definitions");
-    const params = { textDocument: { uri: sourceUri(this.#cwd, document.path) }, position };
-    const definitions = readLocations2(await channel.request("textDocument/definition", params));
-    if (definitions.length === 0)
-      return {
-        status: "unknown",
-        reasons: ["SourceKit-LSP returned no definition for the requested Swift symbol"],
-        dependencies: [
-          sourceDocumentDependency(document),
-          toolchainDependency(this.#configurationFingerprint)
-        ]
-      };
-    const candidates = definitions.flatMap((candidate) => {
-      const targetDocument = this.#context.documentForPath(candidate.path);
-      return targetDocument ? [this.node(candidate, targetDocument, input.symbol)] : [];
-    });
-    if (definitions.length !== 1)
-      return {
-        status: "ambiguous",
-        candidates,
-        reasons: [
-          "SourceKit-LSP returned multiple Swift definitions; include a more precise position"
-        ],
-        dependencies: [
-          sourceDocumentDependency(document),
-          toolchainDependency(this.#configurationFingerprint)
-        ]
-      };
-    const selected = definitions[0];
-    if (!selected)
-      throw new SignalGrepError("SourceKit-LSP definition candidate disappeared");
-    const target = this.#context.documentForPath(selected.path);
-    if (!target)
-      return {
-        status: "unknown",
-        reasons: ["SourceKit-LSP resolved outside admitted Swift source"],
-        dependencies: [
-          sourceDocumentDependency(document),
-          toolchainDependency(this.#configurationFingerprint)
-        ]
-      };
-    const resolvedName = input.symbol ?? await this.nodeName(target, selected);
-    return {
-      status: "resolved",
-      node: this.node(selected, target, resolvedName),
-      reasons: [],
-      dependencies: [
-        sourceDocumentDependency(document),
-        sourceDocumentDependency(target),
-        toolchainDependency(this.#configurationFingerprint)
-      ]
-    };
-  }
-  async nodeName(document, target) {
-    const symbols = await this.#rawOutline(document.path);
-    const visit = (items) => {
-      for (const item of items) {
-        if (item.selectionRange.start.line === target.selectionRange.start.line && item.selectionRange.start.character === target.selectionRange.start.character)
-          return item.name;
-        const child = visit(item.children);
-        if (child)
-          return child;
-      }
-      return;
-    };
-    return visit(symbols);
-  }
-  async expand(node, operation, signal) {
-    this.assertOpen(signal);
-    const document = this.#context.documents.get(resolve30(this.#cwd, node.path));
-    if (!document)
-      return {
-        edges: [],
-        nodes: [],
-        unresolved: [
-          operationUnresolved2(operation, "Swift node source is outside admitted source")
-        ],
-        dependencies: [],
-        coverage: {
-          status: "partial",
-          freshness: "unknown",
-          sources: [],
-          reasons: ["Swift node source is outside admitted source"]
-        }
-      };
-    const indexRequired = isIndexBacked(operation);
-    const channel = await this.#session.channel(indexRequired);
-    await this.#session.openDocument(document, indexRequired);
-    const internal = {
-      id: node.identity.localKey,
-      path: document.path,
-      uri: sourceUri(this.#cwd, document.path),
-      range: {
-        start: { line: node.start.line - 1, character: node.start.column - 1 },
-        end: {
-          line: (node.end?.line ?? node.start.line) - 1,
-          character: (node.end?.column ?? node.start.column) - 1
-        }
-      },
-      selectionRange: {
-        start: { line: node.start.line - 1, character: node.start.column - 1 },
-        end: {
-          line: (node.end?.line ?? node.start.line) - 1,
-          character: (node.end?.column ?? node.start.column) - 1
-        }
-      },
-      name: node.name
-    };
-    await this.#session.requireOperationCapability(operation);
-    const params = {
-      textDocument: { uri: internal.uri },
-      position: positionOf2(internal)
-    };
-    const unresolved = [];
-    const rawEdges = [];
-    if (indexRequired)
-      await this.#session.synchronizeIndex(this.#context.documents.values());
-    if (operation === "callers" || operation === "callees") {
-      const prepared = await channel.request("textDocument/prepareCallHierarchy", params);
-      if (!Array.isArray(prepared))
-        unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned no call hierarchy"));
-      else {
-        for (const item of prepared) {
-          const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-          const response = await channel.request(method, { item });
-          if (!Array.isArray(response)) {
-            unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned an invalid call hierarchy"));
-            continue;
-          }
-          for (const value of response) {
-            if (!rpcRecord(value)) {
-              unresolved.push(operationUnresolved2(operation, "SourceKit-LSP returned an invalid call edge"));
-              continue;
-            }
-            try {
-              const endpoint = readSwiftNode(operation === "callers" ? value.from : value.to);
-              const callRanges = readCallRanges2(value.fromRanges);
-              rawEdges.push({
-                operation,
-                endpoint,
-                ...callRanges ? { callRanges } : {}
-              });
-            } catch (error) {
-              unresolved.push(operationUnresolved2(operation, error instanceof Error ? error.message : "invalid call edge"));
-            }
-          }
-        }
-      }
-    } else {
-      const response = await channel.request(operationMethod3(operation), {
-        ...params,
-        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
-      });
-      for (const candidate of readLocations2(response))
-        rawEdges.push({ operation, endpoint: candidate });
-    }
-    const nodes = [];
-    const edges = [];
-    for (const raw of rawEdges) {
-      const endpoint = this.convertNode(raw.endpoint, unresolved, operation);
-      if (!endpoint)
-        continue;
-      const from = operation === "definitions" || operation === "implementations" || operation === "callees" ? node : endpoint;
-      const to = operation === "definitions" || operation === "implementations" || operation === "callees" ? endpoint : node;
-      const ranges = raw.callRanges?.length ? raw.callRanges : [undefined];
-      for (const [index, range] of ranges.entries()) {
-        const callSite = range ? this.callSite(operation === "callers" ? raw.endpoint : internal, range) : undefined;
-        const edgeKey = operation + ":" + relationshipNodeKey(from) + "->" + relationshipNodeKey(to) + ":" + String(index);
-        const paths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
-        this.#edgePaths.set(edgeKey, paths);
-        edges.push({
-          edgeKey,
-          operation,
-          from,
-          to,
-          ...callSite ? { callSite } : {},
-          evidence: [evidence2(relationReason2(operation))],
-          confidence: "verified-static",
-          dependencies: [...paths].map((path) => this.#context.documents.get(resolve30(this.#cwd, path))).filter((item) => item !== undefined).map(sourceDocumentDependency).concat(toolchainDependency(this.#configurationFingerprint))
-        });
-        nodes.push(from, to);
-      }
-    }
-    return {
-      edges: [...new Map(edges.map((edge) => [edge.edgeKey, edge])).values()],
-      nodes: [...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()],
-      unresolved,
-      dependencies: [
-        sourceDocumentDependency(document),
-        toolchainDependency(this.#configurationFingerprint)
-      ],
-      coverage: {
-        status: this.#context.initialCoveragePartial || unresolved.length ? "partial" : "complete",
-        freshness: "current",
-        sources: currentSourceStatuses(this.#context.documents.values(), this.#configurationFingerprint),
-        reasons: [
-          ...new Set([
-            ...this.#context.initialReasons,
-            relationReason2(operation),
-            ...unresolved.map((item) => item.reason)
-          ])
-        ]
-      }
-    };
-  }
-  async recheck(signal) {
-    this.assertOpen(signal);
-    const result = await this.#context.recheck();
-    if (result.configurationChanged || result.inventoryUnknown)
-      this.#session.invalidateIndex();
-    return {
-      validity: result.validity,
-      coverage: result.coverage,
-      sources: result.sources,
-      affectedNodeKeys: result.configurationChanged || result.inventoryUnknown ? [...this.#nodes.keys()] : [...this.#nodes.entries()].filter(([, path]) => result.stalePaths.has(path)).map(([key]) => key),
-      affectedEdgeKeys: result.configurationChanged || result.inventoryUnknown ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => result.stalePaths.has(path))).map(([key]) => key),
-      reasons: [...result.reasons]
-    };
-  }
-  close() {
-    if (!this.#closePromise)
-      this.#closePromise = this.closeOnce();
-    return this.#closePromise;
-  }
-  async closeOnce() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    try {
-      await this.#session.close();
-    } catch (error) {
-      if (this.#signal.aborted)
-        throw abortError();
-      throw error;
-    } finally {
-      this.#clearTimeout();
-      this.#releaseQueue();
-    }
-  }
-  node(internal, document, fallbackName) {
-    const range = byteRange(document, internal.range);
-    const selection = byteRange(document, internal.selectionRange);
-    const localKey = document.path + ":" + String(selection.start) + ":" + String(selection.end);
-    const fallback = fallbackName ?? (document.slice(selection) || document.path);
-    const node = {
-      identity: {
-        providerId: SWIFT_SEMANTIC_PROVIDER_ID,
-        analysisViewId: this.analysisViewId,
-        sourceScope: this.sourceScope.root,
-        localKey
-      },
-      path: document.path,
-      name: internal.name ?? fallback,
-      kind: internal.kind === undefined ? "unknown" : String(internal.kind),
-      range,
-      start: document.positionAt(selection.start),
-      end: document.positionAt(selection.end),
-      source: document.reference,
-      evidence: [evidence2("SourceKit-LSP Swift compiler navigation result")]
-    };
-    this.#nodes.set(relationshipNodeKey(node), document.path);
-    return node;
-  }
-  convertNode(internal, unresolved, operation) {
-    const document = this.#context.documentForPath(internal.path);
-    if (!document) {
-      unresolved.push(operationUnresolved2(operation, "SourceKit-LSP result is outside admitted Swift source: " + internal.path));
-      return;
-    }
-    return this.node(internal, document);
-  }
-  callSite(endpoint, range) {
-    const document = this.#context.documentForPath(endpoint.path);
-    return document ? sourceLocation2(document, range) : undefined;
-  }
-  assertOpen(signal) {
-    if (this.#closed)
-      throw new SignalGrepError("Swift relationship view is closed");
-    if (signal?.aborted || this.#signal.aborted)
-      throw abortError();
-  }
-}
-var swiftSemanticProvider = {
-  providerId: SWIFT_SEMANTIC_PROVIDER_ID,
-  async open(options) {
-    const releaseQueue = await providerQueue2.acquire(options.signal);
-    const deadline = new AbortController;
-    const sessionSignal = AbortSignal.any([options.signal, deadline.signal]);
-    const timeout = setTimeout(() => deadline.abort(), SWIFT_SEMANTIC_QUERY_TIMEOUT_MS);
-    const clearTimeoutHandle = () => clearTimeout(timeout);
-    const viewOptions = { ...options, signal: sessionSignal };
-    try {
-      const context = await SwiftSourceContext.open(viewOptions);
-      return new SwiftRelationshipView(viewOptions, context, releaseQueue, clearTimeoutHandle);
-    } catch (error) {
-      deadline.abort();
-      clearTimeoutHandle();
-      releaseQueue();
-      throw error;
-    }
-  }
-};
-
-// src/python-relationship-provider.ts
-import { createHash as createHash8, randomUUID as randomUUID8 } from "node:crypto";
-import { fileURLToPath as fileURLToPath6 } from "node:url";
-import { resolve as resolve33 } from "node:path";
-
-// src/python-language-discovery.ts
-import { createHash as createHash7 } from "node:crypto";
-import { access as access2, constants as constants4, readdir as readdir2, stat as stat5 } from "node:fs/promises";
-import { readFileSync } from "node:fs";
-import { createRequire as createRequire2 } from "node:module";
-import { delimiter as delimiter2, dirname as dirname8, isAbsolute as isAbsolute8, resolve as resolve31 } from "node:path";
-var PYTHON_PROJECT_MARKERS = new Set([
-  "pyproject.toml",
-  "pyrightconfig.json",
-  "setup.cfg",
-  "setup.py"
-]);
-var PYTHON_ENVIRONMENT_KEYS = [
-  "PATH",
-  "PYTHONPATH",
-  "PYTHONHOME",
-  "VIRTUAL_ENV",
-  "CONDA_PREFIX"
-];
-var require2 = createRequire2(import.meta.url);
-function configuredExecutable() {
-  const pyright = process.env.BAOER_SIGNAL_GREP_PYRIGHT_PATH?.trim();
-  if (!pyright)
-    return;
-  const path = pyright;
-  if (!path || !isAbsolute8(path))
-    throw new SignalGrepError("BAOER_SIGNAL_GREP_PYRIGHT_PATH must be an absolute executable path");
-  return { kind: "pyright", path };
-}
-function commandArgs(kind) {
-  return kind === "pyright" ? ["--stdio"] : [];
-}
-function environment2(executable, bundled) {
-  const currentPath = process.env.PATH ?? "";
-  const directory = isAbsolute8(executable) ? dirname8(executable) : undefined;
-  return {
-    ...bundled ? scriptRuntimeEnvironment() : process.env,
-    ...directory ? { PATH: `${directory}${delimiter2}${currentPath}` } : {}
-  };
-}
-function pythonLanguageServerCommand() {
-  const configured = configuredExecutable();
-  const kind = configured?.kind ?? "pyright";
-  const script = configured ? undefined : require2.resolve("pyright/langserver.index.js");
-  const executable = configured?.path ?? process.execPath;
-  const args = configured ? commandArgs(kind) : [script, "--stdio"];
-  const env = environment2(executable, !configured);
-  const values = { kind, executable, args: args.join("\x00") };
-  if (script) {
-    values.script = script;
-    values.scriptHash = createHash7("sha256").update(readFileSync(script)).digest("hex");
-  }
-  for (const key of PYTHON_ENVIRONMENT_KEYS)
-    values[key] = env[key] ?? "";
-  return {
-    kind,
-    executable,
-    args,
-    environment: env,
-    fingerprint: createHash7("sha256").update(JSON.stringify(values)).digest("hex")
-  };
-}
-async function resolvePythonProjectRoot(cwd, targetPath, signal) {
-  const absoluteCwd = resolve31(cwd);
-  const absoluteTarget = resolve31(absoluteCwd, targetPath);
-  let current = dirname8(absoluteTarget);
-  try {
-    if ((await stat5(absoluteTarget)).isDirectory())
-      current = absoluteTarget;
-  } catch (error) {
-    if (!(error instanceof Error && ("code" in error) && (error.code === "ENOENT" || error.code === "ENOTDIR")))
-      throw error;
-  }
-  while (current === absoluteCwd || current.startsWith(`${absoluteCwd}/`)) {
-    if (signal?.aborted)
-      throw abortError();
-    try {
-      const entries = await readdir2(current, { withFileTypes: true });
-      if (entries.some((entry) => PYTHON_PROJECT_MARKERS.has(entry.name)))
-        return current;
-    } catch (error) {
-      if (!(error instanceof Error && ("code" in error) && (error.code === "ENOENT" || error.code === "ENOTDIR")))
-        throw error;
-    }
-    if (current === absoluteCwd)
-      break;
-    const parent = dirname8(current);
-    if (parent === current || !parent.startsWith(`${absoluteCwd}/`))
-      break;
-    current = parent;
-  }
-  return dirname8(resolve31(absoluteCwd, targetPath));
-}
-function isPythonProjectMarker(path) {
-  const name = path.replaceAll("\\", "/").split("/").at(-1) ?? "";
-  return PYTHON_PROJECT_MARKERS.has(name);
-}
-function pythonEnvironmentKeys() {
-  return PYTHON_ENVIRONMENT_KEYS;
-}
-
-// src/python-lsp-session.ts
-var PYTHON_LSP_REQUEST_TIMEOUT_MS = 60000;
-function advertised(value) {
-  return value === true || value !== null && typeof value === "object";
-}
-function readCapabilities2(value) {
-  if (!rpcRecord(value) || !rpcRecord(value.capabilities))
-    throw new SignalGrepError("Pyright initialize omitted capabilities");
-  const capabilities = value.capabilities;
-  const operations = new Set;
-  if (advertised(capabilities.definitionProvider))
-    operations.add("definitions");
-  if (advertised(capabilities.referencesProvider))
-    operations.add("references");
-  if (advertised(capabilities.implementationProvider))
-    operations.add("implementations");
-  if (advertised(capabilities.callHierarchyProvider)) {
-    operations.add("callers");
-    operations.add("callees");
-  }
-  return {
-    operations,
-    documentSymbols: advertised(capabilities.documentSymbolProvider)
-  };
-}
-function clientRequest(cwd, rootUri, method, params) {
-  if (method === "workspace/configuration") {
-    if (!rpcRecord(params) || !Array.isArray(params.items))
-      throw new SignalGrepError("Invalid Pyright workspace/configuration request");
-    return params.items.map(() => null);
-  }
-  if (method === "workspace/workspaceFolders")
-    return [{ uri: rootUri, name: cwd }];
-  if (method === "client/registerCapability" || method === "client/unregisterCapability" || method === "window/workDoneProgress/create" || method === "window/showMessageRequest")
-    return null;
-  if (method === "window/logMessage" || method === "window/showMessage" || method === "telemetry/event")
-    return null;
-  if (method === "workspace/applyEdit")
-    return { applied: false, failureReason: "Python relationship search is read-only" };
-  throw new SignalGrepError(`Unsupported Pyright client request: ${method}`);
-}
-
-class PythonLspSession {
-  #context;
-  #command;
-  #signal;
-  #channel;
-  #completion;
-  #abortProcess;
-  #capabilities;
-  #closed = false;
-  #closePromise;
-  constructor(context) {
-    this.#context = context;
-    this.#command = context.command;
-    this.#signal = context.signal;
-  }
-  get capabilities() {
-    if (!this.#capabilities)
-      throw new SignalGrepError("Pyright session is not initialized");
-    return this.#capabilities;
-  }
-  get channel() {
-    if (!this.#channel)
-      throw new SignalGrepError("Pyright session is not initialized");
-    return this.#channel;
-  }
-  async request(method, params) {
-    const channel = this.channel;
-    const deadline = AbortSignal.timeout(PYTHON_LSP_REQUEST_TIMEOUT_MS);
-    let onAbort;
-    const timedOut = new Promise((_, reject) => {
-      onAbort = () => reject(abortError());
-      if (deadline.aborted)
-        onAbort();
-      else
-        deadline.addEventListener("abort", onAbort, { once: true });
-    });
-    try {
-      return await Promise.race([channel.request(method, params), timedOut]);
-    } catch (error) {
-      if (deadline.aborted || this.#signal.aborted) {
-        this.#closed = true;
-        channel.close();
-        this.#abortProcess?.();
-        await this.#completion?.catch(() => {
-          return;
-        });
-        throw abortError();
-      }
-      throw error;
-    } finally {
-      if (onAbort)
-        deadline.removeEventListener("abort", onAbort);
-    }
-  }
-  async start() {
-    if (this.#closed)
-      throw new SignalGrepError("Pyright session is closed");
-    if (this.#channel && this.#capabilities)
-      return this.#capabilities;
-    const rootUri = await semanticUri(this.#context.cwd, this.#context.root);
-    let owned;
-    try {
-      owned = await openOwnedJsonRpc({
-        executable: this.#command.executable,
-        args: [...this.#command.args],
-        cwd: this.#context.root,
-        signal: this.#signal,
-        env: this.#command.environment
-      }, (method, params) => clientRequest(this.#context.cwd, rootUri, method, params));
-      this.#channel = owned.channel;
-      this.#completion = owned.completion;
-      this.#abortProcess = () => owned?.abort();
-      const initialize = await this.request("initialize", {
-        processId: process.pid,
-        rootUri,
-        workspaceFolders: [{ uri: rootUri, name: this.#context.root }],
-        capabilities: {
-          workspace: { workspaceFolders: true, configuration: true },
-          textDocument: {
-            definition: { linkSupport: true },
-            references: {},
-            implementation: { linkSupport: true },
-            documentSymbol: { hierarchicalDocumentSymbolSupport: true },
-            callHierarchy: {}
-          },
-          general: { positionEncodings: ["utf-16"] }
-        },
-        initializationOptions: {}
-      });
-      const capabilities = readCapabilities2(initialize);
-      await owned.channel.notify("initialized", {});
-      this.#capabilities = capabilities;
-      return capabilities;
-    } catch (error) {
-      owned?.channel.close();
-      owned?.abort();
-      await owned?.completion.catch(() => {
-        return;
-      });
-      this.#channel = undefined;
-      this.#completion = undefined;
-      this.#abortProcess = undefined;
-      if (this.#signal.aborted)
-        throw abortError();
-      throw error;
-    }
-  }
-  async openDocuments(documents) {
-    await this.start();
-    for (const document of documents) {
-      if (this.#signal.aborted)
-        throw abortError();
-      await this.channel.notify("textDocument/didOpen", {
-        textDocument: {
-          uri: await semanticUri(this.#context.cwd, document.path),
-          languageId: "python",
-          version: 1,
-          text: document.text
-        }
-      });
-    }
-  }
-  async close() {
-    if (!this.#closePromise)
-      this.#closePromise = this.closeOnce();
-    return this.#closePromise;
-  }
-  async closeOnce() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    const channel = this.#channel;
-    const completion = this.#completion;
-    if (!channel || !completion)
-      return;
-    let onAbort;
-    const aborted = new Promise((_, reject) => {
-      onAbort = () => reject(abortError());
-      if (this.#signal.aborted)
-        onAbort();
-      else
-        this.#signal.addEventListener("abort", onAbort, { once: true });
-    });
-    try {
-      await Promise.race([this.request("shutdown", {}), aborted]);
-      await Promise.race([channel.notify("exit", {}), aborted]);
-      channel.endInput();
-      const result = await Promise.race([completion, aborted]);
-      if (result.code !== 0)
-        throw new SignalGrepError(`Pyright language-server process failed (${String(result.code)}): ${result.stderr}`);
-    } catch (error) {
-      channel.close();
-      this.#abortProcess?.();
-      await completion.catch(() => {
-        return;
-      });
-      if (this.#signal.aborted)
-        throw abortError();
-      throw error;
-    } finally {
-      if (onAbort)
-        this.#signal.removeEventListener("abort", onAbort);
-    }
-  }
-}
-
-// src/python-source-context.ts
-import { realpath as realpath8 } from "node:fs/promises";
-import { resolve as resolve32 } from "node:path";
-var PYTHON_SOURCE = /\.py$/iu;
-function admittedSource(path) {
-  return PYTHON_SOURCE.test(path);
-}
-function key(cwd, path) {
-  return resolve32(cwd, path);
-}
-
-class PythonSourceContext {
-  cwd;
-  root;
-  scope;
-  source;
-  signal;
-  command;
-  maxFiles;
-  inventory;
-  documents;
-  metadata;
-  aliases;
-  initialReasons;
-  initialPartial;
-  constructor(options) {
-    this.cwd = options.source.cwd;
-    this.root = options.root;
-    this.scope = options.source.scope;
-    this.source = options.source.source;
-    this.signal = options.source.signal;
-    this.command = options.source.command;
-    this.maxFiles = options.source.maxFiles;
-    this.inventory = options.inventory;
-    this.documents = options.documents;
-    this.metadata = options.metadata;
-    this.aliases = options.aliases;
-    this.initialReasons = options.reasons;
-    this.initialPartial = options.partial;
-  }
-  static async open(options) {
-    if (options.signal.aborted)
-      throw abortError();
-    const target = options.scope.root;
-    const root = await resolvePythonProjectRoot(options.cwd, target, options.signal);
-    const files = await listWorkspaceFiles(options.cwd, options.signal, {
-      path: root,
-      glob: [...options.scope.include ?? []],
-      exclude: [...options.scope.exclude ?? []],
-      ...options.scope.hidden === undefined ? {} : { hidden: options.scope.hidden },
-      maxFiles: options.maxFiles
-    });
-    const inventory = new Set(files.paths.filter((path) => admittedSource(path) || isPythonProjectMarker(path)));
-    const documents = new Map;
-    const metadata = new Map;
-    const aliases = new Map;
-    const reasons = [...files.reasons];
-    let partial = files.partial;
-    for (const path of inventory) {
-      if (options.signal.aborted)
-        throw abortError();
-      try {
-        const document = await options.source.load(path);
-        if (!document.utf8) {
-          reasons.push(`${path}: source is not lossless UTF-8`);
-          partial = true;
-          continue;
-        }
-        if (admittedSource(path))
-          documents.set(key(options.cwd, path), document);
-        if (isPythonProjectMarker(path))
-          metadata.set(key(options.cwd, path), document);
-        const absolute = key(options.cwd, path);
-        aliases.set(absolute, document);
-        try {
-          aliases.set(await realpath8(absolute), document);
-        } catch {}
-      } catch (error) {
-        if (error instanceof Error && error.name === "AbortError")
-          throw error;
-        reasons.push(`${path}: ${error instanceof Error ? error.message : "source unavailable"}`);
-        partial = true;
-      }
-    }
-    if (documents.size === 0)
-      throw new SignalGrepError("Python semantic provider found no admitted Python source");
-    const context = new PythonSourceContext({
-      source: options,
-      root,
-      inventory,
-      documents,
-      metadata,
-      aliases,
-      reasons,
-      partial
-    });
-    return {
-      context,
-      documents: [...documents.values()],
-      metadata: [...metadata.values()],
-      reasons,
-      partial
-    };
-  }
-  document(path) {
-    return this.aliases.get(key(this.cwd, path));
-  }
-  documentAtAbsolute(path) {
-    return this.aliases.get(path);
-  }
-  configDocuments() {
-    return [...this.metadata.values()];
-  }
-  sourceReference(path) {
-    return this.document(path)?.reference ?? this.metadata.get(key(this.cwd, path))?.reference;
-  }
-}
-
-// src/python-relationship-provider.ts
-var PYTHON_SEMANTIC_PROVIDER_ID = "pyright-python";
-var providerQueue3 = new OwnedTaskQueue;
-var PYTHON_SOURCE2 = /\.py$/iu;
-var PYTHON_ENVIRONMENT_PATH = "python:environment";
-var PYTHON_INVENTORY_PATH = "python:inventory";
-function readLocation(value) {
-  if (!rpcRecord(value))
-    throw new SignalGrepError("Pyright returned an invalid navigation item");
-  const uri = value.uri ?? value.targetUri;
-  const range = value.range ?? value.targetRange ?? value.targetSelectionRange;
-  const selectionRange = value.selectionRange ?? value.targetSelectionRange ?? range;
-  if (typeof uri !== "string" || !uri.startsWith("file:"))
-    throw new SignalGrepError("Pyright returned a non-file navigation URI");
-  if (!range || !selectionRange)
-    throw new SignalGrepError("Pyright navigation item omitted range");
-  return {
-    uri,
-    range: lspRange(range),
-    selectionRange: lspRange(selectionRange),
-    ...typeof value.name === "string" ? { name: value.name } : {},
-    ...typeof value.kind === "number" ? { kind: value.kind } : {}
-  };
-}
-function locations2(value) {
-  if (value === null)
-    return [];
-  return (Array.isArray(value) ? value : [value]).map(readLocation);
-}
-function sourceLocation3(document, range) {
-  const bytes = byteRange(document, range);
-  return {
-    path: document.path,
-    range: bytes,
-    start: document.positionAt(bytes.start),
-    end: document.positionAt(bytes.end),
-    source: document.reference
-  };
-}
-function position(document, input) {
-  if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-    throw new SignalGrepError("Python semantic target line must be one-based");
-  if (input.column !== undefined && (!Number.isSafeInteger(input.column) || input.column < 1))
-    throw new SignalGrepError("Python semantic target column must be one-based");
-  if (input.column !== undefined) {
-    if (input.line === undefined)
-      throw new SignalGrepError("Python semantic column requires a line");
-    return { line: input.line - 1, character: input.column - 1 };
-  }
-  return { line: (input.line ?? 1) - 1, character: 0 };
-}
-function documentDependency2(document) {
-  return { path: document.path, role: "source", reference: document.reference, exists: true };
-}
-function metadataDependency(document) {
-  return { path: document.path, role: "config", reference: document.reference, exists: true };
-}
-function environmentDependency2(fingerprint) {
-  return { path: PYTHON_ENVIRONMENT_PATH, role: "config", fingerprint, exists: true };
-}
-function evidence3(operation) {
-  return {
-    level: "compiler",
-    basis: "semantic",
-    providerBasis: "pyright",
-    reason: operation === "callers" || operation === "callees" ? "Pyright static call hierarchy; dynamic dispatch and runtime execution remain unproven" : `Pyright compiler-bound ${operation} result in the admitted Python project`
-  };
-}
-function operationMethod4(operation) {
-  switch (operation) {
-    case "definitions":
-      return "textDocument/definition";
-    case "references":
-      return "textDocument/references";
-    case "implementations":
-      return "textDocument/implementation";
-    default:
-      throw new SignalGrepError(`Pyright operation ${operation} uses call hierarchy`);
-  }
-}
-function callUnresolved(operation, reason) {
-  return { operation, reason, confidence: "unknown" };
-}
-function pathFromUri(uri) {
-  try {
-    return fileURLToPath6(uri);
-  } catch (error) {
-    throw new SignalGrepError("Pyright returned an invalid file URI", { cause: error });
-  }
-}
-function configurationFingerprint3(command, context) {
-  const configurations = [...context.configDocuments()].map((document) => [
-    document.path,
-    document.reference.origin.kind === "worktree" ? document.reference.origin.contentHash : document.reference.origin.blob
-  ]);
-  const environment = pythonEnvironmentKeys().map((key) => [key, process.env[key] ?? ""]);
-  return createHash8("sha256").update(JSON.stringify({
-    command: command.fingerprint,
-    configurations,
-    environment,
-    root: context.root
-  })).digest("hex");
-}
-
-class PythonRelationshipView {
-  providerId = PYTHON_SEMANTIC_PROVIDER_ID;
-  analysisViewId;
-  sourceScope;
-  #context;
-  #session;
-  #documents;
-  #metadata;
-  #configurationFingerprint;
-  #inventory;
-  #nodePaths = new Map;
-  #edgePaths = new Map;
-  #initialReasons;
-  #initialPartial;
-  #releaseQueue;
-  #closed = false;
-  #closePromise;
-  constructor(options, context, session, releaseQueue, open) {
-    this.analysisViewId = options.analysisViewId ?? randomUUID8();
-    this.sourceScope = { ...options.scope, root: context.root };
-    this.#context = context;
-    this.#session = session;
-    this.#documents = context.documents;
-    this.#metadata = context.configDocuments();
-    this.#configurationFingerprint = configurationFingerprint3(context.command, context);
-    this.#inventory = context.inventory;
-    this.#releaseQueue = releaseQueue;
-    this.#initialReasons = [...open.reasons];
-    this.#initialPartial = open.partial;
-  }
-  async resolveNode(input, signal) {
-    this.assertOpen(signal);
-    const document = this.#context.document(input.path);
-    if (!document)
-      return {
-        status: "unsupported",
-        reasons: ["Python target is outside the admitted Pyright project"],
-        dependencies: []
-      };
-    let selected;
-    let candidates = [];
-    if (input.symbol !== undefined || input.column === undefined) {
-      if (!this.#session.capabilities.documentSymbols)
-        return {
-          status: "unsupported",
-          reasons: ["Pyright did not advertise documentSymbolProvider for symbol selection"],
-          dependencies: [documentDependency2(document), ...this.configurationDependencies()]
-        };
-      candidates = await this.symbolCandidates(document, input);
-      if (input.symbol !== undefined && candidates.length === 0)
-        return {
-          status: "unknown",
-          reasons: [`Pyright returned no admitted Python symbol named ${input.symbol}`],
-          dependencies: [documentDependency2(document), ...this.configurationDependencies()]
-        };
-      if (candidates.length > 1)
-        return {
-          status: "ambiguous",
-          candidates: candidates.map((item) => this.node(item, document, item.name ?? input.symbol ?? "Python symbol")),
-          reasons: ["Pyright returned multiple Python symbols; include a line and column"],
-          dependencies: [documentDependency2(document), ...this.configurationDependencies()]
-        };
-      selected = candidates[0];
-    }
-    if (!selected) {
-      const selectedPosition = position(document, input);
-      selected = {
-        uri: await semanticUri(this.#context.cwd, document.path),
-        range: {
-          start: selectedPosition,
-          end: selectedPosition
-        },
-        selectionRange: {
-          start: selectedPosition,
-          end: selectedPosition
-        },
-        ...input.symbol ? { name: input.symbol } : {}
-      };
-    }
-    const node = this.node(selected, document, selected.name ?? input.symbol ?? "Python symbol");
-    return {
-      status: "resolved",
-      node,
-      reasons: [...this.#initialReasons],
-      dependencies: [documentDependency2(document), ...this.configurationDependencies()]
-    };
-  }
-  async expand(node, operation, signal) {
-    this.assertOpen(signal);
-    if (!this.#session.capabilities.operations.has(operation))
-      throw new SignalGrepError(`Pyright did not advertise Python operation: ${operation}`);
-    const document = this.#context.document(node.path);
-    if (!document)
-      return {
-        edges: [],
-        nodes: [],
-        unresolved: [callUnresolved(operation, "Python node is outside the admitted project")],
-        dependencies: [],
-        coverage: {
-          status: "partial",
-          freshness: "unknown",
-          sources: [],
-          reasons: ["Python node is outside the admitted project"]
-        }
-      };
-    const internal = this.internalLocation(node);
-    const unresolved = [];
-    const rawEdges = [];
-    const uri = await semanticUri(this.#context.cwd, document.path);
-    const internalWithUri = { ...internal, uri };
-    if (operation === "callers" || operation === "callees") {
-      const prepared = await this.#session.request("textDocument/prepareCallHierarchy", {
-        textDocument: { uri },
-        position: internal.selectionRange.start
-      });
-      if (!Array.isArray(prepared) || prepared.length === 0) {
-        unresolved.push(callUnresolved(operation, "Pyright returned no call hierarchy item"));
-      } else {
-        if (prepared.length > 1)
-          unresolved.push(callUnresolved(operation, "Pyright returned ambiguous call hierarchy items"));
-        for (const candidate of prepared) {
-          try {
-            const item = readLocation(candidate);
-            const method = operation === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls";
-            const values = await this.#session.request(method, { item: candidate });
-            if (!Array.isArray(values)) {
-              unresolved.push(callUnresolved(operation, "Pyright returned an invalid call hierarchy response"));
-              continue;
-            }
-            for (const value of values) {
-              if (!rpcRecord(value)) {
-                unresolved.push(callUnresolved(operation, "Pyright returned an invalid call hierarchy edge"));
-                continue;
-              }
-              const endpointValue = operation === "callers" ? value.from : value.to;
-              const endpoint = readLocation(endpointValue);
-              const ranges = Array.isArray(value.fromRanges) ? value.fromRanges.map(lspRange) : [];
-              rawEdges.push({
-                from: operation === "callers" ? endpoint : item,
-                to: operation === "callers" ? item : endpoint,
-                ranges
-              });
-            }
-          } catch (error) {
-            unresolved.push(callUnresolved(operation, error instanceof Error ? error.message : "invalid call edge"));
-          }
-        }
-      }
-    } else {
-      const response = await this.#session.request(operationMethod4(operation), {
-        textDocument: { uri },
-        position: internal.selectionRange.start,
-        ...operation === "references" ? { context: { includeDeclaration: true } } : {}
-      });
-      for (const candidate of locations2(response))
-        rawEdges.push({
-          from: internalWithUri,
-          to: candidate,
-          ranges: []
-        });
-    }
-    const edges = [];
-    const nodes = [];
-    for (const raw of rawEdges) {
-      const fromDocument = this.documentForLocation(raw.from);
-      const toDocument = this.documentForLocation(raw.to);
-      if (!fromDocument || !toDocument) {
-        unresolved.push(callUnresolved(operation, "Pyright returned a location outside admitted Python source"));
-        continue;
-      }
-      const from = this.node(raw.from, fromDocument, raw.from.name ?? node.name);
-      const to = this.node(raw.to, toDocument, raw.to.name ?? node.name);
-      const ranges = raw.ranges.length ? raw.ranges : [undefined];
-      for (const [index, range] of ranges.entries()) {
-        const callSite = range ? sourceLocation3(fromDocument, range) : undefined;
-        const edgeKey = `${operation}:${from.identity.localKey}->${to.identity.localKey}:${String(index)}`;
-        const paths = new Set([from.path, to.path, ...callSite ? [callSite.path] : []]);
-        this.#edgePaths.set(edgeKey, paths);
-        edges.push({
-          edgeKey,
-          operation,
-          from,
-          to,
-          ...callSite ? { callSite } : {},
-          evidence: [evidence3(operation)],
-          confidence: "verified-static",
-          dependencies: [...paths].map((path) => this.#documents.get(resolve33(this.#context.cwd, path))).filter((item) => item !== undefined).map(documentDependency2).concat(this.configurationDependencies())
-        });
-        nodes.push(from, to);
-      }
-    }
-    const uniqueNodes = [
-      ...new Map(nodes.map((item) => [relationshipNodeKey(item), item])).values()
-    ];
-    const reasons = [
-      ...this.#initialReasons,
-      ...unresolved.map((item) => item.reason),
-      evidence3(operation).reason
-    ];
-    return {
-      edges,
-      nodes: uniqueNodes,
-      unresolved,
-      dependencies: [documentDependency2(document), ...this.configurationDependencies()],
-      coverage: {
-        status: this.#initialPartial || unresolved.length ? "partial" : "complete",
-        freshness: "current",
-        sources: this.currentSourceStatuses(),
-        reasons: [...new Set(reasons)]
-      }
-    };
-  }
-  async recheck(signal) {
-    this.assertOpen(signal);
-    const sources = [];
-    const reasons = [];
-    for (const document of [...this.#documents.values(), ...this.#metadata]) {
-      try {
-        await this.#context.source.refresh(document.path, document.reference);
-        sources.push(this.sourceStatus(document, "current"));
-      } catch (error) {
-        if (error instanceof Error && error.name === "AbortError")
-          throw error;
-        const reason = error instanceof Error ? error.message : "Python source recheck failed";
-        sources.push(this.sourceStatus(document, "stale", reason));
-        reasons.push(`${document.path}: ${reason}`);
-      }
-    }
-    const command = pythonLanguageServerCommand();
-    const currentFingerprint = configurationFingerprint3(command, this.#context);
-    const configurationChanged = currentFingerprint !== this.#configurationFingerprint;
-    sources.push({
-      path: PYTHON_ENVIRONMENT_PATH,
-      role: "config",
-      status: configurationChanged ? "stale" : "current",
-      ...configurationChanged ? { reason: "Python executable, environment or project configuration changed" } : {}
-    });
-    if (configurationChanged)
-      reasons.push("Python executable, environment or project configuration changed");
-    const files = await listWorkspaceFiles(this.#context.cwd, this.#context.signal, {
-      path: this.#context.root,
-      glob: [...this.sourceScope.include ?? []],
-      exclude: [...this.sourceScope.exclude ?? []],
-      ...this.sourceScope.hidden === undefined ? {} : { hidden: this.sourceScope.hidden },
-      maxFiles: this.#context.maxFiles
-    });
-    const currentInventory = new Set(files.paths.filter((path) => PYTHON_SOURCE2.test(path) || isPythonProjectMarker(path)));
-    const inventoryChanged = currentInventory.size !== this.#inventory.size || [...currentInventory].some((path) => !this.#inventory.has(path));
-    if (inventoryChanged || files.partial) {
-      reasons.push(inventoryChanged ? "Python source/config inventory changed during query; retry" : files.reasons.join("; "));
-      for (const path of [...this.#inventory].filter((item) => !currentInventory.has(item)))
-        sources.push({
-          path,
-          role: isPythonProjectMarker(path) ? "config" : "source",
-          status: "stale",
-          reason: "source removed during query"
-        });
-      for (const path of [...currentInventory].filter((item) => !this.#inventory.has(item)))
-        sources.push({
-          path,
-          role: isPythonProjectMarker(path) ? "config" : "source",
-          status: "stale",
-          reason: "source added during query; retry"
-        });
-      if (files.partial)
-        sources.push({
-          path: PYTHON_INVENTORY_PATH,
-          role: "metadata",
-          status: "unknown",
-          reason: files.reasons.join("; ") || "Python inventory is incomplete"
-        });
-    }
-    const stalePaths = new Set(sources.filter((item) => item.status === "stale").map((item) => item.path));
-    const unknown = sources.some((item) => item.status === "unknown");
-    const configurationStale = configurationChanged || sources.some((item) => item.path === PYTHON_INVENTORY_PATH && item.status !== "current");
-    return {
-      validity: stalePaths.size ? "stale" : unknown ? "unknown" : aggregateRelationshipValidity(sources),
-      coverage: this.#initialPartial || stalePaths.size || unknown ? "partial" : "complete",
-      sources,
-      affectedNodeKeys: configurationStale ? [...this.#nodePaths.keys()] : [...this.#nodePaths.entries()].filter(([, path]) => stalePaths.has(path)).map(([nodeKey]) => nodeKey),
-      affectedEdgeKeys: configurationStale ? [...this.#edgePaths.keys()] : [...this.#edgePaths.entries()].filter(([, paths]) => [...paths].some((path) => stalePaths.has(path))).map(([edgeKey]) => edgeKey),
-      reasons: [...new Set(reasons)]
-    };
-  }
-  async close() {
-    if (!this.#closePromise)
-      this.#closePromise = this.closeOnce();
-    return this.#closePromise;
-  }
-  async closeOnce() {
-    if (this.#closed)
-      return;
-    this.#closed = true;
-    try {
-      await this.#session.close();
-    } finally {
-      this.#releaseQueue();
-    }
-  }
-  async symbolCandidates(document, input) {
-    const documentUri = await semanticUri(this.#context.cwd, document.path);
-    const response = await this.#session.request("textDocument/documentSymbol", {
-      textDocument: { uri: documentUri }
-    });
-    if (!Array.isArray(response))
-      return [];
-    const found = [];
-    const visit = (value) => {
-      if (!rpcRecord(value))
-        return;
-      try {
-        const item = readLocation(value.location ? { ...value.location, name: value.name, kind: value.kind } : { ...value, uri: documentUri });
-        const matchesName = input.symbol === undefined || item.name === input.symbol;
-        const matchesLine = input.line === undefined || item.selectionRange.start.line + 1 === input.line;
-        if (matchesName && matchesLine)
-          found.push(item);
-        if (Array.isArray(value.children))
-          for (const child of value.children)
-            visit(child);
-      } catch {}
-    };
-    for (const item of response)
-      visit(item);
-    return found;
-  }
-  documentForLocation(location) {
-    try {
-      const path = pathFromUri(location.uri);
-      return this.#context.documentAtAbsolute(resolve33(this.#context.cwd, path));
-    } catch {
-      return;
-    }
-  }
-  internalLocation(node) {
-    const start = { line: node.start.line - 1, character: node.start.column - 1 };
-    const end = {
-      line: (node.end?.line ?? node.start.line) - 1,
-      character: (node.end?.column ?? node.start.column) - 1
-    };
-    return { uri: "", range: { start, end }, selectionRange: { start, end }, name: node.name };
-  }
-  node(location, document, name) {
-    const range = byteRange(document, location.range);
-    const selection = byteRange(document, location.selectionRange);
-    const localKey = `${document.path}:${String(selection.start)}:${String(selection.end)}:${name}`;
-    const node = {
-      identity: {
-        providerId: this.providerId,
-        analysisViewId: this.analysisViewId,
-        sourceScope: this.sourceScope.root,
-        localKey
-      },
-      path: document.path,
-      name,
-      kind: location.kind === undefined ? "symbol" : String(location.kind),
-      range,
-      start: document.positionAt(selection.start),
-      end: document.positionAt(selection.end),
-      source: document.reference,
-      evidence: [evidence3("references")]
-    };
-    this.#nodePaths.set(relationshipNodeKey(node), document.path);
-    return node;
-  }
-  sourceStatus(document, status, reason) {
-    return {
-      path: document.path,
-      role: isPythonProjectMarker(document.path) ? "config" : "source",
-      status,
-      expected: document.reference,
-      ...reason ? { reason } : {}
-    };
-  }
-  currentSourceStatuses() {
-    return [
-      ...[...this.#documents.values()].map((document) => this.sourceStatus(document, "current")),
-      ...this.#metadata.map((document) => this.sourceStatus(document, "current")),
-      { path: PYTHON_ENVIRONMENT_PATH, role: "config", status: "current" }
-    ];
-  }
-  configurationDependencies() {
-    return [
-      ...this.#metadata.map(metadataDependency),
-      environmentDependency2(this.#configurationFingerprint)
-    ];
-  }
-  assertOpen(signal) {
-    if (this.#closed)
-      throw new SignalGrepError("Python relationship view is closed");
-    if (signal?.aborted || this.#context.signal.aborted)
-      throw abortError();
-  }
-}
-var pythonSemanticProvider = {
-  providerId: PYTHON_SEMANTIC_PROVIDER_ID,
-  async open(options) {
-    const releaseQueue = await providerQueue3.acquire(options.signal);
-    try {
-      const command = pythonLanguageServerCommand();
-      const opened = await PythonSourceContext.open({
-        cwd: options.cwd,
-        scope: options.scope,
-        source: options.source,
-        signal: options.signal,
-        maxFiles: options.limits?.maxFiles ?? 200,
-        command
-      });
-      const session = new PythonLspSession(opened.context);
-      await session.start();
-      await session.openDocuments(opened.documents);
-      return new PythonRelationshipView(options, opened.context, session, releaseQueue, {
-        reasons: opened.reasons,
-        partial: opened.partial
-      });
-    } catch (error) {
-      releaseQueue();
-      throw error;
-    }
-  }
-};
-
-// src/relationship-provider-registry.ts
-function sourceProvider(provider, queue, languages, capabilityProvider, supports, limitsForOperation) {
-  return {
-    providerId: provider.providerId,
-    languages,
-    operations: relationshipOperations(capabilityProvider),
-    ...limitsForOperation ? { limitsForOperation } : {},
-    supports,
-    open: async (options) => {
-      const source = new SourceAccess(options.cwd, queue, options.signal, {
-        maxFiles: options.maxFiles
-      });
-      return provider.open({
-        ...options,
-        source,
-        limits: { ...options.limits, maxFiles: options.maxFiles }
-      });
-    }
-  };
-}
-function relationshipOperations(provider) {
-  const operationNames = new Set([
-    "definitions",
-    "references",
-    "implementations",
-    "callers",
-    "callees"
-  ]);
-  const isOperation = (value) => operationNames.has(value);
-  return [
-    ...new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.filter((capability) => capability.provider === provider).flatMap((capability) => capability.relationshipOperations ?? (isOperation(capability.name) ? [capability.name] : []))))
-  ];
-}
-function relationshipLanguages(provider) {
-  return DEFAULT_LANGUAGE_CAPABILITIES.filter((descriptor) => descriptor.capabilities.some((capability) => capability.provider === provider)).map((descriptor) => descriptor.language);
-}
-function createRelationshipProviderRegistry(queue) {
-  const goLanguages = relationshipLanguages("gopls");
-  const swiftLanguages = relationshipLanguages(SWIFT_SEMANTIC_PROVIDER_ID);
-  const pythonLanguages = relationshipLanguages(PYTHON_SEMANTIC_PROVIDER_ID);
-  return [
-    sourceProvider(goSemanticProvider, queue, goLanguages, "gopls", (path) => goLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? "")),
-    createTypeScriptRelationshipRegistration(queue),
-    sourceProvider(swiftSemanticProvider, queue, swiftLanguages, SWIFT_SEMANTIC_PROVIDER_ID, (path) => swiftLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""), (operation) => ["references", "implementations", "callers", "callees"].includes(operation) ? { swiftIndex: 1 } : {}),
-    sourceProvider(pythonSemanticProvider, queue, pythonLanguages, PYTHON_SEMANTIC_PROVIDER_ID, (path) => pythonLanguages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""))
-  ];
-}
-function createTypeScriptRelationshipRegistration(queue) {
-  const languages = relationshipLanguages("TypeScript language service relationship provider");
-  return {
-    providerId: TYPESCRIPT_PROVIDER_ID,
-    languages,
-    operations: relationshipOperations("TypeScript language service relationship provider"),
-    supports: (path) => languages.includes(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.language ?? ""),
-    open: async (options) => {
-      const source = new SourceAccess(options.cwd, queue, options.signal, {
-        maxFiles: options.maxFiles
-      });
-      return createTypeScriptRelationshipProvider(source).open({
-        ...options,
-        source,
-        limits: { ...options.limits, maxFiles: options.maxFiles }
-      });
-    }
-  };
-}
-
-// src/relationship-service.ts
-class RelationshipService {
-  #queue;
-  #resolveScope;
-  #maxFilesToParse;
-  #providers;
-  #relationships = new RelationshipStore;
-  #changeAwareness = new RelationshipChangeAwareness;
-  #relationshipWatchStops = new Set;
-  #watchedRelationshipRoots = new Set;
-  constructor(options) {
-    this.#queue = options.queue;
-    this.#resolveScope = options.resolveScope;
-    this.#maxFilesToParse = options.maxFilesToParse;
-    this.#providers = options.providers ?? createRelationshipProviderRegistry(this.#queue);
-  }
-  clear() {
-    this.#relationships.clear();
-  }
-  async shutdown() {
-    await this.#relationships.close();
-    for (const stop of this.#relationshipWatchStops)
-      stop();
-    this.#relationshipWatchStops.clear();
-    this.#watchedRelationshipRoots.clear();
-    this.#changeAwareness.close();
-  }
-  async trace(input, cwd, signal) {
-    if (input.cursor?.startsWith("relationship.") && input.exploreCursor !== undefined)
-      throw new CursorError("Use cursor for immutable pages or exploreCursor for continuation, not both", "E_CURSOR_OPTIONS_CONFLICT");
-    if (input.exploreCursor !== undefined) {
-      const stored = await this.#relationships.continue(input.exploreCursor, signal);
-      return this.#pageResult(stored, stored.state.scope, input, this.#relationshipHints(stored.state.scope), this.#relationshipWatchHealth());
-    }
-    if (input.cursor?.startsWith("relationship.")) {
-      if (input.cursor.includes(".explore."))
-        throw new SignalGrepError("Use exploreCursor for relationship continuation; cursor is reserved for immutable pages");
-      const state = this.#relationships.snapshot(input.cursor);
-      const page = this.#relationships.page(input.cursor);
-      return this.#pageResult({
-        state,
-        cursor: input.cursor,
-        ...page.exploreCursor ? { exploreCursor: page.exploreCursor } : {}
-      }, state.scope, input, this.#relationshipHints(state.scope), this.#relationshipWatchHealth());
-    }
-    const operation = input.relation;
-    if (operation !== "callers" && operation !== "callees")
-      throw new SignalGrepError("mode=trace requires relation=callers or relation=callees");
-    if (!input.path || input.line === undefined)
-      throw new SignalGrepError("mode=trace requires path and line; add column or symbol to identify the root");
-    const maxDepth = input.depth ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxDepth;
-    const budget = {
-      maxDepth,
-      maxNodes: input.maxNodes ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxNodes,
-      maxEdges: input.maxEdges ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxEdges,
-      maxExpansions: input.maxExpansions ?? DEFAULT_RELATIONSHIP_TRACE_BUDGET.maxExpansions
-    };
-    const maxFiles = this.#maxFilesToParse(input.maxFilesToParse);
-    const { factory, scope } = await this.#factory(input, cwd, signal, maxFiles);
-    const request = {
-      operation,
-      budget,
-      scope,
-      ...signal ? { signal } : {}
-    };
-    const stored = await this.#relationships.create(factory, request, async (view) => ({
-      ...request,
-      root: await view.resolveNode({
-        path: input.path.replace(/^@/, ""),
-        line: input.line,
-        ...input.column !== undefined ? { column: input.column } : {},
-        ...input.symbol ? { symbol: input.symbol } : {}
-      }, signal)
-    }));
-    return this.#pageResult(stored, scope, input, this.#relationshipHints(scope), this.#relationshipWatchHealth());
-  }
-  async validate(input, signal) {
-    const cursor = input.cursor;
-    if (!cursor)
-      throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    const state = this.#relationships.snapshot(cursor);
-    const startedAt = Date.now();
-    const recheck = await this.#relationships.validate(cursor, signal);
-    const finishedAt = Date.now();
-    return validationResult(state, cursor, recheck, {
-      start: startedAt,
-      end: finishedAt,
-      ...input.matchIndex !== undefined ? { selected: input.matchIndex } : {}
-    }, "current-worktree", this.#relationshipHints(state.scope), this.#relationshipWatchHealth());
-  }
-  async#factory(input, cwd, signal, maxFiles) {
-    const target = input.path?.replace(/^@/, "");
-    if (!target)
-      throw new SignalGrepError("mode=trace requires a workspace path");
-    const resolved = await this.#resolveScope(cwd, target, input, signal);
-    const scope = {
-      root: resolved.root,
-      ...resolved.filters.glob.length ? { include: resolved.filters.glob } : {},
-      ...resolved.filters.exclude.length ? { exclude: resolved.filters.exclude } : {},
-      hidden: resolved.filters.hidden
-    };
-    if (!this.#watchedRelationshipRoots.has(scope.root)) {
-      const stop = this.#changeAwareness.start([scope.root], {
-        recursive: true,
-        maxSources: 64
-      });
-      this.#relationshipWatchStops.add(stop);
-      this.#watchedRelationshipRoots.add(scope.root);
-    }
-    const registration = this.#providers.find((provider) => provider.supports(target));
-    if (!registration)
-      throw new SignalGrepError(`No relationship provider is registered for ${target}; use mode=capabilities to inspect available language modes`);
-    const factory = {
-      providerId: registration.providerId,
-      open: async (operationSignal = new AbortController().signal, analysisViewId) => {
-        return registration.open({
-          cwd,
-          scope,
-          signal: operationSignal,
-          queue: this.#queue,
-          maxFiles,
-          ...input.relation && registration.limitsForOperation ? { limits: registration.limitsForOperation(input.relation) } : {},
-          ...analysisViewId ? { analysisViewId } : {}
-        });
-      }
-    };
-    return { factory, scope };
-  }
-  #relationshipHints(scope) {
-    return this.#changeAwareness.dirty().filter((hint) => isPathInsideCwd(resolve34(hint.path), scope.root));
-  }
-  #relationshipWatchHealth() {
-    return this.#changeAwareness.health();
-  }
-  #pageResult(stored, scope, input, changeHints, watchHealth) {
-    let limit;
-    for (;; ) {
-      const page = this.#relationships.page(stored.cursor, limit);
-      const result = traceResult(stored, page, scope, input, changeHints, watchHealth);
-      const bytes = Buffer.byteLength(JSON.stringify({ text: result.text, details: result.details }));
-      if (bytes <= MAX_RESULT_BYTES)
-        return result;
-      if (page.items.length <= 1)
-        throw new SignalGrepError("Relationship evidence cannot fit the shared result byte budget");
-      limit = Math.max(1, Math.floor(page.items.length / 2));
-    }
-  }
-}
-
 // src/evidence-service.ts
-import { realpath as realpath10 } from "node:fs/promises";
-
-// src/semantic-navigation.ts
-import { resolve as resolve35 } from "node:path";
-var semanticRequestQueue = new OwnedTaskQueue;
-async function selection(input, access, document) {
-  if (input.column !== undefined) {
-    if (input.line === undefined || !Number.isSafeInteger(input.column) || input.column < 1 || input.symbol !== undefined)
-      throw new SignalGrepError("Semantic column requires line and no symbol; both are 1-based UTF-16 positions");
-    const position = { line: input.line - 1, character: input.column - 1 };
-    byteAt(document, position);
-    return position;
-  }
-  const syntax = await access.syntax(document);
-  if (syntax.status !== "ok")
-    throw new SignalGrepError("Selecting a semantic symbol requires valid syntax; supply an exact line+column position");
-  const candidates = syntax.nodes.filter((node) => /^(?:identifier|property_identifier|type_identifier|shorthand_property_identifier(?:_pattern)?)$/.test(node.kind) && (input.symbol === undefined || document.text.slice(node.start, node.end) === input.symbol) && (input.line === undefined || document.lineAt(document.toByteOffset(node.start)) === input.line));
-  if (input.line === undefined && input.symbol === undefined)
-    throw new SignalGrepError("Semantic navigation requires path and line+column, or an unambiguous symbol");
-  if (candidates.length !== 1)
-    throw new SignalGrepError(`Semantic target is ${candidates.length ? "ambiguous" : "absent"}; supply an exact 1-based line and UTF-16 column`);
-  const candidate = candidates[0];
-  if (!candidate)
-    throw new Error("Missing semantic candidate");
-  return lspPosition(document, candidate.start);
-}
-function itemFor(document, location, relation) {
-  const range = byteRange(document, location.range);
-  const line = document.lineAt(range.start);
-  const evidence = sourceEvidence(document, range);
-  return {
-    path: document.path,
-    line,
-    range,
-    source: document.reference,
-    label: `Compiler-bound ${relation}`,
-    excerpt: evidence.excerpt,
-    details: {
-      kind: "semantic",
-      excerptRange: evidence.excerptRange,
-      excerptTruncated: evidence.excerptTruncated || range.end > evidence.excerptRange.end,
-      relation,
-      binding: "typescript-compiler",
-      certainty: "static",
-      runtimeDispatch: "unproven",
-      score: 100,
-      rankingReason: "compiler binding with verified source range",
-      position: { line: location.range.start.line + 1, column: location.range.start.character + 1 },
-      nextRequest: {
-        mode: relation === "definitions" ? "references" : "definitions",
-        path: document.path,
-        line: location.range.start.line + 1,
-        column: location.range.start.character + 1
-      }
-    }
-  };
-}
-async function queryLocations(channel, mode, params) {
-  if (mode === "callers" || mode === "callees") {
-    const prepared = await channel.request("textDocument/prepareCallHierarchy", params);
-    if (prepared === null)
-      return [];
-    if (!Array.isArray(prepared))
-      throw new SignalGrepError("Invalid compiler call hierarchy");
-    const found = [];
-    for (const item of prepared) {
-      const calls = await channel.request(mode === "callers" ? "callHierarchy/incomingCalls" : "callHierarchy/outgoingCalls", { item });
-      if (calls === null)
-        continue;
-      if (!Array.isArray(calls))
-        throw new SignalGrepError("Invalid compiler call relationships");
-      for (const call of calls) {
-        if (!rpcRecord(call))
-          throw new SignalGrepError("Invalid compiler call relationship");
-        found.push(semanticLocation(mode === "callers" ? call.from : call.to));
-      }
-    }
-    return found;
-  }
-  const method = mode === "definitions" ? "definition" : mode === "implementations" ? "implementation" : "references";
-  if (!rpcRecord(params))
-    throw new Error("Expected semantic request parameters");
-  return locations(await channel.request(`textDocument/${method}`, {
-    ...params,
-    ...method === "references" ? { context: { includeDeclaration: true } } : {}
-  }));
-}
-async function runSemanticNavigation(input, access) {
-  if (!input.path || !isSemanticMode(input.mode))
-    throw new SignalGrepError("Semantic navigation requires a mode and workspace path");
-  const project = await semanticProject(access, input.path);
-  const { result, documents, primary, root } = project;
-  result.kind = input.mode;
-  result.redact = input.redact ?? false;
-  const mode = input.mode;
-  const graph = mode === "dependencies" || mode === "dependents";
-  if (graph && (input.line !== undefined || input.column !== undefined || input.symbol !== undefined))
-    throw new SignalGrepError("File dependencies/dependents accept path without line, column or symbol");
-  const position = graph ? undefined : await selection(input, access, primary);
-  const sourceAt = await semanticSources(access.cwd, documents.values());
-  const add = async (location, relation) => {
-    const document = await sourceAt(location.path);
-    if (document)
-      result.items.push(itemFor(document, location, relation));
-    else {
-      result.partial = true;
-      result.reasons.push("Compiler returned a location outside admitted source coverage; dependency/ignored/over-budget source was not exposed");
-    }
-  };
-  await withTypeScript(root, [...documents.values()], async (channel) => {
-    if (!graph) {
-      const found = await queryLocations(channel, mode, {
-        textDocument: { uri: await semanticUri(access.cwd, primary.path) },
-        position
-      });
-      for (const location of found) {
-        await add(location, mode);
-      }
-      return;
-    }
-    for (const document of mode === "dependencies" ? [primary] : documents.values()) {
-      const syntax = await access.syntax(document);
-      if (syntax.status !== "ok") {
-        result.partial = true;
-        result.reasons.push(`${document.path}: module syntax ${syntax.status}`);
-        continue;
-      }
-      const uri = await semanticUri(access.cwd, document.path);
-      const specifiers = syntax.nodes.filter((node) => node.kind === "string" && node.parent !== null && (() => {
-        const parent = syntax.nodes[node.parent];
-        if (!parent)
-          return false;
-        if (parent.kind === "import_statement" || parent.kind === "export_statement")
-          return true;
-        if (parent.kind !== "arguments" || parent.parent === null)
-          return false;
-        const call = syntax.nodes[parent.parent];
-        return call?.kind === "call_expression" && /^(?:import|require)\s*\(/.test(document.text.slice(call.start, node.start));
-      })());
-      for (const specifier of specifiers) {
-        const resolved = locations(await channel.request("textDocument/definition", {
-          textDocument: { uri },
-          position: lspPosition(document, specifier.start + 1)
-        }));
-        if (!resolved.length) {
-          result.partial = true;
-          result.reasons.push(`${document.path}: unresolved module ${document.text.slice(specifier.start, specifier.end)}`);
-        }
-        for (const target of resolved) {
-          const targetDocument = await sourceAt(target.path);
-          if (mode === "dependencies") {
-            await add(target, "dependency");
-          } else if (targetDocument === primary) {
-            await add({
-              path: resolve35(access.cwd, document.path),
-              range: {
-                start: lspPosition(document, specifier.start),
-                end: lspPosition(document, specifier.end)
-              }
-            }, "dependent");
-          }
-        }
-      }
-      access.releaseSyntax(document);
-    }
-  }, access.signal, access.cwd);
-  await project.recheck();
-  result.filesRead = access.filesRead;
-  result.bytesRead = access.bytesRead;
-  result.items = rankEvidence([
-    ...new Map(result.items.map((item) => [
-      `${item.path}:${String(item.range?.start)}:${String(item.range?.end)}`,
-      item
-    ])).values()
-  ], () => 0);
-  result.reasons = [...new Set(result.reasons)];
-  result.coverage = {
-    ...result.coverage,
-    compilerBindings: result.partial ? "partial" : "complete"
-  };
-  return result;
-}
-function navigateSemantics(input, access) {
-  return semanticRequestQueue.run(() => runSemanticNavigation(input, access), access.signal);
-}
-
-// src/semantic-navigation-adapter.ts
-import { realpath as realpath9 } from "node:fs/promises";
-import { resolve as resolve36 } from "node:path";
-function scopeFromResolution(resolved) {
-  return {
-    root: resolved.root,
-    ...resolved.filters.glob.length ? { include: resolved.filters.glob } : {},
-    ...resolved.filters.exclude.length ? { exclude: resolved.filters.exclude } : {},
-    hidden: resolved.filters.hidden
-  };
-}
-async function searchScope(cwd, target, scope) {
-  const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath9(resolve36(cwd)).catch(() => resolve36(cwd)),
-    realpath9(scope.root).catch(() => resolve36(scope.root))
-  ]);
-  const isProjectRoot = canonicalRoot === canonicalCwd;
-  return {
-    path: isProjectRoot ? "." : canonicalRoot,
-    requestedPath: target,
-    glob: [...scope.include ?? []],
-    exclude: [...scope.exclude ?? []],
-    hidden: scope.hidden ?? false,
-    expandedToProjectRoot: false,
-    assertion: isProjectRoot ? "project-wide" : "requested-scope"
-  };
-}
-function relatedNode(operation, edge) {
-  return operation === "definitions" || operation === "implementations" || operation === "callees" ? edge.to : edge.from;
-}
-var RELATIONSHIP_OPERATIONS = [
-  "definitions",
-  "references",
-  "implementations",
-  "callers",
-  "callees"
-];
-function isRelationshipOperation(mode) {
-  return RELATIONSHIP_OPERATIONS.some((candidate) => candidate === mode);
-}
-async function itemFor2(access, operation, edge) {
-  const node = relatedNode(operation, edge);
-  const document = await access.load(node.path, node.source);
-  const evidence = sourceEvidence(document, node.range);
-  return {
-    path: node.path,
-    line: node.start.line,
-    label: `Compiler-bound ${operation}`,
-    excerpt: evidence.excerpt,
-    ...node.source ? { source: node.source } : {},
-    range: node.range,
-    details: {
-      kind: "semantic",
-      relation: operation,
-      binding: edge.evidence[0]?.providerBasis ?? edge.from.identity.providerId,
-      certainty: edge.confidence,
-      runtimeDispatch: "unproven",
-      evidence: edge.evidence.map(({ reason, level, basis, providerBasis }) => ({
-        reason,
-        level,
-        basis,
-        ...providerBasis ? { providerBasis } : {}
-      })),
-      excerptRange: evidence.excerptRange,
-      excerptTruncated: evidence.excerptTruncated
-    }
-  };
-}
-async function navigateRelationship(registration, input, access, resolveScope, queue) {
-  if (!isSemanticMode(input.mode))
-    throw new SignalGrepError("A semantic provider requires a semantic mode");
-  const mode = input.mode;
-  if (!isRelationshipOperation(mode))
-    throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=${mode}; use mode=capabilities`);
-  if (!input.path)
-    throw new SignalGrepError(`mode=${mode} requires a workspace path`);
-  if (!registration.operations.includes(mode))
-    throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=${mode}; use mode=capabilities`);
-  if (access.signal?.aborted)
-    throw abortError();
-  const target = input.path.replace(/^@/, "");
-  const resolved = await resolveScope(access.cwd, target, input, access.signal);
-  const scope = scopeFromResolution(resolved);
-  const options = {
-    cwd: access.cwd,
-    scope,
-    signal: access.signal ?? new AbortController().signal,
-    queue,
-    maxFiles: access.maxFiles,
-    ...registration.limitsForOperation ? { limits: registration.limitsForOperation(mode) } : {}
-  };
-  const view = await registration.open(options);
-  try {
-    const resolution = await view.resolveNode({
-      path: target,
-      ...input.line === undefined ? {} : { line: input.line },
-      ...input.column === undefined ? {} : { column: input.column },
-      ...input.symbol === undefined ? {} : { symbol: input.symbol }
-    }, access.signal);
-    if (!resolution.node) {
-      const relationship = publicRelationshipDetails(scope, [], {
-        operation: mode,
-        providerId: registration.providerId,
-        freshness: "unknown",
-        coverage: "partial",
-        comparisonTarget: "current-worktree",
-        truncation: { truncated: false, reasons: resolution.reasons }
-      });
-      return {
-        kind: mode,
-        unit: "relationships",
-        items: [],
-        partial: true,
-        reasons: [
-          ...resolution.reasons,
-          `Semantic provider returned ${resolution.status} without a resolved target`
-        ],
-        filesRead: access.filesRead,
-        bytesRead: access.bytesRead,
-        scope: await searchScope(access.cwd, target, scope),
-        coverage: { compilerBindings: "partial" },
-        relationship,
-        redact: input.redact ?? false
-      };
-    }
-    const expansion = await view.expand(resolution.node, mode, access.signal);
-    const items = await Promise.all(expansion.edges.map((edge) => itemFor2(access, mode, edge)));
-    const recheck = await view.recheck(access.signal);
-    const reasons = [
-      ...resolution.reasons,
-      ...expansion.coverage.reasons,
-      ...expansion.unresolved.map((item) => item.reason),
-      ...recheck.reasons
-    ];
-    const partial = resolution.status !== "resolved" || expansion.coverage.status !== "complete" || expansion.unresolved.length > 0 || recheck.validity !== "current";
-    const relationship = publicRelationshipDetails(scope, recheck.sources, {
-      operation: mode,
-      providerId: registration.providerId,
-      freshness: recheck.validity,
-      coverage: partial ? "partial" : "complete",
-      comparisonTarget: "current-worktree",
-      truncation: { truncated: false, reasons: [...new Set(reasons)] }
-    });
-    return {
-      kind: mode,
-      unit: "relationships",
-      items,
-      partial,
-      reasons: [...new Set(reasons)],
-      filesRead: access.filesRead,
-      bytesRead: access.bytesRead,
-      scope: await searchScope(access.cwd, target, scope),
-      coverage: {
-        compilerBindings: partial ? "partial" : "complete",
-        freshness: recheck.validity === "current" ? "complete" : "partial"
-      },
-      relationship,
-      redact: input.redact ?? false
-    };
-  } finally {
-    await view.close();
-  }
-}
-function outlineItems(nodes, depth = 0) {
-  return nodes.flatMap((node) => [
-    {
-      path: node.path,
-      line: node.start.line,
-      label: `${"  ".repeat(depth)}${node.kind} ${node.name}`,
-      ...node.source ? { source: node.source } : {},
-      range: node.range,
-      details: {
-        kind: "symbol",
-        name: node.name,
-        syntax: "provider-owned outline; it does not prove runtime relationships"
-      }
-    },
-    ...outlineItems(node.children, depth + 1)
-  ]);
-}
-async function navigateOutline(registration, input, access, resolveScope, queue) {
-  if (!input.path)
-    throw new SignalGrepError("mode=outline requires a workspace path");
-  const target = input.path.replace(/^@/, "");
-  const resolved = await resolveScope(access.cwd, target, input, access.signal);
-  const scope = scopeFromResolution(resolved);
-  const view = await registration.open({
-    cwd: access.cwd,
-    scope,
-    signal: access.signal ?? new AbortController().signal,
-    queue,
-    maxFiles: access.maxFiles
-  });
-  try {
-    if (!view.outline)
-      throw new SignalGrepError(`Provider ${registration.providerId} does not implement mode=outline; use mode=capabilities`);
-    const nodes = await view.outline(target);
-    const allItems = outlineItems(nodes);
-    const selectedItems = allItems.filter((item) => {
-      const matchesLine = input.line === undefined || item.line === input.line;
-      const matchesSymbol = input.symbol === undefined || item.details?.name === input.symbol;
-      return matchesLine && matchesSymbol;
-    });
-    const selectorRequested = input.line !== undefined || input.symbol !== undefined;
-    const recheck = await view.recheck(access.signal);
-    const reasons = [...recheck.reasons];
-    if (selectorRequested && selectedItems.length === 0)
-      reasons.push("Outline selector did not match an admitted symbol");
-    const partial = recheck.validity !== "current" || recheck.coverage !== "complete" || selectorRequested && selectedItems.length === 0;
-    return {
-      kind: "outline",
-      unit: "symbols",
-      items: selectedItems,
-      partial,
-      reasons: [...new Set(reasons)],
-      filesRead: access.filesRead,
-      bytesRead: access.bytesRead,
-      scope: await searchScope(access.cwd, target, scope),
-      coverage: { outline: partial ? "partial" : "complete" },
-      redact: input.redact ?? false
-    };
-  } finally {
-    await view.close();
-  }
-}
-function outlineProviderSupports(relationship, path) {
-  return relationship.supports(path) && Boolean(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.capabilities.some((capability) => capability.name === "outline" && capability.provider === relationship.providerId && capability.availability !== "unavailable"));
-}
-function hasDeclaredOutlineProvider(relationship) {
-  return DEFAULT_LANGUAGE_CAPABILITIES.some((descriptor) => descriptor.capabilities.some((capability) => capability.name === "outline" && capability.provider === relationship.providerId));
-}
-
-// src/semantic-provider-registry.ts
-var RELATIONSHIP_OPERATIONS2 = [
-  "definitions",
-  "references",
-  "implementations",
-  "callers",
-  "callees"
-];
-function relationshipMode(mode) {
-  return RELATIONSHIP_OPERATIONS2.some((candidate) => candidate === mode);
-}
-function descriptorSupports(path, mode, provider) {
-  return Boolean(descriptorForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)?.capabilities.some((capability) => capability.name === mode && capability.provider === provider && capability.availability !== "unavailable"));
-}
-function declaredModes(provider) {
-  const isSemanticCapability = (capability) => capability.provider === provider && SEMANTIC_MODES.some((mode) => mode === capability.name);
-  return [
-    ...new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.filter(isSemanticCapability).map((capability) => capability.name)))
-  ];
-}
-function createSemanticProviderRegistry(options) {
-  const typescriptProvider = "TypeScript language service relationship provider";
-  const typescriptModes = declaredModes(typescriptProvider);
-  const registrations = [
-    {
-      providerId: "typescript",
-      modes: typescriptModes,
-      supports: (path, mode) => descriptorSupports(path, mode, typescriptProvider),
-      navigate: (input, access) => navigateSemantics(input, access)
-    }
-  ];
-  for (const relationship of options.relationships) {
-    if (!relationship.operations.length)
-      continue;
-    const modes = declaredModes(relationship.providerId);
-    if (!modes.length)
-      continue;
-    registrations.push({
-      providerId: relationship.providerId,
-      modes,
-      supports: (path, mode) => relationshipMode(mode) && relationship.operations.includes(mode) && descriptorSupports(path, mode, relationship.providerId),
-      navigate: (input, access) => navigateRelationship(relationship, input, access, options.resolveScope, options.queue)
-    });
-  }
-  return registrations;
-}
-function createOutlineProviderRegistry(options) {
-  return options.relationships.flatMap((relationship) => {
-    if (!hasDeclaredOutlineProvider(relationship))
-      return [];
-    return [
-      {
-        providerId: relationship.providerId,
-        supports: (path) => outlineProviderSupports(relationship, path),
-        navigate: (input, access) => navigateOutline(relationship, input, access, options.resolveScope, options.queue)
-      }
-    ];
-  });
-}
-function findOutlineProvider(registrations, path) {
-  return registrations.find((registration) => registration.supports(path));
-}
-function findSemanticProvider(registrations, input) {
-  if (!input.path || !isSemanticMode(input.mode))
-    return;
-  const mode = input.mode;
-  return registrations.find((registration) => registration.supports(input.path, mode));
-}
-
-// src/evidence-service.ts
+import { realpath as realpath6 } from "node:fs/promises";
 function isEvidenceRequest(input) {
-  return isSemanticMode(input.mode) || input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "impact" || input.mode === "trace" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
+  return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
 function maxFilesToParse(value) {
   const candidate = value ?? MAX_STRUCTURE_FILES;
@@ -15521,7 +9289,7 @@ function fileConjunction(document, terms, allowed) {
     }
   };
 }
-function searchScope2(request) {
+function searchScope(request) {
   const path = request.path ?? ".";
   const requestedPath = request.expandedFromPath ?? path;
   return {
@@ -15536,31 +9304,12 @@ function searchScope2(request) {
     ...request.modifiedBeforeMs !== undefined ? { modifiedBeforeMs: request.modifiedBeforeMs } : {}
   };
 }
-function navigationRootFamily(input, path) {
-  const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
-  const providerModes = isSemanticMode(input.mode) || input.mode === "outline" || input.mode === "trace" || input.mode === "validate";
-  if (!providerModes)
-    return "workspace";
-  if (language === "go" || language === "swift")
-    return "relationship";
-  if (language === "javascript" || language === "typescript" || language === "tsx")
-    return "semantic";
-  return "workspace";
-}
-async function navigationRoot(cwd, path, input, signal) {
-  const absolute = resolve37(cwd, path);
-  const family = navigationRootFamily(input, path);
-  if (family === "relationship") {
-    const language = languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path);
-    if (language === "go" || language === "swift")
-      return resolveRelationshipProjectRoot(cwd, path, language, signal);
-  }
-  if (family === "semantic")
-    return resolveSemanticProjectRoot(cwd, path, signal);
-  const repository = await findGitRepository(dirname9(absolute), signal);
+async function navigationRoot(cwd, path, signal) {
+  const absolute = resolve20(cwd, path);
+  const repository = await findGitRepository(dirname4(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve37(cwd) : dirname9(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve20(cwd) : dirname4(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -15573,8 +9322,8 @@ function navigationFilters(input) {
 }
 async function navigationScope(cwd, root, requestedPath, filters) {
   const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath10(resolve37(cwd)).catch(() => resolve37(cwd)),
-    realpath10(root).catch(() => resolve37(root))
+    realpath6(resolve20(cwd)).catch(() => resolve20(cwd)),
+    realpath6(root).catch(() => resolve20(root))
   ]);
   const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
@@ -15588,13 +9337,13 @@ async function navigationScope(cwd, root, requestedPath, filters) {
   };
 }
 async function canonicalNavigationPath(path) {
-  return realpath10(path).catch(() => resolve37(path));
+  return realpath6(path).catch(() => resolve20(path));
 }
 async function canonicalNavigationFiles(cwd, root, files, primaryPath) {
   const canonicalRoot = await canonicalNavigationPath(root);
   const [enumerated, canonicalPrimary] = await Promise.all([
-    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve37(cwd, file)))),
-    canonicalNavigationPath(resolve37(cwd, primaryPath))
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve20(cwd, file)))),
+    canonicalNavigationPath(resolve20(cwd, primaryPath))
   ]);
   const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
   if (isPathInsideRoot(canonicalPrimary, canonicalRoot))
@@ -15610,58 +9359,20 @@ class EvidenceService {
   #queue = new SyntaxQueue;
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
-  #relationshipService;
-  #semanticProviders;
-  #outlineProviders;
-  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch, additionalRelationshipProviders) {
+  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
-    const providers = [
-      ...createRelationshipProviderRegistry(this.#queue),
-      ...additionalRelationshipProviders ?? []
-    ];
-    const resolveScope = async (cwd, target, input, signal) => ({
-      root: await navigationRoot(cwd, target, input, signal),
-      filters: navigationFilters(input)
-    });
-    this.#relationshipService = new RelationshipService({
-      queue: this.#queue,
-      providers,
-      resolveScope,
-      maxFilesToParse
-    });
-    this.#semanticProviders = createSemanticProviderRegistry({
-      relationships: providers,
-      queue: this.#queue,
-      resolveScope
-    });
-    this.#outlineProviders = createOutlineProviderRegistry({
-      relationships: providers,
-      queue: this.#queue,
-      resolveScope
-    });
   }
   clear() {
     this.#analyses.clear();
     this.#continuations.clear();
     this.#queue.clear();
-    this.#relationshipService.clear();
   }
   async shutdown() {
     this.clear();
-    await this.#relationshipService.shutdown();
     await this.#queue.shutdown();
-  }
-  async#relationshipValidate(input, cwd, signal) {
-    const cursor = input.cursor;
-    if (!cursor)
-      throw new SignalGrepError("mode=validate requires a saved evidence cursor");
-    if (cursor.startsWith("relationship.")) {
-      return this.#relationshipService.validate(input, signal);
-    }
-    return this.#validateSavedEvidence(input, cwd, signal);
   }
   async#validateSavedEvidence(input, cwd, signal) {
     const cursor = input.cursor;
@@ -15679,16 +9390,11 @@ class EvidenceService {
       maxFiles: MAX_STRUCTURE_FILES
     });
     const finishedAt = Date.now();
-    return validationResult({
-      scope: validated.scope,
-      coverage: { sources: validated.sources, status: validated.coverage },
-      status: validated.storedPartial || validated.coverage === "partial" ? "partial" : "complete",
-      reasons: validated.reasons
-    }, cursor, validated.recheck, {
+    return validationResult(validated, cursor, {
       start: startedAt,
       end: finishedAt,
       ...input.matchIndex !== undefined ? { selected: input.matchIndex } : {}
-    }, validated.comparisonTarget, []);
+    });
   }
   async#testEntryPaths(root, files, cwd, filters, signal) {
     const sourceGlobs = ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"];
@@ -15730,16 +9436,8 @@ class EvidenceService {
     const analysisStarted = performance.now();
     const fileLimit = maxFilesToParse(input.maxFilesToParse);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-    if (input.mode === "trace" || input.mode === "validate")
-      return input.mode === "trace" ? this.#relationshipService.trace(input, cwd, signal) : this.#relationshipValidate(input, cwd, signal);
-    if (isSemanticMode(input.mode)) {
-      const provider = findSemanticProvider(this.#semanticProviders, input);
-      if (!provider)
-        throw new SignalGrepError(`No semantic provider is registered for ${input.path ?? "the requested path"} and mode=${input.mode}; use mode=capabilities to inspect available language modes`);
-      return this.#analyses.page(this.#analyses.create(await provider.navigate(input, access)));
-    }
-    if (input.column !== undefined)
-      throw new SignalGrepError("column requires semantic navigation");
+    if (input.mode === "validate")
+      return this.#validateSavedEvidence(input, cwd, signal);
     if (input.sourceCursor !== undefined) {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
@@ -15817,8 +9515,6 @@ class EvidenceService {
     if (input.mode === "files") {
       return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
     }
-    if (input.mode === "impact")
-      return this.#impact(input, access);
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
@@ -15889,7 +9585,7 @@ class EvidenceService {
       partial ||= expanded.partial;
       for (const reason of expanded.reasons)
         reasons.add(reason);
-      const scope = searchScope2(chunkResults[0]?.request ?? normalizeRequest({
+      const scope = searchScope(chunkResults[0]?.request ?? normalizeRequest({
         ...input,
         pattern: chunks[0]?.map(escapeRegexLiteral).join("|") ?? "",
         literal: false,
@@ -15949,7 +9645,7 @@ class EvidenceService {
       filesRead: candidates.filesRead,
       bytesRead: candidates.bytesRead,
       ...candidates.changes ? { changes: candidates.changes } : {},
-      scope: searchScope2(selected.request),
+      scope: searchScope(selected.request),
       coverage: {
         candidateSearch: candidates.partial ? "partial" : "complete",
         ...terms || input.roles ? { syntaxClassification: "complete" } : {}
@@ -16049,7 +9745,7 @@ class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const isStructural = item.details?.kind === "symbol" || item.details?.kind === "function" || item.details?.kind === "impact-target";
+      const isStructural = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
@@ -16061,146 +9757,6 @@ class EvidenceService {
       ...legacySourceTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
       ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}
     };
-  }
-  async#impact(input, access) {
-    const impactStarted = performance.now();
-    const filters = navigationFilters(input);
-    let path;
-    let line = input.line;
-    let document;
-    if (input.cursor !== undefined) {
-      if (input.cursor.includes(".analysis."))
-        throw new CursorError("Impact requires an ordinary search snapshot, not an analysis cursor");
-      if (input.matchIndex === undefined || input.path !== undefined || input.line !== undefined || input.symbol !== undefined)
-        throw new SignalGrepError("Snapshot impact requires cursor+matchIndex instead of path, line, or symbol");
-      const selected = resolveInspectionTarget(input, access.cwd, this.#snapshots);
-      if (selected.unverified)
-        throw new SignalGrepError("Snapshot source revision is unverified; refresh the search");
-      path = selected.path;
-      line = selected.line;
-      document = await access.load(path);
-      if (selected.expectedRevision && (document.reference.origin.kind !== "worktree" || !sameSourceRevision(selected.expectedRevision, document.reference.origin.revision)))
-        throw new SignalGrepError("Source changed; refresh the search");
-    } else {
-      if (input.matchIndex !== undefined)
-        throw new SignalGrepError("matchIndex requires an ordinary search cursor");
-      if (!input.path || input.line === undefined && input.symbol === undefined)
-        throw new SignalGrepError("Direct impact requires path and at least one of symbol or line");
-      path = input.path;
-      document = await access.load(path);
-    }
-    if (document.reference.origin.kind !== "worktree")
-      throw new SignalGrepError("Impact currently supports worktree sources only");
-    const root = await navigationRoot(access.cwd, document.path, input, access.signal);
-    const targetSyntax = await access.syntax(document);
-    let target;
-    try {
-      target = selectImpactTarget(document, targetSyntax, {
-        ...line !== undefined ? { line } : {},
-        ...input.symbol !== undefined ? { symbol: input.symbol } : {}
-      });
-    } finally {
-      access.releaseSyntax(document);
-    }
-    const request = normalizeRequest({
-      pattern: target.symbol.name,
-      path: root,
-      glob: filters.glob,
-      exclude: filters.exclude,
-      hidden: filters.hidden,
-      literal: true,
-      ignoreCase: false
-    });
-    const candidates = await collectEvidenceCandidates({
-      request,
-      cwd: access.cwd,
-      ...access.signal ? { signal: access.signal } : {},
-      access,
-      runRipgrep: this.#runner,
-      maxFiles: access.maxFiles
-    });
-    const occurrences = await classifyImpactOccurrences(candidates.files, target, access);
-    const bound = await bindImpactCandidates(target, candidates.files, occurrences.items, access);
-    occurrences.items = bound.items;
-    const reasons = new Set([...candidates.reasons, ...occurrences.reasons]);
-    let partial = candidates.partial || occurrences.partial;
-    let testItems = [];
-    let testStats;
-    let relatedTestsCoverage = "skipped";
-    const retainedBeforeTests = [target.item, ...occurrences.items];
-    if (!target.symbol.hasBody) {
-      reasons.add("Related-test augmentation skipped: selected target has no implementation body");
-    } else if (impactRetentionExhausted(retainedBeforeTests)) {
-      partial = true;
-      reasons.add("Related-test augmentation skipped: exact occurrences exhausted the shared analysis budget");
-    } else {
-      const files = await listWorkspaceFiles(access.cwd, access.signal, {
-        path: root,
-        glob: filters.glob,
-        exclude: filters.exclude,
-        hidden: filters.hidden
-      });
-      const { allowed, primaryPath } = await canonicalNavigationFiles(access.cwd, root, files, document.path);
-      const host = {
-        cwd: access.cwd,
-        ...access.signal ? { signal: access.signal } : {},
-        normalizePath: (file) => workspaceRelativePath(access.cwd, file),
-        load: async (file, expected) => {
-          const absolutePath = await canonicalNavigationPath(resolve37(access.cwd, file));
-          if (!allowed.has(absolutePath))
-            throw new SignalGrepError("Navigation source is excluded by current ignore rules");
-          if (absolutePath === primaryPath && expected === undefined)
-            return document;
-          return expected ? access.refresh(file, expected) : access.load(file);
-        },
-        syntax: (source) => access.syntax(source),
-        releaseSyntax: (source) => access.releaseSyntax(source),
-        listFiles: async () => files,
-        maxFilesToParse: access.maxFiles
-      };
-      const entryPaths = await this.#testEntryPaths(root, files.paths, access.cwd, filters, access.signal);
-      const tests = await findRelatedTests(host, {
-        path: document.path,
-        line: target.item.line,
-        symbol: target.symbol.name
-      }, { entryPaths });
-      testItems = tests.items;
-      testStats = {
-        filesEnumerated: files.paths.length,
-        ...tests.stats,
-        filesParsed: access.syntaxParses,
-        cacheHits: access.syntaxCacheHits
-      };
-      relatedTestsCoverage = tests.partial || files.partial ? "partial" : "complete";
-      partial ||= tests.partial || files.partial;
-      for (const reason of [...tests.reasons, ...files.reasons])
-        reasons.add(reason);
-    }
-    const result = {
-      kind: "impact",
-      unit: "impact-candidates",
-      items: mergeImpactItems(target.item, occurrences.items, testItems),
-      partial,
-      reasons: [...reasons],
-      filesRead: access.filesRead,
-      bytesRead: access.bytesRead,
-      stats: {
-        ...testStats,
-        filesParsed: access.syntaxParses,
-        cacheHits: access.syntaxCacheHits,
-        parseMs: testStats?.parseMs ?? Math.round(performance.now() - impactStarted),
-        budgetExhausted: testStats?.budgetExhausted ?? [...reasons].some((reason) => reason.includes("limit") || reason.includes("budget-exhausted"))
-      },
-      coverage: {
-        compilerCandidateBindings: candidates.partial ? "partial" : "complete",
-        exactOccurrences: candidates.partial ? "partial" : "complete",
-        syntaxClassification: occurrences.partial ? "partial" : "complete",
-        relatedTests: relatedTestsCoverage
-      },
-      scope: await navigationScope(access.cwd, root, document.path, filters),
-      redact: input.redact ?? false
-    };
-    return this.#analyses.page(this.#analyses.create(result, (items) => retainedImpactCounts(items), impactRetentionPriority));
   }
   async#navigate(input, access) {
     const navigationStarted = performance.now();
@@ -16232,11 +9788,6 @@ class EvidenceService {
     const language = syntaxLanguage(document.path);
     const isPython = /\.py$/iu.test(document.path);
     if (input.mode === "outline") {
-      const outlineProvider = findOutlineProvider(this.#outlineProviders, document.path);
-      if (outlineProvider) {
-        const providerInput = input.path === document.path ? input : { ...input, path: document.path };
-        return this.#analyses.page(this.#analyses.create(await outlineProvider.navigate(providerInput, access)));
-      }
       const capabilityFailure = outlineCapabilityError(document.path, "outline", true);
       if (capabilityFailure)
         throw capabilityFailure;
@@ -16324,7 +9875,7 @@ class EvidenceService {
           "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree"
         ]
       }));
-    const root = await navigationRoot(access.cwd, document.path, input, access.signal);
+    const root = await navigationRoot(access.cwd, document.path, access.signal);
     const filters = navigationFilters(input);
     if (input.mode === "tests" && isPython)
       return this.#analyses.page(this.#analyses.create({
@@ -16361,7 +9912,7 @@ class EvidenceService {
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = await canonicalNavigationPath(resolve37(access.cwd, file));
+        const absolutePath = await canonicalNavigationPath(resolve20(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SignalGrepError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -16403,13 +9954,13 @@ class EvidenceService {
 }
 
 // src/service.ts
-import { resolve as resolve39 } from "node:path";
+import { resolve as resolve22 } from "node:path";
 
 // src/discovery-errors.ts
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/format.ts
-import { readFile as readFile3 } from "node:fs/promises";
+import { readFile as readFile2 } from "node:fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -16468,7 +10019,7 @@ async function loadContextLines(match, expectedRevision, cache, signal) {
       cache.set(match.absolutePath, changed);
       return changed;
     }
-    const content = await readFile3(match.absolutePath, { encoding: "utf8", signal });
+    const content = await readFile2(match.absolutePath, { encoding: "utf8", signal });
     const afterRevision = await getSourceRevision(match.absolutePath);
     if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
       const changed = { status: "changed" };
@@ -16775,7 +10326,7 @@ ${lineRows.join(`
 }
 
 // src/snapshot-store.ts
-import { randomUUID as randomUUID9 } from "node:crypto";
+import { randomUUID as randomUUID4 } from "node:crypto";
 class SnapshotStore {
   #snapshots = new Map;
   #expired = new Set;
@@ -16800,7 +10351,7 @@ class SnapshotStore {
     const now = this.#now();
     const snapshot = {
       ...scan,
-      id: randomUUID9(),
+      id: randomUUID4(),
       createdAt: now,
       lastAccessedAt: now
     };
@@ -16905,7 +10456,7 @@ class SnapshotStore {
 }
 
 // src/operation-lifecycle.ts
-import { randomUUID as randomUUID10 } from "node:crypto";
+import { randomUUID as randomUUID5 } from "node:crypto";
 var OPERATION_INITIAL_WAIT_MS = 5000;
 var OPERATION_DEFAULT_DEADLINE_MS = 10 * 60000;
 var OPERATION_DEFAULT_LEASE_MS = 2 * 60000;
@@ -16967,7 +10518,7 @@ class OperationLifecycle {
       throw new Error("Operation lifecycle is closed");
     if (this.#pending.size >= this.#maxOperations)
       throw new Error(`Operation resource limit reached (${String(this.#maxOperations)} pending operations)`);
-    const id = randomUUID10();
+    const id = randomUUID5();
     const startedAt = this.#now();
     const controller = new AbortController;
     const promise = Promise.resolve().then(() => run(controller.signal, id));
@@ -17318,7 +10869,7 @@ function operationOutcome(outcome, mode) {
 }
 
 // src/language-capabilities.ts
-import { resolve as resolve38 } from "node:path";
+import { resolve as resolve21 } from "node:path";
 function normalizeLists(values) {
   return values === undefined ? [] : [...values];
 }
@@ -17371,7 +10922,7 @@ class LanguageCapabilityCatalog {
       ...new Map(entries.flatMap((entry) => this.descriptor(entry.language)?.capabilities ?? []).map((capability) => [capability.id, capability])).values()
     ];
     return {
-      root: resolve38(request.cwd),
+      root: resolve21(request.cwd),
       ...path ? { path } : {},
       partial: files.partial,
       reasons: files.reasons,
@@ -17450,14 +11001,14 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SignalGrepError("Cursor paths cannot be empty");
-    const absolutePath = resolve39(cwd, label);
+    const absolutePath = resolve22(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash9("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash4("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails(snapshot, mode) {
@@ -17472,13 +11023,13 @@ function baseDetails(snapshot, mode) {
     returnedMatches: 0,
     snapshotComplete: snapshot.snapshotComplete,
     ...snapshot.retention ? { retention: snapshot.retention } : {},
-    scope: searchScope3(snapshot.request),
+    scope: searchScope2(snapshot.request),
     ...snapshot.request.redact ? { redactionRequested: true } : {},
     ...snapshot.truncatedLines > 0 ? { lineContentTruncated: snapshot.truncatedLines } : {},
     ...sourceUnverifiedFileCount > 0 ? { sourceUnverifiedFileCount } : {}
   };
 }
-function searchScope3(request) {
+function searchScope2(request) {
   const path = request.path ?? ".";
   const requestedPath = request.expandedFromPath ?? path;
   return {
@@ -17585,7 +11136,7 @@ class SignalGrepService {
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
-    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.additionalRelationshipProviders);
+    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
@@ -17670,7 +11221,7 @@ class SignalGrepService {
       throw new SignalGrepError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
-    if (resolve39(cwd) !== resolve39(existing.metadata.cwd))
+    if (resolve22(cwd) !== resolve22(existing.metadata.cwd))
       throw new SignalGrepError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
@@ -17703,8 +11254,6 @@ class SignalGrepService {
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input))
       return this.#evidence.search(input, cwd, signal, options);
-    if (input.column !== undefined)
-      throw new SignalGrepError("column requires semantic navigation");
     if (input.query !== undefined)
       throw new SignalGrepError(DISCOVERY_MODE_REQUIRED_ERROR);
     if (input.maxFilesToParse !== undefined) {
@@ -17735,7 +11284,7 @@ class SignalGrepService {
       if (snapshot.totalMatches === 0) {
         const details = baseDetails(snapshot, mode);
         result = {
-          text: emptyResultText(details.scope ?? searchScope3(snapshot.request)),
+          text: emptyResultText(details.scope ?? searchScope2(snapshot.request)),
           details
         };
       } else if (snapshot.matches.length === 0) {
@@ -17974,17 +11523,15 @@ function signalGrepPromptGuidelines(structuredOutput = true) {
   return [
     `Use baoer_signal_grep for content search. Start with pattern and optional path; omit mode and limit to let auto choose a complete small result or a broad summary. Use literal=true for literal code fragments rather than escaping them as regex.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide matches with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
-    `For source navigation, imports/tests/impact use the containing Git repository; semantic providers use their declared JS/TS, Go-module or admitted Swift-package root.`,
-    `Use sufficient exact-match evidence directly; do not inspect or reread it only to obtain a citation, since returned matches already have path/line numbers. When definitions repeat, follow the relevant imports/callers before choosing the authoritative file.`,
+    `For source navigation, imports/tests use the containing Git repository and bounded static module resolution.`,
+    `Use sufficient exact-match evidence directly; do not inspect or reread it only to obtain a citation, since returned matches already have path/line numbers. When definitions repeat, inspect the relevant imports and surrounding source before choosing the authoritative file.`,
     `Use the file samples in baoer_signal_grep summaries to choose evidence. Reuse the visible cursor with path or paths for matching lines; mode=summary pages the remaining files. Match counts are not relevance scores.`,
     `When source context is missing, use one baoer_signal_grep batch before reading whole files: {mode:"inspect",cursor:"<returned cursor>",matchIndices:[1,2]} or {mode:"inspect",targets:[{path:"src/example.ts",line:42}]}, at most ${String(MAX_INSPECT_TARGETS)} locations. Copy actual returned selectors. Inspection chooses its own bounded window: omit pattern, context, limit, glob, exclude, literal, ignoreCase and hidden.`,
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrences.`,
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports retained counts per input term, and runs requests above eight terms as bounded parallel chunks. Large term-count inventories have separate termCountsNextRequest pages; copy those requests to retrieve the complete term map.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted evidence. Copy returned continuation requests to preserve source versions.`,
-    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path, not a directory, to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift outline and relationships require SourceKit-LSP prerequisites. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
-    `Before changing one known JS/TS/TSX symbol, use mode:"impact" with path plus symbol or line to retrieve the exact target, every exact same-spelling candidate, and related-test evidence together. Compiler-confirmed references in verified candidate documents are ranked first; remaining same spelling does not prove binding, and returned tests have not been run. Use references for a dedicated workspace reference inventory.`,
+    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path, not a directory, to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift supports ordinary search and source inspection. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
     `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word file queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
-    `Use declared semantic modes definitions, references, implementations, callers or callees with path+line+column (1-based UTF-16), or an unambiguous symbol. JS/TS use the TypeScript service; Go trace needs gopls; Swift relationships need SourceKit-LSP indexing. Returned evidence includes exact positions and executable next requests; static relationships do not prove runtime dispatch. dependencies/dependents take only a workspace file path.`,
     `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; no lang, literal/regex or scope options. Use path/glob/exclude to narrow admitted syntax.`,
     `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Every passage admitted by the source budget is ranked through token-safe windows, and content-addressed embeddings are reused from a bounded local cache. Similarity scores identify source candidates, not proof. File/concept/structure discovery never expands its requested path.`,
     `Use mode:"hybrid" plus query when wording may differ from the source. It always runs exact literal and local concept retrieval, keeps exact evidence first, removes semantic passages that overlap exact evidence, and retains the top three non-overlapping semantic candidates by default. conceptLimit changes only that semantic supplement. Hybrid uses one pageable snapshot and never treats similarity as exact evidence.`,
@@ -17997,7 +11544,7 @@ function signalGrepModelGuidelines() {
   return [
     `Search with pattern and optional path; literal=true avoids regex escaping. Omit mode/limit for auto detail/summary. Omitted path uses cwd; scope:"strict" forbids expansion. paths selects retained cursor files only; split new multi-root searches.`,
     `Use sufficient exact evidence directly. Copy returned cursor/nextRequest/inspect selectors; batch inspect at most ${String(MAX_INSPECT_TARGETS)} targets. A complete snapshot may have unread pages or truncated lines: continue or inspect as needed, never restart just to change limit. A partial status is not complete; read coverage.`,
-    `Modes: capabilities for language prerequisites; files+query for filenames (not business intent); anyOf/allOf for literal terms; outline/imports/tests/impact and semantic navigation for static evidence; structure for AST patterns; concept/hybrid for semantic candidates. Similarity and static links are not proof.`,
+    `Modes: capabilities for language prerequisites; files+query for filenames (not business intent); anyOf/allOf for literal terms; outline/imports/tests for static evidence; structure for AST patterns; concept/hybrid for semantic candidates. Similarity and static links are not proof.`,
     `On rejection keep the strongest applicable mode and apply the stated repair once. Do not repeat the rejected request or include its error. Only explicit capability-unavailable permits a visibly partial alternative.`
   ];
 }
@@ -18020,13 +11567,9 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared capabilities (Swift requires SourceKit-LSP); semantic definitions/references/implementations/callers/callees use path+line+column or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 var SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var signalGrepSchema = Type.Object({
-  column: Type.Optional(Type.Integer({
-    minimum: 1,
-    description: "1-based UTF-16 column for exact compiler navigation; requires path and line."
-  })),
   query: Type.Optional(Type.String({
     maxLength: 256,
     description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model.`
@@ -18082,11 +11625,11 @@ var signalGrepSchema = Type.Object({
     description: "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly."
   })),
   symbol: Type.Optional(Type.String({
-    description: "Binding name for imports/tests/impact; semantic modes accept it only when it identifies one source occurrence. Prefer exact path+line+column when the name repeats."
+    description: "Syntax name for outline/imports/tests; use a concrete source file and line to narrow repeated names."
   })),
   pattern: Type.Optional(Type.String({
     maxLength: MAX_PATTERN_CHARACTERS,
-    description: `${fieldGuidance("pattern")}. mode=structure requires a nonempty ast-grep code pattern for JS/TS/TSX/Go (no lang field), at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.`
+    description: `${fieldGuidance("pattern")}. mode=structure requires a nonempty ast-grep code pattern for JS/TS/TSX/Go (no lang field), at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, syntax navigation, inspection and cursors.`
   })),
   path: Type.Optional(Type.String({
     maxLength: MAX_PATH_CHARACTERS,
@@ -18152,33 +11695,10 @@ var signalGrepSchema = Type.Object({
     description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`
   })),
   mode: Type.Optional(stringEnum(SIGNAL_GREP_MODES, {
-    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. definitions/references/implementations/callers/callees require a workspace path and exact line+column or unique symbol; dependencies/dependents require only a workspace file path. trace follows static callers/callees with bounded depth and explicit budgets, and applies glob/exclude/hidden to the provider source inventory; validate rechecks the entire saved trace or analysis snapshot by default. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Relationship details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests/impact retain their documented location selectors. Compiler results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} Fields: ${MODE_FIELD_SUMMARY}`
-  })),
-  relation: Type.Optional(stringEnum(["callers", "callees"], {
-    description: "mode=trace relationship direction; required for a new trace and ignored only when paging a trace cursor."
-  })),
-  depth: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 8,
-    description: "mode=trace maximum BFS depth; continuation increases the cumulative depth by one."
-  })),
-  maxNodes: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 2000,
-    description: "mode=trace retained node budget across all continuation pages."
-  })),
-  maxEdges: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 4000,
-    description: "mode=trace retained edge budget across all continuation pages."
-  })),
-  maxExpansions: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 2000,
-    description: "mode=trace provider expansion budget across all continuation pages."
+    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} Fields: ${MODE_FIELD_SUMMARY}`
   })),
   line: Type.Optional(Type.Number({
-    description: "1-indexed source line for path inspection/navigation/impact. Omit with matchIndex, matchIndices or targets."
+    description: "1-indexed source line for path inspection/navigation. Omit with matchIndex, matchIndices or targets."
   })),
   matchIndex: Type.Optional(Type.Number({
     description: "1-based retained match index for cursor-scoped inspect; replaces path and line."
@@ -18201,9 +11721,6 @@ var signalGrepSchema = Type.Object({
     minLength: 1,
     maxLength: 128,
     description: "Operation handle returned by a waiting concept/hybrid result. Required with mode=await or mode=cancel; copy it exactly and do not start a new query."
-  })),
-  exploreCursor: Type.Optional(Type.String({
-    description: "Independent relationship exploration handle returned by mode=trace; use it to extend depth without changing immutable result page cursors."
   }))
 });
 
@@ -18493,7 +12010,7 @@ async function handleMcpRequest(request, response, state, createService, cwd) {
       try {
         const service = createService();
         const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID11(),
+          sessionIdGenerator: () => randomUUID6(),
           onsessioninitialized: (initializedSessionId) => {
             if (!pendingSession)
               throw new Error("MCP session initialized before registration");

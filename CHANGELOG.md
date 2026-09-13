@@ -4,12 +4,16 @@
 
 ## [2.1.0] - 2026-09-13
 
+- Remove language-service navigation and its runtime dependencies, provider processes, graph traversal, snapshots and filesystem watchers. Removed modes: `definitions`, `references`, `implementations`, `callers`, `callees`, `dependencies`, `dependents`, `trace` and `impact`; requests fail explicitly without a weaker automatic fallback.
+- Retain ast-grep syntax analysis, bounded Python outline, static JS/TS/TSX imports/tests, exact/file searches, source inspection, Concept and hybrid. Swift outline is no longer advertised; Swift content search and inspection remain available.
+- Preserve the complete source-validation report in compact MCP output, including freshness, comparison target, check interval and per-source status; source rows use one-based indices and retained/returned counts agree.
+- Keep saved-source `validate` independent from language services. Metadata now uses `validation` instead of `relationship`; removed trace cursors and graph fields are unsupported. TypeScript is a development-only dependency and Pyright is no longer installed.
+
 - Deduplicate overlapping semantic passages in rank order before applying the hybrid supplement limit; retained counts and the non-overlap claim now describe the same evidence.
 - Mark truncated matching-line excerpts in tool text, disclose the snapshot-wide line count and per-line bound, and retain an executable inspection request even after the last match page.
 - Put ordinary search scope-expansion notices before evidence while preserving the documented default and explicit `scope="strict"` behavior.
 - Require every word in multi-word file queries to occur literally in the candidate path, preventing unrelated long build paths from satisfying independent fuzzy character walks. Single-word filename abbreviations remain supported.
 - Clarify the ordinary page limit, concrete-file outline requirement, structure language/pattern requirements, and continuation workflow in model-facing contracts.
-- Complete the Go language-service shutdown handshake with an explicit exit notification before closing input.
 - Run JavaScript workers correctly inside compiled Bun hosts such as OMP and include the syntax/concept workers with the bundled OMP extension.
 
 ## [2.0.0] - 2026-09-13

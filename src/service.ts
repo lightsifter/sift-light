@@ -38,7 +38,6 @@ import {
   LanguageCapabilityCatalog,
   type LanguageCapabilityInventory,
 } from "./language-capabilities.js";
-import type { RelationshipProviderRegistration } from "./relationship-provider-registry.js";
 import {
   DEFAULT_SUMMARY_FILE_LIMIT,
   MAX_INSPECT_TARGETS,
@@ -55,10 +54,8 @@ import {
 
 export interface SignalGrepInput extends RawSearchInput {
   query?: string;
-  column?: number;
   mode?: SearchMode;
   cursor?: string;
-  exploreCursor?: string;
   paths?: string[];
   matchIndex?: number;
   matchIndices?: number[];
@@ -73,11 +70,6 @@ export interface SignalGrepInput extends RawSearchInput {
   symbol?: string;
   maxFilesToParse?: number;
   conceptLimit?: number;
-  relation?: "callers" | "callees";
-  depth?: number;
-  maxNodes?: number;
-  maxEdges?: number;
-  maxExpansions?: number;
   operationId?: string;
 }
 
@@ -87,7 +79,6 @@ export interface SignalGrepServiceOptions {
   summaryFileLimit?: number;
   structure?: CodeStructureProvider;
   conceptSearch?: ConceptSearchRunner;
-  additionalRelationshipProviders?: readonly RelationshipProviderRegistration[];
 }
 
 export interface SignalGrepSearchOptions {
@@ -334,7 +325,6 @@ export class SignalGrepService {
       this.#snapshots,
       options.structure,
       options.conceptSearch,
-      options.additionalRelationshipProviders,
     );
   }
 
@@ -499,8 +489,6 @@ export class SignalGrepService {
     }
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal, options);
-    if (input.column !== undefined)
-      throw new SignalGrepError("column requires semantic navigation");
     if (input.query !== undefined) throw new SignalGrepError(DISCOVERY_MODE_REQUIRED_ERROR);
     if (input.maxFilesToParse !== undefined) {
       throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");

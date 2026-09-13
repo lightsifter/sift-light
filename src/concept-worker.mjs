@@ -84,13 +84,8 @@ async function verifyConceptModel(directory = conceptModelDirectory()) {
   }
 }
 
-// src/owned-process.ts
-var MAX_STDERR_BYTES = 16 * 1024;
-
-// src/owned-json-rpc.ts
-var MAX_RPC_FRAME_BYTES = 16 * 1024 * 1024;
-var MAX_RPC_TOTAL_BYTES = 64 * 1024 * 1024;
-function rpcRecord(value) {
+// src/record-value.ts
+function isRecordValue(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -118,11 +113,11 @@ function decodeVector(encoded) {
   return vector.every(Number.isFinite) ? vector : undefined;
 }
 function storedEmbedding(value, key) {
-  if (!rpcRecord(value) || value.version !== CONCEPT_CACHE_VERSION || value.key !== key || !Array.isArray(value.windows) || value.windows.length === 0)
+  if (!isRecordValue(value) || value.version !== CONCEPT_CACHE_VERSION || value.key !== key || !Array.isArray(value.windows) || value.windows.length === 0)
     return;
   const windows = [];
   for (const item of value.windows) {
-    if (!rpcRecord(item) || typeof item.start !== "number" || !Number.isSafeInteger(item.start) || item.start < 0 || typeof item.end !== "number" || !Number.isSafeInteger(item.end) || item.end <= item.start || typeof item.vector !== "string")
+    if (!isRecordValue(item) || typeof item.start !== "number" || !Number.isSafeInteger(item.start) || item.start < 0 || typeof item.end !== "number" || !Number.isSafeInteger(item.end) || item.end <= item.start || typeof item.vector !== "string")
       return;
     const vector = decodeVector(item.vector);
     if (!vector)
@@ -464,7 +459,7 @@ async function requestFromStdin() {
       throw new Error("Concept worker input exceeds its 64 MiB source protocol budget");
   }
   const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  if (!rpcRecord(request) || typeof request.query !== "string" || request.query.length === 0 || request.query.length > 256 || !request.query.isWellFormed() || /[\r\n\0]/u.test(request.query) || !Array.isArray(request.encodedPassages) || request.encodedPassages.some((item) => typeof item !== "string" || item.length === 0 || item.length % 4 !== 0 || item.length > Math.ceil((MAX_CONCEPT_CHARS + 256) * 4 / 3 * 4) + 4 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(item)))
+  if (!isRecordValue(request) || typeof request.query !== "string" || request.query.length === 0 || request.query.length > 256 || !request.query.isWellFormed() || /[\r\n\0]/u.test(request.query) || !Array.isArray(request.encodedPassages) || request.encodedPassages.some((item) => typeof item !== "string" || item.length === 0 || item.length % 4 !== 0 || item.length > Math.ceil((MAX_CONCEPT_CHARS + 256) * 4 / 3 * 4) + 4 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(item)))
     throw new Error("Invalid concept worker input");
   const encodedPassages = request.encodedPassages.filter((item) => typeof item === "string");
   const buffers = encodedPassages.map((item) => Buffer.from(item, "base64"));

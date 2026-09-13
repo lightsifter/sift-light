@@ -1,4 +1,3 @@
-import { isSemanticMode } from "./semantic-protocol.js";
 import { randomUUID } from "node:crypto";
 import {
   ANALYSIS_TTL_MS,
@@ -30,7 +29,6 @@ interface StoredAnalysis {
 export type RetainedAnalysisSummary = (
   items: readonly AnalysisItem[],
 ) => Pick<AnalysisResultSet, "counts" | "termCounts">;
-export type AnalysisRetentionPriority = (item: AnalysisItem) => number;
 
 function boundedReasons(reasons: readonly string[]): string[] {
   const unsupportedSuffix = ": syntax unsupported; this source remains unclassified";
@@ -99,11 +97,7 @@ export class AnalysisStore {
     this.#items.clear();
   }
 
-  create(
-    result: AnalysisResultSet,
-    summarize?: RetainedAnalysisSummary,
-    retentionPriority?: AnalysisRetentionPriority,
-  ): string {
+  create(result: AnalysisResultSet, summarize?: RetainedAnalysisSummary): string {
     this.#expire();
     const bounded: AnalysisResultSet = {
       ...result,
@@ -112,13 +106,7 @@ export class AnalysisStore {
       coverage: { ...result.coverage, retention: "complete" },
     };
     let bytes = Buffer.byteLength(JSON.stringify(bounded));
-    const candidates = result.items
-      .map((item, index) => ({ item, index }))
-      .toSorted(
-        (left, right) =>
-          (retentionPriority?.(left.item) ?? 0) - (retentionPriority?.(right.item) ?? 0) ||
-          left.index - right.index,
-      );
+    const candidates = result.items.map((item, index) => ({ item, index }));
     const retainedIndices: number[] = [];
     const rebuildItems = (): void => {
       const retained = new Set(retainedIndices);
@@ -327,15 +315,13 @@ export class AnalysisStore {
       details: {
         version: 1,
         mode:
-          isSemanticMode(result.kind) ||
           result.kind === "concept" ||
           result.kind === "hybrid" ||
           result.kind === "structure" ||
           result.kind === "files" ||
           result.kind === "outline" ||
           result.kind === "imports" ||
-          result.kind === "tests" ||
-          result.kind === "impact"
+          result.kind === "tests"
             ? result.kind
             : "matches",
         status: result.partial ? "partial" : "complete",
@@ -368,10 +354,8 @@ export class AnalysisStore {
           ...(result.coverage ? { coverage: result.coverage } : {}),
           ...(result.stats ? { stats: result.stats } : {}),
           ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
-          ...(result.relationship ? { relationship: result.relationship } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
         },
-        ...(result.relationship ? { relationship: result.relationship } : {}),
         ...(result.scope ? { scope: result.scope } : {}),
         ...(result.redact ? { redactionRequested: true } : {}),
       },

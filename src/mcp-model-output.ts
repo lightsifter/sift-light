@@ -86,7 +86,9 @@ function distinctNextRequest(
 
 export function compactMcpModelText(result: SignalGrepResult): string {
   const analysis = result.details.analysis;
-  if (!analysis) return result.text;
+  // Validation is a source-state report, not a pageable syntax/result inventory.
+  // Its authoritative text retains freshness, comparison target and check interval.
+  if (!analysis || analysis.kind === "validate") return result.text;
   const header = compactHeader(result.details, analysis);
   const inspect = compactInspectInstruction(analysis);
   const nextRequest = distinctNextRequest(result.details, analysis);

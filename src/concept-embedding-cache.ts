@@ -7,7 +7,7 @@ import {
   CONCEPT_CACHE_VERSION,
   CONCEPT_EMBEDDING_DIMENSIONS,
 } from "./concept-model.js";
-import { rpcRecord } from "./owned-json-rpc.js";
+import { isRecordValue } from "./record-value.js";
 
 export interface CachedConceptWindow {
   start: number;
@@ -57,7 +57,7 @@ function decodeVector(encoded: string): number[] | undefined {
 
 function storedEmbedding(value: unknown, key: string): CachedConceptEmbedding | undefined {
   if (
-    !rpcRecord(value) ||
+    !isRecordValue(value) ||
     value.version !== CONCEPT_CACHE_VERSION ||
     value.key !== key ||
     !Array.isArray(value.windows) ||
@@ -67,7 +67,7 @@ function storedEmbedding(value: unknown, key: string): CachedConceptEmbedding | 
   const windows: CachedConceptWindow[] = [];
   for (const item of value.windows) {
     if (
-      !rpcRecord(item) ||
+      !isRecordValue(item) ||
       typeof item.start !== "number" ||
       !Number.isSafeInteger(item.start) ||
       item.start < 0 ||

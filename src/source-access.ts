@@ -261,7 +261,7 @@ export class SourceAccess {
     this.#syntax.delete(document);
   }
 
-  /** Relationship validation must reread the expected version, not consult the request cache. */
+  /** Saved source validation must reread the expected version, not consult the request cache. */
   refresh(path: string, expected: SourceReference): Promise<SourceDocument> {
     return this.#read(path, expected, true);
   }

@@ -20,7 +20,7 @@ import {
 import { abortError, ConceptUnavailableError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { scriptRuntimeEnvironment } from "./script-runtime.js";
-import { rpcRecord } from "./owned-json-rpc.js";
+import { isRecordValue } from "./record-value.js";
 import { normalizeRequest } from "./request.js";
 import type { SignalGrepInput } from "./service.js";
 import { SourceAccess } from "./source-access.js";
@@ -189,7 +189,7 @@ async function similarities(
             newline = lineBuffer.indexOf("\n");
             if (!line) continue;
             const parsed: unknown = JSON.parse(line);
-            if (!rpcRecord(parsed) || typeof parsed.type !== "string")
+            if (!isRecordValue(parsed) || typeof parsed.type !== "string")
               throw new SignalGrepError("Invalid concept worker progress response");
             if (parsed.type === "progress") {
               if (sawFinal)
@@ -239,7 +239,7 @@ async function similarities(
     lineBuffer += decoder.end();
     if (lineBuffer.trim()) {
       const parsed: unknown = JSON.parse(lineBuffer.trim());
-      if (!rpcRecord(parsed) || parsed.type !== "result")
+      if (!isRecordValue(parsed) || parsed.type !== "result")
         throw new SignalGrepError("Concept worker did not return a result record");
       if (sawFinal) throw new SignalGrepError("Concept worker emitted more than one result");
       finalValue = parsed;
@@ -247,7 +247,7 @@ async function similarities(
     }
     const value: unknown = finalValue;
     if (
-      !rpcRecord(value) ||
+      !isRecordValue(value) ||
       !Array.isArray(value.scores) ||
       value.scores.length !== passages.length ||
       value.scores.some((score) => typeof score !== "number" || !Number.isFinite(score)) ||

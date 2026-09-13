@@ -1,5 +1,5 @@
 import type { AnalysisDetails } from "./analysis-types.js";
-import type { RelationshipPublicDetails } from "./relationship-types.js";
+import type { ValidationDetails } from "./validation-types.js";
 import type { SourceFragment } from "./source-pages.js";
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
@@ -42,13 +42,6 @@ export type SearchMode =
   | "concept"
   | "hybrid"
   | "structure"
-  | "definitions"
-  | "references"
-  | "implementations"
-  | "callers"
-  | "callees"
-  | "dependencies"
-  | "dependents"
   | "files"
   | "auto"
   | "summary"
@@ -57,8 +50,6 @@ export type SearchMode =
   | "outline"
   | "imports"
   | "tests"
-  | "impact"
-  | "trace"
   | "validate"
   | "capabilities"
   | "await"
@@ -167,8 +158,6 @@ export interface SourceExcerptDetails {
 export interface InspectRetry {
   mode: "inspect";
   cursor?: string;
-  exploreCursor?: string;
-  exploreRequest?: SignalGrepInput;
   matchIndex?: number;
   path?: string;
   line?: number;
@@ -264,11 +253,9 @@ export interface SignalGrepDetails {
   snapshotComplete: boolean;
   retention?: SearchRetentionDetails;
   cursor?: string;
-  exploreCursor?: string;
   nextRequest?: SignalGrepInput;
-  exploreRequest?: SignalGrepInput;
   analysis?: AnalysisDetails;
-  relationship?: RelationshipPublicDetails;
+  validation?: ValidationDetails;
   sourceBlocks?: { path: string; source: SourceExcerptDetails }[];
   summaryFilesShown?: number;
   summaryOffset?: number;
