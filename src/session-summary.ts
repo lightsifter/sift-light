@@ -1,4 +1,5 @@
 import type { SignalGrepLocale } from "./config.js";
+import { BAOER_SIGNAL_GREP_VERSION } from "./package-version.js";
 import type { SignalGrepInput } from "./service.js";
 import type { SignalGrepResult } from "./types.js";
 
@@ -7,11 +8,17 @@ export const SESSION_STATUS_KEY = "baoer_signal_grep_session";
 export interface SessionSummarySnapshot {
   queries: number;
   completeQueries: number;
+  partialQueries: number;
   organizedQueries: number;
+  failedCalls: number;
 }
 
 function isNewQuery(input: SignalGrepInput): boolean {
-  return input.cursor === undefined && input.sourceCursor === undefined;
+  return (
+    input.cursor === undefined &&
+    input.sourceCursor === undefined &&
+    input.operationId === undefined
+  );
 }
 
 function wasAutomaticallyOrganized(input: SignalGrepInput, result: SignalGrepResult): boolean {
@@ -19,18 +26,49 @@ function wasAutomaticallyOrganized(input: SignalGrepInput, result: SignalGrepRes
   return autoMode && input.limit === undefined && result.details.summaryFilesShown !== undefined;
 }
 
+function formatChineseCompleteness(snapshot: SessionSummarySnapshot): string {
+  const { completeQueries, partialQueries, queries } = snapshot;
+  if (queries === 0) return "暂无成功查询";
+  const unfinishedQueries = queries - completeQueries - partialQueries;
+  if (completeQueries > 0 && partialQueries === 0 && unfinishedQueries === 0) return "结果全部完整";
+  const parts: string[] = [];
+  if (completeQueries > 0) parts.push(`${String(completeQueries)} 次结果完整`);
+  if (partialQueries > 0) parts.push(`${String(partialQueries)} 次仅获得部分结果并已明确标注`);
+  if (unfinishedQueries > 0) parts.push(`${String(unfinishedQueries)} 次结果尚未完成`);
+  return parts.join("；");
+}
+
+function formatEnglishCompleteness(snapshot: SessionSummarySnapshot): string {
+  const { completeQueries, partialQueries, queries } = snapshot;
+  if (queries === 0) return "no successful queries";
+  const unfinishedQueries = queries - completeQueries - partialQueries;
+  if (completeQueries > 0 && partialQueries === 0 && unfinishedQueries === 0)
+    return "all results complete";
+  const parts: string[] = [];
+  if (completeQueries > 0) parts.push(`${String(completeQueries)} complete`);
+  if (partialQueries > 0) parts.push(`${String(partialQueries)} partial and clearly marked`);
+  if (unfinishedQueries > 0) parts.push(`${String(unfinishedQueries)} not yet complete`);
+  return parts.join("; ");
+}
 export class SessionSummary {
   #snapshot: SessionSummarySnapshot = {
     queries: 0,
     completeQueries: 0,
+    partialQueries: 0,
     organizedQueries: 0,
+    failedCalls: 0,
   };
 
   record(input: SignalGrepInput, result: SignalGrepResult): void {
     if (!isNewQuery(input)) return;
     this.#snapshot.queries += 1;
     if (result.details.status === "complete") this.#snapshot.completeQueries += 1;
+    if (result.details.status === "partial") this.#snapshot.partialQueries += 1;
     if (wasAutomaticallyOrganized(input, result)) this.#snapshot.organizedQueries += 1;
+  }
+
+  recordFailure(): void {
+    this.#snapshot.failedCalls += 1;
   }
 
   get snapshot(): SessionSummarySnapshot {
@@ -38,27 +76,25 @@ export class SessionSummary {
   }
 
   format(locale: SignalGrepLocale): string | undefined {
-    const { completeQueries, organizedQueries, queries } = this.#snapshot;
-    if (queries === 0) return undefined;
-    const partialQueries = queries - completeQueries;
+    const { failedCalls, organizedQueries, queries } = this.#snapshot;
+    if (queries === 0 && failedCalls === 0) return undefined;
     if (locale === "zh-CN") {
-      const completeness =
-        partialQueries === 0
-          ? "结果全部完整"
-          : `${String(completeQueries)} 次结果完整；${String(partialQueries)} 次仅获得部分结果并已明确标注`;
       const organized =
         organizedQueries > 0 ? `；${String(organizedQueries)} 次结果已自动按文件整理` : "";
-      return `baoer_signal_grep：已处理 ${String(queries)} 次查询，${completeness}${organized}`;
+      const failures = failedCalls > 0 ? `；${String(failedCalls)} 次调用失败` : "";
+      return `baoer_signal_grep ${BAOER_SIGNAL_GREP_VERSION}：已处理 ${String(queries)} 次查询，${formatChineseCompleteness(this.#snapshot)}${organized}${failures}`;
     }
-
-    const completeness =
-      partialQueries === 0
-        ? "all results complete"
-        : `${String(completeQueries)} complete; ${String(partialQueries)} partial and clearly marked`;
-    const organized =
-      organizedQueries > 0
-        ? `; ${String(organizedQueries)} ${organizedQueries === 1 ? "result" : "results"} automatically organized by file`
-        : "";
-    return `baoer_signal_grep: handled ${String(queries)} ${queries === 1 ? "query" : "queries"}; ${completeness}${organized}`;
+    const queryWord = queries === 1 ? "query" : "queries";
+    let organized = "";
+    if (organizedQueries > 0) {
+      const resultWord = organizedQueries === 1 ? "result" : "results";
+      organized = `; ${organizedQueries} ${resultWord} automatically organized by file`;
+    }
+    let failures = "";
+    if (failedCalls > 0) {
+      const callWord = failedCalls === 1 ? "call" : "calls";
+      failures = `; ${failedCalls} failed ${callWord}`;
+    }
+    return `baoer_signal_grep ${BAOER_SIGNAL_GREP_VERSION}: handled ${String(queries)} ${queryWord}; ${formatEnglishCompleteness(this.#snapshot)}${organized}${failures}`;
   }
 }

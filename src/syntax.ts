@@ -113,7 +113,12 @@ function readNode(
 }
 
 function readResult(output: string, length: number): SyntaxWorkerResult {
-  const result: unknown = JSON.parse(output);
+  let result: unknown;
+  try {
+    result = JSON.parse(output);
+  } catch {
+    return invalidProtocol();
+  }
   if (
     !result ||
     typeof result !== "object" ||

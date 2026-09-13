@@ -1,6 +1,6 @@
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
-import type { SearchScopeDetails } from "./types.js";
+import type { SearchScopeDetails, ResultStatistics } from "./types.js";
 import type { ValidationDetails } from "./validation-types.js";
 import type { ConceptSourceSummary } from "./concept-source-generation.js";
 
@@ -51,6 +51,7 @@ export interface AnalysisDetails {
     | "evidence-items";
   totalItems: number;
   returnedItems: number;
+  statistics?: ResultStatistics;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SignalGrepInput })[];
   sources?: SourceReference[];
   inspectCursor?: string;

@@ -22,27 +22,35 @@ export type RequestContractDetails = SignalGrepDiagnosticDetails;
 
 /** A typed boundary error; callers can project it without parsing message text. */
 export class RequestContractError extends SignalGrepError {
-  readonly code: string;
-  readonly mode: string | undefined;
-  readonly issues: readonly RequestIssue[];
-  readonly recovery: RequestRecovery;
+  readonly #details: RequestContractDetails;
 
   constructor(details: RequestContractDetails, message: string) {
     super(message);
     this.name = "RequestContractError";
-    this.code = details.code;
-    this.mode = details.mode;
-    this.issues = details.issues;
-    this.recovery = details.recovery;
+    this.#details = details;
+  }
+
+  get code(): string {
+    return this.#details.code;
+  }
+
+  get mode(): string | undefined {
+    return this.#details.mode;
+  }
+
+  get issues(): readonly RequestIssue[] {
+    return this.#details.issues;
+  }
+
+  get recovery(): RequestRecovery {
+    return this.#details.recovery;
   }
 
   get details(): RequestContractDetails {
-    return boundedRequestContractDetails({
-      code: this.code,
-      ...(this.mode ? { mode: this.mode } : {}),
-      issues: this.issues,
-      recovery: this.recovery,
-    });
+    return boundedRequestContractDetails(this.#details);
+  }
+  toJSON(): RequestContractDetails & { name: string } {
+    return { name: this.name, ...this.details };
   }
 }
 
@@ -50,7 +58,7 @@ export function isSignalGrepDiagnosticError(
   error: unknown,
 ): error is import("./errors.js").SignalGrepDiagnosticError {
   if (!(error instanceof Error)) return false;
-  const details = Reflect.get(error, "details");
+  const details = "details" in error ? error.details : undefined;
   return typeof details === "object" && details !== null;
 }
 

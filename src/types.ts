@@ -240,6 +240,28 @@ export interface SearchSnapshot extends SearchScan {
   lastAccessedAt: number;
 }
 
+export interface StatisticsEntry {
+  label: string;
+  count: number;
+}
+
+export interface StatisticsGroup {
+  dimension: string;
+  entries: StatisticsEntry[];
+  omitted: number;
+  total: number;
+}
+
+export interface ResultStatistics {
+  unit: string;
+  total: number;
+  files: number;
+  directories: number;
+  groups: StatisticsGroup[];
+  topFiles: StatisticsEntry[];
+  topFilesOmitted: number;
+}
+
 export interface SignalGrepDetails {
   inspectRequest?: SignalGrepInput;
   version: 1;
@@ -255,6 +277,7 @@ export interface SignalGrepDetails {
   cursor?: string;
   nextRequest?: SignalGrepInput;
   analysis?: AnalysisDetails;
+  statistics?: ResultStatistics;
   validation?: ValidationDetails;
   sourceBlocks?: { path: string; source: SourceExcerptDetails }[];
   summaryFilesShown?: number;

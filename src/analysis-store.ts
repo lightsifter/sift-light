@@ -19,6 +19,7 @@ import {
   termCountRequest,
 } from "./analysis-term-pages.js";
 
+import { analysisExtraGroups, formatStatistics, statisticsForItems } from "./result-statistics.js";
 interface StoredAnalysis {
   id: string;
   result: AnalysisResultSet;
@@ -72,6 +73,71 @@ function boundedReasons(reasons: readonly string[]): string[] {
   }
   retained.push(notice);
   return retained;
+}
+
+function publicAnalysisLabel(result: AnalysisResultSet): string {
+  switch (result.kind) {
+    case "files":
+      return "file metadata";
+    case "outline":
+      return "symbol metadata";
+    case "imports":
+      return "import relationship metadata";
+    case "tests":
+      return "test candidate metadata";
+    case "structure":
+      return "structure match metadata";
+    case "roles":
+      return "role match metadata";
+    case "function-and":
+      return "function match metadata";
+    case "file-and":
+      return "file match metadata";
+    case "changes":
+      return "change metadata";
+    case "concept":
+      return "semantic candidate metadata";
+    case "hybrid":
+      return "combined evidence metadata";
+    case "any-of":
+      return "condition match metadata";
+    case "validate":
+      return "validation metadata";
+  }
+  throw new Error("Unknown analysis result kind");
+}
+
+function publicAnalysisItem(
+  result: AnalysisResultSet,
+  item: AnalysisItem,
+  index: number,
+  storedId: string,
+): NonNullable<SignalGrepResult["details"]["analysis"]>["items"][number] {
+  const inspect =
+    item.source && item.range
+      ? {
+          mode: "inspect" as const,
+          cursor: `${storedId}.analysis.0`,
+          matchIndex: index + 1,
+          ...(result.redact ? { redact: true } : {}),
+        }
+      : undefined;
+  return {
+    path: item.path,
+    line: item.line,
+    label: publicAnalysisLabel(result),
+    index: index + 1,
+    ...(inspect ? { inspect } : {}),
+  };
+}
+
+function safeTermCounts(
+  termCounts: readonly { retainedOccurrences: number }[] | undefined,
+): { term: string; retainedOccurrences: number }[] | undefined {
+  return termCounts?.map((entry, index) => ({
+    term: `condition #${String(index + 1)}`,
+    retainedOccurrences: entry.retainedOccurrences,
+  }));
 }
 
 function hybridPreviewIndices(items: readonly AnalysisItem[]): number[] {
@@ -225,68 +291,62 @@ export class AnalysisStore {
     const pagedTerms =
       result.termCounts &&
       Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
-    const inlineTerms = pagedTerms ? undefined : result.termCounts;
+    const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
-    const items: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
-    const sources: NonNullable<SignalGrepResult["details"]["analysis"]>["sources"] = [];
-    const sourceIds = new Map<string, number>();
-    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
+    const statistics = statisticsForItems(
+      result.items,
+      result.items.length,
+      result.unit,
+      analysisExtraGroups(result.counts, result.termCounts, result.items),
+    );
+    const publicItems: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
     const scope = result.scope
-      ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
-      : "";
-    const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
-    const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
-    const hasItemDetails = result.items.some((item) => item.details !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
+      ? `Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
+      : undefined;
+    const coverage = result.coverage ? `Coverage: ${JSON.stringify(result.coverage)}.` : undefined;
+    const stats = result.stats ? `Stats: ${JSON.stringify(result.stats)}.` : undefined;
+    const header = [
+      `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}).`,
+      ...formatStatistics(statistics),
+      inlineTerms ? `Condition counts: ${JSON.stringify(inlineTerms)}.` : undefined,
+      termsRequest ? `Condition counts are paginated: ${JSON.stringify(termsRequest)}.` : undefined,
+      scope,
+      coverage,
+      stats,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
     const notice = result.reasons.length
-      ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
-      : "";
+      ? result.reasons.map((reason) => `[${reason}]`).join("\n")
+      : undefined;
     const rows: string[] = [];
-    let bytes = Buffer.byteLength(header + notice) + 1200;
+    let bytes = Buffer.byteLength(header) + Buffer.byteLength(notice ?? "") + 1200;
     let next = offset;
     const appendItem = (index: number): boolean => {
       const item = result.items[index];
       if (!item) throw new Error("Analysis item unavailable");
-      const inspect =
-        item.source && item.range
-          ? {
-              mode: "inspect" as const,
-              cursor: `${stored.id}.analysis.0`,
-              matchIndex: index + 1,
-              ...(result.redact ? { redact: true } : {}),
-            }
-          : undefined;
-      const row = `#${index + 1} ${item.path}:${item.line} ${item.label}${item.excerpt ? `\n${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `\nInspect: ${JSON.stringify(inspect)}` : ""}`;
+      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const row = `#${String(index + 1)} ${item.path}:${String(item.line)} ${publicItem.label}`;
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
-        if (items.length === 0)
-          throw new SignalGrepError("Analysis item exceeds the response limit; narrow its source");
+        if (publicItems.length === 0)
+          throw new SignalGrepError(
+            "Analysis metadata exceeds the response limit; narrow the query",
+          );
         return false;
       }
       rows.push(row);
       bytes += rowBytes;
+      publicItems.push(publicItem);
       if (!hybridPreview) next = index + 1;
-      if (hybridInspectCursor && item.source) {
-        const sourceKey = JSON.stringify(item.source);
-        let sourceId = sourceIds.get(sourceKey);
-        if (sourceId === undefined) {
-          sourceId = sources.length;
-          sources.push(item.source);
-          sourceIds.set(sourceKey, sourceId);
-        }
-        const { source: _source, ...sharedItem } = item;
-        items.push({ ...sharedItem, index: index + 1, sourceId });
-      } else {
-        items.push({ ...item, index: index + 1, ...(inspect ? { inspect } : {}) });
-      }
       return true;
     };
     if (hybridPreview) {
       for (const index of hybridPreviewIndices(result.items)) {
-        if (items.length >= 30 || !appendItem(index)) break;
+        if (publicItems.length >= 30 || !appendItem(index)) break;
       }
     } else {
-      for (let index = offset; index < result.items.length && items.length < 30; index += 1) {
+      for (let index = offset; index < result.items.length && publicItems.length < 30; index += 1) {
         if (!appendItem(index)) break;
       }
     }
@@ -299,15 +359,16 @@ export class AnalysisStore {
           }
         : undefined);
     const text = [
-      header + notice,
-      ...rows,
-      ...(hybridInspectCursor
-        ? [
-            `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`,
-          ]
-        : []),
-      ...(nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []),
-    ].join("\n\n");
+      header,
+      notice,
+      rows.length ? rows.join("\n") : "No retained item metadata is available.",
+      hybridMatchesRequest
+        ? `Match metadata request: ${JSON.stringify(hybridMatchesRequest)}.`
+        : undefined,
+      nextRequest ? `Next request: ${JSON.stringify(nextRequest)}` : undefined,
+    ]
+      .filter((line): line is string => line !== undefined && line.length > 0)
+      .join("\n\n");
     if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
       throw new SignalGrepError("Analysis metadata exceeds the output limit");
     return {
@@ -328,18 +389,18 @@ export class AnalysisStore {
         snapshotComplete: !result.partial,
         totalMatches: result.items.length,
         storedMatches: result.items.length,
-        returnedMatches: items.length,
-        totalFiles: new Set(result.items.map((item) => item.path)).size,
+        returnedMatches: publicItems.length,
+        totalFiles: statistics.files,
+        statistics,
         cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
         ...(nextRequest ? { nextRequest } : {}),
         analysis: {
           kind: result.kind,
           unit: result.unit,
           totalItems: result.items.length,
-          returnedItems: items.length,
-          items,
-          ...(sources.length ? { sources } : {}),
-          ...(hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}),
+          returnedItems: publicItems.length,
+          statistics,
+          items: publicItems,
           reasons: result.reasons,
           ...(result.filesRead !== undefined ? { filesRead: result.filesRead } : {}),
           ...(result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {}),
@@ -355,6 +416,7 @@ export class AnalysisStore {
           ...(result.stats ? { stats: result.stats } : {}),
           ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
+          ...(hybridPreview ? { inspectCursor: `${stored.id}.analysis.0` } : {}),
         },
         ...(result.scope ? { scope: result.scope } : {}),
         ...(result.redact ? { redactionRequested: true } : {}),

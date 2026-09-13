@@ -36,8 +36,8 @@ import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js
 import { SourceContinuations } from "./source-continuations.js";
 import { type ByteRange, type SourceDocument, type SourceReference } from "./source-document.js";
 import {
-  continueSource,
-  inspectDocuments,
+  continueSourceMetadata,
+  inspectDocumentsMetadata,
   matchInspectionTarget,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
@@ -384,11 +384,11 @@ export class EvidenceService {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect") throw new SignalGrepError("sourceCursor requires mode=inspect");
-      return continueSource(input.sourceCursor, access, this.#continuations);
+      return continueSourceMetadata(input.sourceCursor, this.#continuations);
     }
     if (input.mode === "inspect") {
       const targets = this.#inspectionTargets(input, cwd);
-      return inspectDocuments(targets, access, this.#continuations, this.#structure);
+      return inspectDocumentsMetadata(targets, access, this.#structure);
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);

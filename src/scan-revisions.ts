@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { abortError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import {
+  boundedRipgrepDiagnostic,
   classifyRipgrepDiagnostics,
   createRipgrepInputError,
   type RipgrepUnreadableDiagnostic,
@@ -13,18 +14,29 @@ import {
   type SourceRevision,
 } from "./types.js";
 
+async function captureRevision(
+  path: string,
+  revisions: Map<string, SourceRevision>,
+  onRevisionError?: (path: string, error: unknown) => void,
+): Promise<void> {
+  let failed = false;
+  let failure: unknown;
+  const revision = await getSourceRevision(path, (error) => {
+    failed = true;
+    failure = error;
+  });
+  if (revision) revisions.set(path, revision);
+  if (failed) onRevisionError?.(path, failure);
+}
+
 async function captureBatch(
   paths: string[],
   revisions: Map<string, SourceRevision>,
   signal?: AbortSignal,
+  onRevisionError?: (path: string, error: unknown) => void,
 ): Promise<void> {
   if (signal?.aborted) throw abortError();
-  await Promise.all(
-    paths.map(async (path) => {
-      const revision = await getSourceRevision(path);
-      if (revision) revisions.set(path, revision);
-    }),
-  );
+  await Promise.all(paths.map((path) => captureRevision(path, revisions, onRevisionError)));
   if (signal?.aborted) throw abortError();
 }
 
@@ -39,6 +51,14 @@ export async function captureCandidateRevisions(
 ): Promise<{ revisions: Map<string, SourceRevision>; unreadable: RipgrepUnreadableDiagnostic[] }> {
   const revisions = new Map<string, SourceRevision>();
   let candidateCount = 0;
+  const metadataFailures: RipgrepUnreadableDiagnostic[] = [];
+  const recordMetadataFailure = (path: string, error: unknown): void => {
+    const reason = error instanceof Error ? error.message : String(error);
+    metadataFailures.push({
+      path,
+      message: `Source metadata unavailable: ${boundedRipgrepDiagnostic(reason, redact)}`,
+    });
+  };
   const result = await runOwnedProcess(
     { executable, args, cwd, ...(signal ? { signal } : {}) },
     async (stdout) => {
@@ -62,7 +82,7 @@ export async function captureCandidateRevisions(
             }
             if (batch.length === MAX_SOURCE_REVISION_CONCURRENCY) {
               // oxlint-disable-next-line no-await-in-loop -- backpressure bounds concurrent metadata reads.
-              await captureBatch(batch, revisions, signal);
+              await captureBatch(batch, revisions, signal, recordMetadataFailure);
               batch = [];
             }
           }
@@ -76,20 +96,21 @@ export async function captureCandidateRevisions(
       if (pending.length > 0) {
         throw new SignalGrepError("ripgrep file enumeration ended without a NUL delimiter");
       }
-      await captureBatch(batch, revisions, signal);
+      await captureBatch(batch, revisions, signal, recordMetadataFailure);
     },
   );
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
   const inputError = createRipgrepInputError(result.stderr, redact);
+  const unreadable = [...diagnostics.unreadable, ...metadataFailures];
   if (inputError) throw inputError;
-  if (result.code === 2 && diagnostics.other.length === 0 && diagnostics.unreadable.length > 0)
-    return { revisions, unreadable: diagnostics.unreadable };
+  if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
+    return { revisions, unreadable };
   if (result.code !== 0 && result.code !== 1) {
     throw new SignalGrepError(
       result.stderr.trim() || `ripgrep file enumeration exited with status ${String(result.code)}`,
     );
   }
-  return { revisions, unreadable: diagnostics.unreadable };
+  return { revisions, unreadable };
 }
 
 export async function retainStableSourceRevisions(

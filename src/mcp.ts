@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import packageMetadata from "../package.json" with { type: "json" };
+import { BAOER_SIGNAL_GREP_VERSION } from "./package-version.js";
 import { Value } from "typebox/value";
 import {
   CallToolRequestSchema,
@@ -42,15 +42,13 @@ export const DEFAULT_MCP_MAX_SESSIONS = 100;
 export const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 export const MAX_MCP_BODY_BYTES = 16 * 1024 * 1024;
 
-const BAOER_SIGNAL_GREP_MCP_VERSION = packageMetadata.version;
-
 const SIGNAL_GREP_OUTPUT_SCHEMA: Tool["outputSchema"] = {
   type: "object",
   properties: {
     text: {
       type: "string",
       description:
-        "Complete formatted result page, including source evidence, limits and continuation requests.",
+        "Complete formatted metadata page, including statistics, coverage and continuation requests; source text is never included.",
     },
     details: { type: "object" },
   },
@@ -150,7 +148,7 @@ export function createSignalGrepMcpServer(
   const resolvedOutputMode = parseSignalGrepMcpOutputMode(outputMode);
   const tool = signalGrepTool(resolvedOutputMode);
   const server = new McpServer(
-    { name: "baoer_signal_grep", version: BAOER_SIGNAL_GREP_MCP_VERSION },
+    { name: "baoer_signal_grep", version: BAOER_SIGNAL_GREP_VERSION },
     {
       capabilities: { tools: {} },
       instructions: signalGrepMcpInstructions(resolvedOutputMode),

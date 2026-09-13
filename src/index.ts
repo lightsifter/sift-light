@@ -69,6 +69,8 @@ export async function registerSignalGrepExtension(
         };
       } catch (error) {
         if (signal?.aborted) throw error;
+        runtime.recordFailure();
+        ctx.ui.setStatus(SESSION_STATUS_KEY, runtime.formatSessionStatus(locale));
         // oxlint-disable-next-line preserve-caught-error -- the model boundary must not expose a recursive cause chain
         throw new Error(modelErrorText(error));
       }

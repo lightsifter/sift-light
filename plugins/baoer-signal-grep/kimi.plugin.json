@@ -9,14 +9,12 @@
   "license": "AGPL-3.0-only",
   "mcpServers": {
     "baoer_signal_grep": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "--yes",
-        "--package",
-        "baoer_signal_grep@latest",
-        "baoer_signal_grep_mcp",
+        "./mcp-server.mjs",
         "--stdio"
       ],
+      "cwd": "./",
       "env": {
         "npm_config_ignore_scripts": "true",
         "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",

@@ -43,6 +43,7 @@ Multi-word `files` queries require each word literally in the path; a single abb
 Long results arrive in pages with a way to continue. When the original material changes, the plugin asks for a fresh check. Like a careful research assistant, it distinguishes the passages already shown from the pages still to come.
 
 A complete snapshot describes match retention, not complete source text. Truncated matching-line excerpts show their limit and an executable `inspectRequest`, which remains usable after the final match page. Follow pagination cursors instead of repeating the query with a different limit.
+In Pi and OMP, the passive session status includes the loaded package version, counts returned new queries, distinguishes complete, partial and unfinished results, and reports non-cancelled failed calls. Cursor and operation continuations do not inflate the new-query count.
 
 ### Discover language capabilities before loading a provider
 

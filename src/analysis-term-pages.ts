@@ -1,9 +1,9 @@
 import type { AnalysisResultSet } from "./analysis-types.js";
 import type { SignalGrepResult } from "./types.js";
 
-export const MAX_INLINE_TERM_COUNT_BYTES = 4 * 1024;
+export const MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
 
-export function termCountRequest(id: string, offset: number, redact?: boolean) {
+export function termCountRequest(id: string, offset: number, redact = false) {
   return {
     cursor: `${id}.analysis-terms.${offset.toString(36)}`,
     ...(redact ? { redact: true } : {}),
@@ -17,17 +17,18 @@ export function analysisTermPage(
   offset: number,
 ): SignalGrepResult {
   const all = result.termCounts ?? [];
-  const terms: typeof all = [];
+  const terms: { term: string; retainedOccurrences: number }[] = [];
   const rows: string[] = [];
   let bytes = 0;
   for (let index = offset; index < all.length; index++) {
     const term = all[index];
     if (!term) throw new Error("Term inventory index unavailable");
-    const row = `Term #${String(index + 1)} ${JSON.stringify(term.term)}: ${String(term.retainedOccurrences)} retained occurrences`;
+    const label = `condition #${String(index + 1)}`;
+    const row = `${label}: ${String(term.retainedOccurrences)} retained occurrences`;
     const size = Buffer.byteLength(row) + 2;
-    if (bytes + size > 8 * 1024) break;
+    if (bytes + size > MAX_INLINE_TERM_COUNT_BYTES) break;
     rows.push(row);
-    terms.push(term);
+    terms.push({ term: label, retainedOccurrences: term.retainedOccurrences });
     bytes += size;
   }
   const nextOffset = offset + terms.length;
@@ -36,10 +37,10 @@ export function analysisTermPage(
   const matchesRequest = { cursor: `${id}.analysis.0`, ...(result.redact ? { redact: true } : {}) };
   return {
     text: [
-      `Term inventory ${String(offset + 1)}-${String(nextOffset)} of ${String(all.length)} (${result.partial ? "PARTIAL evidence" : "complete evidence"}). Counts refer to retained occurrences.`,
+      `Condition inventory ${String(offset + 1)}-${String(nextOffset)} of ${String(all.length)} (${result.partial ? "PARTIAL evidence" : "complete evidence"}). Counts refer to retained occurrences.`,
       ...rows,
       ...(nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []),
-      `Matches request: ${JSON.stringify(matchesRequest)}`,
+      `Match metadata request: ${JSON.stringify(matchesRequest)}`,
     ].join("\n\n"),
     details: {
       version: 1,

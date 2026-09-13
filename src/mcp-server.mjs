@@ -148,6 +148,9 @@ var package_default = {
   }
 };
 
+// src/package-version.ts
+var BAOER_SIGNAL_GREP_VERSION = package_default.version;
+
 // src/mcp.ts
 import { Value } from "typebox/value";
 import {
@@ -168,9 +171,130 @@ function parseSignalGrepMcpOutputMode(value) {
   throw new Error('BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE must be "structured", "text", or "model"');
 }
 
+// src/result-statistics.ts
+var MAX_BREAKDOWN_ENTRIES = 5;
+var MAX_TOP_FILES = 8;
+function normalizedPath(value) {
+  return value.replaceAll("\\", "/");
+}
+function extensionOf(value) {
+  const path = normalizedPath(value);
+  const slash = path.lastIndexOf("/");
+  const basename = path.slice(slash + 1);
+  const dot = basename.lastIndexOf(".");
+  if (dot <= 0)
+    return "[no extension]";
+  return basename.slice(dot).toLowerCase();
+}
+function directoryOf(value) {
+  const path = normalizedPath(value);
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "." : `${path.slice(0, slash)}/`;
+}
+function rankedEntries(counts) {
+  return [...counts.entries()].map(([label, count]) => ({ label, count })).toSorted((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+}
+function group(dimension, counts) {
+  const ranked = rankedEntries(counts);
+  if (!ranked.length)
+    return;
+  return {
+    dimension,
+    entries: ranked.slice(0, MAX_BREAKDOWN_ENTRIES),
+    omitted: Math.max(0, ranked.length - MAX_BREAKDOWN_ENTRIES),
+    total: ranked.reduce((sum, entry) => sum + entry.count, 0)
+  };
+}
+function fileCountsFromItems(items) {
+  const counts = new Map;
+  for (const item of items)
+    counts.set(item.path, (counts.get(item.path) ?? 0) + 1);
+  return counts;
+}
+function pathsFromCounts(counts) {
+  return [...counts.keys()];
+}
+function createStatistics(unit, total, fileCounts, extraGroups = []) {
+  const extensionCounts = new Map;
+  const directoryCounts = new Map;
+  for (const path of pathsFromCounts(fileCounts)) {
+    extensionCounts.set(extensionOf(path), (extensionCounts.get(extensionOf(path)) ?? 0) + (fileCounts.get(path) ?? 0));
+    directoryCounts.set(directoryOf(path), (directoryCounts.get(directoryOf(path)) ?? 0) + (fileCounts.get(path) ?? 0));
+  }
+  const groups = [
+    group("file type", extensionCounts),
+    group("directory", directoryCounts),
+    ...extraGroups
+  ].filter((entry) => entry !== undefined);
+  const rankedFiles = rankedEntries(fileCounts);
+  return {
+    unit,
+    total,
+    files: fileCounts.size,
+    directories: new Set(pathsFromCounts(fileCounts).map(directoryOf)).size,
+    groups,
+    topFiles: rankedFiles.slice(0, MAX_TOP_FILES),
+    topFilesOmitted: Math.max(0, rankedFiles.length - MAX_TOP_FILES)
+  };
+}
+function statisticsForSnapshot(snapshot) {
+  return createStatistics("matches", snapshot.totalMatches, new Map(snapshot.fileCounts));
+}
+function statisticsForItems(items, total, unit, extraGroups = []) {
+  return createStatistics(unit, total, fileCountsFromItems(items), extraGroups);
+}
+function statisticsGroup(dimension, entries) {
+  if (!entries.length)
+    return;
+  const ranked = [...entries].toSorted((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+  return {
+    dimension,
+    entries: ranked.slice(0, MAX_BREAKDOWN_ENTRIES),
+    omitted: Math.max(0, ranked.length - MAX_BREAKDOWN_ENTRIES),
+    total: ranked.reduce((sum, entry) => sum + entry.count, 0)
+  };
+}
+function formatStatistics(statistics, options = {}) {
+  const lines = [
+    `Result: ${String(statistics.total)} ${statistics.unit} across ${String(statistics.files)} files and ${String(statistics.directories)} directories.`
+  ];
+  for (const breakdown of statistics.groups) {
+    const entries = breakdown.entries.map((entry) => `${entry.label}=${String(entry.count)}`).join(", ");
+    const omitted = breakdown.omitted > 0 ? `, +${String(breakdown.omitted)} other categories` : "";
+    lines.push(`By ${breakdown.dimension}: ${entries}${omitted}`);
+  }
+  if (options.includeTopFiles !== false && statistics.topFiles.length) {
+    lines.push(`Top files: ${statistics.topFiles.map((entry) => `${entry.label}=${String(entry.count)}`).join(", ")}${statistics.topFilesOmitted > 0 ? `, +${String(statistics.topFilesOmitted)} other files` : ""}`);
+  }
+  return lines;
+}
+function analysisExtraGroups(counts, termCounts, items) {
+  const groups = [];
+  const classification = counts ? statisticsGroup("classification", Object.entries(counts).map(([label, count]) => ({ label, count }))) : undefined;
+  if (classification)
+    groups.push(classification);
+  const terms = termCounts ? statisticsGroup("conditions", termCounts.map((term, index) => ({
+    label: `condition #${String(index + 1)}`,
+    count: term.retainedOccurrences
+  }))) : undefined;
+  if (terms)
+    groups.push(terms);
+  const evidence = new Map;
+  for (const item of items) {
+    const source = item.details?.source;
+    if (source === "literal" || source === "concept")
+      evidence.set(source, (evidence.get(source) ?? 0) + 1);
+  }
+  const evidenceGroup = group("evidence", evidence);
+  if (evidenceGroup)
+    groups.push(evidenceGroup);
+  return groups;
+}
+
 // src/mcp-model-output.ts
 function compactMetadata(details, analysis) {
   return [
+    ...analysis.statistics ? formatStatistics(analysis.statistics) : [],
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,
     analysis.termCounts ? `Term counts: ${JSON.stringify(analysis.termCounts)}` : undefined,
     analysis.termCountsNextRequest ? `More term counts: ${JSON.stringify(analysis.termCountsNextRequest)}` : undefined,
@@ -182,13 +306,12 @@ function compactMetadata(details, analysis) {
     analysis.stats ? `Stats: ${JSON.stringify(analysis.stats)}` : undefined,
     analysis.sourceGeneration ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}` : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
-    analysis.kind === "outline" ? "[Outline signatures are deferred; inspect item #N for version-checked source.]" : undefined,
+    analysis.kind === "outline" ? "[Outline names withheld; item locations and structure status are available.]" : undefined,
     ...analysis.reasons.map((reason) => `[${reason}]`),
     details.redactionApplied ? "[Display redaction applied.]" : undefined
   ].filter((line) => line !== undefined);
 }
 function compactRows(analysis) {
-  const omitExcerpt = analysis.kind === "outline";
   const rows = [];
   let previousPath;
   for (const item of analysis.items) {
@@ -196,11 +319,7 @@ function compactRows(analysis) {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    const row = `#${String(item.index)} L${String(item.line)} ${item.label}`;
-    rows.push(omitExcerpt || !item.excerpt ? row : `${row}
-  ${item.excerpt.replaceAll(`
-`, `
-  `)}`);
+    rows.push(`#${String(item.index)} L${String(item.line)} metadata`);
   }
   return rows;
 }
@@ -286,7 +405,6 @@ var ESTIMATED_CHARACTERS_PER_TOKEN = 4;
 var DEFAULT_SUMMARY_FILE_LIMIT = 30;
 var MAX_SELECTED_PATHS = 20;
 var MAX_INSPECT_TARGETS = 5;
-var MAX_DISPLAYED_OCCURRENCES = 20;
 var MAX_STORED_MATCHES = 50000;
 var MAX_STORED_OCCURRENCES = 200000;
 var MAX_SEARCH_STORAGE_BYTES = 32 * 1024 * 1024;
@@ -452,31 +570,35 @@ function boundedDisplay(value, maximum = MAX_REQUEST_DISPLAY_CHARACTERS) {
 }
 
 class RequestContractError extends SignalGrepError {
-  code;
-  mode;
-  issues;
-  recovery;
+  #details;
   constructor(details, message) {
     super(message);
     this.name = "RequestContractError";
-    this.code = details.code;
-    this.mode = details.mode;
-    this.issues = details.issues;
-    this.recovery = details.recovery;
+    this.#details = details;
+  }
+  get code() {
+    return this.#details.code;
+  }
+  get mode() {
+    return this.#details.mode;
+  }
+  get issues() {
+    return this.#details.issues;
+  }
+  get recovery() {
+    return this.#details.recovery;
   }
   get details() {
-    return boundedRequestContractDetails({
-      code: this.code,
-      ...this.mode ? { mode: this.mode } : {},
-      issues: this.issues,
-      recovery: this.recovery
-    });
+    return boundedRequestContractDetails(this.#details);
+  }
+  toJSON() {
+    return { name: this.name, ...this.details };
   }
 }
 function isSignalGrepDiagnosticError(error) {
   if (!(error instanceof Error))
     return false;
-  const details = Reflect.get(error, "details");
+  const details = "details" in error ? error.details : undefined;
   return typeof details === "object" && details !== null;
 }
 function boundedRequestContractDetails(details) {
@@ -1737,11 +1859,12 @@ function describeUnreadableDiagnostics(diagnostics) {
 import { readFile, realpath as realpath2, stat as stat2 } from "node:fs/promises";
 var SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
 var MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
-async function getSourceRevision(path) {
+async function getSourceRevision(path, onError) {
   try {
     const metadata = await stat2(path);
     return sourceRevisionFromStats(metadata);
-  } catch {
+  } catch (error) {
+    onError?.(error);
     return;
   }
 }
@@ -1782,128 +1905,39 @@ async function assertExistingPathInsideCwd(path, cwd) {
     throw new SignalGrepError("Path must stay within the working directory");
   }
 }
-class SourceBudgetTooSmallError extends SignalGrepError {
-  constructor() {
-    super("Source target line exceeds the available byte budget");
-    this.name = "SourceBudgetTooSmallError";
-  }
-}
-
-class SourceLineUnavailableError extends SignalGrepError {
-  constructor(line) {
-    super(`Source line ${String(line)} is beyond the end of the file`);
-    this.name = "SourceLineUnavailableError";
-  }
-}
-function sourceLineBytes(line) {
-  return Buffer.byteLength(`${String(line.line)}: ${line.text}`, "utf8");
-}
-function selectSourceWindow(rendered, targetIndex, maxBytes) {
-  let startIndex = targetIndex;
-  let endIndex = targetIndex;
-  const target = rendered[targetIndex];
-  if (!target)
-    throw new Error("Source target line is unavailable");
-  let bytes = sourceLineBytes(target);
-  if (bytes > maxBytes)
-    throw new SourceBudgetTooSmallError;
-  let canGrowBefore = true;
-  let canGrowAfter = true;
-  while (canGrowBefore || canGrowAfter) {
-    let grew = false;
-    if (canGrowBefore) {
-      const candidate = rendered[startIndex - 1];
-      if (candidate === undefined) {
-        canGrowBefore = false;
-      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
-        startIndex -= 1;
-        bytes += 1 + sourceLineBytes(candidate);
-        grew = true;
-      } else {
-        canGrowBefore = false;
-      }
-    }
-    if (canGrowAfter) {
-      const candidate = rendered[endIndex + 1];
-      if (candidate === undefined) {
-        canGrowAfter = false;
-      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
-        endIndex += 1;
-        bytes += 1 + sourceLineBytes(candidate);
-        grew = true;
-      } else {
-        canGrowAfter = false;
-      }
-    }
-    if (!grew && !canGrowBefore && !canGrowAfter)
-      break;
-  }
-  return { lines: rendered.slice(startIndex, endIndex + 1), startIndex, endIndex };
-}
-function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLine, options = {}) {
-  const maxBytes = options.maxBytes ?? MAX_SOURCE_RANGE_BYTES;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_SOURCE_RANGE_BYTES)
-    throw new Error("Source range byte budget must be within the result body limit");
-  const lines = [];
-  let lineStart = 0;
-  for (let newline = content.indexOf(10);newline >= 0; newline = content.indexOf(10, lineStart)) {
-    lines.push(content.subarray(lineStart, newline));
-    lineStart = newline + 1;
-  }
-  lines.push(content.subarray(lineStart));
-  const boundedStart = Math.max(1, startLine);
-  if (boundedStart > lines.length) {
-    throw new SourceLineUnavailableError(targetLine);
-  }
-  const boundedEnd = Math.min(lines.length, Math.max(boundedStart, endLine));
-  if (targetLine < 1 || targetLine > lines.length) {
-    throw new SourceLineUnavailableError(targetLine);
-  }
-  const boundedTarget = Math.min(boundedEnd, Math.max(boundedStart, targetLine));
-  const rendered = Array.from({ length: boundedEnd - boundedStart + 1 }, (_, index) => {
-    const lineNumber = boundedStart + index;
-    const raw = lines[lineNumber - 1];
-    if (!raw)
-      throw new Error("Source line is unavailable");
-    const focus = lineNumber === targetLine ? options.focus : undefined;
-    const start = focus?.range.start.character ?? 0;
-    const end = focus?.range.end.character ?? start;
-    const bytes = focus?.range.encoding === "utf-8" ? raw : undefined;
-    const excerpt = excerptText(raw.toString("utf8").replaceAll("\r", ""), bytes ? bytes.subarray(0, start).toString("utf8").replaceAll("\r", "").length : start, bytes ? bytes.subarray(0, end).toString("utf8").replaceAll("\r", "").length : end);
-    return { line: lineNumber, text: excerpt.text, truncated: excerpt.truncated };
-  });
-  const selected = selectSourceWindow(rendered, boundedTarget - boundedStart, maxBytes);
-  const omittedBefore = selected.startIndex;
-  const omittedAfter = rendered.length - selected.endIndex - 1;
-  return {
-    text: selected.lines.map((line) => `${String(line.line)}: ${line.text}`).join(`
-`),
-    lines: selected.lines,
-    startLine: boundedStart + selected.startIndex,
-    endLine: boundedStart + selected.endIndex,
-    truncated: omittedBefore > 0 || omittedAfter > 0,
-    omittedBefore,
-    omittedAfter,
-    truncatedLines: selected.lines.filter((line) => line.truncated).map((line) => line.line)
-  };
-}
 
 // src/scan-revisions.ts
 import { resolve as resolve3 } from "node:path";
-async function captureBatch(paths, revisions, signal) {
+async function captureRevision(path, revisions, onRevisionError) {
+  let failed = false;
+  let failure;
+  const revision = await getSourceRevision(path, (error) => {
+    failed = true;
+    failure = error;
+  });
+  if (revision)
+    revisions.set(path, revision);
+  if (failed)
+    onRevisionError?.(path, failure);
+}
+async function captureBatch(paths, revisions, signal, onRevisionError) {
   if (signal?.aborted)
     throw abortError();
-  await Promise.all(paths.map(async (path) => {
-    const revision = await getSourceRevision(path);
-    if (revision)
-      revisions.set(path, revision);
-  }));
+  await Promise.all(paths.map((path) => captureRevision(path, revisions, onRevisionError)));
   if (signal?.aborted)
     throw abortError();
 }
 async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal, redact = false) {
   const revisions = new Map;
   let candidateCount = 0;
+  const metadataFailures = [];
+  const recordMetadataFailure = (path, error) => {
+    const reason = error instanceof Error ? error.message : String(error);
+    metadataFailures.push({
+      path,
+      message: `Source metadata unavailable: ${boundedRipgrepDiagnostic(reason, redact)}`
+    });
+  };
   const result = await runOwnedProcess({ executable, args, cwd, ...signal ? { signal } : {} }, async (stdout) => {
     let pending = Buffer.alloc(0);
     let batch = [];
@@ -1924,7 +1958,7 @@ async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal
             batch.push(resolve3(cwd, path));
           }
           if (batch.length === MAX_SOURCE_REVISION_CONCURRENCY) {
-            await captureBatch(batch, revisions, signal);
+            await captureBatch(batch, revisions, signal, recordMetadataFailure);
             batch = [];
           }
         }
@@ -1938,18 +1972,19 @@ async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal
     if (pending.length > 0) {
       throw new SignalGrepError("ripgrep file enumeration ended without a NUL delimiter");
     }
-    await captureBatch(batch, revisions, signal);
+    await captureBatch(batch, revisions, signal, recordMetadataFailure);
   });
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
   const inputError = createRipgrepInputError(result.stderr, redact);
+  const unreadable = [...diagnostics.unreadable, ...metadataFailures];
   if (inputError)
     throw inputError;
-  if (result.code === 2 && diagnostics.other.length === 0 && diagnostics.unreadable.length > 0)
-    return { revisions, unreadable: diagnostics.unreadable };
+  if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
+    return { revisions, unreadable };
   if (result.code !== 0 && result.code !== 1) {
     throw new SignalGrepError(result.stderr.trim() || `ripgrep file enumeration exited with status ${String(result.code)}`);
   }
-  return { revisions, unreadable: diagnostics.unreadable };
+  return { revisions, unreadable };
 }
 async function retainStableSourceRevisions(paths, before, signal) {
   const after = new Map;
@@ -3720,6 +3755,12 @@ class SourceDocument {
   lineStarts = [0];
   #byteOffsets;
   constructor(reference, bytes) {
+    if (typeof reference !== "object" || reference === null || typeof reference.path !== "string" || reference.path.length === 0 || typeof reference.origin !== "object" || reference.origin === null || !("kind" in reference.origin) || reference.origin.kind !== "git" && reference.origin.kind !== "worktree") {
+      throw new SourceDocumentError("source-unavailable", "Source reference is invalid");
+    }
+    if (!Buffer.isBuffer(bytes)) {
+      throw new SourceDocumentError("source-unavailable", "Source bytes are invalid");
+    }
     this.reference = reference;
     this.bytes = bytes;
     if (bytes.length > MAX_SOURCE_FILE_BYTES) {
@@ -4388,7 +4429,12 @@ function readNode(value, index, nodes, length) {
   };
 }
 function readResult(output, length) {
-  const result = JSON.parse(output);
+  let result;
+  try {
+    result = JSON.parse(output);
+  } catch {
+    return invalidProtocol();
+  }
   if (!result || typeof result !== "object" || !("status" in result) || !("nodes" in result) || !["ok", "parse-error", "limit"].includes(String(result.status)) || !Array.isArray(result.nodes) || result.nodes.length === 0 || result.nodes.length > MAX_SYNTAX_NODES) {
     return invalidProtocol();
   }
@@ -5252,8 +5298,8 @@ import { dirname as dirname4, extname as extname3, resolve as resolve20 } from "
 import { randomUUID as randomUUID2 } from "node:crypto";
 
 // src/analysis-term-pages.ts
-var MAX_INLINE_TERM_COUNT_BYTES = 4 * 1024;
-function termCountRequest(id, offset, redact) {
+var MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
+function termCountRequest(id, offset, redact = false) {
   return {
     cursor: `${id}.analysis-terms.${offset.toString(36)}`,
     ...redact ? { redact: true } : {}
@@ -5268,12 +5314,13 @@ function analysisTermPage(result, id, offset) {
     const term = all[index];
     if (!term)
       throw new Error("Term inventory index unavailable");
-    const row = `Term #${String(index + 1)} ${JSON.stringify(term.term)}: ${String(term.retainedOccurrences)} retained occurrences`;
+    const label = `condition #${String(index + 1)}`;
+    const row = `${label}: ${String(term.retainedOccurrences)} retained occurrences`;
     const size = Buffer.byteLength(row) + 2;
-    if (bytes + size > 8 * 1024)
+    if (bytes + size > MAX_INLINE_TERM_COUNT_BYTES)
       break;
     rows.push(row);
-    terms.push(term);
+    terms.push({ term: label, retainedOccurrences: term.retainedOccurrences });
     bytes += size;
   }
   const nextOffset = offset + terms.length;
@@ -5281,10 +5328,10 @@ function analysisTermPage(result, id, offset) {
   const matchesRequest = { cursor: `${id}.analysis.0`, ...result.redact ? { redact: true } : {} };
   return {
     text: [
-      `Term inventory ${String(offset + 1)}-${String(nextOffset)} of ${String(all.length)} (${result.partial ? "PARTIAL evidence" : "complete evidence"}). Counts refer to retained occurrences.`,
+      `Condition inventory ${String(offset + 1)}-${String(nextOffset)} of ${String(all.length)} (${result.partial ? "PARTIAL evidence" : "complete evidence"}). Counts refer to retained occurrences.`,
       ...rows,
       ...nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : [],
-      `Matches request: ${JSON.stringify(matchesRequest)}`
+      `Match metadata request: ${JSON.stringify(matchesRequest)}`
     ].join(`
 
 `),
@@ -5353,6 +5400,58 @@ function boundedReasons(reasons) {
   }
   retained.push(notice);
   return retained;
+}
+function publicAnalysisLabel(result) {
+  switch (result.kind) {
+    case "files":
+      return "file metadata";
+    case "outline":
+      return "symbol metadata";
+    case "imports":
+      return "import relationship metadata";
+    case "tests":
+      return "test candidate metadata";
+    case "structure":
+      return "structure match metadata";
+    case "roles":
+      return "role match metadata";
+    case "function-and":
+      return "function match metadata";
+    case "file-and":
+      return "file match metadata";
+    case "changes":
+      return "change metadata";
+    case "concept":
+      return "semantic candidate metadata";
+    case "hybrid":
+      return "combined evidence metadata";
+    case "any-of":
+      return "condition match metadata";
+    case "validate":
+      return "validation metadata";
+  }
+  throw new Error("Unknown analysis result kind");
+}
+function publicAnalysisItem(result, item, index, storedId) {
+  const inspect = item.source && item.range ? {
+    mode: "inspect",
+    cursor: `${storedId}.analysis.0`,
+    matchIndex: index + 1,
+    ...result.redact ? { redact: true } : {}
+  } : undefined;
+  return {
+    path: item.path,
+    line: item.line,
+    label: publicAnalysisLabel(result),
+    index: index + 1,
+    ...inspect ? { inspect } : {}
+  };
+}
+function safeTermCounts(termCounts) {
+  return termCounts?.map((entry, index) => ({
+    term: `condition #${String(index + 1)}`,
+    retainedOccurrences: entry.retainedOccurrences
+  }));
 }
 function hybridPreviewIndices(items) {
   const literal = [];
@@ -5477,68 +5576,54 @@ class AnalysisStore {
     const hybridPreview = kind === "analysis-hybrid";
     const hybridMatchesRequest = hybridPreview ? { cursor: `${stored.id}.analysis.0`, ...result.redact ? { redact: true } : {} } : undefined;
     const pagedTerms = result.termCounts && Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
-    const inlineTerms = pagedTerms ? undefined : result.termCounts;
+    const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
-    const items = [];
-    const sources = [];
-    const sourceIds = new Map;
-    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
-    const scope = result.scope ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : "";
-    const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
-    const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
-    const hasItemDetails = result.items.some((item) => item.details !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
-    const notice = result.reasons.length ? `
-${result.reasons.map((reason) => `[${reason}]`).join(`
-`)}` : "";
+    const statistics = statisticsForItems(result.items, result.items.length, result.unit, analysisExtraGroups(result.counts, result.termCounts, result.items));
+    const publicItems = [];
+    const scope = result.scope ? `Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : undefined;
+    const coverage = result.coverage ? `Coverage: ${JSON.stringify(result.coverage)}.` : undefined;
+    const stats = result.stats ? `Stats: ${JSON.stringify(result.stats)}.` : undefined;
+    const header = [
+      `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}).`,
+      ...formatStatistics(statistics),
+      inlineTerms ? `Condition counts: ${JSON.stringify(inlineTerms)}.` : undefined,
+      termsRequest ? `Condition counts are paginated: ${JSON.stringify(termsRequest)}.` : undefined,
+      scope,
+      coverage,
+      stats
+    ].filter((line) => line !== undefined).join(`
+`);
+    const notice = result.reasons.length ? result.reasons.map((reason) => `[${reason}]`).join(`
+`) : undefined;
     const rows = [];
-    let bytes = Buffer.byteLength(header + notice) + 1200;
+    let bytes = Buffer.byteLength(header) + Buffer.byteLength(notice ?? "") + 1200;
     let next = offset;
     const appendItem = (index) => {
       const item = result.items[index];
       if (!item)
         throw new Error("Analysis item unavailable");
-      const inspect = item.source && item.range ? {
-        mode: "inspect",
-        cursor: `${stored.id}.analysis.0`,
-        matchIndex: index + 1,
-        ...result.redact ? { redact: true } : {}
-      } : undefined;
-      const row = `#${index + 1} ${item.path}:${item.line} ${item.label}${item.excerpt ? `
-${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `
-Inspect: ${JSON.stringify(inspect)}` : ""}`;
+      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const row = `#${String(index + 1)} ${item.path}:${String(item.line)} ${publicItem.label}`;
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
-        if (items.length === 0)
-          throw new SignalGrepError("Analysis item exceeds the response limit; narrow its source");
+        if (publicItems.length === 0)
+          throw new SignalGrepError("Analysis metadata exceeds the response limit; narrow the query");
         return false;
       }
       rows.push(row);
       bytes += rowBytes;
+      publicItems.push(publicItem);
       if (!hybridPreview)
         next = index + 1;
-      if (hybridInspectCursor && item.source) {
-        const sourceKey = JSON.stringify(item.source);
-        let sourceId = sourceIds.get(sourceKey);
-        if (sourceId === undefined) {
-          sourceId = sources.length;
-          sources.push(item.source);
-          sourceIds.set(sourceKey, sourceId);
-        }
-        const { source: _source, ...sharedItem } = item;
-        items.push({ ...sharedItem, index: index + 1, sourceId });
-      } else {
-        items.push({ ...item, index: index + 1, ...inspect ? { inspect } : {} });
-      }
       return true;
     };
     if (hybridPreview) {
       for (const index of hybridPreviewIndices(result.items)) {
-        if (items.length >= 30 || !appendItem(index))
+        if (publicItems.length >= 30 || !appendItem(index))
           break;
       }
     } else {
-      for (let index = offset;index < result.items.length && items.length < 30; index += 1) {
+      for (let index = offset;index < result.items.length && publicItems.length < 30; index += 1) {
         if (!appendItem(index))
           break;
       }
@@ -5548,13 +5633,13 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
       ...result.redact ? { redact: true } : {}
     } : undefined);
     const text = [
-      header + notice,
-      ...rows,
-      ...hybridInspectCursor ? [
-        `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`
-      ] : [],
-      ...nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []
-    ].join(`
+      header,
+      notice,
+      rows.length ? rows.join(`
+`) : "No retained item metadata is available.",
+      hybridMatchesRequest ? `Match metadata request: ${JSON.stringify(hybridMatchesRequest)}.` : undefined,
+      nextRequest ? `Next request: ${JSON.stringify(nextRequest)}` : undefined
+    ].filter((line) => line !== undefined && line.length > 0).join(`
 
 `);
     if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
@@ -5568,18 +5653,18 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
         snapshotComplete: !result.partial,
         totalMatches: result.items.length,
         storedMatches: result.items.length,
-        returnedMatches: items.length,
-        totalFiles: new Set(result.items.map((item) => item.path)).size,
+        returnedMatches: publicItems.length,
+        totalFiles: statistics.files,
+        statistics,
         cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
         ...nextRequest ? { nextRequest } : {},
         analysis: {
           kind: result.kind,
           unit: result.unit,
           totalItems: result.items.length,
-          returnedItems: items.length,
-          items,
-          ...sources.length ? { sources } : {},
-          ...hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {},
+          returnedItems: publicItems.length,
+          statistics,
+          items: publicItems,
           reasons: result.reasons,
           ...result.filesRead !== undefined ? { filesRead: result.filesRead } : {},
           ...result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {},
@@ -5592,7 +5677,8 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...result.coverage ? { coverage: result.coverage } : {},
           ...result.stats ? { stats: result.stats } : {},
           ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
-          ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}
+          ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {},
+          ...hybridPreview ? { inspectCursor: `${stored.id}.analysis.0` } : {}
         },
         ...result.scope ? { scope: result.scope } : {},
         ...result.redact ? { redactionRequested: true } : {}
@@ -7512,68 +7598,6 @@ function subtractByteRange(ranges, returned) {
   }
   return remaining;
 }
-function utf8Boundary(document, offset, direction) {
-  let byte = Math.max(0, Math.min(document.bytes.length, offset));
-  while (byte > 0 && byte < document.bytes.length) {
-    const value = document.bytes[byte];
-    if (value === undefined || (value & 192) !== 128)
-      break;
-    byte += direction;
-  }
-  return byte;
-}
-function renderSourceFragment(fragment) {
-  const header = `[source bytes ${String(fragment.start)}..${String(fragment.end)}; ${String(fragment.startPosition.line)}:${String(fragment.startPosition.column)}–${String(fragment.endPosition.line)}:${String(fragment.endPosition.column)}; UTF-8, end exclusive]`;
-  const lines = fragment.text.split(`
-`);
-  return [
-    header,
-    ...lines.map((text, index) => `${String(fragment.startPosition.line + index)}: ${text}`)
-  ].join(`
-`);
-}
-function sourcePage(document, ranges, maxBytes, focus) {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 256) {
-    throw new SignalGrepError("Source page budget must allow at least 256 bytes");
-  }
-  const gaps = mergeByteRanges(ranges);
-  const range = gaps.find((item) => focus !== undefined && item.start <= focus && focus < item.end) ?? gaps[0];
-  if (!range)
-    throw new SignalGrepError("Source range is already complete");
-  document.checkRange(range);
-  document.toCharacterOffset(range.start);
-  document.toCharacterOffset(range.end);
-  const target = Math.max(range.start, Math.min(range.end, focus ?? range.start));
-  let available = Math.max(4, maxBytes - 160);
-  for (;; ) {
-    let start = range.start;
-    if (range.end - range.start > available && target - range.start > available / 2) {
-      start = utf8Boundary(document, Math.floor(target - available / 2), 1);
-    }
-    start = Math.max(range.start, start);
-    let end = utf8Boundary(document, Math.min(range.end, start + available), -1);
-    if (end <= start && range.end > range.start)
-      end = utf8Boundary(document, start + 1, 1);
-    const fragment = {
-      start,
-      end,
-      text: document.slice({ start, end }),
-      startPosition: document.positionAt(start),
-      endPosition: document.positionAt(end)
-    };
-    const text = renderSourceFragment(fragment);
-    if (Buffer.byteLength(text) <= maxBytes) {
-      return {
-        fragment,
-        remaining: subtractByteRange(gaps, fragment).filter((gap) => gap.start < gap.end),
-        text
-      };
-    }
-    if (available <= 4)
-      throw new SignalGrepError("Source metadata exceeds the page budget");
-    available = Math.max(4, Math.floor(available * 0.75));
-  }
-}
 
 // src/source-continuations.ts
 class SourceContinuations {
@@ -7767,110 +7791,36 @@ async function prepare(target, access, structure) {
   document.checkRange(range);
   return { target, document, range, structure: details, boundary, focus };
 }
-function boundaryNote(block) {
-  if (block.boundary === "line-window" || block.boundary === "mixed") {
-    const fallback = block.prepared.find((prepared) => prepared.boundary === "line-window");
-    const status = fallback?.structure.status;
-    const provider = fallback?.structure.provider;
-    const diagnostic = status === "no-symbol" && provider === undefined ? "" : status ? " (" + status + (provider ? " via " + provider : "") + ")" : "";
-    return "; syntax boundary unavailable" + diagnostic + "; bounded line window";
-  }
-  return block.boundary === "requested-range" ? "; requested range; syntax boundary not inferred" : "";
-}
-function blockDetails(block) {
-  const starts = block.fragments.map((fragment) => fragment.start);
-  const ends = block.fragments.map((fragment) => fragment.end);
-  const start = starts.length > 0 ? Math.min(...starts) : block.ranges[0]?.start ?? 0;
-  const end = ends.length > 0 ? Math.max(...ends) : start;
-  const nextRequest = block.continuation ? { mode: "inspect", sourceCursor: block.continuation } : undefined;
+function metadataStructure(details) {
   return {
-    range: {
-      startLine: block.document.lineAt(start),
-      endLine: block.document.lineAt(Math.max(start, end - 1))
-    },
-    omittedBefore: block.remaining.filter((range) => range.end <= start).reduce((n, range) => n + block.document.lineAt(range.end) - block.document.lineAt(range.start), 0),
-    omittedAfter: block.remaining.filter((range) => range.start >= end).reduce((n, range) => n + block.document.lineAt(range.end) - block.document.lineAt(range.start), 0),
-    truncatedLines: [],
-    reference: block.document.reference,
-    targetRanges: block.ranges,
-    fragments: block.fragments,
-    remainingRanges: block.remaining,
-    complete: block.document.utf8 && block.remaining.length === 0,
-    ...block.boundary ? { boundary: block.boundary } : {},
-    ...nextRequest ? { nextRequest } : {}
+    status: details.status,
+    ...details.provider ? { provider: details.provider } : {},
+    ...details.language ? { language: details.language } : {},
+    ...details.range ? { range: details.range } : {}
   };
 }
-function render(items, blocks, single) {
-  const rows = items.map((item) => `Target #${item.inputIndex} ${item.path ?? ""}:${item.line ?? ""}: ${item.status}${item.block ? `; Block #${item.block}` : ""}${item.structure && !(item.structure.status === "no-symbol" && item.structure.provider === undefined) ? ` [structure: ${item.structure.status}${item.structure.provider ? ` via ${item.structure.provider}` : ""}${item.structure.reason ? `; ${item.structure.reason}` : ""}]` : ""}${item.structure?.symbol ? ` ${item.structure.symbol.name} (${item.structure.symbol.kind}) lines ${item.structure.symbol.range.startLine}-${item.structure.symbol.range.endLine}` : ""}${item.error ? `; ${item.error}` : ""}${item.retry ? `
-Retry: ${JSON.stringify(item.retry)}` : ""}`);
-  const sourceRows = blocks.map((block, index) => {
-    const origin = block.document.reference.origin.kind === "git" ? "commit " + block.document.reference.origin.commit + "; blob " + block.document.reference.origin.blob : "source sha256 " + block.document.reference.origin.contentHash;
-    const completeness = block.remaining.length ? "PARTIAL; missing byte ranges " + JSON.stringify(block.remaining) : "complete for selected range";
-    const next = block.continuation ? `
-Next request: ` + JSON.stringify({ mode: "inspect", sourceCursor: block.continuation }) : "";
-    return "[Block #" + String(index + 1) + "] " + block.document.path + "; " + origin + `
-` + block.text.join(`
-`) + `
-[source ` + completeness + boundaryNote(block) + "; shared 16384-byte output limit]" + next;
-  });
-  return [
-    single ? "Source inspection" : `Batch inspection: ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
-    ...rows,
-    ...sourceRows
-  ].join(`
-
-`);
+async function sourceDocumentIsCurrent(document, access) {
+  if (document.reference.origin.kind !== "worktree")
+    return true;
+  const current = await getSourceRevision(resolve17(access.cwd, document.path));
+  return current !== undefined && sameSourceRevision(current, document.reference.origin.revision);
 }
-function blockBoundary(block) {
-  const boundaries = [...new Set(block.prepared.map((prepared) => prepared.boundary))];
-  if (boundaries.length === 1)
-    return boundaries[0];
-  return boundaries.length > 1 ? "mixed" : undefined;
-}
-function fallbackContinuationRange(document, ranges) {
-  const last = ranges.at(-1);
-  if (!last || last.end >= document.bytes.length)
-    return;
-  const nextStartLine = document.lineAt(last.end);
-  const nextFocusLine = Math.min(document.lineStarts.length, nextStartLine + 10);
-  if (nextFocusLine <= nextStartLine)
-    return;
-  return document.lineRange(nextStartLine, Math.min(document.lineStarts.length, nextFocusLine + 10));
-}
-async function inspectDocuments(targets, access, continuations, structure) {
+async function inspectDocumentsMetadata(targets, access, structure) {
   const items = [];
-  const blocks = [];
+  const paths = new Set;
+  const preparedTargets = [];
   for (const [index, target] of targets.entries()) {
     try {
       const prepared = await prepare(target, access, structure);
-      let blockIndex = blocks.findIndex((block) => block.document === prepared.document);
-      if (blockIndex < 0) {
-        blockIndex = blocks.length;
-        blocks.push({
-          document: prepared.document,
-          ranges: [],
-          targets: [],
-          prepared: [],
-          fragments: [],
-          remaining: [],
-          text: [],
-          boundary: undefined
-        });
-      }
-      const block = blocks[blockIndex];
-      if (!block)
-        throw new Error("Inspection block is unavailable");
-      block.ranges.push(prepared.range);
-      block.targets.push(index);
-      block.prepared.push(prepared);
+      paths.add(prepared.document.path);
+      preparedTargets.push({ itemIndex: items.length, document: prepared.document });
       items.push({
         inputIndex: index + 1,
         path: target.path,
         line: target.line,
         status: "returned",
         ...target.matchIndex !== undefined ? { matchIndex: target.matchIndex } : {},
-        block: blockIndex + 1,
-        structure: prepared.structure
+        structure: metadataStructure(prepared.structure)
       });
     } catch (error) {
       if (access.signal?.aborted || error instanceof Error && error.name === "AbortError")
@@ -7884,120 +7834,47 @@ async function inspectDocuments(targets, access, continuations, structure) {
         line: target.line,
         status: "error",
         structure: { status },
-        error: error instanceof Error ? error.message : status
+        error: error instanceof Error ? error.message : `inspection unavailable (${status})`
       });
     }
   }
-  for (const block of blocks) {
-    block.ranges = mergeByteRanges(block.ranges);
-    block.remaining = block.ranges;
-    block.boundary = blockBoundary(block);
+  const preparedByPath = new Map;
+  for (const prepared of preparedTargets) {
+    const entries = preparedByPath.get(prepared.document.path) ?? [];
+    entries.push(prepared);
+    preparedByPath.set(prepared.document.path, entries);
   }
-  const baseBytes = Buffer.byteLength(render(items, blocks, targets.length === 1));
-  let remainingResponseBytes = MAX_RESULT_BYTES - baseBytes - blocks.length * 400;
-  if (blocks.length && remainingResponseBytes < blocks.length * 256)
-    throw new SignalGrepError("Inspection selectors exceed the shared response limit; use fewer targets");
-  for (const [index, block] of blocks.entries()) {
-    const followingBlocks = blocks.length - index - 1;
-    let allowance = remainingResponseBytes - followingBlocks * 256;
-    if (!block.document.utf8) {
-      const target = block.prepared[0];
-      if (!target)
-        throw new Error("Missing lossy-source target");
-      const lineStart = block.document.lineStarts[target.target.line - 1] ?? 0;
-      const relativeFocus = target.focus - lineStart;
-      const preview = sourceRangeFromBytes(block.document.bytes, Math.max(1, target.target.line - 10), Math.min(block.document.lineStarts.length, target.target.line + 10), target.target.line, {
-        maxBytes: Math.min(MAX_RESULT_BYTES - 1024, Math.max(256, allowance - 300)),
-        focus: {
-          byteStart: relativeFocus,
-          byteEnd: relativeFocus,
-          range: {
-            start: { line: target.target.line - 1, character: relativeFocus },
-            end: { line: target.target.line - 1, character: relativeFocus },
-            encoding: "utf-8"
-          }
-        }
-      });
-      block.text.push(`[lossy UTF-8 preview only; original bytes are not fully representable; source continuation unavailable; lines may be clipped at 500 characters]
-${preview.text}`);
-      remainingResponseBytes -= Buffer.byteLength(block.text.at(-1) ?? "") + 1;
-      for (const targetIndex of block.targets) {
-        const item = items[targetIndex];
-        if (item)
-          item.source = {
-            range: { startLine: preview.startLine, endLine: preview.endLine },
-            omittedBefore: preview.omittedBefore,
-            omittedAfter: preview.omittedAfter,
-            truncatedLines: preview.truncatedLines,
-            complete: false,
-            ...block.boundary ? { boundary: block.boundary } : {},
-            reference: block.document.reference
-          };
-      }
+  for (const entries of preparedByPath.values()) {
+    const first = entries[0];
+    if (!first)
       continue;
-    }
-    const focuses = [...new Set(block.prepared.map((prepared) => prepared.focus))];
-    for (const [focusIndex, focus] of focuses.entries()) {
-      if (!block.remaining.some((range) => range.start <= focus && focus < range.end) || allowance < 256)
+    const firstOrigin = first.document.reference.origin;
+    const revisionsDiffer = firstOrigin.kind === "worktree" && entries.some(({ document }) => {
+      const origin = document.reference.origin;
+      return origin.kind !== "worktree" || !sameSourceRevision(origin.revision, firstOrigin.revision);
+    });
+    const changed = revisionsDiffer || !await sourceDocumentIsCurrent(first.document, access);
+    if (!changed)
+      continue;
+    for (const { itemIndex } of entries) {
+      const item = items[itemIndex];
+      if (!item)
         continue;
-      const missingBytes = block.remaining.reduce((total, range) => total + range.end - range.start, 0);
-      const budget = missingBytes + block.remaining.length * 200 < allowance ? allowance : Math.max(256, Math.floor(allowance / (focuses.length - focusIndex)));
-      const page = sourcePage(block.document, block.remaining, budget, focus);
-      block.fragments.push(page.fragment);
-      block.remaining = page.remaining;
-      block.text.push(page.text);
-      const pageBytes = Buffer.byteLength(page.text) + 1;
-      allowance -= pageBytes;
-      remainingResponseBytes -= pageBytes;
+      item.status = "error";
+      item.structure = { status: "source-changed" };
+      item.error = "Source changed during inspection; refresh the source";
     }
-    while (block.remaining.length && allowance >= 256) {
-      const page = sourcePage(block.document, block.remaining, allowance);
-      block.fragments.push(page.fragment);
-      block.remaining = page.remaining;
-      block.text.push(page.text);
-      const pageBytes = Buffer.byteLength(page.text) + 1;
-      allowance -= pageBytes;
-      remainingResponseBytes -= pageBytes;
-    }
-    const fallback = block.boundary === "line-window" || block.boundary === "mixed" ? fallbackContinuationRange(block.document, block.ranges) : undefined;
-    const continuationTarget = fallback ? [...block.ranges, fallback] : block.ranges;
-    const continuationGaps = fallback ? [...block.remaining, fallback] : block.remaining;
-    if (continuationGaps.length)
-      block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
-    if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve17(access.cwd, block.document.path));
-      if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
-        block.text = [];
-        block.fragments = [];
-        block.remaining = block.ranges;
-        delete block.continuation;
-        for (const targetIndex of block.targets) {
-          const item = items[targetIndex];
-          if (item) {
-            item.status = "error";
-            item.structure = { status: "source-changed" };
-            item.error = "Source changed during inspection; refresh the source";
-          }
-        }
-      }
-    }
-    for (const targetIndex of block.targets) {
-      const item = items[targetIndex];
-      if (item?.status === "returned")
-        item.source = blockDetails(block);
-    }
-    if (access.signal?.aborted)
-      throw abortError();
-    if (index >= 5)
-      throw new Error("Inspection target limit was not validated");
   }
-  const text = render(items, blocks, targets.length === 1);
-  if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-    throw new SignalGrepError("Inspection metadata exceeds the response byte limit");
-  const complete = items.every((item) => item.status === "returned") && blocks.every((block) => block.remaining.length === 0);
+  const complete = items.every((item) => item.status === "returned");
+  const lines = [
+    `Inspection metadata (${complete ? "complete" : "PARTIAL"}; ${String(targets.length)} target(s); ${String(paths.size)} file(s)).`,
+    ...items.map((item) => `#${String(item.inputIndex)} ${item.path ?? "[unknown path]"}:${String(item.line ?? "?")} — ${item.status}${item.structure?.status ? `; structure=${item.structure.status}` : ""}${item.structure?.language ? `; language=${item.structure.language}` : ""}${item.error ? `; ${item.error}` : ""}`)
+  ];
   const first = items[0];
   return {
-    text,
+    text: lines.join(`
+
+`),
     details: {
       version: 1,
       mode: "inspect",
@@ -8006,54 +7883,26 @@ ${preview.text}`);
       totalMatches: 0,
       storedMatches: 0,
       returnedMatches: 0,
-      totalFiles: blocks.length,
+      totalFiles: paths.size,
       inspections: items,
-      sourceBlocks: blocks.map((block) => ({
-        path: block.document.path,
-        source: blockDetails(block)
-      })),
-      ...targets.length === 1 && first?.structure ? { structure: first.structure } : {},
-      ...targets.length === 1 && first?.source ? {
-        source: first.source,
-        ...first.source.nextRequest ? { nextRequest: first.source.nextRequest } : {}
-      } : {}
+      ...targets.length === 1 && first?.structure ? { structure: metadataStructure(first.structure) } : {}
     }
   };
 }
-async function continueSource(cursor, access, continuations) {
+function continueSourceMetadata(cursor, continuations) {
   const state = continuations.resolve(cursor);
-  const document = await access.load(state.source.path, state.source);
-  const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
-  const next = continuations.advance(cursor, page.fragment);
-  const block = {
-    document,
-    ranges: state.target,
-    targets: [],
-    prepared: [],
-    fragments: [page.fragment],
-    remaining: page.remaining,
-    text: [page.text],
-    boundary: state.boundary,
-    ...next ? { continuation: next } : {}
-  };
-  const source = blockDetails(block);
-  const text = render([], [block], true);
-  if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-    throw new SignalGrepError("Source continuation metadata exceeds the output limit");
+  const remainingBytes = state.remaining.reduce((total, range) => total + range.end - range.start, 0);
   return {
-    text,
+    text: `Source continuation metadata (PARTIAL). Source content is not displayed; ${state.source.path} has ${String(state.remaining.length)} remaining range(s) and ${String(remainingBytes)} remaining byte(s).`,
     details: {
       version: 1,
       mode: "inspect",
-      status: next ? "partial" : "complete",
-      snapshotComplete: !next,
+      status: "partial",
+      snapshotComplete: false,
       totalMatches: 0,
       storedMatches: 0,
       returnedMatches: 0,
-      totalFiles: 1,
-      source,
-      sourceBlocks: [{ path: document.path, source }],
-      ...source.nextRequest ? { nextRequest: source.nextRequest } : {}
+      totalFiles: 1
     }
   };
 }
@@ -9443,11 +9292,11 @@ class EvidenceService {
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect")
         throw new SignalGrepError("sourceCursor requires mode=inspect");
-      return continueSource(input.sourceCursor, access, this.#continuations);
+      return continueSourceMetadata(input.sourceCursor, this.#continuations);
     }
     if (input.mode === "inspect") {
       const targets = this.#inspectionTargets(input, cwd);
-      return inspectDocuments(targets, access, this.#continuations, this.#structure);
+      return inspectDocumentsMetadata(targets, access, this.#structure);
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
@@ -9960,7 +9809,6 @@ import { resolve as resolve22 } from "node:path";
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/format.ts
-import { readFile as readFile2 } from "node:fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -9980,122 +9828,16 @@ function pageBodyCharacterLimit(resultTokenBudget = DEFAULT_RESULT_TOKEN_BUDGET)
   }
   return limit;
 }
-function compactLine(line) {
-  const clean = line.replaceAll("\r", "").trimEnd();
-  return excerptText(clean).text;
+function formatMetadataMatchLine(match, matchIndex) {
+  const occurrences = match.occurrences.length;
+  const occurrenceLabel = occurrences === 1 ? "occurrence" : "occurrences";
+  return ` ${match.lineNumber}: ${String(occurrences)} ${occurrenceLabel} {match #${String(matchIndex)}}`;
 }
-function matchLocationSuffix(match) {
-  if (match.occurrences.length === 0)
-    return "";
-  const displayed = match.occurrences.slice(0, MAX_DISPLAYED_OCCURRENCES);
-  const ranges = displayed.map(({ range }) => {
-    const start = range.start.character + 1;
-    const end = Math.max(start, range.end.character);
-    const suffix = range.encoding === "utf-8" ? "b" : "";
-    return `${start}-${end}${suffix}`;
-  });
-  const omitted = match.occurrences.length - displayed.length;
-  const notice = omitted > 0 ? ` [ranges: ${String(displayed.length)} of ${String(match.occurrences.length)} shown; ${String(omitted)} omitted; mode=inspect with this path/line for source]` : "";
-  return ` [${ranges.join(",")}]${notice}`;
-}
-function formatMatchLine(match, matchIndex) {
-  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}${match.lineTruncated ? " [line excerpt truncated]" : ""}`;
-}
-async function loadContextLines(match, expectedRevision, cache, signal) {
-  const cached = cache.get(match.absolutePath);
-  if (cached)
-    return cached;
-  try {
-    if (signal?.aborted)
-      throw abortError();
-    if (!expectedRevision || expectedRevision.size > MAX_SOURCE_FILE_BYTES) {
-      const unavailable = { status: "unavailable" };
-      cache.set(match.absolutePath, unavailable);
-      return unavailable;
-    }
-    const beforeRevision = await getSourceRevision(match.absolutePath);
-    if (!beforeRevision || !sameSourceRevision(expectedRevision, beforeRevision)) {
-      const changed = { status: "changed" };
-      cache.set(match.absolutePath, changed);
-      return changed;
-    }
-    const content = await readFile2(match.absolutePath, { encoding: "utf8", signal });
-    const afterRevision = await getSourceRevision(match.absolutePath);
-    if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
-      const changed = { status: "changed" };
-      cache.set(match.absolutePath, changed);
-      return changed;
-    }
-    const available = {
-      status: "available",
-      lines: content.replaceAll("\r", "").split(`
-`)
-    };
-    cache.set(match.absolutePath, available);
-    return available;
-  } catch (error) {
-    if (signal?.aborted || error instanceof Error && error.name === "AbortError") {
-      throw abortError();
-    }
-    const unavailable = { status: "unavailable" };
-    cache.set(match.absolutePath, unavailable);
-    return unavailable;
-  }
-}
-function matchContextWindows(snapshot, include) {
-  const windows = new Map;
-  const context = Math.min(Math.max(0, snapshot.request.context), MAX_CONTEXT_LINES);
-  if (context === 0)
-    return windows;
-  const selectedFiles = new Map;
-  for (const [index, match] of snapshot.matches.entries()) {
-    if (include && !include(match, index))
-      continue;
-    const matches = selectedFiles.get(match.absolutePath) ?? [];
-    matches.push(match);
-    selectedFiles.set(match.absolutePath, matches);
-  }
-  for (const matches of selectedFiles.values()) {
-    const ordered = matches.toSorted((left, right) => left.lineNumber - right.lineNumber);
-    for (const [index, match] of ordered.entries()) {
-      const previous = ordered[index - 1];
-      const next = ordered[index + 1];
-      windows.set(match, {
-        startLine: Math.max(1, match.lineNumber - context, previous ? Math.floor((previous.lineNumber + match.lineNumber) / 2) + 1 : 1),
-        endLine: Math.min(match.lineNumber + context, next ? Math.floor((match.lineNumber + next.lineNumber) / 2) : Number.MAX_SAFE_INTEGER)
-      });
-    }
-  }
-  return windows;
-}
-async function formatBlock(match, matchIndex, expectedRevision, window, cache, allMatchLines, signal) {
-  const matchingLine = formatMatchLine(match, matchIndex);
-  if (!window)
-    return { text: matchingLine, contextStatus: "none" };
-  const contextLoad = await loadContextLines(match, expectedRevision, cache, signal);
-  if (contextLoad.status !== "available") {
-    return { text: matchingLine, contextStatus: contextLoad.status };
-  }
-  const { lines } = contextLoad;
-  const output = [];
-  for (let lineNumber = window.startLine;lineNumber <= window.endLine; lineNumber += 1) {
-    if (lineNumber === match.lineNumber) {
-      output.push(matchingLine);
-    } else if (lineNumber <= lines.length && !allMatchLines.get(match.absolutePath)?.has(lineNumber)) {
-      output.push(` ${lineNumber}- ${compactLine(lines[lineNumber - 1] ?? "")}`);
-    }
-  }
-  return { text: output.join(`
-`), contextStatus: "available" };
-}
-async function formatMatchPage(snapshot, offset, signal, options = {}) {
+async function formatMatchMetadataPage(snapshot, offset, signal, options = {}) {
   const maxPageBodyBytes = MAX_RESULT_BYTES - Math.max(RESULT_METADATA_RESERVE_BYTES, options.metadataReserveBytes ?? 0);
   if (maxPageBodyBytes <= 0)
     throw new Error("Continuation metadata exceeds the response byte budget; select fewer paths");
   const maxPageBodyCharacters = pageBodyCharacterLimit(options.resultTokenBudget);
-  const cache = new Map;
-  const omittedFiles = new Set;
-  const changedFiles = new Set;
   const output = [];
   let returnedMatches = 0;
   let nextOffset = offset;
@@ -10105,18 +9847,6 @@ async function formatMatchPage(snapshot, offset, signal, options = {}) {
   let firstMatchIndex;
   let lastMatchIndex;
   let hasMatchRanges = false;
-  let hasByteRanges = false;
-  let occurrenceRangesOmitted = 0;
-  let occurrenceMatchesTruncated = 0;
-  const contextWindows = matchContextWindows(snapshot, options.include);
-  const allMatchLines = new Map;
-  if (contextWindows.size > 0) {
-    for (const match of snapshot.matches) {
-      const lines = allMatchLines.get(match.absolutePath) ?? new Set;
-      lines.add(match.lineNumber);
-      allMatchLines.set(match.absolutePath, lines);
-    }
-  }
   while (nextOffset < snapshot.matches.length && returnedMatches < snapshot.request.pageSize) {
     if (signal?.aborted)
       throw abortError();
@@ -10127,47 +9857,30 @@ async function formatMatchPage(snapshot, offset, signal, options = {}) {
     nextOffset += 1;
     if (options.include && !options.include(match, matchIndex))
       continue;
-    let block = await formatBlock(match, matchIndex + 1, snapshot.sourceRevisions.get(match.absolutePath), contextWindows.get(match), cache, allMatchLines, signal);
     const fileHeader = match.displayPath === currentFile ? "" : `${match.displayPath}
 `;
     const separator = output.length === 0 ? "" : fileHeader.length === 0 ? `
 ` : `
 
 `;
-    let addition = `${separator}${fileHeader}${block.text}`;
-    let additionBytes = Buffer.byteLength(addition);
-    let additionCharacters = addition.length;
-    const exceedsBudget = () => outputBytes + additionBytes > maxPageBodyBytes || outputCharacters + additionCharacters > maxPageBodyCharacters;
-    if (exceedsBudget()) {
+    const addition = `${separator}${fileHeader}${formatMetadataMatchLine(match, matchIndex + 1)}`;
+    const additionBytes = Buffer.byteLength(addition);
+    const additionCharacters = addition.length;
+    if (outputBytes + additionBytes > maxPageBodyBytes || outputCharacters + additionCharacters > maxPageBodyCharacters) {
       if (returnedMatches > 0) {
         nextOffset = matchIndex;
         break;
       }
-      block = { text: formatMatchLine(match, matchIndex + 1), contextStatus: "unavailable" };
-      addition = `${fileHeader}${block.text}`;
-      additionBytes = Buffer.byteLength(addition);
-      additionCharacters = addition.length;
-    }
-    if (additionBytes > maxPageBodyBytes) {
-      throw new Error("A single match exceeds the reserved result budget");
-    }
-    if (additionCharacters > maxPageBodyCharacters)
+      if (additionBytes > maxPageBodyBytes)
+        throw new Error("A single match exceeds the reserved result budget");
       throw new MatchPageSoftLimitError;
+    }
     output.push(addition);
     outputBytes += additionBytes;
     outputCharacters += additionCharacters;
     currentFile = match.displayPath;
     returnedMatches += 1;
     hasMatchRanges ||= match.occurrences.length > 0;
-    hasByteRanges ||= match.occurrences.slice(0, MAX_DISPLAYED_OCCURRENCES).some(({ range }) => range.encoding === "utf-8");
-    const omittedRanges = Math.max(0, match.occurrences.length - MAX_DISPLAYED_OCCURRENCES);
-    occurrenceRangesOmitted += omittedRanges;
-    if (omittedRanges > 0)
-      occurrenceMatchesTruncated += 1;
-    if (block.contextStatus === "changed")
-      changedFiles.add(match.displayPath);
-    if (block.contextStatus === "unavailable")
-      omittedFiles.add(match.displayPath);
     firstMatchIndex ??= matchIndex;
     lastMatchIndex = matchIndex;
   }
@@ -10178,11 +9891,11 @@ async function formatMatchPage(snapshot, offset, signal, options = {}) {
     nextOffset,
     hasNext,
     hasMatchRanges,
-    hasByteRanges,
-    occurrenceRangesOmitted,
-    occurrenceMatchesTruncated,
-    contextOmittedFiles: [...omittedFiles].toSorted((left, right) => left.localeCompare(right)),
-    contextChangedFiles: [...changedFiles].toSorted((left, right) => left.localeCompare(right))
+    hasByteRanges: false,
+    occurrenceRangesOmitted: 0,
+    occurrenceMatchesTruncated: 0,
+    contextOmittedFiles: [],
+    contextChangedFiles: []
   };
   if (firstMatchIndex !== undefined)
     page.firstMatchIndex = firstMatchIndex;
@@ -10192,24 +9905,26 @@ async function formatMatchPage(snapshot, offset, signal, options = {}) {
 }
 
 // src/summary.ts
-var METADATA_CHARACTERS = 2400;
-var METADATA_BYTES = 3584;
+var METADATA_BYTES = 1024;
+var METADATA_CHARACTERS = 512;
 function formatSummary(snapshot, fileLimit, offset = 0, resultTokenBudget = DEFAULT_RESULT_TOKEN_BUDGET) {
   if (!Number.isSafeInteger(fileLimit) || fileLimit <= 0)
     throw new Error("Summary file limit must be a positive safe integer");
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.fileCounts.size)
     throw new Error("Summary offset is outside the file summary");
+  if (!Number.isSafeInteger(resultTokenBudget) || resultTokenBudget <= 0)
+    throw new Error("Result token budget must be a positive safe integer");
+  const statistics = statisticsForSnapshot(snapshot);
+  const statisticsText = formatStatistics(statistics, { includeTopFiles: false });
   const files = [...snapshot.fileCounts.entries()].toSorted(([left, leftCount], [right, rightCount]) => rightCount - leftCount || left.localeCompare(right));
-  const firstMatches = new Map;
-  for (const [index, match] of snapshot.matches.entries())
-    if (!firstMatches.has(match.displayPath))
-      firstMatches.set(match.displayPath, { match, index });
   const maxCharacters = Math.max(256, resultTokenBudget * ESTIMATED_CHARACTERS_PER_TOKEN - METADATA_CHARACTERS);
   const maxBytes = MAX_RESULT_BYTES - METADATA_BYTES;
   const rows = [];
   const shownPaths = [];
-  let bytes = 0;
-  let characters = 0;
+  let bytes = Buffer.byteLength(statisticsText.join(`
+`));
+  let characters = statisticsText.join(`
+`).length;
   for (const [file, count] of files.slice(offset, offset + Math.min(30, fileLimit))) {
     const row = `${file}  ${String(count).padStart(6)}`;
     if (bytes + Buffer.byteLength(row) + 1 > maxBytes) {
@@ -10224,105 +9939,19 @@ function formatSummary(snapshot, fileLimit, offset = 0, resultTokenBudget = DEFA
     bytes += Buffer.byteLength(row) + 1;
     characters += row.length + 1;
   }
-  const previews = [];
-  const sampleIndices = [];
-  const sampleBudget = Math.max(0, Math.min(maxBytes - bytes, maxCharacters - characters));
-  let sampleBytes = 0;
-  for (const path of shownPaths.slice(0, 5)) {
-    const retained = firstMatches.get(path);
-    if (!retained)
-      continue;
-    const preview = `${path}:${retained.match.lineNumber} {match #${retained.index + 1}} ${retained.match.lineContent}`;
-    if (sampleBytes + Buffer.byteLength(preview) + 1 > sampleBudget)
-      continue;
-    previews.push(preview);
-    sampleIndices.push(retained.index + 1);
-    sampleBytes += Buffer.byteLength(preview) + 1;
-  }
   const nextOffset = offset + rows.length;
   return {
     body: rows.join(`
 `),
-    previews: previews.join(`
-`),
-    previewsShown: previews.length,
-    previewsOmitted: shownPaths.length - previews.length,
+    statistics,
+    statisticsText,
     shown: rows.length,
     offset,
     nextOffset,
     hasNext: nextOffset < files.length,
     omitted: files.length - nextOffset,
-    shownPaths,
-    sampleIndices,
-    previewByteBudget: sampleBudget
+    shownPaths
   };
-}
-
-// src/summary-previews.ts
-async function summarySourcePreviews(snapshot, paths, maxBytes, cwd, signal) {
-  const rows = [];
-  const indices = [];
-  let bytes = 0;
-  let filesRead = 0;
-  let windows = 0;
-  const reasons = [];
-  for (const path of paths) {
-    if (filesRead >= 5 || maxBytes - bytes < 256)
-      break;
-    const matches = snapshot.matches.flatMap((match, index) => match.displayPath === path ? [{ match, index }] : []);
-    const first = matches[0];
-    if (!first)
-      continue;
-    const revision = snapshot.sourceRevisions.get(first.match.absolutePath);
-    if (!revision || revision.size > MAX_SOURCE_FILE_BYTES) {
-      reasons.push(`${path}: preview source unverified or over 5 MiB`);
-      continue;
-    }
-    filesRead += 1;
-    try {
-      const document = await readWorkspaceDocument(path, cwd, signal);
-      if (document.reference.origin.kind !== "worktree" || !sameSourceRevision(revision, document.reference.origin.revision) || !document.utf8) {
-        reasons.push(`${path}: preview source changed or is not lossless UTF-8`);
-        continue;
-      }
-      let lastEnd = 0;
-      let perFile = 0;
-      for (const { match, index } of matches) {
-        if (perFile >= 2)
-          break;
-        const start = Math.max(1, match.lineNumber - 3);
-        const end = Math.min(document.lineStarts.length, start + 6);
-        if (start <= lastEnd)
-          continue;
-        const lineRows = [];
-        for (let line = start;line <= end; line += 1) {
-          const value = document.slice(document.lineRange(line)).replace(/\n$/, "");
-          const excerpt = excerptText(value);
-          lineRows.push(`${line}: ${excerpt.text}${excerpt.truncated ? " [preview line truncated]" : ""}`);
-        }
-        const row = `${path}:${match.lineNumber} {match #${index + 1}} [source preview lines ${start}-${end}]
-${lineRows.join(`
-`)}`;
-        if (bytes + Buffer.byteLength(row) + 2 > maxBytes)
-          continue;
-        rows.push(row);
-        indices.push(index + 1);
-        bytes += Buffer.byteLength(row) + 2;
-        windows += 1;
-        perFile += 1;
-        lastEnd = end;
-      }
-    } catch (error) {
-      if (signal?.aborted || error instanceof Error && error.name === "AbortError")
-        throw abortError();
-      if (!(error instanceof Error) || !(("code" in error) || error.name === "SourceDocumentError"))
-        throw error;
-      reasons.push(`${path}: preview unavailable`);
-    }
-  }
-  return { text: rows.join(`
-
-`), indices, windows, filesRead, reasons };
 }
 
 // src/snapshot-store.ts
@@ -11064,11 +10693,6 @@ function completenessNote(snapshot) {
   const reasons = snapshot.retention?.reasons.join("; ");
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
 }
-function lineExcerptNote(snapshot) {
-  return snapshot.truncatedLines > 0 ? `
-
-[Line excerpts truncated: ${String(snapshot.truncatedLines)} matching lines in this snapshot; maximum ${String(MAX_LINE_CHARACTERS)} source characters per line. Complete snapshot describes retained matches, not complete source text.]` : "";
-}
 function sourceVerificationNote(details) {
   return details.sourceUnverifiedFileCount ? `
 
@@ -11078,11 +10702,6 @@ function selectContextBudget(input, mode, candidate) {
   if (mode !== "auto" || input.limit !== undefined || input.cursor)
     return;
   return candidate;
-}
-function matchPageOptions(budget) {
-  if (!budget)
-    return {};
-  return { resultTokenBudget: budget.resultTokenBudget };
 }
 function attachContextBudget(result, budget, totalMatches) {
   if (!budget || totalMatches === 0)
@@ -11287,21 +10906,10 @@ class SignalGrepService {
           text: emptyResultText(details.scope ?? searchScope2(snapshot.request)),
           details
         };
-      } else if (snapshot.matches.length === 0) {
-        result = await this.#summary(snapshot, mode, cwd, signal);
-      } else if (mode === "summary") {
-        result = await this.#summary(snapshot, mode, cwd, signal);
-      } else if (mode === "matches") {
+      } else if (mode === "matches" || input.limit !== undefined) {
         result = await this.#page(snapshot, 0, mode, signal);
       } else {
-        try {
-          const page = await formatMatchPage(snapshot, 0, signal, matchPageOptions(contextBudget));
-          result = input.limit !== undefined || snapshot.snapshotComplete && page.nextOffset === snapshot.matches.length ? this.#pageResult(snapshot, 0, mode, page) : await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
-        } catch (error) {
-          if (input.limit !== undefined || !(error instanceof MatchPageSoftLimitError))
-            throw error;
-          result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
-        }
+        result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
       }
       result = {
         ...result,
@@ -11372,66 +10980,56 @@ class SignalGrepService {
     }
     return result;
   }
-  async#summary(snapshot, mode, cwd, signal, offset = 0, budget) {
+  async#summary(snapshot, mode, _cwd, _signal, offset = 0, budget) {
     this.#reusableSummarySnapshots.add(snapshot);
     const summary = formatSummary(snapshot, this.#summaryFileLimit, offset, budget?.resultTokenBudget);
     const details = baseDetails(snapshot, mode);
     const cursor = snapshot.fileCounts.size > 0 ? this.#snapshots.cursor(snapshot, summary.nextOffset, "summary") : undefined;
     const fileRange = summary.shown > 0 ? `Files ${String(summary.offset + 1)}-${String(summary.nextOffset)} of ${String(snapshot.fileCounts.size)}, ordered by match count.` : "No retained file summaries are available.";
-    const omitted = summary.omitted > 0 ? `
-… ${String(summary.omitted)} lower-ranked files remain.` : "";
-    const preview = await summarySourcePreviews(snapshot, summary.shownPaths, summary.previewByteBudget, cwd, signal);
-    const sampleText = preview.text || summary.previews;
-    const indices = preview.text ? preview.indices : summary.sampleIndices;
-    const samples = sampleText ? `
-
-Samples: bounded source windows; not relevance-ranked or exhaustive.
-${sampleText}` : "";
-    const sampleOmissions = `
-[Preview limits: at most 5 source files, 2 non-overlapping windows/file, 7 lines/window. File rows and navigation take priority; shown ${preview.text ? preview.windows : summary.previewsShown} previews.]${preview.reasons.length ? `
-[${preview.reasons.map((reason) => reason.slice(0, 200)).join("; ")}]` : ""}`;
+    const omitted = summary.omitted > 0 ? `+${String(summary.omitted)} lower-ranked files remain.` : undefined;
     const redaction = snapshot.request.redact ? { redact: true } : {};
     const nextRequest = cursor && summary.hasNext ? { cursor, mode: "summary", ...redaction } : undefined;
-    const inspectRequest = cursor && indices.length ? {
-      mode: "inspect",
-      cursor,
-      matchIndices: indices.slice(0, MAX_INSPECT_TARGETS),
-      ...redaction
-    } : undefined;
     const matchesRequest = cursor && snapshot.matches.length > 0 && summary.shownPaths.length ? { cursor, paths: summary.shownPaths.slice(0, 1), ...redaction } : undefined;
-    const followUp = cursor ? `
+    const navigation = cursor ? [
+      `Snapshot cursor available: ${cursor}.`,
+      matchesRequest ? `Match metadata request: ${JSON.stringify(matchesRequest)}.` : undefined,
+      nextRequest ? `Next summary page: ${JSON.stringify(nextRequest)}.` : undefined
+    ].filter((line) => line !== undefined) : [];
+    const text = [
+      `Search summary (${snapshot.snapshotComplete ? "complete" : "PARTIAL"}).`,
+      ...summary.statisticsText,
+      `Scope: ${JSON.stringify(details.scope)}.`,
+      fileRange,
+      summary.body || "No retained file summaries are available.",
+      omitted,
+      ...navigation,
+      modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs),
+      sourceVerificationNote(details)
+    ].filter((line) => line !== undefined && line.length > 0).join(`
 
-Snapshot cursor="${cursor}".${inspectRequest ? `
-Inspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `
-Retrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `
-Next request: ${JSON.stringify(nextRequest)}` : ""}` : "";
-    const text = `${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).
-${fileRange}
-
-${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
+`);
     return {
       text,
       details: {
         ...details,
         ...cursor ? { cursor } : {},
         ...nextRequest ? { nextRequest } : {},
+        statistics: summary.statistics,
         summaryOffset: summary.offset,
         summaryFilesShown: summary.shown,
-        summaryFilesOmitted: summary.omitted,
-        summaryPreviewsShown: preview.text ? preview.windows : summary.previewsShown,
-        summaryPreviewsOmitted: Math.max(0, summary.shown - (preview.text ? new Set(indices.map((index) => snapshot.matches[index - 1]?.displayPath)).size : summary.previewsShown))
+        summaryFilesOmitted: summary.omitted
       }
     };
   }
   async#page(snapshot, offset, mode, signal, selection) {
-    if (offset === snapshot.matches.length) {
+    if (offset === snapshot.matches.length && snapshot.matches.length > 0) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
     }
     const pageOptions = selection ? {
       metadataReserveBytes: 1536 + Buffer.byteLength(JSON.stringify({ paths: selection.labels })),
       include: (match) => selection.absolutePaths.has(match.absolutePath)
     } : {};
-    const page = await formatMatchPage(snapshot, offset, signal, pageOptions);
+    const page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
     if (page.returnedMatches === 0 && selection) {
       throw new CursorError("No retained matches exist for the selected paths.");
     }
@@ -11455,64 +11053,55 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
   }
   #pageResult(snapshot, offset, mode, page, selectedPaths, selectionMissingPaths = [], selectionKey = "all") {
     if (page.returnedMatches === 0) {
-      throw new SignalGrepError("The output budget could not fit a single match");
+      if (snapshot.matches.length > 0)
+        throw new SignalGrepError("The output budget could not fit a single match");
+      const details = baseDetails(snapshot, mode);
+      const statistics = statisticsForSnapshot(snapshot);
+      return {
+        text: [
+          `Match metadata 0-0 of ${String(snapshot.totalMatches)} (${completenessNote(snapshot)}).`,
+          ...formatStatistics(statistics, { includeTopFiles: false }),
+          "No retained match metadata is available; narrow the search to retrieve retained evidence.",
+          sourceVerificationNote(details)
+        ].filter((line) => line !== undefined && line.length > 0).join(`
+
+`),
+        details: { ...details, statistics }
+      };
     }
     const cursor = page.hasNext ? this.#snapshots.cursor(snapshot, page.nextOffset, "matches", selectionKey) : undefined;
     const firstMatch = page.firstMatchIndex ?? offset;
     const lastMatch = page.lastMatchIndex ?? firstMatch;
     const range = `${firstMatch + 1}-${lastMatch + 1}`;
     const selection = selectedPaths ? `; selected ${String(selectedPaths.length)} path(s)` : "";
-    const next = cursor ? `
-
-Continue with cursor="${cursor}".
-Next request: ${JSON.stringify({ cursor, ...selectedPaths ? { paths: selectedPaths } : {}, ...snapshot.request.redact ? { redact: true } : {} })}` : "";
-    const missingSelectionNote = selectionMissingPaths.length > 0 ? `
-
-[${String(selectionMissingPaths.length)} selected path(s) had no retained matches.]` : "";
-    const rangeNote = page.hasMatchRanges ? `
-
-[Match columns are 1-based UTF-16 positions${page.hasByteRanges ? "; b ranges use raw UTF-8 bytes" : ""}.]` : "";
-    const contextNotes = [];
-    if (page.contextChangedFiles.length > 0) {
-      contextNotes.push(`Context omitted for ${String(page.contextChangedFiles.length)} changed file(s); refresh the search before relying on surrounding lines.`);
-    }
-    if (page.contextOmittedFiles.length > 0) {
-      contextNotes.push(`Context unavailable for ${String(page.contextOmittedFiles.length)} file(s); retained matching lines are still shown.`);
-    }
-    const contextNote = contextNotes.length > 0 ? `
-
-[${contextNotes.join(" ")}]` : "";
-    const details = baseDetails(snapshot, mode);
-    const inspectRequest = snapshot.truncatedLines > 0 ? {
-      mode: "inspect",
-      cursor: this.#snapshots.cursor(snapshot, 0, "matches"),
-      matchIndex: firstMatch + 1,
+    const nextRequest = cursor ? {
+      cursor,
+      ...selectedPaths ? { paths: selectedPaths } : {},
       ...snapshot.request.redact ? { redact: true } : {}
     } : undefined;
-    const inspectNote = inspectRequest ? `
-Inspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}` : "";
-    return {
-      text: `${page.body}${rangeNote}${contextNote}${missingSelectionNote}
+    const missingSelectionNote = selectionMissingPaths.length > 0 ? `${String(selectionMissingPaths.length)} selected path(s) had no retained matches.` : undefined;
+    const details = baseDetails(snapshot, mode);
+    const statistics = statisticsForSnapshot(snapshot);
+    const text = [
+      `Match metadata ${range} of ${String(snapshot.totalMatches)}${selection} (${completenessNote(snapshot)}).`,
+      ...formatStatistics(statistics, { includeTopFiles: false }),
+      page.body,
+      missingSelectionNote,
+      modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs),
+      nextRequest ? `Continue with match metadata: ${JSON.stringify(nextRequest)}.` : undefined,
+      sourceVerificationNote(details)
+    ].filter((line) => line !== undefined && line.length > 0).join(`
 
-[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${lineExcerptNote(snapshot)}${inspectNote}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
+`);
+    return {
+      text,
       details: {
         ...details,
-        ...inspectRequest ? { inspectRequest } : {},
+        statistics,
         returnedMatches: page.returnedMatches,
-        ...page.occurrenceRangesOmitted > 0 ? { occurrenceRangesOmitted: page.occurrenceRangesOmitted } : {},
-        ...page.occurrenceMatchesTruncated > 0 ? { occurrenceMatchesTruncated: page.occurrenceMatchesTruncated } : {},
-        ...cursor ? { cursor } : {},
-        ...cursor ? {
-          nextRequest: {
-            cursor,
-            ...selectedPaths ? { paths: selectedPaths } : {},
-            ...snapshot.request.redact ? { redact: true } : {}
-          }
-        } : {},
+        ...nextRequest ? { cursor: nextRequest.cursor, nextRequest } : {},
         ...selectedPaths ? { selectedPaths } : {},
-        ...selectionMissingPaths.length > 0 ? { selectionMissingPaths } : {},
-        ...page.contextOmittedFiles.length > 0 ? { contextOmittedFiles: page.contextOmittedFiles } : {},
-        ...page.contextChangedFiles.length > 0 ? { contextChangedFiles: page.contextChangedFiles } : {}
+        ...selectionMissingPaths.length > 0 ? { selectionMissingPaths } : {}
       }
     };
   }
@@ -11521,37 +11110,36 @@ Inspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}`
 // src/prompt-guidelines.ts
 function signalGrepPromptGuidelines(structuredOutput = true) {
   return [
-    `Use baoer_signal_grep for content search. Start with pattern and optional path; omit mode and limit to let auto choose a complete small result or a broad summary. Use literal=true for literal code fragments rather than escaping them as regex.`,
-    `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide matches with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
-    `For source navigation, imports/tests use the containing Git repository and bounded static module resolution.`,
-    `Use sufficient exact-match evidence directly; do not inspect or reread it only to obtain a citation, since returned matches already have path/line numbers. When definitions repeat, inspect the relevant imports and surrounding source before choosing the authoritative file.`,
-    `Use the file samples in baoer_signal_grep summaries to choose evidence. Reuse the visible cursor with path or paths for matching lines; mode=summary pages the remaining files. Match counts are not relevance scores.`,
-    `When source context is missing, use one baoer_signal_grep batch before reading whole files: {mode:"inspect",cursor:"<returned cursor>",matchIndices:[1,2]} or {mode:"inspect",targets:[{path:"src/example.ts",line:42}]}, at most ${String(MAX_INSPECT_TARGETS)} locations. Copy actual returned selectors. Inspection chooses its own bounded window: omit pattern, context, limit, glob, exclude, literal, ignoreCase and hidden.`,
-    `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrences.`,
-    `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports retained counts per input term, and runs requests above eight terms as bounded parallel chunks. Large term-count inventories have separate termCountsNextRequest pages; copy those requests to retrieve the complete term map.`,
-    `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted evidence. Copy returned continuation requests to preserve source versions.`,
-    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path, not a directory, to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift supports ordinary search and source inspection. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
-    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word file queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
-    `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; no lang, literal/regex or scope options. Use path/glob/exclude to narrow admitted syntax.`,
-    `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Every passage admitted by the source budget is ranked through token-safe windows, and content-addressed embeddings are reused from a bounded local cache. Similarity scores identify source candidates, not proof. File/concept/structure discovery never expands its requested path.`,
-    `Use mode:"hybrid" plus query when wording may differ from the source. It always runs exact literal and local concept retrieval, keeps exact evidence first, removes semantic passages that overlap exact evidence, and retains the top three non-overlapping semantic candidates by default. conceptLimit changes only that semantic supplement. Hybrid uses one pageable snapshot and never treats similarity as exact evidence.`,
-    `If inspection reports missing source, execute its complete nextRequest with sourceCursor. Never treat a partial source excerpt as the complete implementation.`,
+    `Use baoer_signal_grep for read-only content search. Results are metadata-only: never expect source lines, excerpts, AST text, signatures or diffs. Omit mode and limit for a compact statistical summary; use mode="matches" or a cursor only when file and line metadata is needed.`,
+    `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
+    `Search output includes counts, categories, ranked paths, coverage and continuation metadata, but never echoes the raw pattern or query. Use the host read capability separately when source text is explicitly required for an edit or verification.`,
+    `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
+    `Mode="inspect" verifies a selected location and returns only path, line, parser status and source-revision metadata; it does not return source. Do not use inspection merely to obtain a citation.`,
+    `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrence statistics.`,
+    `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
+    `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
+    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path to get symbol counts and locations without names or signatures, mode:"imports" for static relationship counts, and mode:"tests" for related-test candidate counts. These modes do not expose source text.`,
+    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
+    `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; the result reports structural counts and locations without source text.`,
+    `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Results expose candidate counts, score statistics and paths, never ranked passages. Similarity scores identify candidates, not correctness.`,
+    `Use mode:"hybrid" plus query when wording may differ from the source. It reports exact and semantic counts separately, removes overlap, and retains one pageable metadata snapshot. conceptLimit changes only the semantic candidate count; it never causes source text to be returned.`,
+    `If an operation is waiting or partial, follow its visible continuation request and read coverage/reasons. Never treat a partial result as complete, and never restart solely to obtain source text.`,
     `If a request is rejected, keep the strongest applicable mode and follow its repair instruction exactly once. Do not paste the error or rejected request into the retry, repeat an unchanged request, or switch to a weaker search because of a fixable argument error. Only an explicit capability-unavailable result permits a bounded alternative, which remains partial and must not be presented as complete.`,
     structuredOutput ? `When status=partial, read details.analysis.coverage to see which conclusion is incomplete; an exact occurrence count may remain complete even when syntax or related-test analysis is partial.` : `When status=partial, read the visible Coverage and bracketed reasons to see which conclusion is incomplete; an exact occurrence count may remain complete even when syntax or related-test analysis is partial.`
   ];
 }
 function signalGrepModelGuidelines() {
   return [
-    `Search with pattern and optional path; literal=true avoids regex escaping. Omit mode/limit for auto detail/summary. Omitted path uses cwd; scope:"strict" forbids expansion. paths selects retained cursor files only; split new multi-root searches.`,
-    `Use sufficient exact evidence directly. Copy returned cursor/nextRequest/inspect selectors; batch inspect at most ${String(MAX_INSPECT_TARGETS)} targets. A complete snapshot may have unread pages or truncated lines: continue or inspect as needed, never restart just to change limit. A partial status is not complete; read coverage.`,
-    `Modes: capabilities for language prerequisites; files+query for filenames (not business intent); anyOf/allOf for literal terms; outline/imports/tests for static evidence; structure for AST patterns; concept/hybrid for semantic candidates. Similarity and static links are not proof.`,
+    `Search with pattern and optional path. Results are always metadata-only: counts, categories, paths, locations and coverage; no source text, excerpts, signatures or diffs are returned. Omit mode/limit for the compact statistical summary.`,
+    `Use file and directory distributions, ranked paths and condition counts to choose the next action. Cursor continuation returns more metadata, not source. Use the host read capability separately when an edit requires source text.`,
+    `Modes: capabilities for language prerequisites; files+query for filenames; anyOf/allOf for literal condition statistics; outline/imports/tests for metadata-only structural and relationship counts; structure for AST match statistics; concept/hybrid for semantic candidate statistics. Similarity and static links are not proof.`,
     `On rejection keep the strongest applicable mode and apply the stated repair once. Do not repeat the rejected request or include its error. Only explicit capability-unavailable permits a visibly partial alternative.`
   ];
 }
 function signalGrepMcpInstructions(outputMode = DEFAULT_MCP_OUTPUT_MODE) {
-  const outputInstruction = outputMode === "structured" ? "Successful MCP results provide text (the complete formatted evidence page) and details (counts, coverage and continuation selectors). The text content block contains the same page. Use either representation; do not treat the two copies as separate evidence." : outputMode === "model" ? "Returns one model-facing text page. Compact rows share path/inspect cursor; use visible item numbers and copy continuation requests exactly." : "Successful MCP results provide one complete formatted text page, including counts, coverage and continuation selectors.";
+  const outputInstruction = outputMode === "structured" ? "Successful MCP results provide text and details containing only statistics, categories, paths, locations, coverage and continuation metadata. Both projections are code-free and describe the same result." : outputMode === "model" ? "Returns one compact model-facing metadata page. Rows contain only paths, locations and classifications; copy continuation requests exactly." : "Successful MCP results provide one complete code-free metadata page with statistics, coverage and continuation selectors.";
   return [
-    "Use baoer_signal_grep for read-only local search and bounded source inspection from the configured project cwd.",
+    "Use baoer_signal_grep for read-only local search and metadata-only source analysis from the configured project cwd. Source text is not returned by this tool; use the host read capability when needed.",
     outputInstruction,
     ...outputMode === "model" ? signalGrepModelGuidelines() : signalGrepPromptGuidelines(outputMode === "structured")
   ].join(`
@@ -11731,13 +11319,12 @@ var DEFAULT_MCP_PORT = 3000;
 var DEFAULT_MCP_MAX_SESSIONS = 100;
 var DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 var MAX_MCP_BODY_BYTES = 16 * 1024 * 1024;
-var BAOER_SIGNAL_GREP_MCP_VERSION = package_default.version;
 var SIGNAL_GREP_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
     text: {
       type: "string",
-      description: "Complete formatted result page, including source evidence, limits and continuation requests."
+      description: "Complete formatted metadata page, including statistics, coverage and continuation requests; source text is never included."
     },
     details: { type: "object" }
   },
@@ -11810,7 +11397,7 @@ function toolError(error, outputMode) {
 function createSignalGrepMcpServer(service, cwd, outputMode = DEFAULT_MCP_OUTPUT_MODE) {
   const resolvedOutputMode = parseSignalGrepMcpOutputMode(outputMode);
   const tool = signalGrepTool(resolvedOutputMode);
-  const server = new McpServer({ name: "baoer_signal_grep", version: BAOER_SIGNAL_GREP_MCP_VERSION }, {
+  const server = new McpServer({ name: "baoer_signal_grep", version: BAOER_SIGNAL_GREP_VERSION }, {
     capabilities: { tools: {} },
     instructions: signalGrepMcpInstructions(resolvedOutputMode)
   });

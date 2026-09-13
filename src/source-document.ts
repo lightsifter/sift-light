@@ -54,6 +54,21 @@ export class SourceDocument {
   #byteOffsets?: Uint32Array;
 
   constructor(reference: SourceReference, bytes: Buffer) {
+    if (
+      typeof reference !== "object" ||
+      reference === null ||
+      typeof reference.path !== "string" ||
+      reference.path.length === 0 ||
+      typeof reference.origin !== "object" ||
+      reference.origin === null ||
+      !("kind" in reference.origin) ||
+      (reference.origin.kind !== "git" && reference.origin.kind !== "worktree")
+    ) {
+      throw new SourceDocumentError("source-unavailable", "Source reference is invalid");
+    }
+    if (!Buffer.isBuffer(bytes)) {
+      throw new SourceDocumentError("source-unavailable", "Source bytes are invalid");
+    }
     this.reference = reference;
     this.bytes = bytes;
     if (bytes.length > MAX_SOURCE_FILE_BYTES) {

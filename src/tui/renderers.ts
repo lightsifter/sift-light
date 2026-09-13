@@ -110,6 +110,7 @@ export function renderSignalGrepResult(
       text,
     );
   }
+  if (result.details?.statistics) return new Text(text, 0, 0);
   if (options.expanded) return new Text(text, 0, 0);
 
   let presentation;

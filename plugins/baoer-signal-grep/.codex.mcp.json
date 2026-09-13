@@ -3,9 +3,10 @@
     "baoer_signal_grep": {
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/mcp-server.mjs",
+        "./mcp-server.mjs",
         "--stdio"
       ],
+      "cwd": "./",
       "env": {
         "npm_config_ignore_scripts": "true",
         "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",
