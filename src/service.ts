@@ -42,6 +42,7 @@ import type { RelationshipProviderRegistration } from "./relationship-provider-r
 import {
   DEFAULT_SUMMARY_FILE_LIMIT,
   MAX_INSPECT_TARGETS,
+  MAX_LINE_CHARACTERS,
   MAX_SELECTED_PATHS,
   type ContextBudget,
   type InspectTarget,
@@ -246,6 +247,12 @@ function completenessNote(snapshot: SearchSnapshot): string {
   if (snapshot.snapshotComplete) return "complete snapshot";
   const reasons = snapshot.retention?.reasons.join("; ");
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
+}
+
+function lineExcerptNote(snapshot: SearchSnapshot): string {
+  return snapshot.truncatedLines > 0
+    ? `\n\n[Line excerpts truncated: ${String(snapshot.truncatedLines)} matching lines in this snapshot; maximum ${String(MAX_LINE_CHARACTERS)} source characters per line. Complete snapshot describes retained matches, not complete source text.]`
+    : "";
 }
 
 function sourceVerificationNote(details: SignalGrepDetails): string {
@@ -554,7 +561,7 @@ export class SignalGrepService {
 
       result = {
         ...result,
-        text: `${result.text}${scopeExpansionNote(result.details.scope, result.details.totalMatches)}`,
+        text: `${scopeExpansionNote(result.details.scope, result.details.totalMatches).trim()}${result.details.scope?.expandedToProjectRoot ? "\n\n" : ""}${result.text}`,
       };
       const budgetedResult = attachContextBudget(result, contextBudget, snapshot.totalMatches);
       return this.#finalize(snapshot, budgetedResult);
@@ -636,6 +643,7 @@ export class SignalGrepService {
   ): SignalGrepResult {
     if (
       !result.details.cursor &&
+      !result.details.inspectRequest &&
       !retainSnapshot &&
       !this.#reusableSummarySnapshots.has(snapshot)
     ) {
@@ -702,7 +710,7 @@ export class SignalGrepService {
     const followUp = cursor
       ? `\n\nSnapshot cursor="${cursor}".${inspectRequest ? `\nInspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `\nRetrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `\nNext request: ${JSON.stringify(nextRequest)}` : ""}`
       : "";
-    const text = `${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
+    const text = `${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
 
     return {
       text,
@@ -819,10 +827,24 @@ export class SignalGrepService {
     const contextNote = contextNotes.length > 0 ? `\n\n[${contextNotes.join(" ")}]` : "";
     const details = baseDetails(snapshot, mode);
 
+    const inspectRequest: SignalGrepInput | undefined =
+      snapshot.truncatedLines > 0
+        ? {
+            mode: "inspect",
+            cursor: this.#snapshots.cursor(snapshot, 0, "matches"),
+            matchIndex: firstMatch + 1,
+            ...(snapshot.request.redact ? { redact: true } : {}),
+          }
+        : undefined;
+    const inspectNote = inspectRequest
+      ? `\nInspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}`
+      : "";
+
     return {
-      text: `${page.body}${rangeNote}${contextNote}${missingSelectionNote}\n\n[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
+      text: `${page.body}${rangeNote}${contextNote}${missingSelectionNote}\n\n[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${lineExcerptNote(snapshot)}${inspectNote}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
       details: {
         ...details,
+        ...(inspectRequest ? { inspectRequest } : {}),
         returnedMatches: page.returnedMatches,
         ...(page.occurrenceRangesOmitted > 0
           ? { occurrenceRangesOmitted: page.occurrenceRangesOmitted }

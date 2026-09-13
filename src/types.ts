@@ -252,6 +252,7 @@ export interface SearchSnapshot extends SearchScan {
 }
 
 export interface SignalGrepDetails {
+  inspectRequest?: SignalGrepInput;
   version: 1;
   mode: SearchMode;
   status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";

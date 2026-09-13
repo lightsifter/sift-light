@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { MAX_PARSE_TIME_MS, MAX_STRUCTURE_BYTES, MAX_SYNTAX_NODES } from "./analysis-limits.js";
 import { abortError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
+import { scriptRuntimeEnvironment } from "./script-runtime.js";
 import { deriveSyntaxFacts } from "./syntax-facts.js";
 import { syntaxChildren } from "./syntax-tree.js";
 import type {
@@ -176,8 +177,7 @@ export async function parseSyntax(
   const args = process.versions.bun
     ? [`--config=${config}`, "--no-env-file", "--no-macros", "--no-install", worker]
     : [worker];
-  const env = { ...process.env };
-  delete env.NODE_OPTIONS;
+  const env = scriptRuntimeEnvironment();
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort();

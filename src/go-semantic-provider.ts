@@ -619,6 +619,7 @@ class GoRelationshipView implements RelationshipView {
     this.#closed = true;
     try {
       await this.#channel.request("shutdown", undefined);
+      await this.#channel.notify("exit");
       this.#channel.endInput();
       const result = await this.#completion;
       if (result.code !== 0)

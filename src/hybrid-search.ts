@@ -191,9 +191,29 @@ export async function combineHybridSearch(
   if (concept.kind !== "concept") throw new Error("Hybrid search requires concept evidence");
   await verifyConceptSourceGeneration(execution.sourceGeneration, access);
   const literal = await literalEvidence(scan, access, execution.sourceGeneration);
-  const eligibleConcept = concept.items.filter(
-    (item) => !isLiteralOverlap(item, literal.rangesByPath),
-  );
+  // Concept passages deliberately overlap at chunk boundaries. Deduplicate in
+  // rank order before applying the supplement limit, keeping the best evidence.
+  const retainedRanges = new Map<string, ByteRange[]>();
+  const eligibleConcept = concept.items.filter((item) => {
+    if (isLiteralOverlap(item, literal.rangesByPath)) return false;
+    const range = item.range;
+    if (!range) return true;
+    const ranges = retainedRanges.get(item.path) ?? [];
+    let low = 0;
+    let high = ranges.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (ranges[middle]!.start < range.start) low = middle + 1;
+      else high = middle;
+    }
+    const previous = ranges[low - 1];
+    const next = ranges[low];
+    if ((previous && rangesOverlap(previous, range)) || (next && rangesOverlap(next, range)))
+      return false;
+    ranges.splice(low, 0, range);
+    retainedRanges.set(item.path, ranges);
+    return true;
+  });
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
   const selectedConcept: AnalysisItem[] = [];
   for (const item of eligibleConcept.slice(0, conceptLimit)) {

@@ -1,3 +1,4 @@
+import { MAX_PAGE_SIZE } from "./types.js";
 import type { SignalGrepInput } from "./service.js";
 import {
   DEFAULT_LANGUAGE_CAPABILITIES,
@@ -209,8 +210,9 @@ export const MODEL_USAGE_GUIDANCE = [
   "pattern is regex by default; literal=true matches source text exactly",
   "path is an existing exact file or root; use files+query for an unknown name",
   "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
-  "limit/context are output budgets and are never silently dropped",
-  "outline and semantic modes follow capabilities; Swift needs SourceKit-LSP, Go trace needs gopls and a valid workspace; bounded evidence",
+  `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
+  "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
+  "Swift outline/navigation needs SourceKit-LSP; Go trace needs gopls and a valid workspace; bounded evidence",
   `selectors: inspect={${modeFields("inspect").join(",")}}; references={${modeFields("references").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
   "exact, any-of and max_results are not parameters",
 ].join("; ");

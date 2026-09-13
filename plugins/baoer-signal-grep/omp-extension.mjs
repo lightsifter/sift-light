@@ -2267,6 +2267,15 @@ var MAX_IMPORT_FILES = 20;
 var DEFAULT_HYBRID_CONCEPT_LIMIT = 3;
 var MAX_HYBRID_CONCEPT_LIMIT = 20;
 
+// src/script-runtime.ts
+function scriptRuntimeEnvironment() {
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS;
+  if (process.versions.bun)
+    env.BUN_BE_BUN = "1";
+  return env;
+}
+
 // src/syntax-tree.ts
 function syntaxField(analysis, node, field) {
   return analysis.children[node]?.find((child) => analysis.nodes[child]?.field === field);
@@ -3042,8 +3051,7 @@ async function parseSyntax(path, text, signal, pattern) {
   const worker = fileURLToPath2(new URL("./syntax-worker.mjs", import.meta.url));
   const config = fileURLToPath2(new URL("./syntax-worker.toml", import.meta.url));
   const args2 = process.versions.bun ? [`--config=${config}`, "--no-env-file", "--no-macros", "--no-install", worker] : [worker];
-  const env = { ...process.env };
-  delete env.NODE_OPTIONS;
+  const env = scriptRuntimeEnvironment();
   const controller = new AbortController;
   let timedOut = false;
   const abort2 = () => controller.abort();
@@ -4883,8 +4891,7 @@ function passage(document2, start2) {
 async function similarities(query, passages, parent, onProgress) {
   const worker = fileURLToPath3(new URL("./concept-worker.mjs", import.meta.url));
   const config = fileURLToPath3(new URL("./syntax-worker.toml", import.meta.url));
-  const env = { ...process.env };
-  delete env.NODE_OPTIONS;
+  const env = scriptRuntimeEnvironment();
   const stagingRoot = join5(conceptCacheDirectory(), ".staging", randomUUID());
   await mkdir2(stagingRoot, { recursive: true });
   let bytes = 0;
@@ -7792,7 +7799,11 @@ function scoreFilePath(path, query) {
     return { score: 85, reason: "filename substring" };
   if (normalized.includes(needle))
     return { score: 70, reason: "path substring" };
-  const scores = needle.trim().split(/\s+/).map((term) => subsequenceScore(normalized, term));
+  const terms = needle.trim().split(/\s+/);
+  if (terms.length > 1) {
+    return terms.every((term) => normalized.includes(term)) ? { score: 60, reason: "all query words occur literally in the path" } : undefined;
+  }
+  const scores = terms.map((term) => subsequenceScore(normalized, term));
   if (scores.some((score) => score === undefined))
     return;
   return {
@@ -9429,7 +9440,31 @@ async function combineHybridSearch(scan, execution, access, conceptLimit) {
     throw new Error("Hybrid search requires concept evidence");
   await verifyConceptSourceGeneration(execution.sourceGeneration, access);
   const literal = await literalEvidence(scan, access, execution.sourceGeneration);
-  const eligibleConcept = concept.items.filter((item) => !isLiteralOverlap(item, literal.rangesByPath));
+  const retainedRanges = new Map;
+  const eligibleConcept = concept.items.filter((item) => {
+    if (isLiteralOverlap(item, literal.rangesByPath))
+      return false;
+    const range = item.range;
+    if (!range)
+      return true;
+    const ranges = retainedRanges.get(item.path) ?? [];
+    let low = 0;
+    let high = ranges.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (ranges[middle].start < range.start)
+        low = middle + 1;
+      else
+        high = middle;
+    }
+    const previous = ranges[low - 1];
+    const next = ranges[low];
+    if (previous && rangesOverlap(previous, range) || next && rangesOverlap(next, range))
+      return false;
+    ranges.splice(low, 0, range);
+    retainedRanges.set(item.path, ranges);
+    return true;
+  });
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
   const selectedConcept = [];
   for (const item of eligibleConcept.slice(0, conceptLimit)) {
@@ -11148,6 +11183,7 @@ class GoRelationshipView {
     this.#closed = true;
     try {
       await this.#channel.request("shutdown", undefined);
+      await this.#channel.notify("exit");
       this.#channel.endInput();
       const result = await this.#completion;
       if (result.code !== 0)
@@ -13086,11 +13122,11 @@ function configuredExecutable() {
 function commandArgs(kind) {
   return kind === "pyright" ? ["--stdio"] : [];
 }
-function environment2(executable) {
+function environment2(executable, bundled) {
   const currentPath = process.env.PATH ?? "";
   const directory = isAbsolute8(executable) ? dirname8(executable) : undefined;
   return {
-    ...process.env,
+    ...bundled ? scriptRuntimeEnvironment() : process.env,
     ...directory ? { PATH: `${directory}${delimiter2}${currentPath}` } : {}
   };
 }
@@ -13100,7 +13136,7 @@ function pythonLanguageServerCommand() {
   const script = configured ? undefined : require3.resolve("pyright/langserver.index.js");
   const executable = configured?.path ?? process.execPath;
   const args2 = configured ? commandArgs(kind) : [script, "--stdio"];
-  const env = environment2(executable);
+  const env = environment2(executable, !configured);
   const values = { kind, executable, args: args2.join("\x00") };
   if (script) {
     values.script = script;
@@ -14458,8 +14494,9 @@ var MODEL_USAGE_GUIDANCE = [
   "pattern is regex by default; literal=true matches source text exactly",
   "path is an existing exact file or root; use files+query for an unknown name",
   "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
-  "limit/context are output budgets and are never silently dropped",
-  "outline and semantic modes follow capabilities; Swift needs SourceKit-LSP, Go trace needs gopls and a valid workspace; bounded evidence",
+  `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
+  "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
+  "Swift outline/navigation needs SourceKit-LSP; Go trace needs gopls and a valid workspace; bounded evidence",
   `selectors: inspect={${modeFields("inspect").join(",")}}; references={${modeFields("references").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
   "exact, any-of and max_results are not parameters"
 ].join("; ");
@@ -16277,7 +16314,7 @@ function matchLocationSuffix(match) {
   return ` [${ranges.join(",")}]${notice}`;
 }
 function formatMatchLine(match, matchIndex) {
-  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}`;
+  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}${match.lineTruncated ? " [line excerpt truncated]" : ""}`;
 }
 async function loadContextLines(match, expectedRevision, cache, signal) {
   const cached = cache.get(match.absolutePath);
@@ -17342,6 +17379,11 @@ function completenessNote(snapshot) {
   const reasons = snapshot.retention?.reasons.join("; ");
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
 }
+function lineExcerptNote(snapshot) {
+  return snapshot.truncatedLines > 0 ? `
+
+[Line excerpts truncated: ${String(snapshot.truncatedLines)} matching lines in this snapshot; maximum ${String(MAX_LINE_CHARACTERS)} source characters per line. Complete snapshot describes retained matches, not complete source text.]` : "";
+}
 function sourceVerificationNote(details) {
   return details.sourceUnverifiedFileCount ? `
 
@@ -17580,7 +17622,9 @@ class SignalGrepService {
       }
       result = {
         ...result,
-        text: `${result.text}${scopeExpansionNote(result.details.scope, result.details.totalMatches)}`
+        text: `${scopeExpansionNote(result.details.scope, result.details.totalMatches).trim()}${result.details.scope?.expandedToProjectRoot ? `
+
+` : ""}${result.text}`
       };
       const budgetedResult = attachContextBudget(result, contextBudget, snapshot.totalMatches);
       return this.#finalize(snapshot, budgetedResult);
@@ -17640,7 +17684,7 @@ class SignalGrepService {
     return this.#finalize(snapshot, result, kind === "summary" || selection !== undefined);
   }
   #finalize(snapshot, result, retainSnapshot = false) {
-    if (!result.details.cursor && !retainSnapshot && !this.#reusableSummarySnapshots.has(snapshot)) {
+    if (!result.details.cursor && !result.details.inspectRequest && !retainSnapshot && !this.#reusableSummarySnapshots.has(snapshot)) {
       this.#snapshots.delete(snapshot);
     }
     return result;
@@ -17681,7 +17725,7 @@ Next request: ${JSON.stringify(nextRequest)}` : ""}` : "";
     const text = `${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).
 ${fileRange}
 
-${summary.body}${omitted}${samples}${sampleOmissions}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
+${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
     return {
       text,
       details: {
@@ -17756,12 +17800,21 @@ Next request: ${JSON.stringify({ cursor, ...selectedPaths ? { paths: selectedPat
 
 [${contextNotes.join(" ")}]` : "";
     const details = baseDetails(snapshot, mode);
+    const inspectRequest = snapshot.truncatedLines > 0 ? {
+      mode: "inspect",
+      cursor: this.#snapshots.cursor(snapshot, 0, "matches"),
+      matchIndex: firstMatch + 1,
+      ...snapshot.request.redact ? { redact: true } : {}
+    } : undefined;
+    const inspectNote = inspectRequest ? `
+Inspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}` : "";
     return {
       text: `${page.body}${rangeNote}${contextNote}${missingSelectionNote}
 
-[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
+[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${lineExcerptNote(snapshot)}${inspectNote}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
       details: {
         ...details,
+        ...inspectRequest ? { inspectRequest } : {},
         returnedMatches: page.returnedMatches,
         ...page.occurrenceRangesOmitted > 0 ? { occurrenceRangesOmitted: page.occurrenceRangesOmitted } : {},
         ...page.occurrenceMatchesTruncated > 0 ? { occurrenceMatchesTruncated: page.occurrenceMatchesTruncated } : {},
@@ -17794,11 +17847,11 @@ function signalGrepPromptGuidelines(structuredOutput = true) {
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrences.`,
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports retained counts per input term, and runs requests above eight terms as bounded parallel chunks. Large term-count inventories have separate termCountsNextRequest pages; copy those requests to retrieve the complete term map.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted evidence. Copy returned continuation requests to preserve source versions.`,
-    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with path to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift outline and relationships require SourceKit-LSP prerequisites. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
+    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path, not a directory, to see symbols, mode:"imports" with path and a binding symbol or line to follow static named/default ESM links, and mode:"tests" with path for related test candidates. tests supports JS/TS/TSX; Python supports outline; Swift outline and relationships require SourceKit-LSP prerequisites. Imports/tests accept glob, exclude and hidden to narrow the candidate scope; the target source remains admitted. Import links do not prove runtime calls; test candidates do not prove coverage or passing tests.`,
     `Before changing one known JS/TS/TSX symbol, use mode:"impact" with path plus symbol or line to retrieve the exact target, every exact same-spelling candidate, and related-test evidence together. Compiler-confirmed references in verified candidate documents are ranked first; remaining same spelling does not prove binding, and returned tests have not been run. Use references for a dedicated workspace reference inventory.`,
-    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
+    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word file queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
     `Use declared semantic modes definitions, references, implementations, callers or callees with path+line+column (1-based UTF-16), or an unambiguous symbol. JS/TS use the TypeScript service; Go trace needs gopls; Swift relationships need SourceKit-LSP indexing. Returned evidence includes exact positions and executable next requests; static relationships do not prove runtime dispatch. dependencies/dependents take only a workspace file path.`,
-    `Use mode:"structure" plus an ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; no literal/regex or scope options. Use path/glob/exclude to narrow admitted syntax.`,
+    `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; no lang, literal/regex or scope options. Use path/glob/exclude to narrow admitted syntax.`,
     `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Every passage admitted by the source budget is ranked through token-safe windows, and content-addressed embeddings are reused from a bounded local cache. Similarity scores identify source candidates, not proof. File/concept/structure discovery never expands its requested path.`,
     `Use mode:"hybrid" plus query when wording may differ from the source. It always runs exact literal and local concept retrieval, keeps exact evidence first, removes semantic passages that overlap exact evidence, and retains the top three non-overlapping semantic candidates by default. conceptLimit changes only that semantic supplement. Hybrid uses one pageable snapshot and never treats similarity as exact evidence.`,
     `If inspection reports missing source, execute its complete nextRequest with sourceCursor. Never treat a partial source excerpt as the complete implementation.`,
@@ -25467,7 +25520,7 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure+pattern matches AST shapes. Outline uses a source path or retained cursor+matchIndex and follows declared capabilities (Swift requires SourceKit-LSP); semantic definitions/references/implementations/callers/callees use path+line+column or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared capabilities (Swift requires SourceKit-LSP); semantic definitions/references/implementations/callers/callees use path+line+column or an unambiguous symbol. dependencies/dependents use a workspace file path and the compiler's project module resolution. impact combines compiler-confirmed candidate bindings, exact occurrences and related-test candidates without running tests; all analysis is static evidence, and partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 var SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var signalGrepSchema = _Object_({
   column: Optional(Integer({
@@ -25533,11 +25586,11 @@ var signalGrepSchema = _Object_({
   })),
   pattern: Optional(String2({
     maxLength: MAX_PATTERN_CHARACTERS,
-    description: `${fieldGuidance("pattern")}. mode=structure uses an ast-grep code pattern, at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.`
+    description: `${fieldGuidance("pattern")}. mode=structure requires a nonempty ast-grep code pattern for JS/TS/TSX/Go (no lang field), at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, semantic navigation, inspection and cursors.`
   })),
   path: Optional(String2({
     maxLength: MAX_PATH_CHARACTERS,
-    description: `${fieldGuidance("path")}. A zero-result content search expands from cwd unless scope=strict. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.`
+    description: `${fieldGuidance("path")}. A zero-result content search expands from cwd unless scope=strict. outline and compiler navigation require a concrete file, not a directory. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.`
   })),
   paths: Optional(_Array_(String2(), {
     minItems: 1,

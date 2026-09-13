@@ -82,7 +82,7 @@ function matchLocationSuffix(match: MatchRecord): string {
 }
 
 function formatMatchLine(match: MatchRecord, matchIndex: number): string {
-  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}`;
+  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}${match.lineTruncated ? " [line excerpt truncated]" : ""}`;
 }
 
 async function loadContextLines(

@@ -36,9 +36,13 @@ Slow Concept and hybrid requests return within the default five-second wait wind
 
 Ask the agent to restrict a search to one folder when that is the scope you need. If you remember only part of a filename, start by finding the file and then inspect its contents—like narrowing a cabinet down to a shelf and then a document.
 
+Multi-word `files` queries require each word literally in the path; a single abbreviation still supports fuzzy matching. Use `hybrid` or `concept` for business intent. Ordinary content searches retain their default zero-result expansion; use `scope: "strict"` to stay within an explicit path. Expansion is announced before returned evidence.
+
 ### Know what has been shown
 
 Long results arrive in pages with a way to continue. When the original material changes, the plugin asks for a fresh check. Like a careful research assistant, it distinguishes the passages already shown from the pages still to come.
+
+A complete snapshot describes match retention, not complete source text. Truncated matching-line excerpts show their limit and an executable `inspectRequest`, which remains usable after the final match page. Follow pagination cursors instead of repeating the query with a different limit.
 
 ### Discover language capabilities before loading a provider
 

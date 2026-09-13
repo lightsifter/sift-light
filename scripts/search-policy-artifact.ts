@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
+import { buildConceptWorker } from "./concept-worker-artifact.js";
+import { buildSyntaxWorker } from "./syntax-worker-artifact.js";
 
 const repository = resolve(import.meta.dirname, "..");
 export const searchPluginRoot = join(repository, "plugins/baoer-signal-grep");
@@ -8,6 +10,9 @@ export const SEARCH_PLUGIN_FILES = [
   "LICENSE",
   "package.json",
   "omp-extension.mjs",
+  "concept-worker.mjs",
+  "syntax-worker.mjs",
+  "syntax-worker.toml",
   ".codex-plugin/plugin.json",
   ".claude-plugin/plugin.json",
   ".mcp.json",
@@ -44,6 +49,11 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     sourcemap: "none",
   });
   if (!ompResult.success) throw new AggregateError(ompResult.logs, "OMP extension build failed");
+  await Promise.all([
+    buildConceptWorker(root),
+    buildSyntaxWorker(root),
+    copyFile(join(repository, "src/syntax-worker.toml"), join(root, "syntax-worker.toml")),
+  ]);
   const notices = await Promise.all(
     [
       ["web-tree-sitter", "tree-sitter.wasm"],

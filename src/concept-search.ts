@@ -19,6 +19,7 @@ import {
 } from "./concept-model.js";
 import { abortError, ConceptUnavailableError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
+import { scriptRuntimeEnvironment } from "./script-runtime.js";
 import { rpcRecord } from "./owned-json-rpc.js";
 import { normalizeRequest } from "./request.js";
 import type { SignalGrepInput } from "./service.js";
@@ -143,8 +144,7 @@ async function similarities(
 ): Promise<ConceptInferenceResult> {
   const worker = fileURLToPath(new URL("./concept-worker.mjs", import.meta.url));
   const config = fileURLToPath(new URL("./syntax-worker.toml", import.meta.url));
-  const env = { ...process.env };
-  delete env.NODE_OPTIONS;
+  const env = scriptRuntimeEnvironment();
   const stagingRoot = join(conceptCacheDirectory(), ".staging", randomUUID());
   await mkdir(stagingRoot, { recursive: true });
   let bytes = 0;

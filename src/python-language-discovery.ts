@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { delimiter, dirname, isAbsolute, resolve } from "node:path";
 import { abortError, SignalGrepError } from "./errors.js";
+import { scriptRuntimeEnvironment } from "./script-runtime.js";
 
 /** The default Python provider is the pinned Pyright runtime bundled by this package. */
 export type PythonLanguageServerKind = "pylsp" | "pyright";
@@ -45,11 +46,11 @@ function commandArgs(kind: PythonLanguageServerKind): readonly string[] {
   return kind === "pyright" ? ["--stdio"] : [];
 }
 
-function environment(executable: string): NodeJS.ProcessEnv {
+function environment(executable: string, bundled: boolean): NodeJS.ProcessEnv {
   const currentPath = process.env.PATH ?? "";
   const directory = isAbsolute(executable) ? dirname(executable) : undefined;
   return {
-    ...process.env,
+    ...(bundled ? scriptRuntimeEnvironment() : process.env),
     ...(directory ? { PATH: `${directory}${delimiter}${currentPath}` } : {}),
   };
 }
@@ -64,7 +65,7 @@ export function pythonLanguageServerCommand(): PythonLanguageServerCommand {
   const script = configured ? undefined : require.resolve("pyright/langserver.index.js");
   const executable = configured?.path ?? process.execPath;
   const args = configured ? commandArgs(kind) : [script!, "--stdio"];
-  const env = environment(executable);
+  const env = environment(executable, !configured);
   const values: Record<string, string> = { kind, executable, args: args.join("\0") };
   if (script) {
     values.script = script;
