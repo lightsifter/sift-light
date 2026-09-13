@@ -840,7 +840,18 @@ var PYTHON_LANGUAGE_CAPABILITIES = [
     availability: "conditional",
     load: "lazy",
     prerequisites: ["bundled Pyright language server and an admitted Python workspace"]
-  }))
+  })),
+  {
+    id: "pyright-python.trace",
+    name: "trace",
+    provider: "pyright-python",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
+    relationshipOperations: ["callers", "callees"]
+  }
 ];
 var SWIFT_LANGUAGE_CAPABILITIES = [
   {
@@ -862,7 +873,18 @@ var SWIFT_LANGUAGE_CAPABILITIES = [
     availability: "conditional",
     load: "lazy",
     prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"]
-  }))
+  })),
+  {
+    id: "sourcekit-lsp.trace",
+    name: "trace",
+    provider: "sourcekit-lsp-swift",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
+    relationshipOperations: ["callers", "callees"]
+  }
 ];
 var DEFAULT_LANGUAGE_CAPABILITIES = [
   {

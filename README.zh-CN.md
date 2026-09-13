@@ -44,7 +44,7 @@ Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: 
 
 使用 `mode: "capabilities"` 和项目根目录，可以得到紧凑的、只含名称的语言能力清单，查看项目中的语言以及每种语言声明的操作。这个检查不会启动 parser、编译器、模型或语言服务器；普通的 `files`、`content`、`outline` 和关系查询也不会加载无关提供方。清单会给出实际声明的能力、提供方身份、证据类型和前置条件；运行时是否就绪只在真正打开所选操作时核验。
 
-JavaScript、TypeScript 和 TSX 提供语法结构、imports、tests 以及 TypeScript language service 关系能力。Go 提供语法结构和角色分析；在存在有效 Go 工程和 `gopls` 可执行文件时，可追踪 callers/callees。Python 提供有边界的语法 outline，并通过包内 Pyright language server 按需提供条件式编译器关系能力（server 实际声明并返回时支持 definitions、references、callers 和 callees）。Swift 在 SourceKit-LSP 能够接纳并建立目标 Swift 工程索引时，提供 outline、definitions、references、implementations、callers 和 callees。不可用或不支持的操作会在能力结果中明确表示，不会伪装成空的成功搜索。
+JavaScript、TypeScript 和 TSX 提供语法结构、imports、tests 以及 TypeScript language service 关系能力。Go 提供语法结构和角色分析；在存在有效 Go 工程和 `gopls` 可执行文件时，可追踪 callers/callees。Python 提供有边界的语法 outline，并通过包内 Pyright language server 按需提供条件式编译器关系能力（server 实际声明并返回时支持 definitions、references、callers、callees 和 trace）。Swift 在 SourceKit-LSP 能够接纳并建立目标 Swift 工程索引时，提供 outline、definitions、references、implementations、callers、callees 和 trace。不可用或不支持的操作会在能力结果中明确表示，不会伪装成空的成功搜索。
 
 ### 在有界证据内追踪调用关系
 

@@ -200,6 +200,17 @@ const PYTHON_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
       prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
     }),
   ),
+  {
+    id: "pyright-python.trace",
+    name: "trace",
+    provider: "pyright-python",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["bundled Pyright language server and an admitted Python workspace"],
+    relationshipOperations: ["callers", "callees"],
+  },
 ];
 
 const SWIFT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
@@ -225,6 +236,17 @@ const SWIFT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
       prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
     }),
   ),
+  {
+    id: "sourcekit-lsp.trace",
+    name: "trace",
+    provider: "sourcekit-lsp-swift",
+    providerKind: "external",
+    evidence: "compiler",
+    availability: "conditional",
+    load: "lazy",
+    prerequisites: ["sourcekit-lsp executable and an admitted Swift workspace"],
+    relationshipOperations: ["callers", "callees"],
+  },
 ];
 
 export const DEFAULT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilityDescriptor[] = [
