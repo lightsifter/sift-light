@@ -1,7 +1,11 @@
 import type { AnalysisDetails } from "./analysis-types.js";
+import type { ValidationDetails } from "./validation-types.js";
 import type { SourceFragment } from "./source-pages.js";
 import type { ByteRange, SourceReference } from "./source-document.js";
 import type { SignalGrepInput } from "./service.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
+import type { RequestContractDetails } from "./request-contract.js";
+import type { LanguageCapabilityInventory } from "./language-capabilities.js";
 
 export const DEFAULT_PAGE_SIZE = 100;
 export const MAX_PAGE_SIZE = 100;
@@ -38,13 +42,6 @@ export type SearchMode =
   | "concept"
   | "hybrid"
   | "structure"
-  | "definitions"
-  | "references"
-  | "implementations"
-  | "callers"
-  | "callees"
-  | "dependencies"
-  | "dependents"
   | "files"
   | "auto"
   | "summary"
@@ -53,7 +50,26 @@ export type SearchMode =
   | "outline"
   | "imports"
   | "tests"
-  | "impact";
+  | "validate"
+  | "capabilities"
+  | "await"
+  | "cancel";
+
+export type OperationResultState = "running" | "complete" | "failed" | "cancelled" | "expired";
+
+export type OperationProgressDetails = OperationProgress;
+
+export interface OperationDetails {
+  id: string;
+  mode: "concept" | "hybrid";
+  state: OperationResultState;
+  startedAt: number;
+  deadlineAt: number;
+  leaseExpiresAt: number;
+  progress?: OperationProgressDetails;
+  nextRequest?: SignalGrepInput;
+  error?: string;
+}
 
 export type ContextBudgetTier = keyof typeof CONTEXT_BUDGET_POLICY.resultTokenBudgets;
 
@@ -224,10 +240,34 @@ export interface SearchSnapshot extends SearchScan {
   lastAccessedAt: number;
 }
 
+export interface StatisticsEntry {
+  label: string;
+  count: number;
+}
+
+export interface StatisticsGroup {
+  dimension: string;
+  entries: StatisticsEntry[];
+  omitted: number;
+  total: number;
+}
+
+export interface ResultStatistics {
+  unit: string;
+  total: number;
+  files: number;
+  directories: number;
+  groups: StatisticsGroup[];
+  topFiles: StatisticsEntry[];
+  topFilesOmitted: number;
+}
+
 export interface SignalGrepDetails {
+  inspectRequest?: SignalGrepInput;
   version: 1;
   mode: SearchMode;
-  status: "complete" | "partial";
+  status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";
+  error?: RequestContractDetails;
   totalMatches: number;
   storedMatches: number;
   totalFiles: number;
@@ -237,6 +277,8 @@ export interface SignalGrepDetails {
   cursor?: string;
   nextRequest?: SignalGrepInput;
   analysis?: AnalysisDetails;
+  statistics?: ResultStatistics;
+  validation?: ValidationDetails;
   sourceBlocks?: { path: string; source: SourceExcerptDetails }[];
   summaryFilesShown?: number;
   summaryOffset?: number;
@@ -261,6 +303,8 @@ export interface SignalGrepDetails {
   redactedCount?: number;
   redactionRequested?: boolean;
   redactionApplied?: boolean;
+  operation?: OperationDetails;
+  capabilities?: LanguageCapabilityInventory;
 }
 
 export interface SignalGrepResult {

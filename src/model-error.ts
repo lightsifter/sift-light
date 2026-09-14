@@ -1,4 +1,11 @@
 import { types } from "node:util";
+import {
+  boundedRequestContractDetails,
+  isSignalGrepDiagnosticError,
+  MAX_REQUEST_RECOVERY_BYTES,
+} from "./request-contract.js";
+import type { SignalGrepDiagnosticError } from "./errors.js";
+import type { RequestContractDetails } from "./request-contract.js";
 
 const MAX_RAW_ERROR_SCAN_CHARACTERS = 4_096;
 const MAX_MODEL_ERROR_CHARACTERS = 1_024;
@@ -38,6 +45,7 @@ function errorMessage(error: unknown): string {
 
 /** One bounded model-facing diagnostic; never serialize causes, stacks, or repeated request text. */
 export function modelErrorText(error: unknown): string {
+  if (isSignalGrepDiagnosticError(error)) return requestContractErrorText(error);
   const raw = errorMessage(error);
   const normalized = raw
     .slice(0, MAX_RAW_ERROR_SCAN_CHARACTERS)
@@ -49,4 +57,65 @@ export function modelErrorText(error: unknown): string {
   const text = `${MODEL_ERROR_PREFIX} ${message}`;
   if (text.length <= MAX_MODEL_ERROR_CHARACTERS) return text;
   return `${text.slice(0, MAX_MODEL_ERROR_CHARACTERS - 1).toWellFormed()}…`;
+}
+
+/**
+ * Contract recovery is a copy protocol, so it must bypass the generic model
+ * error whitespace normalization and character truncation.  The contract
+ * builder omits oversized next requests instead of allowing a false exact
+ * retry to be emitted.
+ */
+export function requestContractErrorText(error: SignalGrepDiagnosticError): string {
+  return requestContractProjection(error).text;
+}
+
+export interface RequestContractProjection {
+  details: RequestContractDetails;
+  text: string;
+}
+
+function projectRequestContract(
+  projected: RequestContractDetails,
+  serialized: string,
+  message: string,
+): string {
+  const prefix = `baoer_signal_grep failed: request rejected [${projected.code}]: ${message}`;
+  const recovery = projected.recovery;
+  const next = recovery.nextRequest
+    ? "\nCopy the nested recovery.nextRequest object unchanged; do not repeat the original query."
+    : `\nRecovery action: ${recovery.action}. ${recovery.reason}`;
+  // Put the machine payload first so simple host adapters that locate the
+  // first `nextRequest` marker see the exact nested request object.
+  return `\nError details: ${serialized}\n${prefix}${next}`;
+}
+
+/** Build the one bounded contract projection consumed by structured and text hosts. */
+export function requestContractProjection(
+  error: SignalGrepDiagnosticError,
+): RequestContractProjection {
+  const details = boundedRequestContractDetails(error.details);
+  const serializedDetails = JSON.stringify(details);
+  const boundedMessage = error.message.toWellFormed().slice(0, 1_024);
+  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES) return { details, text: result };
+  const compact: RequestContractDetails = {
+    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    ...(details.mode ? { mode: details.mode } : {}),
+    issues: [
+      {
+        field: "<payload>",
+        reason: "The visible request-contract error exceeded its bounded payload budget.",
+      },
+    ],
+    recovery: {
+      action: "manual" as const,
+      reason: "Exact recovery was omitted; correct the request explicitly.",
+    },
+  };
+  const compactText = projectRequestContract(
+    compact,
+    JSON.stringify(compact),
+    "The request-contract error exceeded the bounded payload budget; correct the request explicitly.",
+  );
+  return { details: compact, text: compactText };
 }

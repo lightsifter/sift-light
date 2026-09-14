@@ -24,11 +24,27 @@ import {
   verifyConceptModel,
 } from "./concept-model.js";
 import { installConceptModel } from "./concept-setup.js";
-import { rpcRecord } from "./owned-json-rpc.js";
+import { isRecordValue } from "./record-value.js";
 
 const CACHE_IO_CONCURRENCY = 64;
 
-async function readCachedEmbeddings(root: string, requested: readonly PendingConceptEmbedding[]) {
+interface WorkerProgress {
+  phase: "cache-read" | "model-loading" | "embedding" | "cache-write" | "cache-cleanup";
+  completed?: number;
+  total?: number;
+  uniqueEmbeddings: number;
+  passages: number;
+}
+
+function emitProgress(progress: WorkerProgress): void {
+  process.stdout.write(`${JSON.stringify({ type: "progress", ...progress })}\n`);
+}
+
+async function readCachedEmbeddings(
+  root: string,
+  requested: readonly PendingConceptEmbedding[],
+  onProgress?: (completed: number, total: number) => void,
+) {
   const cached = [];
   for (let offset = 0; offset < requested.length; offset += CACHE_IO_CONCURRENCY) {
     // oxlint-disable-next-line no-await-in-loop -- bounded batches avoid exhausting file descriptors.
@@ -38,25 +54,9 @@ async function readCachedEmbeddings(root: string, requested: readonly PendingCon
         .map((item) => readConceptEmbedding(root, item.key)),
     );
     cached.push(...batch);
+    onProgress?.(Math.min(offset + batch.length, requested.length), requested.length);
   }
   return cached;
-}
-
-async function writeCachedEmbeddings(
-  root: string,
-  created: readonly CachedConceptEmbedding[],
-): Promise<boolean> {
-  let failed = false;
-  for (let offset = 0; offset < created.length; offset += CACHE_IO_CONCURRENCY) {
-    // oxlint-disable-next-line no-await-in-loop -- bounded batches avoid exhausting file descriptors.
-    const batch = await Promise.allSettled(
-      created
-        .slice(offset, offset + CACHE_IO_CONCURRENCY)
-        .map((item) => writeConceptEmbedding(root, item)),
-    );
-    failed ||= batch.some((item) => item.status === "rejected");
-  }
-  return failed;
 }
 
 async function requestFromStdin(): Promise<{ query: string; passages: string[] }> {
@@ -71,7 +71,7 @@ async function requestFromStdin(): Promise<{ query: string; passages: string[] }
   }
   const request: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   if (
-    !rpcRecord(request) ||
+    !isRecordValue(request) ||
     typeof request.query !== "string" ||
     request.query.length === 0 ||
     request.query.length > 256 ||
@@ -108,6 +108,7 @@ async function search(): Promise<void> {
   const request = await requestFromStdin();
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
+  const stagingRoot = process.env.SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
   await verifyConceptModel(directory);
   const requested: PendingConceptEmbedding[] = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
@@ -117,15 +118,24 @@ async function search(): Promise<void> {
       text,
     })),
   ];
-  const cached = await readCachedEmbeddings(cacheRoot, requested);
-  const missing = requested.filter((_item, index) => !cached[index]);
+  const uniqueRequested = [...new Map(requested.map((item) => [item.key, item])).values()];
+  const progressContext = {
+    uniqueEmbeddings: uniqueRequested.length,
+    passages: request.passages.length,
+  };
+  const cached = await readCachedEmbeddings(cacheRoot, uniqueRequested, (completed, total) =>
+    emitProgress({ phase: "cache-read", completed, total, ...progressContext }),
+  );
+  const missing = uniqueRequested.filter((_item, index) => !cached[index]);
   const warnings: string[] = [];
   let created: CachedConceptEmbedding[] = [];
+  let cacheWriteFailed = false;
   if (missing.length) {
     env.allowRemoteModels = false;
     env.useFSCache = false;
     env.useBrowserCache = false;
     env.localModelPath = "/";
+    emitProgress({ phase: "model-loading", ...progressContext });
     const extractor = await pipeline("feature-extraction", directory, {
       local_files_only: true,
       dtype: "q8",
@@ -133,17 +143,31 @@ async function search(): Promise<void> {
       session_options: { intraOpNumThreads: 2, interOpNumThreads: 1 },
     });
     try {
-      created = await embedConceptInputs(extractor, missing);
+      created = await embedConceptInputs(extractor, missing, {
+        onCompletedEmbedding: async (embedding, completed, total) => {
+          try {
+            await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
+          } catch {
+            cacheWriteFailed = true;
+          }
+          emitProgress({ phase: "cache-write", completed, total, ...progressContext });
+        },
+        onBatch: (completed, total) =>
+          emitProgress({ phase: "embedding", completed, total, ...progressContext }),
+      });
     } finally {
       await extractor.dispose();
     }
-    if (await writeCachedEmbeddings(cacheRoot, created))
+    if (cacheWriteFailed)
       warnings.push(
         "Concept embedding cache write failed; ranking completed but some work may repeat",
       );
   }
   const createdByKey = new Map(created.map((item) => [item.key, item]));
-  const embeddings = requested.map((item, index) => cached[index] ?? createdByKey.get(item.key));
+  const embeddingsByKey = new Map(
+    uniqueRequested.map((item, index) => [item.key, cached[index] ?? createdByKey.get(item.key)]),
+  );
+  const embeddings = requested.map((item) => embeddingsByKey.get(item.key));
   if (embeddings.some((item) => !item)) throw new Error("Missing concept embedding result");
   const queryWindows = embeddings[0]?.windows;
   if (!queryWindows?.length) throw new Error("Missing concept query embedding");
@@ -155,6 +179,7 @@ async function search(): Promise<void> {
   });
   let cacheBytes: number | undefined;
   try {
+    emitProgress({ phase: "cache-cleanup", ...progressContext });
     cacheBytes = await enforceConceptCacheLimit(cacheRoot);
   } catch {
     warnings.push(
@@ -163,6 +188,7 @@ async function search(): Promise<void> {
   }
   process.stdout.write(
     JSON.stringify({
+      type: "result",
       scores,
       cacheHits: cached.filter(Boolean).length,
       cacheMisses: missing.length,

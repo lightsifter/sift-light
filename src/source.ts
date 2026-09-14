@@ -15,11 +15,15 @@ export { isPathInsideCwd } from "./path-policy.js";
 const SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
 const MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
 
-export async function getSourceRevision(path: string): Promise<SourceRevision | undefined> {
+export async function getSourceRevision(
+  path: string,
+  onError?: (error: unknown) => void,
+): Promise<SourceRevision | undefined> {
   try {
     const metadata = await stat(path);
     return sourceRevisionFromStats(metadata);
-  } catch {
+  } catch (error) {
+    onError?.(error);
     return undefined;
   }
 }

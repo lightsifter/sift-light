@@ -1,8 +1,10 @@
 import type { AnalysisDetails } from "./analysis-types.js";
 import type { SignalGrepDetails, SignalGrepResult } from "./types.js";
 
+import { formatStatistics } from "./result-statistics.js";
 function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails): string[] {
   return [
+    ...(analysis.statistics ? formatStatistics(analysis.statistics) : []),
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,
     analysis.termCounts ? `Term counts: ${JSON.stringify(analysis.termCounts)}` : undefined,
     analysis.termCountsNextRequest
@@ -16,8 +18,12 @@ function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails):
     analysis.chunks ? `Chunks: ${JSON.stringify(analysis.chunks)}` : undefined,
     analysis.coverage ? `Coverage: ${JSON.stringify(analysis.coverage)}` : undefined,
     analysis.stats ? `Stats: ${JSON.stringify(analysis.stats)}` : undefined,
+    analysis.sourceGeneration
+      ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}`
+      : undefined,
+    details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline"
-      ? "[Outline signatures are deferred; inspect item #N for version-checked source.]"
+      ? "[Outline names withheld; item locations and structure status are available.]"
       : undefined,
     ...analysis.reasons.map((reason) => `[${reason}]`),
     details.redactionApplied ? "[Display redaction applied.]" : undefined,
@@ -25,7 +31,6 @@ function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails):
 }
 
 function compactRows(analysis: AnalysisDetails): string[] {
-  const omitExcerpt = analysis.kind === "outline";
   const rows: string[] = [];
   let previousPath: string | undefined;
   for (const item of analysis.items) {
@@ -33,10 +38,7 @@ function compactRows(analysis: AnalysisDetails): string[] {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    const row = `#${String(item.index)} L${String(item.line)} ${item.label}`;
-    rows.push(
-      omitExcerpt || !item.excerpt ? row : `${row}\n  ${item.excerpt.replaceAll("\n", "\n  ")}`,
-    );
+    rows.push(`#${String(item.index)} L${String(item.line)} metadata`);
   }
   return rows;
 }
@@ -82,7 +84,9 @@ function distinctNextRequest(
 
 export function compactMcpModelText(result: SignalGrepResult): string {
   const analysis = result.details.analysis;
-  if (!analysis) return result.text;
+  // Validation is a source-state report, not a pageable syntax/result inventory.
+  // Its authoritative text retains freshness, comparison target and check interval.
+  if (!analysis || analysis.kind === "validate") return result.text;
   const header = compactHeader(result.details, analysis);
   const inspect = compactInspectInstruction(analysis);
   const nextRequest = distinctNextRequest(result.details, analysis);

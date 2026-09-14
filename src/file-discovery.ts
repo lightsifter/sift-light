@@ -38,10 +38,15 @@ export function scoreFilePath(path: string, query: string): FileScore | undefine
     return { score: 95, reason: "exact filename stem" };
   if (basename.includes(needle)) return { score: 85, reason: "filename substring" };
   if (normalized.includes(needle)) return { score: 70, reason: "path substring" };
-  const scores = needle
-    .trim()
-    .split(/\s+/)
-    .map((term) => subsequenceScore(normalized, term));
+  const terms = needle.trim().split(/\s+/);
+  // Several words describe path components, not independent fuzzy character
+  // walks through an arbitrarily long build-artifact path.
+  if (terms.length > 1) {
+    return terms.every((term) => normalized.includes(term))
+      ? { score: 60, reason: "all query words occur literally in the path" }
+      : undefined;
+  }
+  const scores = terms.map((term) => subsequenceScore(normalized, term));
   if (scores.some((score) => score === undefined)) return undefined;
   return {
     score: Math.min(...scores.map((score) => score ?? 0)),

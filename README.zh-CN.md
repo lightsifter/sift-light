@@ -26,7 +26,7 @@
 
 Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段落，不再固定抽取范围开头的一小部分。超过模型 token 窗口的段落会拆成带重叠、且保证不截断的窗口参与排名，后半段内容不会被静默丢弃。离线 embedding 按内容、模型版本和分段版本缓存在本地，缓存上限为 512 MiB；重复内容直接复用，内容变化自然失效，缓存写入或清理失败会在结果中明确显示。
 
-如果 Concept 推理失败或超时，hybrid 仍会返回已完成的精确字面结果，并把 `coverage.conceptCandidates` 标为 `skipped`，同时写明原因；不会丢掉已经算完的字面搜索。交互场景可用 `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` 限制 Concept 时限（整数毫秒，1000–3600000，默认 600000）。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`）会出现在结果里，便于在下一次请求前用 `path` 或 `glob` 收窄大库。空文件属于正常跳过，不会把结果标成 partial。
+Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: "waiting"` 或 `"running"`、`operationId`、进度和精确的 `nextRequest`，例如 `{ "mode": "await", "operationId": "..." }`。请原样复制这个请求：它会续接同一个计算，不会重启查询，也不会降级成只有字面的结果。最终结果可稳定复取十分钟；每个服务会话最多保留 32 个终态结果。`mode: "cancel"` 会停止自有任务并等待清理完成。每个服务会话最多同时接纳八个 pending operation；单个 operation 使用 `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` 指定一个总执行时限（整数毫秒，1000–3600000，默认 600000），另有 120 秒无人续接租期。真实模型、来源或资源故障会以明确失败返回。发布结果前会重新枚举并校验同一来源 generation；源文件变化会刷新 operation，混合版本不会被标成 complete。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`）会出现在结果里，便于在下一次请求前用 `path` 或 `glob` 收窄大库。空文件属于正常跳过，不会把结果标成 partial。
 
 ### 几个条件，可以一起交代
 
@@ -39,12 +39,23 @@ Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段�
 ### 看到了多少，说得清楚
 
 一页装不下的内容会分批展示，并提供继续查看的入口。原文发生变化时，也会提醒重新确认。像一位认真整理资料的助手，会把“已经看到的”和“还需要往后翻的”交代清楚。
+Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已返回的新查询，区分完整、部分和未完成结果，并报告未取消的失败调用。cursor 与 operation 续接不会重复计入新查询。
+
+### 先发现语言能力，再按需加载提供方
+
+使用 `mode: "capabilities"` 和项目根目录，可以获取紧凑的文件语言清单。JavaScript、TypeScript 和 TSX 支持 AST 结构、角色、outline、静态 imports 和关联测试候选；Go 支持 AST 结构和角色；Python 支持基于缩进的有界 outline。Swift 和其他语言仍可使用普通内容搜索、文件发现和源码 inspect。能力清单不会启动 parser 或 Concept 模型。
+
+2.1.0 移除语言服务导航：`definitions`、`references`、`implementations`、`callers`、`callees`、`dependencies`、`dependents`、`trace` 和 `impact`。这些模式会明确报错，不会以文本搜索伪装精确导航。插件不再启动 Pyright、SourceKit-LSP、gopls 或 TypeScript language service；TypeScript 仅作为开发期类型检查工具。
+
+### 校验已保存的源码证据
+
+使用 `mode: "validate"` 加普通搜索或 analysis 的 `cursor`，可以按需传入 `matchIndex` 选择单项证据。校验将已保留源码与当前工作区或固定 Git 对象比较，报告 `current`、`stale` 或 `unknown`，并保留原搜索的不完整覆盖状态。结构化信息位于 `details.validation` 和 `details.analysis.validation`；旧关系图字段和 trace cursor 不再支持。校验按需读取源码，不启动后台监听；它验证已保存证据，不证明搜索后没有新增匹配文件。
 
 ### 按文件时间缩小范围，也可以看代码结构
 
 工作区搜索支持用 Unix 毫秒时间戳传入 `modifiedAfter` 和 `modifiedBefore`。下界包含、上界不包含，因此可以准确表示一个时间窗口，不必改动搜索关键词。内容搜索和文件名搜索使用同一过滤条件；无法核验文件元数据时会明确报告证据不完整，不会静默当作命中。
 
-对文件路径使用 `mode: "outline"` 可以查看有边界的符号范围。JavaScript 和 TypeScript 使用语法提供方；Python 使用基于缩进的类、函数和方法 outline。Python 结果适合定位后续要看的范围，但不宣称编译器绑定、运行时调用关系或测试覆盖。`mode: "tests"` 目前只支持 JavaScript 和 TypeScript 的关联测试候选；对 Python 会明确返回 partial 不支持结果，应改用 `mode: "outline"`。
+对具体的 JS/TS/TSX 或 Python 文件使用 `mode: "outline"`，可以查看有界符号范围。JS/TS/TSX 使用 ast-grep，Python 使用基于缩进的类、函数和方法范围；它们不证明编译器绑定、运行时调用或测试覆盖。`mode: "tests"` 提供 JS/TS/TSX 关联测试候选，不支持的语言操作会明确报错。Swift 源码可使用普通搜索和 `inspect`。
 
 可读正文会保持精简；每项证据的范围、计数、覆盖状态和继续请求仍保留在结构化 `details` 中，客户端无需为了拿到这些字段再次搜索。
 
@@ -63,6 +74,7 @@ Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段�
 - “按这个 Unix 毫秒时间戳之后修改过的文件搜索。”
 - “这句话我可能记得不准确，把精确和语义证据一起找出来。”
 - “列出这个 Python 文件里的类和函数，再打开需要看的方法。”
+- “搜索这个函数名并查看相关源码；我修改文件后，再校验已保存的证据。”
 
 插件提供文件位置和实际文本，帮助 Agent 根据原文回答，也方便你回到资料中核对。
 
@@ -78,7 +90,7 @@ MCP 需要 Node.js 22.19+；Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun
 pi install npm:baoer_signal_grep
 ```
 
-安装或更新后重启 Pi。Pi 默认让常规搜索使用本插件，读取、编辑、测试、构建和脚本仍可使用。`enforceSearch` 支持 `"hard"`（默认严格拦截）、`"prefer"`（保留专用工具和模型指引，但不拒绝其他搜索）和 `"off"`；已有的 `true`、`false` 分别继续等价于 `"hard"`、`"off"`。请在 `~/.pi/agent/baoer_signal_grep.json` 中配置后重启；设置 `"locale": "zh-CN"` 可启用中文界面。
+安装或更新后重启 Pi。Pi 默认让常规搜索使用本插件，读取、编辑、测试、构建和脚本仍可使用。`enforceSearch` 支持 `"hard"`（默认严格拦截）、`"prefer"`（保留专用工具和模型指引，但不拒绝其他搜索）和 `"off"`；布尔值及未知配置字段会直接报错。请在 `~/.pi/agent/baoer_signal_grep.json` 中配置后重启；设置 `"locale": "zh-CN"` 可启用中文界面。
 
 ### OMP（Oh My Pi）
 
@@ -86,7 +98,7 @@ pi install npm:baoer_signal_grep
 omp install npm:baoer_signal_grep@latest
 ```
 
-安装或更新后重启 OMP。安装包声明了 OMP 原生扩展并注册 `baoer_signal_grep`。默认 hard 模式会从活动工具集中移除 OMP 内置的 `grep` 和 `glob`，并在执行前阻止直接搜索命令，同时保留读取、编辑、测试、构建和其他开发工具。prefer 模式会同时保留专用工具与其他搜索工具，加入模型指引，但不拒绝 shell 搜索。OMP 当前 profile 会被正确识别：默认配置文件是 `~/.omp/agent/baoer_signal_grep.json`，命名 profile 使用 `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`。在当前文件中将 `enforceSearch` 设置为 `"hard"`（默认）、`"prefer"` 或 `"off"` 后重启 OMP；已有的 `true`、`false` 继续兼容。设置 `"locale": "zh-CN"` 可启用中文界面。
+安装或更新后重启 OMP。安装包声明了 OMP 原生扩展并注册 `baoer_signal_grep`。默认 hard 模式会从活动工具集中移除 OMP 内置的 `grep` 和 `glob`，并在执行前阻止直接搜索命令，同时保留读取、编辑、测试、构建和其他开发工具。prefer 模式会同时保留专用工具与其他搜索工具，加入模型指引，但不拒绝 shell 搜索。OMP 当前 profile 会被正确识别：默认配置文件是 `~/.omp/agent/baoer_signal_grep.json`，命名 profile 使用 `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`。在当前文件中将 `enforceSearch` 设置为 `"hard"`（默认）、`"prefer"` 或 `"off"` 后重启 OMP；布尔值及未知配置字段会直接报错。设置 `"locale": "zh-CN"` 可启用中文界面。
 
 ### Claude Code 或 Codex：连接 MCP
 
@@ -121,3 +133,9 @@ Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相
 本地搜索在你的机器上进行。请只允许 Agent 读取已获授权的文件。HTTP 服务对外开放前需要认证网关，详见[安全说明](SECURITY.md)。
 
 [更新记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [AGPL-3.0-only 许可证](LICENSE)
+
+### 2.1.0 搜索结果边界
+
+`files` 多词查询要求每个词都在路径中按字面出现；单个缩写仍支持模糊匹配。业务意图使用 `hybrid` 或 `concept`。普通内容搜索保留零匹配后扩大范围的既有默认；需要限定目录时传 `scope: "strict"`。范围扩大的提示会先于证据显示。
+
+完整快照表示匹配保留完整，不代表源码正文没有截断。长行摘录会明确标记限制，并给出最后一页之后仍可执行的 `inspectRequest`。需要更多结果时沿游标继续，不要仅为翻页而修改 limit 重搜。

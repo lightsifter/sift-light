@@ -12,6 +12,15 @@ export interface PendingConceptEmbedding {
   text: string;
 }
 
+export interface ConceptEmbeddingCallbacks {
+  onBatch?: (completed: number, total: number) => void;
+  onCompletedEmbedding?: (
+    embedding: CachedConceptEmbedding,
+    completed: number,
+    total: number,
+  ) => void | Promise<void>;
+}
+
 const INFERENCE_BATCH_SIZE = 16;
 
 /** Snap a candidate UTF-16 index so it never splits a surrogate pair. */
@@ -129,10 +138,18 @@ export function tokenSafeWindows(
 export async function embedConceptInputs(
   extractor: FeatureExtractionPipeline,
   pending: readonly PendingConceptEmbedding[],
+  callbacks: ConceptEmbeddingCallbacks = {},
 ): Promise<CachedConceptEmbedding[]> {
   const layouts = pending.map((item) => tokenSafeWindows(extractor, item));
   const inputs = layouts.flatMap((windows) => windows.map((window) => window.input));
   const vectors: number[][] = [];
+  const layoutEnds: number[] = [];
+  let layoutEnd = 0;
+  for (const windows of layouts) {
+    layoutEnd += windows.length;
+    layoutEnds.push(layoutEnd);
+  }
+  let completedEmbedding = 0;
   for (let offset = 0; offset < inputs.length; offset += INFERENCE_BATCH_SIZE) {
     const batch = inputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
     // oxlint-disable-next-line no-await-in-loop -- bounded batches cap native tensor memory.
@@ -145,6 +162,30 @@ export async function embedConceptInputs(
         Array.from(tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS), Number),
       );
     }
+    const completedWindows = Math.min(offset + batch.length, inputs.length);
+    while (
+      layoutEnds[completedEmbedding] !== undefined &&
+      layoutEnds[completedEmbedding]! <= completedWindows
+    ) {
+      const start = completedEmbedding === 0 ? 0 : layoutEnds[completedEmbedding - 1]!;
+      const item = pending[completedEmbedding];
+      if (!item) throw new Error("Missing completed concept embedding input");
+      // oxlint-disable-next-line no-await-in-loop -- cache writes must complete at each embedding boundary.
+      await callbacks.onCompletedEmbedding?.(
+        {
+          key: item.key,
+          windows: (layouts[completedEmbedding] ?? []).map((window, index) => ({
+            start: window.start,
+            end: window.end,
+            vector: vectors[start + index] ?? [],
+          })),
+        },
+        completedEmbedding + 1,
+        pending.length,
+      );
+      completedEmbedding += 1;
+    }
+    callbacks.onBatch?.(completedWindows, inputs.length);
   }
   let vectorIndex = 0;
   return pending.map((item, index) => ({

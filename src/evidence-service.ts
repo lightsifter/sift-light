@@ -1,15 +1,16 @@
-import { bindImpactCandidates } from "./impact-bindings.js";
-import { fileDiscoveryQueryHint } from "./discovery-errors.js";
-import { conceptSearch, type ConceptSearchRunner, validateConceptQuery } from "./concept-search.js";
+import {
+  conceptSearch,
+  type ConceptSearchExecution,
+  type ConceptSearchRunner,
+  validateConceptQuery,
+} from "./concept-search.js";
 import { structuralSearch } from "./structural-search.js";
-import { isSemanticMode } from "./semantic-protocol.js";
-import { navigateSemantics } from "./semantic-navigation.js";
-import { dirname, resolve } from "node:path";
+import { dirname, extname, resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
-import type { AnalysisItem, AnalysisResultSet, CoverageStatus } from "./analysis-types.js";
+import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
 import { abortError, CursorError, SignalGrepError } from "./errors.js";
 import { findGitRepository } from "./git-repository.js";
-import { isPathInsideCwd } from "./path-policy.js";
+import { isPathInsideCwd, isPathInsideRoot } from "./path-policy.js";
 import { resolveInspectionTarget } from "./inspect.js";
 import {
   collectEvidenceCandidates,
@@ -19,14 +20,6 @@ import {
 import { listWorkspaceFiles, workspaceRelativePath } from "./workspace-files.js";
 import { navigateImports } from "./import-navigation.js";
 import { findRelatedTests, isLikelyTestPath, TEST_DISCOVERY_PATTERN } from "./test-navigation.js";
-import { selectImpactTarget } from "./impact-target.js";
-import {
-  classifyImpactOccurrences,
-  impactRetentionExhausted,
-  impactRetentionPriority,
-  mergeImpactItems,
-  retainedImpactCounts,
-} from "./impact-analysis.js";
 import { escapeRegexLiteral, literalOccurrences } from "./literal-search.js";
 import {
   expandMultiTermCandidates,
@@ -45,15 +38,27 @@ import { type ByteRange, type SourceDocument, type SourceReference } from "./sou
 import {
   continueSource,
   inspectDocuments,
-  legacySourceTarget,
+  matchInspectionTarget,
+  inspectDocumentsMetadata,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
+import { validateSavedEvidence } from "./evidence-validation.js";
 import { sameSourceRevision } from "./source.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { filterRoleOccurrences, findFunctionConjunctions } from "./syntax-search.js";
 import { syntaxLanguage } from "./syntax.js";
 import { parsePythonOutline } from "./python-outline.js";
-import { combineHybridSearch, hybridConceptLimit, retainedHybridCounts } from "./hybrid-search.js";
+import {
+  combineHybridSearch,
+  hybridConceptLimit,
+  retainedHybridCounts,
+  sameHybridLiteralScan,
+  HybridSourceChangedError,
+} from "./hybrid-search.js";
+import { validationResult } from "./validation-output.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
+import { outlineCapabilityError } from "./request-contract.js";
+import { realpath } from "node:fs/promises";
 import {
   MAX_ANY_OF_TERMS,
   MAX_CONFIGURABLE_STRUCTURE_FILES,
@@ -68,7 +73,6 @@ import {
 
 export function isEvidenceRequest(input: SignalGrepInput): boolean {
   return (
-    isSemanticMode(input.mode) ||
     input.mode === "concept" ||
     input.mode === "hybrid" ||
     input.mode === "structure" ||
@@ -77,7 +81,7 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
     input.mode === "outline" ||
     input.mode === "imports" ||
     input.mode === "tests" ||
-    input.mode === "impact" ||
+    input.mode === "validate" ||
     input.sourceCursor !== undefined ||
     input.anyOf !== undefined ||
     input.allOf !== undefined ||
@@ -90,48 +94,9 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
   );
 }
 
-function rejectFields(
-  input: SignalGrepInput,
-  fields: (keyof SignalGrepInput)[],
-  operation: string,
-  cursor = false,
-  repair = "copy the complete returned request unchanged",
-): void {
-  const present = fields.filter((field) => input[field] !== undefined);
-  const message = `${operation} does not accept ${present.join(", ")}. Remove only those fields, then retry once: ${repair}. Keep the requested mode and remaining filters unchanged; do not include this error text in the retry.`;
-  if (present.length)
-    throw cursor
-      ? new CursorError(message, "E_CURSOR_OPTIONS_CONFLICT")
-      : new SignalGrepError(message);
+export interface EvidenceSearchOptions {
+  onProgress?: (progress: OperationProgress) => void;
 }
-const searchFields = [
-  "query",
-  "scope",
-  "wholeWord",
-  "pattern",
-  "anyOf",
-  "allOf",
-  "within",
-  "roles",
-  "changes",
-  "glob",
-  "exclude",
-  "literal",
-  "ignoreCase",
-  "hidden",
-  "context",
-  "limit",
-  "modifiedAfter",
-  "modifiedBefore",
-  "conceptLimit",
-] satisfies (keyof SignalGrepInput)[];
-const navigationFilterFields = new Set<keyof SignalGrepInput>(["glob", "exclude", "hidden"]);
-const inspectFields = [
-  "paths",
-  "matchIndices",
-  "targets",
-  "sourceCursor",
-] satisfies (keyof SignalGrepInput)[];
 
 function maxFilesToParse(value: number | undefined): number {
   const candidate = value ?? MAX_STRUCTURE_FILES;
@@ -251,22 +216,46 @@ function navigationFilters(input: SignalGrepInput): NavigationFilters {
   return { glob: request.glob, exclude: request.exclude, hidden: request.hidden };
 }
 
-function navigationScope(
+async function navigationScope(
   cwd: string,
   root: string,
   requestedPath: string,
   filters: NavigationFilters,
-): SearchScopeDetails {
-  const projectRoot = resolve(cwd);
+): Promise<SearchScopeDetails> {
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath(resolve(cwd)).catch(() => resolve(cwd)),
+    realpath(root).catch(() => resolve(root)),
+  ]);
+  const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
-    path: root === projectRoot ? "." : root,
+    path: isProjectRoot ? "." : canonicalRoot,
     requestedPath,
     glob: [...filters.glob],
     exclude: [...filters.exclude],
     hidden: filters.hidden,
     expandedToProjectRoot: false,
-    assertion: root === projectRoot ? "project-wide" : "requested-scope",
+    assertion: isProjectRoot ? "project-wide" : "requested-scope",
   };
+}
+
+async function canonicalNavigationPath(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
+
+async function canonicalNavigationFiles(
+  cwd: string,
+  root: string,
+  files: { paths: readonly string[] },
+  primaryPath: string,
+): Promise<{ allowed: ReadonlySet<string>; primaryPath: string }> {
+  const canonicalRoot = await canonicalNavigationPath(root);
+  const [enumerated, canonicalPrimary] = await Promise.all([
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve(cwd, file)))),
+    canonicalNavigationPath(resolve(cwd, primaryPath)),
+  ]);
+  const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
+  if (isPathInsideRoot(canonicalPrimary, canonicalRoot)) allowed.add(canonicalPrimary);
+  return { allowed, primaryPath: canonicalPrimary };
 }
 
 export class EvidenceService {
@@ -296,6 +285,32 @@ export class EvidenceService {
   async shutdown(): Promise<void> {
     this.clear();
     await this.#queue.shutdown();
+  }
+
+  async #validateSavedEvidence(
+    input: SignalGrepInput,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<SignalGrepResult> {
+    const cursor = input.cursor;
+    if (!cursor) throw new SignalGrepError("A saved evidence cursor is required");
+    const startedAt = Date.now();
+    const validated = await validateSavedEvidence({
+      cursor,
+      cwd,
+      ...(signal ? { signal } : {}),
+      ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
+      analyses: this.#analyses,
+      snapshots: this.#snapshots,
+      queue: this.#queue,
+      maxFiles: MAX_STRUCTURE_FILES,
+    });
+    const finishedAt = Date.now();
+    return validationResult(validated, cursor, {
+      start: startedAt,
+      end: finishedAt,
+      ...(input.matchIndex !== undefined ? { selected: input.matchIndex } : {}),
+    });
   }
 
   async #testEntryPaths(
@@ -355,6 +370,7 @@ export class EvidenceService {
     input: SignalGrepInput,
     cwd: string,
     signal?: AbortSignal,
+    options: EvidenceSearchOptions = {},
   ): Promise<SignalGrepResult> {
     if (signal?.aborted) throw abortError();
     if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
@@ -364,81 +380,24 @@ export class EvidenceService {
     const analysisStarted = performance.now();
     const fileLimit = maxFilesToParse(input.maxFilesToParse);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-    if (isSemanticMode(input.mode)) {
-      rejectFields(
-        input,
-        [...searchFields, ...inspectFields, "cursor", "matchIndex"],
-        `mode=${input.mode}`,
-      );
-      return this.#analyses.page(this.#analyses.create(await navigateSemantics(input, access)));
-    }
-    if (input.column !== undefined)
-      throw new SignalGrepError("column requires semantic navigation");
+    if (input.mode === "validate") return this.#validateSavedEvidence(input, cwd, signal);
     if (input.sourceCursor !== undefined) {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect") throw new SignalGrepError("sourceCursor requires mode=inspect");
-      rejectFields(
-        input,
-        [
-          ...searchFields,
-          "cursor",
-          "path",
-          "paths",
-          "line",
-          "matchIndex",
-          "matchIndices",
-          "targets",
-          "symbol",
-          "maxFilesToParse",
-        ],
-        "Source continuation",
-        true,
-      );
       return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
-      rejectFields(input, [...searchFields, "paths", "symbol", "maxFilesToParse"], "mode=inspect");
       const targets = this.#inspectionTargets(input, cwd);
-      return inspectDocuments(targets, access, this.#continuations, this.#structure);
+      return targets.some((target) => target.range !== undefined)
+        ? inspectDocumentsMetadata(targets, access, this.#structure)
+        : inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["query", "glob", "exclude", "hidden"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-        ],
-        "mode=concept",
-        false,
-        "use only mode, query, path, glob, exclude, hidden and redact",
-      );
-      return this.#analyses.page(this.#analyses.create(await this.#conceptSearch(input, access)));
+      const execution = await this.#conceptSearch(input, access, options.onProgress);
+      return this.#analyses.page(this.#analyses.create(execution.analysis));
     }
     if (input.mode === "hybrid") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["query", "glob", "exclude", "hidden", "conceptLimit"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-          "maxFilesToParse",
-        ],
-        "mode=hybrid",
-        false,
-        "use only mode, query, path, glob, exclude, hidden, conceptLimit and redact",
-      );
       const query = validateConceptQuery(input.query);
       const limit = hybridConceptLimit(input.conceptLimit);
       const literalRequest = normalizeRequest({
@@ -452,9 +411,10 @@ export class EvidenceService {
         redact: input.redact ?? false,
       });
       let literalResult: Awaited<ReturnType<RipgrepRunner>> | undefined;
-      let conceptResult: AnalysisResultSet | undefined;
+      let conceptResult: ConceptSearchExecution | undefined;
       let conceptAccess: SourceAccess | undefined;
       let conceptFailure: unknown;
+      options.onProgress?.({ phase: "literal-search" });
       await runOwnedParallel<void>((groupSignal) => {
         conceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
         return [
@@ -463,7 +423,7 @@ export class EvidenceService {
             return undefined;
           }),
           // Semantic failure must not cancel an in-flight literal search owned by the same group.
-          this.#conceptSearch(input, conceptAccess)
+          this.#conceptSearch(input, conceptAccess, options.onProgress)
             .then((result) => {
               conceptResult = result;
               return undefined;
@@ -478,21 +438,23 @@ export class EvidenceService {
       if (!literalResult || !conceptAccess)
         throw new Error("Hybrid search did not settle its owned literal operation");
       if (!conceptResult) {
-        const message =
-          conceptFailure instanceof Error
-            ? conceptFailure.message
-            : "concept search failed without a diagnostic";
-        conceptResult = {
-          kind: "concept",
-          unit: "evidence-items",
-          items: [],
-          partial: true,
-          reasons: [`Semantic candidates unavailable: ${message}`],
-          coverage: { conceptCandidates: "skipped" },
-        };
+        if (conceptFailure instanceof Error) throw conceptFailure;
+        throw new SignalGrepError("Concept search failed without a diagnostic");
+      }
+      const firstLiteralResult = literalResult;
+      const verifiedLiteralResult = await this.#runner(literalRequest, cwd, signal);
+      if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
+        throw new HybridSourceChangedError(
+          "Literal source evidence changed while concept evidence was being computed",
+        );
       }
       const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-      const hybrid = await combineHybridSearch(literalResult, conceptResult, literalAccess, limit);
+      const hybrid = await combineHybridSearch(
+        verifiedLiteralResult,
+        conceptResult,
+        literalAccess,
+        limit,
+      );
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items),
@@ -500,69 +462,13 @@ export class EvidenceService {
       return this.#analyses.page(cursor);
     }
     if (input.mode === "structure") {
-      rejectFields(
-        input,
-        [
-          ...searchFields.filter(
-            (field) => !["pattern", "glob", "exclude", "hidden"].includes(field),
-          ),
-          ...inspectFields,
-          "cursor",
-          "line",
-          "symbol",
-          "matchIndex",
-        ],
-        "mode=structure",
-      );
       return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
     }
     if (input.mode === "files") {
-      rejectFields(
-        input,
-        [
-          "pattern",
-          "cursor",
-          "line",
-          "matchIndex",
-          "symbol",
-          "maxFilesToParse",
-          "wholeWord",
-          "scope",
-          "literal",
-          "ignoreCase",
-          "context",
-          "limit",
-          "anyOf",
-          "allOf",
-          "within",
-          "roles",
-          "changes",
-          "conceptLimit",
-          ...inspectFields,
-        ],
-        "mode=files",
-        false,
-        fileDiscoveryQueryHint(input.query ?? input.pattern),
-      );
       return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
     }
-    if (input.mode === "impact") return this.#impact(input, access);
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
-      rejectFields(
-        input,
-        [
-          ...searchFields,
-          ...inspectFields,
-          "path",
-          "line",
-          "matchIndex",
-          "symbol",
-          "maxFilesToParse",
-        ],
-        "Analysis continuation",
-        true,
-      );
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError(
           "Analysis cursor cannot continue in the requested mode",
@@ -572,13 +478,6 @@ export class EvidenceService {
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access);
-    rejectFields(
-      input,
-      [...inspectFields, "query", "line", "matchIndex", "symbol", "cursor", "conceptLimit"],
-      "Evidence search",
-      false,
-      "a new search accepts one path; split multiple paths into separate requests without widening their scope",
-    );
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (
@@ -836,7 +735,10 @@ export class EvidenceService {
     if (input.targets !== undefined && input.matchIndices !== undefined)
       throw new SignalGrepError("Use targets or matchIndices, not both");
     if (input.targets !== undefined || input.matchIndices !== undefined) {
-      rejectFields(input, ["path", "line", "matchIndex"], "Batch inspection");
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
+        throw new SignalGrepError(
+          "Batch inspection accepts targets or matchIndices instead of path, line or matchIndex",
+        );
       const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
       if (size < 1 || size > MAX_INSPECT_TARGETS)
         throw new SignalGrepError("Batch inspection requires 1-5 targets");
@@ -844,7 +746,7 @@ export class EvidenceService {
         if (input.cursor !== undefined)
           throw new SignalGrepError("targets cannot be combined with cursor");
         return input.targets.map((target) =>
-          legacySourceTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
+          matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
         );
       }
       if (!input.cursor) throw new SignalGrepError("matchIndices requires a cursor");
@@ -862,219 +764,22 @@ export class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const isStructural =
-        item.details?.kind === "symbol" ||
-        item.details?.kind === "function" ||
-        item.details?.kind === "impact-target";
+      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
-        ...(isStructural ? { range: item.range } : { absoluteFocus: item.range.start }),
+        ...(metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }),
       };
     }
     return {
-      ...legacySourceTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
+      ...matchInspectionTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
       ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
     };
   }
 
-  async #impact(input: SignalGrepInput, access: SourceAccess): Promise<SignalGrepResult> {
-    const impactStarted = performance.now();
-    rejectFields(
-      input,
-      [...searchFields.filter((field) => !navigationFilterFields.has(field)), ...inspectFields],
-      "mode=impact",
-    );
-    const filters = navigationFilters(input);
-    let path: string;
-    let line = input.line;
-    let document: SourceDocument;
-    if (input.cursor !== undefined) {
-      if (input.cursor.includes(".analysis."))
-        throw new CursorError(
-          "Impact requires an ordinary search snapshot, not an analysis cursor",
-        );
-      if (
-        input.matchIndex === undefined ||
-        input.path !== undefined ||
-        input.line !== undefined ||
-        input.symbol !== undefined
-      )
-        throw new SignalGrepError(
-          "Snapshot impact requires cursor+matchIndex instead of path, line, or symbol",
-        );
-      const selected = resolveInspectionTarget(input, access.cwd, this.#snapshots);
-      if (selected.unverified)
-        throw new SignalGrepError("Snapshot source revision is unverified; refresh the search");
-      path = selected.path;
-      line = selected.line;
-      document = await access.load(path);
-      if (
-        selected.expectedRevision &&
-        (document.reference.origin.kind !== "worktree" ||
-          !sameSourceRevision(selected.expectedRevision, document.reference.origin.revision))
-      )
-        throw new SignalGrepError("Source changed; refresh the search");
-    } else {
-      if (input.matchIndex !== undefined)
-        throw new SignalGrepError("matchIndex requires an ordinary search cursor");
-      if (!input.path || (input.line === undefined && input.symbol === undefined))
-        throw new SignalGrepError("Direct impact requires path and at least one of symbol or line");
-      path = input.path;
-      document = await access.load(path);
-    }
-    if (document.reference.origin.kind !== "worktree")
-      throw new SignalGrepError("Impact currently supports worktree sources only");
-    const root = await navigationRoot(access.cwd, document.path, access.signal);
-
-    const targetSyntax = await access.syntax(document);
-    let target;
-    try {
-      target = selectImpactTarget(document, targetSyntax, {
-        ...(line !== undefined ? { line } : {}),
-        ...(input.symbol !== undefined ? { symbol: input.symbol } : {}),
-      });
-    } finally {
-      access.releaseSyntax(document);
-    }
-
-    const request = normalizeRequest({
-      pattern: target.symbol.name,
-      path: root,
-      glob: filters.glob,
-      exclude: filters.exclude,
-      hidden: filters.hidden,
-      literal: true,
-      ignoreCase: false,
-    });
-    const candidates = await collectEvidenceCandidates({
-      request,
-      cwd: access.cwd,
-      ...(access.signal ? { signal: access.signal } : {}),
-      access,
-      runRipgrep: this.#runner,
-      maxFiles: access.maxFiles,
-    });
-    const occurrences = await classifyImpactOccurrences(candidates.files, target, access);
-    const bound = await bindImpactCandidates(target, candidates.files, occurrences.items, access);
-    occurrences.items = bound.items;
-    const reasons = new Set([...candidates.reasons, ...occurrences.reasons]);
-    let partial = candidates.partial || occurrences.partial;
-    let testItems: AnalysisItem[] = [];
-    let testStats: AnalysisResultSet["stats"];
-    let relatedTestsCoverage: CoverageStatus = "skipped";
-    const retainedBeforeTests = [target.item, ...occurrences.items];
-    if (!target.symbol.hasBody) {
-      reasons.add("Related-test augmentation skipped: selected target has no implementation body");
-    } else if (impactRetentionExhausted(retainedBeforeTests)) {
-      partial = true;
-      reasons.add(
-        "Related-test augmentation skipped: exact occurrences exhausted the shared analysis budget",
-      );
-    } else {
-      const files = await listWorkspaceFiles(access.cwd, access.signal, {
-        path: root,
-        glob: filters.glob,
-        exclude: filters.exclude,
-        hidden: filters.hidden,
-      });
-      const allowed = new Set(files.paths.map((file) => resolve(access.cwd, file)));
-      const primaryPath = resolve(access.cwd, document.path);
-      allowed.add(primaryPath);
-      const host = {
-        cwd: access.cwd,
-        ...(access.signal ? { signal: access.signal } : {}),
-        normalizePath: (file: string) => workspaceRelativePath(access.cwd, file),
-        load: async (file: string, expected?: SourceReference) => {
-          const absolutePath = resolve(access.cwd, file);
-          if (!allowed.has(absolutePath))
-            throw new SignalGrepError("Navigation source is excluded by current ignore rules");
-          if (absolutePath === primaryPath && expected === undefined) return document;
-          return expected ? access.refresh(file, expected) : access.load(file);
-        },
-        syntax: (source: SourceDocument) => access.syntax(source),
-        releaseSyntax: (source: SourceDocument) => access.releaseSyntax(source),
-        listFiles: async () => files,
-        maxFilesToParse: access.maxFiles,
-      };
-      const entryPaths = await this.#testEntryPaths(
-        root,
-        files.paths,
-        access.cwd,
-        filters,
-        access.signal,
-      );
-      const tests = await findRelatedTests(
-        host,
-        {
-          path: document.path,
-          line: target.item.line,
-          symbol: target.symbol.name,
-        },
-        { entryPaths },
-      );
-      testItems = tests.items;
-      testStats = {
-        filesEnumerated: files.paths.length,
-        ...tests.stats,
-        filesParsed: access.syntaxParses,
-        cacheHits: access.syntaxCacheHits,
-      };
-      relatedTestsCoverage = tests.partial || files.partial ? "partial" : "complete";
-      partial ||= tests.partial || files.partial;
-      for (const reason of [...tests.reasons, ...files.reasons]) reasons.add(reason);
-    }
-    const result: AnalysisResultSet = {
-      kind: "impact",
-      unit: "impact-candidates",
-      items: mergeImpactItems(target.item, occurrences.items, testItems),
-      partial,
-      reasons: [...reasons],
-      filesRead: access.filesRead,
-      bytesRead: access.bytesRead,
-      stats: {
-        ...testStats,
-        filesParsed: access.syntaxParses,
-        cacheHits: access.syntaxCacheHits,
-        parseMs: testStats?.parseMs ?? Math.round(performance.now() - impactStarted),
-        budgetExhausted:
-          testStats?.budgetExhausted ??
-          [...reasons].some(
-            (reason) => reason.includes("limit") || reason.includes("budget-exhausted"),
-          ),
-      },
-      coverage: {
-        compilerCandidateBindings: candidates.partial ? "partial" : "complete",
-        exactOccurrences: candidates.partial ? "partial" : "complete",
-        syntaxClassification: occurrences.partial ? "partial" : "complete",
-        relatedTests: relatedTestsCoverage,
-      },
-      scope: navigationScope(access.cwd, root, document.path, filters),
-      redact: input.redact ?? false,
-    };
-    return this.#analyses.page(
-      this.#analyses.create(
-        result,
-        (items) => retainedImpactCounts(items),
-        impactRetentionPriority,
-      ),
-    );
-  }
-
   async #navigate(input: SignalGrepInput, access: SourceAccess): Promise<SignalGrepResult> {
     const navigationStarted = performance.now();
-    const allowsFilters = input.mode === "imports" || input.mode === "tests";
-    rejectFields(
-      input,
-      [
-        ...(allowsFilters
-          ? searchFields.filter((field) => !navigationFilterFields.has(field))
-          : searchFields),
-        ...inspectFields,
-      ],
-      `mode=${input.mode}`,
-    );
     let path = input.path;
     let reference: SourceReference | undefined;
     let line = input.line;
@@ -1106,9 +811,18 @@ export class EvidenceService {
     const document = loaded ?? (await access.load(path, reference));
     const language = syntaxLanguage(document.path);
     const isPython = /\.py$/iu.test(document.path);
+    if (input.mode === "outline") {
+      const capabilityFailure = outlineCapabilityError(document.path, "outline", true);
+      if (capabilityFailure) throw capabilityFailure;
+      if (!language && !isPython)
+        throw new SignalGrepError(
+          `No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`,
+        );
+    }
     if ((!language && !isPython) || language === "go") {
+      const extension = extname(document.path) || "extensionless source";
       throw new SignalGrepError(
-        `${input.mode} requires reliable JS/TS/TSX or Python outline syntax (${language ?? "unsupported"})`,
+        `${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`,
       );
     }
     if (input.mode === "outline") {
@@ -1195,7 +909,7 @@ export class EvidenceService {
       return this.#analyses.page(
         this.#analyses.create({
           kind: input.mode === "imports" ? "imports" : "tests",
-          unit: input.mode === "imports" ? "relationships" : "evidence-items",
+          unit: "evidence-items",
           items: [],
           partial: true,
           reasons: [
@@ -1226,7 +940,7 @@ export class EvidenceService {
             budgetExhausted: false,
           },
           coverage: { navigation: "not-applicable" },
-          scope: navigationScope(access.cwd, root, document.path, filters),
+          scope: await navigationScope(access.cwd, root, document.path, filters),
           redact: input.redact ?? false,
         }),
       );
@@ -1236,15 +950,18 @@ export class EvidenceService {
       exclude: filters.exclude,
       hidden: filters.hidden,
     });
-    const allowed = new Set(files.paths.map((file) => resolve(access.cwd, file)));
-    const primaryPath = resolve(access.cwd, document.path);
-    allowed.add(primaryPath);
+    const { allowed, primaryPath } = await canonicalNavigationFiles(
+      access.cwd,
+      root,
+      files,
+      document.path,
+    );
     const host = {
       cwd: access.cwd,
       ...(access.signal ? { signal: access.signal } : {}),
       normalizePath: (file: string) => workspaceRelativePath(access.cwd, file),
       load: async (file: string, expected?: SourceReference) => {
-        const absolutePath = resolve(access.cwd, file);
+        const absolutePath = await canonicalNavigationPath(resolve(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SignalGrepError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined) return document;
@@ -1278,7 +995,7 @@ export class EvidenceService {
         partial: result.partial || files.partial,
         reasons: [...result.reasons, ...files.reasons],
         kind: input.mode === "imports" ? "imports" : "tests",
-        unit: input.mode === "imports" ? "relationships" : "evidence-items",
+        unit: "evidence-items",
         coverage: {
           navigation: result.partial || files.partial ? "partial" : "complete",
         },
@@ -1288,7 +1005,7 @@ export class EvidenceService {
           filesParsed: access.syntaxParses,
           cacheHits: access.syntaxCacheHits,
         },
-        scope: navigationScope(access.cwd, root, document.path, filters),
+        scope: await navigationScope(access.cwd, root, document.path, filters),
         redact: input.redact ?? false,
       }),
     );

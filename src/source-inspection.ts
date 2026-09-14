@@ -30,7 +30,7 @@ export interface SourceInspectionTarget {
   matchIndex?: number;
   reference?: SourceReference;
   range?: ByteRange;
-  /** Raw source byte offset; legacy retained-match focus is line-relative. */
+  /** Raw source byte offset; retained-match focus is line-relative. */
   absoluteFocus?: number;
   focus?: number;
   expectedRevision?: SourceRevision;
@@ -61,7 +61,13 @@ function usesDocumentLineWindow(path: string): boolean {
   return /\.(?:md|markdown)$/iu.test(path);
 }
 
-export function legacySourceTarget(target: InspectionTarget): SourceInspectionTarget {
+function hasBareCarriageReturn(bytes: Uint8Array): boolean {
+  for (let index = 0; index < bytes.length; index += 1)
+    if (bytes[index] === 13 && bytes[index + 1] !== 10) return true;
+  return false;
+}
+
+export function matchInspectionTarget(target: InspectionTarget): SourceInspectionTarget {
   return {
     path: target.path,
     line: target.line,
@@ -298,8 +304,8 @@ function render(items: InspectBatchItemDetails[], blocks: SourceBlock[], single:
   });
   return [
     single
-      ? "Source inspection"
-      : `Batch inspection: ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
+      ? "Source inspection (Inspection metadata)"
+      : `Batch inspection (Inspection metadata): ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
     ...rows,
     ...sourceRows,
   ].join("\n\n");
@@ -325,6 +331,119 @@ function fallbackContinuationRange(
   );
 }
 
+function metadataStructure(details: StructureDetails): StructureDetails {
+  return {
+    status: details.status,
+    ...(details.provider ? { provider: details.provider } : {}),
+    ...(details.language ? { language: details.language } : {}),
+    ...(details.range ? { range: details.range } : {}),
+  };
+}
+
+async function sourceDocumentIsCurrent(
+  document: SourceDocument,
+  access: SourceAccess,
+): Promise<boolean> {
+  if (document.reference.origin.kind !== "worktree") return true;
+  const current = await getSourceRevision(resolve(access.cwd, document.path));
+  return current !== undefined && sameSourceRevision(current, document.reference.origin.revision);
+}
+
+/** Inspects and verifies targets while exposing only location and parser metadata. */
+export async function inspectDocumentsMetadata(
+  targets: SourceInspectionTarget[],
+  access: SourceAccess,
+  structure?: CodeStructureProvider,
+): Promise<SignalGrepResult> {
+  const items: InspectBatchItemDetails[] = [];
+  const paths = new Set<string>();
+  const preparedTargets: Array<{ itemIndex: number; document: SourceDocument }> = [];
+  for (const [index, target] of targets.entries()) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- targets share one bounded source/parse context.
+      const prepared = await prepare(target, access, structure);
+      paths.add(prepared.document.path);
+      preparedTargets.push({ itemIndex: items.length, document: prepared.document });
+      items.push({
+        inputIndex: index + 1,
+        path: target.path,
+        line: target.line,
+        status: "returned",
+        ...(target.matchIndex !== undefined ? { matchIndex: target.matchIndex } : {}),
+        structure: metadataStructure(prepared.structure),
+      });
+    } catch (error) {
+      if (access.signal?.aborted || (error instanceof Error && error.name === "AbortError"))
+        throw abortError();
+      const status = errorStatus(error);
+      if (!status) throw error;
+      items.push({
+        inputIndex: index + 1,
+        path: target.path,
+        line: target.line,
+        status: "error",
+        structure: { status },
+        error: error instanceof Error ? error.message : `inspection unavailable (${status})`,
+      });
+    }
+  }
+  const preparedByPath = new Map<string, Array<{ itemIndex: number; document: SourceDocument }>>();
+  for (const prepared of preparedTargets) {
+    const entries = preparedByPath.get(prepared.document.path) ?? [];
+    entries.push(prepared);
+    preparedByPath.set(prepared.document.path, entries);
+  }
+  for (const entries of preparedByPath.values()) {
+    const first = entries[0];
+    if (!first) continue;
+    const firstOrigin = first.document.reference.origin;
+    const revisionsDiffer =
+      firstOrigin.kind === "worktree" &&
+      entries.some(({ document }) => {
+        const origin = document.reference.origin;
+        return (
+          origin.kind !== "worktree" || !sameSourceRevision(origin.revision, firstOrigin.revision)
+        );
+      });
+    // oxlint-disable-next-line no-await-in-loop -- each distinct source path is revalidated after its targets are prepared.
+    const changed = revisionsDiffer || !(await sourceDocumentIsCurrent(first.document, access));
+    if (!changed) continue;
+    for (const { itemIndex } of entries) {
+      const item = items[itemIndex];
+      if (!item) continue;
+      item.status = "error";
+      item.structure = { status: "source-changed" };
+      item.error = "Source changed during inspection; refresh the source";
+    }
+  }
+  const complete = items.every((item) => item.status === "returned");
+  const lines = [
+    `Inspection metadata (${complete ? "complete" : "PARTIAL"}; ${String(targets.length)} target(s); ${String(paths.size)} file(s)).`,
+    ...items.map(
+      (item) =>
+        `#${String(item.inputIndex)} ${item.path ?? "[unknown path]"}:${String(item.line ?? "?")} — ${item.status}${item.structure?.status ? `; structure=${item.structure.status}` : ""}${item.structure?.language ? `; language=${item.structure.language}` : ""}${item.error ? `; ${item.error}` : ""}`,
+    ),
+  ];
+  const first = items[0];
+  return {
+    text: lines.join("\n\n"),
+    details: {
+      version: 1,
+      mode: "inspect",
+      status: complete ? "complete" : "partial",
+      snapshotComplete: complete,
+      totalMatches: 0,
+      storedMatches: 0,
+      returnedMatches: 0,
+      totalFiles: paths.size,
+      inspections: items,
+      ...(targets.length === 1 && first?.structure
+        ? { structure: metadataStructure(first.structure) }
+        : {}),
+    },
+  };
+}
+
 export async function inspectDocuments(
   targets: SourceInspectionTarget[],
   access: SourceAccess,
@@ -333,10 +452,12 @@ export async function inspectDocuments(
 ): Promise<SignalGrepResult> {
   const items: InspectBatchItemDetails[] = [];
   const blocks: SourceBlock[] = [];
+  let metadataOnly = false;
   for (const [index, target] of targets.entries()) {
     try {
       // oxlint-disable-next-line no-await-in-loop -- targets share one bounded source/parse context and input-order response budget.
       const prepared = await prepare(target, access, structure);
+      metadataOnly ||= !prepared.document.utf8 || hasBareCarriageReturn(prepared.document.bytes);
       let blockIndex = blocks.findIndex((block) => block.document === prepared.document);
       if (blockIndex < 0) {
         blockIndex = blocks.length;
@@ -380,6 +501,7 @@ export async function inspectDocuments(
       });
     }
   }
+  if (metadataOnly) return inspectDocumentsMetadata(targets, access, structure);
   for (const block of blocks) {
     block.ranges = mergeByteRanges(block.ranges);
     block.remaining = block.ranges;
@@ -538,6 +660,30 @@ export async function inspectDocuments(
             ...(first.source.nextRequest ? { nextRequest: first.source.nextRequest } : {}),
           }
         : {}),
+    },
+  };
+}
+
+export function continueSourceMetadata(
+  cursor: string,
+  continuations: SourceContinuations,
+): SignalGrepResult {
+  const state = continuations.resolve(cursor);
+  const remainingBytes = state.remaining.reduce(
+    (total, range) => total + range.end - range.start,
+    0,
+  );
+  return {
+    text: `Source continuation metadata (PARTIAL). Source content is not displayed; ${state.source.path} has ${String(state.remaining.length)} remaining range(s) and ${String(remainingBytes)} remaining byte(s).`,
+    details: {
+      version: 1,
+      mode: "inspect",
+      status: "partial",
+      snapshotComplete: false,
+      totalMatches: 0,
+      storedMatches: 0,
+      returnedMatches: 0,
+      totalFiles: 1,
     },
   };
 }

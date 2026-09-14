@@ -1,4 +1,6 @@
 import { posix } from "node:path";
+import { realpath } from "node:fs/promises";
+import { relative, resolve } from "node:path";
 import { MAX_STRUCTURE_BYTES, MAX_STRUCTURE_FILES } from "./analysis-limits.js";
 import { abortError, SignalGrepError } from "./errors.js";
 import {
@@ -7,6 +9,7 @@ import {
   type SourceDocument,
   type SourceReference,
 } from "./source-document.js";
+import { isPathInsideRoot } from "./path-policy.js";
 import { syntaxField } from "./syntax-tree.js";
 import type { SyntaxAnalysis } from "./syntax-types.js";
 
@@ -459,6 +462,7 @@ export class NavigationContext {
   readonly reasons = new Set<string>();
   bytesRead = 0;
   #files?: Set<string>;
+  readonly #pathAliases = new Map<string, string>();
   #fileLimit: number;
   #failures = new Map<string, string>();
   #attempted = new Set<string>();
@@ -470,7 +474,8 @@ export class NavigationContext {
     if (this.host.signal?.aborted) throw abortError();
   }
   normalizePath(path: string): string {
-    return this.host.normalizePath?.(path) ?? navigationPath(path);
+    const normalized = this.host.normalizePath?.(path) ?? navigationPath(path);
+    return this.#pathAliases.get(normalized) ?? normalized;
   }
   async files(): Promise<Set<string>> {
     this.checkAbort();
@@ -478,9 +483,32 @@ export class NavigationContext {
     const listed = await this.host.listFiles();
     if (!Array.isArray(listed) && listed.partial)
       for (const reason of listed.reasons) this.reasons.add(reason);
-    this.#files = new Set(
-      (Array.isArray(listed) ? listed : listed.paths).map((path) => this.normalizePath(path)),
+    const paths = new Set<string>();
+    const canonicalCwd = await realpath(this.host.cwd).catch(() => undefined);
+    const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map(
+      (path) => this.host.normalizePath?.(path) ?? navigationPath(path),
     );
+    const canonicalPaths = await Promise.all(
+      normalizedPaths.map(async (normalized) => {
+        try {
+          const target = await realpath(resolve(this.host.cwd, normalized));
+          const canonical =
+            canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd)
+              ? relative(canonicalCwd, target).replaceAll("\\", "/")
+              : target.replaceAll("\\", "/");
+          return [normalized, canonical] as const;
+        } catch {
+          // Retain the verified enumeration path when its target disappears during discovery.
+          return [normalized, normalized] as const;
+        }
+      }),
+    );
+    for (const [normalized, canonical] of canonicalPaths) {
+      this.#pathAliases.set(normalized, canonical);
+      this.#pathAliases.set(canonical, canonical);
+      paths.add(canonical);
+    }
+    this.#files = paths;
     return this.#files;
   }
   async module(path: string, retainSyntax = false): Promise<ModuleFacts> {

@@ -5,7 +5,6 @@ import type { SignalGrepDetails } from "../types.js";
 import {
   localizedErrorText,
   renderSignalGrepCallLines,
-  renderSignalGrepPresentationLines,
   localizedSearchingText,
   type SignalGrepTheme,
 } from "./layout.js";
@@ -53,23 +52,44 @@ function component(render: (width: number) => string[], fallbackText: string): C
 
 interface ErrorLineOptions {
   copy: { hint: string; title: string };
-  expanded: boolean;
   theme: Theme;
   width: number;
 }
 
-function errorLines(text: string, options: ErrorLineOptions): string[] {
-  const { copy, expanded, theme, width } = options;
-  if (expanded) return textLines(text, width);
+function errorLines(options: ErrorLineOptions): string[] {
+  const { copy, theme, width } = options;
   const available = Math.max(1, width);
-  const sourceLines = text.split("\n").filter((line) => line.length > 0);
-  const shown = sourceLines.slice(0, 4);
-  const lines = [
-    theme.fg("error", theme.bold(`── ${copy.title} ──`)),
-    ...shown.map((line) => theme.fg("error", line)),
-  ];
-  if (sourceLines.length > shown.length) lines.push(theme.fg("dim", `… ${copy.hint}`));
+  const lines = [theme.fg("error", theme.bold(`── ${copy.title} ──`)), theme.fg("dim", copy.hint)];
   return lines.map((line) => truncateToWidth(line, available));
+}
+
+function renderHumanStats(
+  details: SignalGrepDetails,
+  locale: SignalGrepLocale,
+  theme: Theme,
+  width: number,
+): string[] {
+  const chinese = locale === "zh-CN";
+  const title = chinese ? "结果" : "RESULT";
+  const status =
+    details.status === "complete" ? (chinese ? "完整" : "complete") : chinese ? "部分" : "partial";
+  const count = details.analysis?.totalItems ?? details.totalMatches;
+  const files = details.totalFiles;
+  const unit = details.analysis ? (chinese ? "项" : "items") : chinese ? "处匹配" : "matches";
+  const lines = [
+    theme.fg("borderMuted", `── ${theme.bold(title)} ──`),
+    theme.fg(
+      "toolOutput",
+      `${String(count)} ${unit} · ${String(files)} ${chinese ? "个文件" : files === 1 ? "file" : "files"} · ${status}`,
+    ),
+  ];
+  if (details.analysis?.statistics) {
+    const stats = details.analysis.statistics;
+    lines.push(theme.fg("dim", `${chinese ? "统计" : "stats"}: ${String(stats.total)} ${unit}`));
+  }
+  if (details.cursor || details.nextRequest)
+    lines.push(theme.fg("dim", chinese ? "可继续" : "cursor ready"));
+  return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
 }
 
 export function renderSignalGrepCall(
@@ -92,22 +112,23 @@ export function renderSignalGrepResult(
   const text = resultText(result);
   if (text === undefined) return new Text("", 0, 0);
 
+  if (result.details?.operation && result.details.operation.state !== "complete") {
+    return new Text(theme.fg("warning", text), 0, 0);
+  }
   if (options.isPartial) {
     return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
   }
   if (options.isError) {
     return component(
       (width) =>
-        errorLines(text, {
+        errorLines({
           copy: localizedErrorText(locale),
-          expanded: options.expanded,
           theme,
           width,
         }),
-      text,
+      locale === "zh-CN" ? "本次操作未完成。" : "Operation did not complete.",
     );
   }
-  if (options.expanded) return new Text(text, 0, 0);
 
   let presentation;
   try {
@@ -115,9 +136,28 @@ export function renderSignalGrepResult(
   } catch {
     return new Text(text, 0, 0);
   }
-  if (!presentation) return new Text(text, 0, 0);
+  if (!presentation)
+    return component(
+      (width) =>
+        renderHumanStats(
+          result.details ?? {
+            version: 1,
+            mode: "auto",
+            status: "complete",
+            totalMatches: 0,
+            storedMatches: 0,
+            totalFiles: 0,
+            returnedMatches: 0,
+            snapshotComplete: true,
+          },
+          locale,
+          theme,
+          width,
+        ),
+      locale === "zh-CN" ? "结果" : "RESULT",
+    );
   return component(
-    (width) => renderSignalGrepPresentationLines(presentation, locale, theme, width),
-    text,
+    (width) => renderHumanStats(result.details ?? presentation.details, locale, theme, width),
+    locale === "zh-CN" ? "结果" : "RESULT",
   );
 }

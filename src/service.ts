@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import { EvidenceService, isEvidenceRequest } from "./evidence-service.js";
+import { ConceptSourceChangedError } from "./concept-source-generation.js";
 import type { GitChangeRequest } from "./git-source.js";
 import type { SyntaxRoleName } from "./syntax.js";
 import { resolve } from "node:path";
 import { CursorError, SignalGrepError } from "./errors.js";
 import { DISCOVERY_MODE_REQUIRED_ERROR } from "./discovery-errors.js";
-import { formatMatchPage, MatchPageSoftLimitError, type MatchPageOptions } from "./format.js";
+import { validateRequestContract } from "./request-contract.js";
+import {
+  formatMatchMetadataPage,
+  formatMatchPage,
+  MatchPageSoftLimitError,
+  type MatchPageOptions,
+} from "./format.js";
 import { formatSummary } from "./summary.js";
 import { summarySourcePreviews } from "./summary-previews.js";
 import {
@@ -17,13 +24,29 @@ import {
 import { redactSignalGrepResult } from "./redaction.js";
 import type { RipgrepRunner } from "./rg.js";
 import type { CodeStructureProvider } from "./structure.js";
-import type { ConceptSearchRunner } from "./concept-search.js";
+import { ConceptWorkerExitError, type ConceptSearchRunner } from "./concept-search.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { SnapshotStore } from "./snapshot-store.js";
+import {
+  OPERATION_INITIAL_WAIT_MS,
+  OperationLifecycle,
+  type OperationProgress,
+} from "./operation-lifecycle.js";
+import {
+  completeOperationResult,
+  operationOutcome,
+  operationStateResult,
+} from "./operation-output.js";
 import { modificationTimeBoundsText } from "./source.js";
+import { resolveConceptTimeoutMs } from "./concept-model.js";
+import {
+  LanguageCapabilityCatalog,
+  type LanguageCapabilityInventory,
+} from "./language-capabilities.js";
 import {
   DEFAULT_SUMMARY_FILE_LIMIT,
   MAX_INSPECT_TARGETS,
+  MAX_LINE_CHARACTERS,
   MAX_SELECTED_PATHS,
   type ContextBudget,
   type InspectTarget,
@@ -36,7 +59,6 @@ import {
 
 export interface SignalGrepInput extends RawSearchInput {
   query?: string;
-  column?: number;
   mode?: SearchMode;
   cursor?: string;
   paths?: string[];
@@ -53,6 +75,7 @@ export interface SignalGrepInput extends RawSearchInput {
   symbol?: string;
   maxFilesToParse?: number;
   conceptLimit?: number;
+  operationId?: string;
 }
 
 export interface SignalGrepServiceOptions {
@@ -65,6 +88,49 @@ export interface SignalGrepServiceOptions {
 
 export interface SignalGrepSearchOptions {
   contextBudget?: ContextBudget;
+  onProgress?: (progress: OperationProgress) => void;
+}
+
+function filterList(value: string | string[] | undefined): string[] {
+  return value === undefined ? [] : Array.isArray(value) ? [...value] : [value];
+}
+
+function capabilitiesResult(inventory: LanguageCapabilityInventory): SignalGrepResult {
+  const languageText = inventory.languages.length
+    ? inventory.languages
+        .map((entry) => {
+          const providers = [
+            ...new Set(
+              inventory.capabilityDefinitions
+                .filter((capability) =>
+                  entry.capabilities.some((reference) => reference.id === capability.id),
+                )
+                .map((capability) => capability.provider),
+            ),
+          ].join(" + ");
+          const load = entry.capabilities.length ? "lazy" : "none";
+          const names = entry.capabilities.map((reference) => reference.name).join(", ");
+          return `${entry.language} (${String(entry.files)} file${entry.files === 1 ? "" : "s"}): ${names || "no language analysis capability is currently registered"}; providers=${providers || "none"}; availability=${entry.availability}; readiness=${entry.readiness}; load=${load}`;
+        })
+        .join("\n")
+    : "No recognized language source files were found in the requested scope.";
+  const partial = inventory.partial ? "partial" : "complete";
+  const reason = inventory.reasons.length ? `\nReasons: ${inventory.reasons.join("; ")}` : "";
+  const text = `Project language capability inventory (${partial}; names-only; providers load lazily).\nLanguage-specific modes:\n${languageText}\nLanguage-neutral modes: ${inventory.neutral.map((capability) => `${capability.name} [${capability.availability}; ${capability.load}]`).join(", ")}.${reason}`;
+  return {
+    text,
+    details: {
+      version: 1,
+      mode: "capabilities",
+      status: inventory.partial ? "partial" : "complete",
+      totalMatches: 0,
+      storedMatches: 0,
+      totalFiles: inventory.languages.reduce((sum, entry) => sum + entry.files, 0),
+      returnedMatches: 0,
+      snapshotComplete: !inventory.partial,
+      capabilities: inventory,
+    },
+  };
 }
 interface PathSelection {
   labels: string[];
@@ -179,6 +245,12 @@ function completenessNote(snapshot: SearchSnapshot): string {
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
 }
 
+function lineExcerptNote(snapshot: SearchSnapshot): string {
+  return snapshot.truncatedLines > 0
+    ? `\n\n[Line excerpts truncated: ${String(snapshot.truncatedLines)} matching lines in this snapshot; maximum ${String(MAX_LINE_CHARACTERS)} source characters per line. Complete snapshot describes retained matches, not complete source text.]`
+    : "";
+}
+
 function sourceVerificationNote(details: SignalGrepDetails): string {
   return details.sourceUnverifiedFileCount
     ? `\n\n[Source revision unverified for ${String(details.sourceUnverifiedFileCount)} retained file(s); context and snapshot-scoped inspection require verified source.]`
@@ -196,6 +268,12 @@ function selectContextBudget(
 function matchPageOptions(budget: ContextBudget | undefined): MatchPageOptions {
   if (!budget) return {};
   return { resultTokenBudget: budget.resultTokenBudget };
+}
+
+function pageMatchesOccurrences(snapshot: SearchSnapshot, first: number, last: number): number {
+  return snapshot.matches
+    .slice(first, last + 1)
+    .reduce((total, match) => total + match.occurrences.length, 0);
 }
 
 function attachContextBudget(
@@ -220,46 +298,39 @@ function attachContextBudget(
   };
 }
 
-function rejectCursorOnlyOptions(input: SignalGrepInput): void {
-  const ignored: string[] = [];
-  if (input.scope !== undefined) ignored.push("scope");
-  if (input.wholeWord !== undefined) ignored.push("wholeWord");
-  if (input.query !== undefined) ignored.push("query");
-  if (input.pattern !== undefined) ignored.push("pattern");
-  if (input.glob !== undefined) ignored.push("glob");
-  if (input.exclude !== undefined) ignored.push("exclude");
-  if (input.literal !== undefined) ignored.push("literal");
-  if (input.ignoreCase !== undefined) ignored.push("ignoreCase");
-  if (input.hidden !== undefined) ignored.push("hidden");
-  if (input.context !== undefined) ignored.push("context");
-  if (input.limit !== undefined) ignored.push("limit");
-  if (input.modifiedAfter !== undefined) ignored.push("modifiedAfter");
-  if (input.modifiedBefore !== undefined) ignored.push("modifiedBefore");
-  if (input.line !== undefined) ignored.push("line");
-  if (input.matchIndex !== undefined) ignored.push("matchIndex");
-  if (input.matchIndices !== undefined) ignored.push("matchIndices");
-  if (input.targets !== undefined) ignored.push("targets");
-  if (ignored.length > 0) {
-    throw new CursorError(
-      `The following options cannot be used with cursor: ${ignored.join(", ")}`,
-      "E_CURSOR_OPTIONS_CONFLICT",
-    );
-  }
+async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promise<void> {
+  if (signal.aborted)
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  await new Promise<void>((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolveDelay();
+    }, delayMs);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      rejectDelay(signal.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class SignalGrepService {
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
   readonly #summaryFileLimit: number;
+  readonly #capabilities = new LanguageCapabilityCatalog();
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
   readonly #active = new Set<Promise<SignalGrepResult>>();
+  #operations: OperationLifecycle<SignalGrepResult>;
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
   constructor(options: SignalGrepServiceOptions) {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(
       this.#runRipgrep,
       this.#snapshots,
@@ -275,15 +346,25 @@ export class SignalGrepService {
     options: SignalGrepSearchOptions = {},
   ): Promise<SignalGrepResult> {
     validateRawSearchInput(input);
-    for (const path of input.paths ?? []) validateSearchPath(path, "paths");
-    for (const target of input.targets ?? []) {
-      if (target && typeof target.path === "string")
-        validateSearchPath(target.path, "targets.path");
+    validateRequestContract(input);
+    let request: Promise<SignalGrepResult>;
+    if (input.mode === "await" || input.mode === "cancel") {
+      request = this.#operationCommand(input, cwd, signal);
+    } else {
+      if (input.operationId !== undefined)
+        throw new SignalGrepError("operationId is only valid with mode=await or mode=cancel");
+      for (const path of input.paths ?? []) validateSearchPath(path, "paths");
+      for (const target of input.targets ?? []) {
+        if (target && typeof target.path === "string")
+          validateSearchPath(target.path, "targets.path");
+      }
+      const combined = signal
+        ? AbortSignal.any([signal, this.#lifecycle.signal])
+        : this.#lifecycle.signal;
+      request = this.#isLongRunningQuery(input)
+        ? this.#searchOperation(input, cwd, signal, options)
+        : this.#search(input, cwd, combined, options);
     }
-    const combined = signal
-      ? AbortSignal.any([signal, this.#lifecycle.signal])
-      : this.#lifecycle.signal;
-    const request = this.#search(input, cwd, combined, options);
     this.#active.add(request);
     try {
       const result = await request;
@@ -293,6 +374,104 @@ export class SignalGrepService {
     } finally {
       this.#active.delete(request);
     }
+  }
+
+  #isLongRunningQuery(input: SignalGrepInput): input is SignalGrepInput & {
+    mode: "concept" | "hybrid";
+  } {
+    return (
+      (input.mode === "concept" || input.mode === "hybrid") &&
+      input.operationId === undefined &&
+      input.cursor === undefined
+    );
+  }
+
+  async #searchOperation(
+    input: SignalGrepInput & { mode: "concept" | "hybrid" },
+    cwd: string,
+    signal: AbortSignal | undefined,
+    options: SignalGrepSearchOptions,
+  ): Promise<SignalGrepResult> {
+    const started = this.#operations.start(
+      async (operationSignal, operationId) => {
+        const combined = AbortSignal.any([operationSignal, this.#lifecycle.signal]);
+        const deadlineAt = this.#operations.get(operationId).deadlineAt;
+        this.#operations.updateProgress(operationId, { phase: "queued" });
+        let refreshAttempt = 0;
+        let workerRestarted = false;
+        while (true) {
+          try {
+            this.#operations.updateProgress(operationId, { phase: "running" });
+            // oxlint-disable-next-line no-await-in-loop -- retries share one operation deadline and signal.
+            return await this.#search(input, cwd, combined, {
+              ...options,
+              onProgress: (progress) => this.#operations.updateProgress(operationId, progress),
+            });
+          } catch (error) {
+            if (error instanceof ConceptWorkerExitError) {
+              if (workerRestarted || combined.aborted) throw error;
+              const remaining = deadlineAt - Date.now();
+              if (remaining <= 0) throw error;
+              workerRestarted = true;
+              this.#operations.updateProgress(operationId, {
+                phase: "refreshing",
+                detail:
+                  "worker restart 1 after unexpected worker termination; completed cache entries are reusable",
+              });
+              // oxlint-disable-next-line no-await-in-loop -- bounded retry backoff preserves one deadline.
+              await waitForSourceRefresh(combined, Math.min(100, remaining));
+              continue;
+            }
+            if (!(error instanceof ConceptSourceChangedError)) throw error;
+            if (combined.aborted) throw error;
+            const remaining = deadlineAt - Date.now();
+            if (remaining <= 0)
+              throw new SignalGrepError("Source did not stabilize before the operation deadline", {
+                cause: error,
+              });
+            this.#operations.updateProgress(operationId, {
+              phase: "refreshing",
+              detail: `generation retry ${String(++refreshAttempt)}: ${error.message}`,
+            });
+            // oxlint-disable-next-line no-await-in-loop -- bounded retry backoff preserves one deadline.
+            await waitForSourceRefresh(combined, Math.min(100, remaining));
+          }
+        }
+      },
+      { mode: input.mode, redact: input.redact ?? false, cwd },
+    );
+    const outcome = await this.#operations.wait(started.id, OPERATION_INITIAL_WAIT_MS, signal);
+    return operationOutcome(outcome, input.mode);
+  }
+
+  async #operationCommand(
+    input: SignalGrepInput,
+    cwd: string,
+    signal: AbortSignal | undefined,
+  ): Promise<SignalGrepResult> {
+    if (!input.operationId || typeof input.operationId !== "string")
+      throw new SignalGrepError("mode=await and mode=cancel require operationId");
+    const existing = this.#operations.get(input.operationId);
+    const mode = existing.metadata.mode;
+    if (resolve(cwd) !== resolve(existing.metadata.cwd))
+      throw new SignalGrepError("Operation belongs to a different working directory");
+    const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
+    if (forbidden.length > 0)
+      throw new SignalGrepError(
+        `${input.mode} accepts only operationId; remove ${forbidden.join(", ")} and copy the returned nextRequest exactly`,
+      );
+    if (input.mode === "cancel") {
+      const cancelled = await this.#operations.cancelAndWait(input.operationId);
+      if (cancelled.state === "complete" && cancelled.result !== undefined)
+        return completeOperationResult(cancelled.result, cancelled);
+      return operationStateResult(cancelled, mode);
+    }
+    const outcome = await this.#operations.wait(
+      input.operationId,
+      OPERATION_INITIAL_WAIT_MS,
+      signal,
+    );
+    return operationOutcome(outcome, mode);
   }
 
   async #search(
@@ -308,10 +487,19 @@ export class SignalGrepService {
       throw new CursorError("Invalid cursor. Copy a nonempty cursor from a previous result.");
     }
     const mode = input.mode ?? "auto";
+    if (mode === "capabilities") {
+      const inventory = await this.#capabilities.inspect({
+        cwd,
+        ...(input.path !== undefined ? { path: input.path } : {}),
+        glob: filterList(input.glob),
+        exclude: filterList(input.exclude),
+        ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+        ...(signal ? { signal } : {}),
+      });
+      return capabilitiesResult(inventory);
+    }
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
-    if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal);
-    if (input.column !== undefined)
-      throw new SignalGrepError("column requires semantic navigation");
+    if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal, options);
     if (input.query !== undefined) throw new SignalGrepError(DISCOVERY_MODE_REQUIRED_ERROR);
     if (input.maxFilesToParse !== undefined) {
       throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");
@@ -355,24 +543,36 @@ export class SignalGrepService {
       } else if (mode === "matches") {
         result = await this.#page(snapshot, 0, mode, signal);
       } else {
-        try {
-          const page = await formatMatchPage(snapshot, 0, signal, matchPageOptions(contextBudget));
-          result =
-            input.limit !== undefined ||
-            (snapshot.snapshotComplete && page.nextOffset === snapshot.matches.length)
-              ? this.#pageResult(snapshot, 0, mode, page)
-              : await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
-        } catch (error) {
-          // Auto can summarize evidence that does not fit its soft detail target.
-          // Explicit limits, hard byte bounds, and runtime failures still fail clearly.
-          if (input.limit !== undefined || !(error instanceof MatchPageSoftLimitError)) throw error;
+        if (input.limit !== undefined) {
+          result = await this.#page(snapshot, 0, mode, signal);
+        } else if (
+          contextBudget !== undefined &&
+          contextBudget.tier !== "full" &&
+          input.limit === undefined
+        ) {
           result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+        } else {
+          try {
+            const page = await formatMatchPage(
+              snapshot,
+              0,
+              signal,
+              matchPageOptions(input.limit === undefined ? contextBudget : undefined),
+            );
+            result =
+              snapshot.snapshotComplete && page.nextOffset === snapshot.matches.length
+                ? this.#pageResult(snapshot, 0, mode, page)
+                : await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+          } catch (error) {
+            if (!(error instanceof MatchPageSoftLimitError)) throw error;
+            result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+          }
         }
       }
 
       result = {
         ...result,
-        text: `${result.text}${scopeExpansionNote(result.details.scope, result.details.totalMatches)}`,
+        text: `${scopeExpansionNote(result.details.scope, result.details.totalMatches).trim()}${result.details.scope?.expandedToProjectRoot ? "\n\n" : ""}${result.text}`,
       };
       const budgetedResult = attachContextBudget(result, contextBudget, snapshot.totalMatches);
       return this.#finalize(snapshot, budgetedResult);
@@ -385,14 +585,19 @@ export class SignalGrepService {
   clear(): void {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController();
+    this.#operations.reset();
     this.#snapshots.clear();
     this.#evidence.clear();
   }
 
   async shutdown(): Promise<void> {
-    this.clear();
+    this.#lifecycle.abort();
+    this.#operations.clear();
     const pending = [...this.#active];
     await Promise.allSettled(pending);
+    await this.#operations.shutdown();
+    this.#snapshots.clear();
+    this.#evidence.clear();
     await this.#evidence.shutdown();
   }
 
@@ -412,7 +617,6 @@ export class SignalGrepService {
     const cursor = input.cursor;
     if (!cursor) throw new CursorError("A cursor is required to continue a search");
     const { snapshot, offset, kind, selectionKey } = this.#snapshots.resolve(cursor);
-    rejectCursorOnlyOptions(input);
     const mode = input.mode ?? "auto";
     if (mode === "summary") {
       if (input.path !== undefined || input.paths !== undefined) {
@@ -450,6 +654,7 @@ export class SignalGrepService {
   ): SignalGrepResult {
     if (
       !result.details.cursor &&
+      !result.details.inspectRequest &&
       !retainSnapshot &&
       !this.#reusableSummarySnapshots.has(snapshot)
     ) {
@@ -491,10 +696,10 @@ export class SignalGrepService {
       cwd,
       signal,
     );
-    const sampleText = preview.text || summary.previews;
-    const indices = preview.text ? preview.indices : summary.sampleIndices;
+    const sampleText = preview.text;
+    const indices = preview.indices;
     const samples = sampleText
-      ? `\n\nSamples: bounded source windows; not relevance-ranked or exhaustive.\n${sampleText}`
+      ? `\n\nSamples: first retained match; bounded source windows; not relevance-ranked or exhaustive.\n${sampleText}`
       : "";
     const sampleOmissions = `\n[Preview limits: at most 5 source files, 2 non-overlapping windows/file, 7 lines/window. File rows and navigation take priority; shown ${preview.text ? preview.windows : summary.previewsShown} previews.]${preview.reasons.length ? `\n[${preview.reasons.map((reason) => reason.slice(0, 200)).join("; ")}]` : ""}`;
     const redaction = snapshot.request.redact ? { redact: true } : {};
@@ -514,10 +719,9 @@ export class SignalGrepService {
         ? { cursor, paths: summary.shownPaths.slice(0, 1), ...redaction }
         : undefined;
     const followUp = cursor
-      ? `\n\nSnapshot cursor="${cursor}".${inspectRequest ? `\nInspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `\nRetrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `\nNext request: ${JSON.stringify(nextRequest)}` : ""}`
+      ? `\n\nSnapshot cursor="${cursor}". Snapshot cursor available: ${cursor}.${inspectRequest ? `\nInspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `\nRetrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `\nNext request: ${JSON.stringify(nextRequest)}` : ""}`
       : "";
-    const text = `${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
-
+    const text = `Search summary (${snapshot.snapshotComplete ? "complete" : "PARTIAL"}). ${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
     return {
       text,
       details: {
@@ -558,7 +762,7 @@ export class SignalGrepService {
             selection.absolutePaths.has(match.absolutePath),
         }
       : {};
-    const page = await formatMatchPage(snapshot, offset, signal, pageOptions);
+    const page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
     if (page.returnedMatches === 0 && selection) {
       throw new CursorError("No retained matches exist for the selected paths.");
     }
@@ -593,7 +797,7 @@ export class SignalGrepService {
     snapshot: SearchSnapshot,
     offset: number,
     mode: SearchMode,
-    page: Awaited<ReturnType<typeof formatMatchPage>>,
+    page: Awaited<ReturnType<typeof formatMatchMetadataPage>>,
     selectedPaths?: string[],
     selectionMissingPaths: string[] = [],
     selectionKey = "all",
@@ -601,7 +805,6 @@ export class SignalGrepService {
     if (page.returnedMatches === 0) {
       throw new SignalGrepError("The output budget could not fit a single match");
     }
-
     const cursor = page.hasNext
       ? this.#snapshots.cursor(snapshot, page.nextOffset, "matches", selectionKey)
       : undefined;
@@ -609,35 +812,45 @@ export class SignalGrepService {
     const lastMatch = page.lastMatchIndex ?? firstMatch;
     const range = `${firstMatch + 1}-${lastMatch + 1}`;
     const selection = selectedPaths ? `; selected ${String(selectedPaths.length)} path(s)` : "";
-    const next = cursor
-      ? `\n\nContinue with cursor="${cursor}".\nNext request: ${JSON.stringify({ cursor, ...(selectedPaths ? { paths: selectedPaths } : {}), ...(snapshot.request.redact ? { redact: true } : {}) })}`
-      : "";
     const missingSelectionNote =
       selectionMissingPaths.length > 0
         ? `\n\n[${String(selectionMissingPaths.length)} selected path(s) had no retained matches.]`
         : "";
+    const details = baseDetails(snapshot, mode);
+    const next = cursor
+      ? `\n\nContinue with cursor="${cursor}".\nNext request: ${JSON.stringify({ cursor, ...(selectedPaths ? { paths: selectedPaths } : {}), ...(snapshot.request.redact ? { redact: true } : {}) })}`
+      : "";
     const rangeNote = page.hasMatchRanges
       ? `\n\n[Match columns are 1-based UTF-16 positions${page.hasByteRanges ? "; b ranges use raw UTF-8 bytes" : ""}.]`
       : "";
     const contextNotes: string[] = [];
-    if (page.contextChangedFiles.length > 0) {
+    if (page.contextChangedFiles.length > 0)
       contextNotes.push(
         `Context omitted for ${String(page.contextChangedFiles.length)} changed file(s); refresh the search before relying on surrounding lines.`,
       );
-    }
-    if (page.contextOmittedFiles.length > 0) {
+    if (page.contextOmittedFiles.length > 0)
       contextNotes.push(
         `Context unavailable for ${String(page.contextOmittedFiles.length)} file(s); retained matching lines are still shown.`,
       );
-    }
     const contextNote = contextNotes.length > 0 ? `\n\n[${contextNotes.join(" ")}]` : "";
-    const details = baseDetails(snapshot, mode);
-
+    const inspectRequest: SignalGrepInput | undefined =
+      snapshot.truncatedLines > 0
+        ? {
+            mode: "inspect",
+            cursor: this.#snapshots.cursor(snapshot, 0, "matches"),
+            matchIndex: firstMatch + 1,
+            ...(snapshot.request.redact ? { redact: true } : {}),
+          }
+        : undefined;
+    const inspectNote = inspectRequest
+      ? `\nInspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}`
+      : "";
     return {
-      text: `${page.body}${rangeNote}${contextNote}${missingSelectionNote}\n\n[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
+      text: `Match metadata ${range} of ${snapshot.totalMatches}${selection}; ${page.returnedMatches} returned.\nOccurrences: ${pageMatchesOccurrences(snapshot, firstMatch, lastMatch)} occurrences.\n\n${page.body}${rangeNote}${contextNote}${missingSelectionNote}\n\n[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${lineExcerptNote(snapshot)}${inspectNote}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
       details: {
         ...details,
         returnedMatches: page.returnedMatches,
+        ...(inspectRequest ? { inspectRequest } : {}),
         ...(page.occurrenceRangesOmitted > 0
           ? { occurrenceRangesOmitted: page.occurrenceRangesOmitted }
           : {}),

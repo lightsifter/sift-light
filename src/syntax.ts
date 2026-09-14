@@ -1,8 +1,9 @@
-import { dirname, extname } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_PARSE_TIME_MS, MAX_STRUCTURE_BYTES, MAX_SYNTAX_NODES } from "./analysis-limits.js";
 import { abortError, SignalGrepError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
+import { scriptRuntimeEnvironment } from "./script-runtime.js";
 import { deriveSyntaxFacts } from "./syntax-facts.js";
 import { syntaxChildren } from "./syntax-tree.js";
 import type {
@@ -13,6 +14,10 @@ import type {
   SyntaxWorkerResult,
 } from "./syntax-types.js";
 import { MAX_SOURCE_FILE_BYTES } from "./types.js";
+import {
+  DEFAULT_LANGUAGE_CAPABILITIES,
+  languageForPath,
+} from "./language-capability-definitions.js";
 
 export type {
   SyntaxAnalysis,
@@ -28,19 +33,14 @@ export { classifySyntaxRange } from "./syntax-facts.js";
 export { syntaxField, syntaxFields, syntaxText } from "./syntax-tree.js";
 
 export function syntaxLanguage(path: string): SyntaxLanguage | undefined {
-  switch (extname(path).toLowerCase()) {
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
+  switch (languageForPath(DEFAULT_LANGUAGE_CAPABILITIES, path)) {
+    case "javascript":
       return "javascript";
-    case ".ts":
-    case ".mts":
-    case ".cts":
+    case "typescript":
       return "typescript";
-    case ".tsx":
+    case "tsx":
       return "tsx";
-    case ".go":
+    case "go":
       return "go";
     default:
       return undefined;
@@ -113,7 +113,12 @@ function readNode(
 }
 
 function readResult(output: string, length: number): SyntaxWorkerResult {
-  const result: unknown = JSON.parse(output);
+  let result: unknown;
+  try {
+    result = JSON.parse(output);
+  } catch {
+    return invalidProtocol();
+  }
   if (
     !result ||
     typeof result !== "object" ||
@@ -177,8 +182,7 @@ export async function parseSyntax(
   const args = process.versions.bun
     ? [`--config=${config}`, "--no-env-file", "--no-macros", "--no-install", worker]
     : [worker];
-  const env = { ...process.env };
-  delete env.NODE_OPTIONS;
+  const env = scriptRuntimeEnvironment();
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort();

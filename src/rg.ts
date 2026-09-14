@@ -1,5 +1,5 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, RipgrepInputError, SignalGrepError } from "./errors.js";
 import { excerptText } from "./excerpt.js";
 import { SearchRetention } from "./search-retention.js";
 import { consumeCappedLines } from "./capped-lines.js";
@@ -7,7 +7,9 @@ import { isPathInsideCwd, SearchPathPolicy } from "./path-policy.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { resolveRipgrepExecutable } from "./ripgrep-executable.js";
 import {
+  boundedRipgrepDiagnostic,
   classifyRipgrepDiagnostics,
+  createRipgrepInputError,
   describeUnreadableDiagnostics,
   hasRequestedRootUnreadable,
 } from "./ripgrep-diagnostics.js";
@@ -426,6 +428,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         cwd,
         maxSourceRevisionFiles,
         signal,
+        request.redact,
       );
       if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
         throw new SignalGrepError(describeUnreadableDiagnostics(before.unreadable));
@@ -450,6 +453,8 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           }),
       );
       const diagnostics = classifyRipgrepDiagnostics(stderr);
+      const inputError = createRipgrepInputError(stderr, request.redact);
+      if (inputError) throw inputError;
       if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
         throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
       if (diagnostics.unreadable.length > 0)
@@ -483,11 +488,12 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") throw abortError();
+      if (error instanceof RipgrepInputError) throw error;
       const cause = error instanceof Error ? error : new Error(String(error));
       const executableMissing = "code" in cause && cause.code === "ENOENT";
       const message = executableMissing
-        ? `ripgrep executable not found: ${executable}`
-        : cause.message;
+        ? `ripgrep executable not found: ${boundedRipgrepDiagnostic(executable, request.redact)}`
+        : boundedRipgrepDiagnostic(cause.message, request.redact);
       throw new SignalGrepError(message, { cause });
     }
   };

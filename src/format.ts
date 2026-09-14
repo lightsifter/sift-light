@@ -49,6 +49,86 @@ export interface FormattedPage {
   contextChangedFiles: string[];
 }
 
+function formatMetadataMatchLine(match: MatchRecord, matchIndex: number): string {
+  const occurrences = match.occurrences.length;
+  const occurrenceLabel = occurrences === 1 ? "occurrence" : "occurrences";
+  return ` ${match.lineNumber}: ${String(occurrences)} ${occurrenceLabel} {match #${String(matchIndex)}}`;
+}
+
+/** Returns location metadata only; source text is intentionally never part of public results. */
+export async function formatMatchMetadataPage(
+  snapshot: SearchSnapshot,
+  offset: number,
+  signal?: AbortSignal,
+  options: MatchPageOptions = {},
+): Promise<FormattedPage> {
+  const maxPageBodyBytes =
+    MAX_RESULT_BYTES - Math.max(RESULT_METADATA_RESERVE_BYTES, options.metadataReserveBytes ?? 0);
+  if (maxPageBodyBytes <= 0)
+    throw new Error("Continuation metadata exceeds the response byte budget; select fewer paths");
+  const maxPageBodyCharacters = pageBodyCharacterLimit(options.resultTokenBudget);
+  const output: string[] = [];
+  let returnedMatches = 0;
+  let nextOffset = offset;
+  let currentFile: string | undefined;
+  let outputBytes = 0;
+  let outputCharacters = 0;
+  let firstMatchIndex: number | undefined;
+  let lastMatchIndex: number | undefined;
+  let hasMatchRanges = false;
+  while (nextOffset < snapshot.matches.length && returnedMatches < snapshot.request.pageSize) {
+    if (signal?.aborted) throw abortError();
+    const matchIndex = nextOffset;
+    const match = snapshot.matches[matchIndex];
+    if (!match) break;
+    nextOffset += 1;
+    if (options.include && !options.include(match, matchIndex)) continue;
+    const fileHeader = match.displayPath === currentFile ? "" : `${match.displayPath}\n`;
+    const separator = output.length === 0 ? "" : fileHeader.length === 0 ? "\n" : "\n\n";
+    const addition = `${separator}${fileHeader}${formatMetadataMatchLine(match, matchIndex + 1)}`;
+    const additionBytes = Buffer.byteLength(addition);
+    const additionCharacters = addition.length;
+    if (
+      outputBytes + additionBytes > maxPageBodyBytes ||
+      outputCharacters + additionCharacters > maxPageBodyCharacters
+    ) {
+      if (returnedMatches > 0) {
+        nextOffset = matchIndex;
+        break;
+      }
+      if (additionBytes > maxPageBodyBytes)
+        throw new Error("A single match exceeds the reserved result budget");
+      throw new MatchPageSoftLimitError();
+    }
+    output.push(addition);
+    outputBytes += additionBytes;
+    outputCharacters += additionCharacters;
+    currentFile = match.displayPath;
+    returnedMatches += 1;
+    hasMatchRanges ||= match.occurrences.length > 0;
+    firstMatchIndex ??= matchIndex;
+    lastMatchIndex = matchIndex;
+  }
+  const hasNext = snapshot.matches
+    .slice(nextOffset)
+    .some((match, index) => !options.include || options.include(match, nextOffset + index));
+  const page: FormattedPage = {
+    body: output.join(""),
+    returnedMatches,
+    nextOffset,
+    hasNext,
+    hasMatchRanges,
+    hasByteRanges: false,
+    occurrenceRangesOmitted: 0,
+    occurrenceMatchesTruncated: 0,
+    contextOmittedFiles: [],
+    contextChangedFiles: [],
+  };
+  if (firstMatchIndex !== undefined) page.firstMatchIndex = firstMatchIndex;
+  if (lastMatchIndex !== undefined) page.lastMatchIndex = lastMatchIndex;
+  return page;
+}
+
 export interface MatchPageOptions {
   resultTokenBudget?: number;
   metadataReserveBytes?: number;
@@ -82,7 +162,7 @@ function matchLocationSuffix(match: MatchRecord): string {
 }
 
 function formatMatchLine(match: MatchRecord, matchIndex: number): string {
-  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}`;
+  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}${match.lineTruncated ? " [line excerpt truncated]" : ""}`;
 }
 
 async function loadContextLines(

@@ -26,7 +26,7 @@ Use `mode: "hybrid"` with one natural-language `query` when a sentence may have 
 
 Concept ranking covers every UTF-8 passage admitted by the request's documented source budget; it no longer samples a fixed prefix of the scope. Passages that exceed the model token window are ranked through overlapping token-safe windows, so later text is not silently discarded. Offline embeddings are cached by content, model revision and chunking revision in a bounded 512 MiB local cache. Repeated content is reused, changed content misses naturally, and cache write or cleanup failures remain visible in the result.
 
-If Concept inference fails or times out, hybrid still returns the exact literal page with `coverage.conceptCandidates` set to `skipped` and an explicit reason; it does not discard a completed literal search. Bound interactive Concept latency with `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` (integer milliseconds from 1000 through 3600000; default 600000). Admission planning counts (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`) stay visible so large libraries can be narrowed with `path` or `glob` before another attempt. Empty files are a normal skip and do not mark the result partial.
+Slow Concept and hybrid requests return within the default five-second wait window with `status: "waiting"` or `"running"`, an `operationId`, progress and an exact `nextRequest` such as `{ "mode": "await", "operationId": "..." }`. Copy that request unchanged: it resumes the same computation and never restarts the query or downgrades to a literal-only result. A final result remains available for stable re-fetch for 10 minutes, with up to 32 terminal results retained per service session, and `mode: "cancel"` stops the owned work and waits for cleanup. Each service session admits at most eight pending operations; an operation has one total deadline controlled by `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` (integer milliseconds from 1000 through 3600000; default 600000) and a 120-second idle continuation lease. A real model, source or resource failure is returned as a failure with its diagnostic. Source generation is re-enumerated and re-verified before publication, so changes refresh the operation and mixed versions are never marked complete. Admission planning counts (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`) stay visible so large libraries can be narrowed with `path` or `glob` before another attempt. Empty files are a normal skip and do not mark the result partial.
 
 ### Give several search conditions together
 
@@ -36,15 +36,30 @@ If Concept inference fails or times out, hybrid still returns the exact literal 
 
 Ask the agent to restrict a search to one folder when that is the scope you need. If you remember only part of a filename, start by finding the file and then inspect its contents—like narrowing a cabinet down to a shelf and then a document.
 
+Multi-word `files` queries require each word literally in the path; a single abbreviation still supports fuzzy matching. Use `hybrid` or `concept` for business intent. Ordinary content searches retain their default zero-result expansion; use `scope: "strict"` to stay within an explicit path. Expansion is announced before returned evidence.
+
 ### Know what has been shown
 
 Long results arrive in pages with a way to continue. When the original material changes, the plugin asks for a fresh check. Like a careful research assistant, it distinguishes the passages already shown from the pages still to come.
+
+A complete snapshot describes match retention, not complete source text. Truncated matching-line excerpts show their limit and an executable `inspectRequest`, which remains usable after the final match page. Follow pagination cursors instead of repeating the query with a different limit.
+In Pi and OMP, the passive session status includes the loaded package version, counts returned new queries, distinguishes complete, partial and unfinished results, and reports non-cancelled failed calls. Cursor and operation continuations do not inflate the new-query count.
+
+### Discover language capabilities before loading a provider
+
+Use `mode: "capabilities"` with the project root for a compact, names-only inventory. JavaScript, TypeScript and TSX support AST structure, roles, outline, static imports and related-test candidates. Go supports AST structure and roles. Python supports bounded indentation-based outline. Swift and other languages remain available to ordinary content search, filename discovery and source inspection. Capability inventory does not start parsers or the Concept model.
+
+Version 2.1.0 removes language-service navigation: `definitions`, `references`, `implementations`, `callers`, `callees`, `dependencies`, `dependents`, `trace` and `impact`. These modes fail explicitly; there is no text-search substitute disguised as precise navigation. The package does not start Pyright, SourceKit-LSP, gopls or a TypeScript language service. TypeScript remains a development-only type checker.
+
+### Check saved source evidence
+
+Use `mode: "validate"` with a saved ordinary-search or analysis `cursor`, optionally selecting a `matchIndex`. Validation compares retained sources with the current worktree or their pinned Git objects, reports `current`, `stale` or `unknown`, and preserves incomplete search coverage. Structured metadata is under `details.validation` and `details.analysis.validation`; the removed graph fields and trace cursors are no longer supported. Validation checks sources on demand and does not run background watchers. It checks saved evidence, not whether new matching files have appeared since the search.
 
 ### Narrow by file age or inspect code structure
 
 Worktree searches can use `modifiedAfter` and `modifiedBefore` as Unix millisecond bounds. The lower bound is inclusive and the upper bound is exclusive, so a time window can be expressed without changing the search pattern. The same filter applies to content and filename searches; unavailable file metadata is reported as incomplete evidence rather than silently treated as a match.
 
-Use `mode: "outline"` with a file path to see bounded symbol ranges. JavaScript and TypeScript use the syntax provider; Python files use indentation-based class, function and method evidence. Python outline results are useful for finding a range to inspect, but do not claim compiler bindings, runtime calls or test coverage. `mode: "tests"` currently supports related-test candidates for JavaScript and TypeScript sources; Python requests return an explicit partial unsupported result and should use `mode: "outline"` instead.
+Use `mode: "outline"` with a concrete JS/TS/TSX or Python file to see bounded symbol ranges. JS/TS/TSX use ast-grep; Python uses indentation-based class, function and method evidence. These ranges do not prove compiler bindings, runtime calls or test coverage. `mode: "tests"` provides JS/TS/TSX related-test candidates; unsupported language operations fail explicitly. Use ordinary search and `inspect` for Swift source.
 
 The readable result keeps the main evidence compact. Per-item ranges, counts, coverage and continuation requests remain in structured `details`, so a client can use the structured fields without requiring a second search.
 
@@ -63,6 +78,7 @@ Tell your agent what you need, for example:
 - “Search files modified since this Unix millisecond timestamp.”
 - “I may remember this sentence incorrectly; search exact and semantic evidence together.”
 - “Show the Python classes and functions in this file, then inspect the method that matters.”
+- “Find this function name in source, inspect the relevant occurrences, then validate the saved evidence after I edit the file.”
 
 The plugin provides file locations and actual text so the agent can answer from the material and you can check the original yourself.
 
@@ -78,7 +94,7 @@ To use your own ripgrep, set `BAOER_SIGNAL_GREP_RG_PATH` in the MCP server or Pi
 pi install npm:baoer_signal_grep
 ```
 
-Restart Pi after installing or updating. Pi uses this plugin for conventional searches by default; reads, edits, tests, builds and scripts remain available. `enforceSearch` accepts `"hard"` (the default), `"prefer"` (keep the dedicated tool and guidance without denying alternative searches), or `"off"`. Existing `true` and `false` values remain aliases for `"hard"` and `"off"`. Configure it in `~/.pi/agent/baoer_signal_grep.json`, then restart. Set `"locale": "zh-CN"` there for the Chinese interface.
+Restart Pi after installing or updating. Pi uses this plugin for conventional searches by default; reads, edits, tests, builds and scripts remain available. `enforceSearch` accepts `"hard"` (the default), `"prefer"` (keep the dedicated tool and guidance without denying alternative searches), or `"off"`. Boolean values and unknown configuration fields are rejected. Configure it in `~/.pi/agent/baoer_signal_grep.json`, then restart. Set `"locale": "zh-CN"` there for the Chinese interface.
 
 ### OMP (Oh My Pi)
 
@@ -86,7 +102,7 @@ Restart Pi after installing or updating. Pi uses this plugin for conventional se
 omp install npm:baoer_signal_grep@latest
 ```
 
-Restart OMP after installing or updating. The package declares its native OMP extension and registers `baoer_signal_grep`. In the default hard mode it removes OMP's built-in `grep` and `glob` entries from the active tool set and blocks direct search commands while leaving reads, edits, tests, builds and other development tools available. Prefer mode keeps both the dedicated and alternative tools active, adds model guidance, and does not deny shell searches. OMP's active profile is respected; the default configuration file is `~/.omp/agent/baoer_signal_grep.json`, and a named profile uses `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`. Set `enforceSearch` to `"hard"` (default), `"prefer"`, or `"off"` in the active file, then restart OMP. Existing `true` and `false` values remain compatible. Set `"locale": "zh-CN"` to use the Chinese interface.
+Restart OMP after installing or updating. The package declares its native OMP extension and registers `baoer_signal_grep`. In the default hard mode it removes OMP's built-in `grep` and `glob` entries from the active tool set and blocks direct search commands while leaving reads, edits, tests, builds and other development tools available. Prefer mode keeps both the dedicated and alternative tools active, adds model guidance, and does not deny shell searches. OMP's active profile is respected; the default configuration file is `~/.omp/agent/baoer_signal_grep.json`, and a named profile uses `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`. Set `enforceSearch` to `"hard"` (default), `"prefer"`, or `"off"` in the active file, then restart OMP. Only these current string values are accepted; boolean values and unknown configuration fields are rejected. Set `"locale": "zh-CN"` to use the Chinese interface.
 
 ### Claude Code or Codex: MCP connection
 
@@ -100,7 +116,7 @@ codex mcp add baoer_signal_grep -- npx -y --package baoer_signal_grep@latest bao
 
 `@latest` follows the newest published version when MCP starts. Restart the host to load updates. The server searches the active project; `BAOER_SIGNAL_GREP_MCP_CWD` can select a different root. An MCP-only connection adds the tool without disabling other search tools.
 
-MCP returns readable text plus structured evidence by default. If a host serializes both forms into the model context, set `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model` in that MCP server's environment and restart it. Model mode omits `structuredContent` and its advertised output schema, advertises concise workflow guidance, and selects the smaller of the standard page and a compact view of the same retained analysis snapshot. Repeated paths and inspect requests are shared, hybrid does not concatenate separate literal and Concept bodies, and outline excerpts are deferred to version-checked inspection. Counts, coverage, partial status, reasons and continuation requests remain visible. Use `text` to omit structured output while preserving the complete standard text and full compatibility guidance, or retain the default `structured` mode for programmatic consumers and clients that expose only structured results. Any other value fails at startup. The bundled Claude Code, Codex and Kimi native plugins select `model`; direct MCP connections retain the compatible default unless configured explicitly.
+MCP returns readable text plus structured evidence by default. If a host serializes both forms into the model context, set `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model` in that MCP server's environment and restart it. Model mode omits `structuredContent` and its advertised output schema, advertises concise workflow guidance, and selects the smaller of the standard page and a compact view of the same retained analysis snapshot. Repeated paths and inspect requests are shared, hybrid does not concatenate separate literal and Concept bodies, and outline excerpts are deferred to version-checked inspection. Counts, coverage, partial status, reasons and continuation requests remain visible. Use `text` to omit structured output while preserving the complete standard text and full usage guidance, or retain the default `structured` mode for programmatic consumers and clients that expose only structured results. Any other value fails at startup. The bundled Claude Code, Codex and Kimi native plugins select `model`; direct MCP connections retain the structured default unless configured explicitly.
 
 `paths` selects exact retained files from an existing cursor; a new search accepts one `path`. Split unrelated roots into separate requests rather than replacing them with a broader common parent. Markdown inspection uses a bounded line window and does not require Universal Ctags; missing structure providers remain visible when they affect code structure inspection.
 

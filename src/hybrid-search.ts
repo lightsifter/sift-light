@@ -1,10 +1,65 @@
 import { DEFAULT_HYBRID_CONCEPT_LIMIT, MAX_HYBRID_CONCEPT_LIMIT } from "./analysis-limits.js";
+import { resolve } from "node:path";
 import type { AnalysisItem, AnalysisResultSet, CoverageStatus } from "./analysis-types.js";
+import type { ConceptSearchExecution } from "./concept-search.js";
+import {
+  ConceptSourceChangedError,
+  verifyConceptSourceGeneration,
+} from "./concept-source-generation.js";
 import { SignalGrepError } from "./errors.js";
 import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import { SourceDocumentError, type ByteRange, type SourceDocument } from "./source-document.js";
 import { sameSourceRevision } from "./source.js";
 import type { SearchScan } from "./types.js";
+
+export class HybridSourceChangedError extends ConceptSourceChangedError {
+  constructor(
+    message = "Hybrid source changed while exact and concept evidence were being merged",
+  ) {
+    super(message);
+    this.name = "HybridSourceChangedError";
+  }
+}
+
+export function sameHybridLiteralScan(left: SearchScan, right: SearchScan): boolean {
+  if (
+    left.totalMatches !== right.totalMatches ||
+    left.snapshotComplete !== right.snapshotComplete ||
+    left.fileCounts.size !== right.fileCounts.size
+  )
+    return false;
+
+  // A scan can retain file counts without retaining source revisions. Build the
+  // lookup once so a large exact-result page does not repeatedly scan matches
+  // while comparing its admitted inventory.
+  const leftMatchesByDisplayPath = new Map<string, SearchScan["matches"][number]>();
+  for (const match of left.matches) {
+    if (!leftMatchesByDisplayPath.has(match.displayPath)) {
+      leftMatchesByDisplayPath.set(match.displayPath, match);
+    }
+  }
+  const rightMatchesByDisplayPath = new Map<string, SearchScan["matches"][number]>();
+  for (const match of right.matches) {
+    if (!rightMatchesByDisplayPath.has(match.displayPath)) {
+      rightMatchesByDisplayPath.set(match.displayPath, match);
+    }
+  }
+
+  for (const [path, count] of left.fileCounts) {
+    if (right.fileCounts.get(path) !== count) return false;
+    const leftMatch = leftMatchesByDisplayPath.get(path);
+    const rightMatch = rightMatchesByDisplayPath.get(path);
+    if (leftMatch?.absolutePath !== rightMatch?.absolutePath) return false;
+    if (!leftMatch || !rightMatch) continue;
+    const leftRevision = left.sourceRevisions.get(leftMatch.absolutePath);
+    const rightRevision = right.sourceRevisions.get(rightMatch.absolutePath);
+    // Missing revision metadata is unknown coverage, not evidence that the
+    // source changed. literalEvidence carries that uncertainty as partial.
+    if (leftRevision === undefined || rightRevision === undefined) continue;
+    if (!sameSourceRevision(leftRevision, rightRevision)) return false;
+  }
+  return true;
+}
 
 function rangesOverlap(left: ByteRange, right: ByteRange): boolean {
   return left.start < right.end && right.start < left.end;
@@ -35,6 +90,7 @@ function absoluteOccurrenceRanges(
 async function literalEvidence(
   scan: SearchScan,
   access: SourceAccess,
+  generation: ConceptSearchExecution["sourceGeneration"],
 ): Promise<{
   items: AnalysisItem[];
   rangesByPath: Map<string, ByteRange[]>;
@@ -43,22 +99,35 @@ async function literalEvidence(
 }> {
   const documents = new Map<string, SourceDocument>();
   const unavailable = new Map<string, string>();
+  const generatedDocuments = new Map(
+    generation.documents.map((document) => [resolve(access.cwd, document.path), document]),
+  );
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath)) continue;
     try {
-      // oxlint-disable-next-line no-await-in-loop -- SourceAccess owns a bounded serialized read budget.
-      const document = await access.load(match.absolutePath);
+      const generated = generatedDocuments.get(resolve(access.cwd, match.absolutePath));
+      // Reuse the document admitted by the unified source generation; only unmatched literal
+      // files need a bounded inspection read.
+      // oxlint-disable-next-line no-await-in-loop -- source reads share one bounded access budget.
+      const document = generated ?? (await access.load(match.absolutePath));
       const expected = scan.sourceRevisions.get(match.absolutePath);
-      if (
-        !expected ||
-        document.reference.origin.kind !== "worktree" ||
-        !sameSourceRevision(expected, document.reference.origin.revision)
-      ) {
-        unavailable.set(match.absolutePath, "source revision was not stable across hybrid search");
+      if (!expected) {
+        unavailable.set(match.absolutePath, "source revision metadata was unavailable");
         continue;
+      }
+      if (document.reference.origin.kind !== "worktree") {
+        unavailable.set(match.absolutePath, "source revision origin was unavailable");
+        continue;
+      }
+      if (!sameSourceRevision(expected, document.reference.origin.revision)) {
+        throw new HybridSourceChangedError(
+          `${match.displayPath}: source revision changed while preparing hybrid evidence`,
+        );
       }
       documents.set(match.absolutePath, document);
     } catch (error) {
+      if (error instanceof SourceDocumentError && error.reason === "source-changed")
+        throw new HybridSourceChangedError(`${match.displayPath}: ${error.message}`);
       if (error instanceof SourceBudgetError || error instanceof SourceDocumentError) {
         unavailable.set(match.absolutePath, error.message);
         continue;
@@ -114,15 +183,37 @@ function isLiteralOverlap(item: AnalysisItem, rangesByPath: Map<string, ByteRang
 
 export async function combineHybridSearch(
   scan: SearchScan,
-  concept: AnalysisResultSet,
+  execution: ConceptSearchExecution,
   access: SourceAccess,
   conceptLimit: number,
 ): Promise<AnalysisResultSet> {
+  const concept = execution.analysis;
   if (concept.kind !== "concept") throw new Error("Hybrid search requires concept evidence");
-  const literal = await literalEvidence(scan, access);
-  const eligibleConcept = concept.items.filter(
-    (item) => !isLiteralOverlap(item, literal.rangesByPath),
-  );
+  await verifyConceptSourceGeneration(execution.sourceGeneration, access);
+  const literal = await literalEvidence(scan, access, execution.sourceGeneration);
+  // Concept passages deliberately overlap at chunk boundaries. Deduplicate in
+  // rank order before applying the supplement limit, keeping the best evidence.
+  const retainedRanges = new Map<string, ByteRange[]>();
+  const eligibleConcept = concept.items.filter((item) => {
+    if (isLiteralOverlap(item, literal.rangesByPath)) return false;
+    const range = item.range;
+    if (!range) return true;
+    const ranges = retainedRanges.get(item.path) ?? [];
+    let low = 0;
+    let high = ranges.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (ranges[middle]!.start < range.start) low = middle + 1;
+      else high = middle;
+    }
+    const previous = ranges[low - 1];
+    const next = ranges[low];
+    if ((previous && rangesOverlap(previous, range)) || (next && rangesOverlap(next, range)))
+      return false;
+    ranges.splice(low, 0, range);
+    retainedRanges.set(item.path, ranges);
+    return true;
+  });
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
   const selectedConcept: AnalysisItem[] = [];
   for (const item of eligibleConcept.slice(0, conceptLimit)) {
@@ -139,12 +230,20 @@ export async function combineHybridSearch(
   const literalCoverage: CoverageStatus = scan.snapshotComplete ? "complete" : "partial";
   const conceptCoverage =
     concept.coverage?.conceptCandidates ?? (concept.partial ? "partial" : "complete");
+  const conceptSourceCoverage: CoverageStatus = execution.sourceGeneration.partial
+    ? "partial"
+    : "complete";
   const deduplicationCoverage: CoverageStatus =
-    scan.snapshotComplete && literal.sourceCoverage === "complete" ? "complete" : "partial";
+    scan.snapshotComplete &&
+    literal.sourceCoverage === "complete" &&
+    conceptSourceCoverage === "complete"
+      ? "complete"
+      : "partial";
   const partial =
     !scan.snapshotComplete ||
     concept.partial ||
     conceptCoverage === "skipped" ||
+    conceptSourceCoverage === "partial" ||
     literal.sourceCoverage === "partial" ||
     deduplicationCoverage === "partial";
   const selectionReason = conceptCandidatesOmitted
@@ -159,6 +258,7 @@ export async function combineHybridSearch(
       ...(scan.retention?.reasons ?? []),
       ...concept.reasons,
       ...literal.reasons,
+      ...execution.sourceGeneration.reasons,
       ...(selectionReason ? [selectionReason] : []),
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
@@ -182,10 +282,12 @@ export async function combineHybridSearch(
       conceptCandidates: conceptCoverage,
       crossSourceDeduplication: deduplicationCoverage,
       sourceInspection: literal.sourceCoverage,
+      conceptSourceInspection: conceptSourceCoverage,
       retention: "complete",
     },
     ...(concept.stats ? { stats: concept.stats } : {}),
     ...(concept.redact !== undefined ? { redact: concept.redact } : {}),
+    ...(concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {}),
   };
 }
 

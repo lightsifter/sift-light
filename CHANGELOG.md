@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+## [1.6.0] - 2026-09-14
+
+- Simplify interactive host output to the essential result statistics: match or item count, file count, completion state, budget state and continuation availability. File lists, source excerpts and raw failure diagnostics stay available to the model through structured evidence and inspect requests.
+- Keep model-facing evidence navigable with bounded match metadata, source inspection, semantic excerpts and explicit continuation requests. Recoverable request-contract failures remain actionable for the model without leaking their raw diagnostic text into the human-facing display.
+- Refresh Claude Code, Codex and Kimi MCP manifests to resolve the published `baoer_signal_grep@latest` package and keep all generated plugin artifacts on one release version.
+
+## [2.1.0] - 2026-09-13
+
+- Accept only current configuration: `enforceSearch` uses `hard`, `prefer` or `off`; retired boolean values and unknown config keys fail explicitly. No compatibility aliases or silent ignored settings.
+
+- Remove language-service navigation and its runtime dependencies, provider processes, graph traversal, snapshots and filesystem watchers. Removed modes: `definitions`, `references`, `implementations`, `callers`, `callees`, `dependencies`, `dependents`, `trace` and `impact`; requests fail explicitly without a weaker automatic fallback.
+- Retain ast-grep syntax analysis, bounded Python outline, static JS/TS/TSX imports/tests, exact/file searches, source inspection, Concept and hybrid. Swift outline is no longer advertised; Swift content search and inspection remain available.
+- Preserve the complete source-validation report in compact MCP output, including freshness, comparison target, check interval and per-source status; source rows use one-based indices and retained/returned counts agree.
+- Keep saved-source `validate` independent from language services. Metadata now uses `validation` instead of `relationship`; removed trace cursors and graph fields are unsupported. TypeScript is a development-only dependency and Pyright is no longer installed.
+
+- Deduplicate overlapping semantic passages in rank order before applying the hybrid supplement limit; retained counts and the non-overlap claim now describe the same evidence.
+- Mark truncated matching-line excerpts in tool text, disclose the snapshot-wide line count and per-line bound, and retain an executable inspection request even after the last match page.
+- Put ordinary search scope-expansion notices before evidence while preserving the documented default and explicit `scope="strict"` behavior.
+- Require every word in multi-word file queries to occur literally in the candidate path, preventing unrelated long build paths from satisfying independent fuzzy character walks. Single-word filename abbreviations remain supported.
+- Clarify the ordinary page limit, concrete-file outline requirement, structure language/pattern requirements, and continuation workflow in model-facing contracts.
+- Run JavaScript workers correctly inside compiled Bun hosts such as OMP and include the syntax/concept workers with the bundled OMP extension.
+
+## [2.0.0] - 2026-09-13
+
+- Add one owned lifecycle for long-running Concept and hybrid requests: the initial wait returns an exact `mode="await"` continuation with an operation id and progress, continuation resumes the same computation, final results are stably retained, and explicit cancellation waits for owned cleanup. Pending operations are bounded per service session, idle leases expire abandoned work, and real failures remain diagnostic instead of degrading to literal-only evidence.
+- Re-enumerate and verify a complete Concept source generation before publishing either Concept or hybrid evidence. Empty, unavailable, added, deleted and replaced files remain visible in coverage; source changes refresh within the operation deadline and mixed generations cannot be reported complete.
+- Deduplicate repeated embedding inputs before inference and atomically cache each completed embedding batch, exposing progress for unique embeddings and mapped passages. Cache reads distinguish misses or rebuildable corruption from real I/O failures.
+- Add bounded static caller/callee traces for TypeScript and Go with immutable result cursors, independent exploration cursors, cumulative depth/node/edge/expansion budgets, and visible partial coverage.
+- Add `mode: "validate"` for saved trace and analysis evidence. Validation checks retained source, configuration, manifest, and provider dependencies against the current worktree and reports `current`, `stale`, or `unknown` without changing the original snapshot or turning partial coverage into a complete result.
+
 ## [1.5.6-3] - 2026-09-10
 
 - Provide ready-to-copy `baoer_signal_grep` requests when the hard search policy blocks a static standalone `rg` or `ripgrep` command that can be translated without ambiguity, while preserving search options, the original working-directory scope, and conservative manual recovery for unsupported shell behavior.

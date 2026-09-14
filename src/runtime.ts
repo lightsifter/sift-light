@@ -23,6 +23,9 @@ export class SignalGrepRuntime {
     this.#summary.record(input, result);
     return result;
   }
+  recordFailure(): void {
+    this.#summary.recordFailure();
+  }
 
   get sessionSummary(): SessionSummarySnapshot {
     return this.#summary.snapshot;

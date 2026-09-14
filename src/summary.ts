@@ -23,9 +23,6 @@ export function formatSummary(
   const files = [...snapshot.fileCounts.entries()].toSorted(
     ([left, leftCount], [right, rightCount]) => rightCount - leftCount || left.localeCompare(right),
   );
-  const firstMatches = new Map<string, { match: MatchRecord; index: number }>();
-  for (const [index, match] of snapshot.matches.entries())
-    if (!firstMatches.has(match.displayPath)) firstMatches.set(match.displayPath, { match, index });
   const maxCharacters = Math.max(
     256,
     resultTokenBudget * ESTIMATED_CHARACTERS_PER_TOKEN - METADATA_CHARACTERS,
@@ -33,6 +30,9 @@ export function formatSummary(
   const maxBytes = MAX_RESULT_BYTES - METADATA_BYTES;
   const rows: string[] = [];
   const shownPaths: string[] = [];
+  const firstMatches = new Map<string, { match: MatchRecord; index: number }>();
+  for (const [index, match] of snapshot.matches.entries())
+    if (!firstMatches.has(match.displayPath)) firstMatches.set(match.displayPath, { match, index });
   let bytes = 0;
   let characters = 0;
   for (const [file, count] of files.slice(offset, offset + Math.min(30, fileLimit))) {

@@ -3974,13 +3974,13 @@ class SearchPolicy {
 // src/config-reader.ts
 var SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
 function normalizeSearchEnforcement(value, source) {
-  if (value === undefined || value === true || value === "hard")
+  if (value === undefined || value === "hard")
     return "hard";
   if (value === "prefer")
     return "prefer";
-  if (value === false || value === "off")
+  if (value === "off")
     return "off";
-  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be true, false, "hard", "prefer", or "off"`);
+  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
 }
 function readNativeSearchEnforcement(environment = process.env) {
   const value = environment[SIGNAL_GREP_ENFORCEMENT_ENV];

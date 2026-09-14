@@ -1,4 +1,3 @@
-import { isSemanticMode } from "./semantic-protocol.js";
 import { randomUUID } from "node:crypto";
 import {
   ANALYSIS_TTL_MS,
@@ -20,6 +19,7 @@ import {
   termCountRequest,
 } from "./analysis-term-pages.js";
 
+import { analysisExtraGroups, statisticsForItems } from "./result-statistics.js";
 interface StoredAnalysis {
   id: string;
   result: AnalysisResultSet;
@@ -30,7 +30,6 @@ interface StoredAnalysis {
 export type RetainedAnalysisSummary = (
   items: readonly AnalysisItem[],
 ) => Pick<AnalysisResultSet, "counts" | "termCounts">;
-export type AnalysisRetentionPriority = (item: AnalysisItem) => number;
 
 function boundedReasons(reasons: readonly string[]): string[] {
   const unsupportedSuffix = ": syntax unsupported; this source remains unclassified";
@@ -76,6 +75,96 @@ function boundedReasons(reasons: readonly string[]): string[] {
   return retained;
 }
 
+function publicAnalysisLabel(result: AnalysisResultSet): string {
+  switch (result.kind) {
+    case "files":
+      return "file metadata";
+    case "outline":
+      return "symbol metadata";
+    case "imports":
+      return "import relationship metadata";
+    case "tests":
+      return "test candidate metadata";
+    case "structure":
+      return "structure match metadata";
+    case "roles":
+      return "role match metadata";
+    case "function-and":
+      return "function match metadata";
+    case "file-and":
+      return "file match metadata";
+    case "changes":
+      return "change metadata";
+    case "concept":
+      return "semantic candidate metadata";
+    case "hybrid":
+      return "combined evidence metadata";
+    case "any-of":
+      return "condition match metadata";
+    case "validate":
+      return "validation metadata";
+  }
+  throw new Error("Unknown analysis result kind");
+}
+
+function publicStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) return undefined;
+  return value;
+}
+
+function publicStructureDetails(item: AnalysisItem): Record<string, unknown> | undefined {
+  if (item.details?.kind !== "symbol") return undefined;
+  const details = item.details;
+  const scope = publicStringArray(details.scope);
+  return {
+    kind: "symbol",
+    ...(typeof details.language === "string" ? { language: details.language } : {}),
+    ...(typeof details.name === "string" ? { name: details.name } : {}),
+    ...(scope ? { scope } : {}),
+    ...(typeof details.hasBody === "boolean" ? { hasBody: details.hasBody } : {}),
+    ...(typeof details.exported === "boolean" ? { exported: details.exported } : {}),
+    ...(typeof details.syntax === "string" ? { syntax: details.syntax } : {}),
+    ...(typeof details.signatureTruncated === "boolean"
+      ? { signatureTruncated: details.signatureTruncated }
+      : {}),
+  };
+}
+
+function publicAnalysisItem(
+  result: AnalysisResultSet,
+  item: AnalysisItem,
+  index: number,
+  storedId: string,
+): NonNullable<SignalGrepResult["details"]["analysis"]>["items"][number] {
+  const inspect =
+    item.source && item.range
+      ? {
+          mode: "inspect" as const,
+          cursor: `${storedId}.analysis.0`,
+          matchIndex: index + 1,
+          ...(result.redact ? { redact: true } : {}),
+        }
+      : undefined;
+  const publicDetails = publicStructureDetails(item);
+  return {
+    path: item.path,
+    line: item.line,
+    label: publicAnalysisLabel(result),
+    index: index + 1,
+    ...(inspect ? { inspect } : {}),
+    ...(publicDetails ? { details: publicDetails } : {}),
+  };
+}
+
+function safeTermCounts(
+  termCounts: readonly { retainedOccurrences: number }[] | undefined,
+): { term: string; retainedOccurrences: number }[] | undefined {
+  return termCounts?.map((entry, index) => ({
+    term: `condition #${String(index + 1)}`,
+    retainedOccurrences: entry.retainedOccurrences,
+  }));
+}
+
 function hybridPreviewIndices(items: readonly AnalysisItem[]): number[] {
   const literal: number[] = [];
   const concept: number[] = [];
@@ -99,11 +188,7 @@ export class AnalysisStore {
     this.#items.clear();
   }
 
-  create(
-    result: AnalysisResultSet,
-    summarize?: RetainedAnalysisSummary,
-    retentionPriority?: AnalysisRetentionPriority,
-  ): string {
+  create(result: AnalysisResultSet, summarize?: RetainedAnalysisSummary): string {
     this.#expire();
     const bounded: AnalysisResultSet = {
       ...result,
@@ -112,13 +197,7 @@ export class AnalysisStore {
       coverage: { ...result.coverage, retention: "complete" },
     };
     let bytes = Buffer.byteLength(JSON.stringify(bounded));
-    const candidates = result.items
-      .map((item, index) => ({ item, index }))
-      .toSorted(
-        (left, right) =>
-          (retentionPriority?.(left.item) ?? 0) - (retentionPriority?.(right.item) ?? 0) ||
-          left.index - right.index,
-      );
+    const candidates = result.items.map((item, index) => ({ item, index }));
     const retainedIndices: number[] = [];
     const rebuildItems = (): void => {
       const retained = new Set(retainedIndices);
@@ -237,19 +316,25 @@ export class AnalysisStore {
     const pagedTerms =
       result.termCounts &&
       Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
-    const inlineTerms = pagedTerms ? undefined : result.termCounts;
+    const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
     const items: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
     const sources: NonNullable<SignalGrepResult["details"]["analysis"]>["sources"] = [];
     const sourceIds = new Map<string, number>();
     const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
+    const statistics = statisticsForItems(
+      result.items,
+      result.items.length,
+      result.unit,
+      analysisExtraGroups(result.counts, result.termCounts, result.items),
+    );
     const scope = result.scope
       ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
       : "";
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
     const hasItemDetails = result.items.some((item) => item.details !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
     const notice = result.reasons.length
       ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
       : "";
@@ -259,16 +344,12 @@ export class AnalysisStore {
     const appendItem = (index: number): boolean => {
       const item = result.items[index];
       if (!item) throw new Error("Analysis item unavailable");
-      const inspect =
-        item.source && item.range
-          ? {
-              mode: "inspect" as const,
-              cursor: `${stored.id}.analysis.0`,
-              matchIndex: index + 1,
-              ...(result.redact ? { redact: true } : {}),
-            }
-          : undefined;
-      const row = `#${index + 1} ${item.path}:${item.line} ${item.label}${item.excerpt ? `\n${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `\nInspect: ${JSON.stringify(inspect)}` : ""}`;
+      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const inspect = publicItem.inspect;
+      const exposeExcerpt =
+        result.kind === "concept" ||
+        (result.kind === "hybrid" && item.details?.source === "concept");
+      const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `\n${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `\nInspect: ${JSON.stringify(inspect)}` : ""}`;
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
         if (items.length === 0)
@@ -277,7 +358,6 @@ export class AnalysisStore {
       }
       rows.push(row);
       bytes += rowBytes;
-      if (!hybridPreview) next = index + 1;
       if (hybridInspectCursor && item.source) {
         const sourceKey = JSON.stringify(item.source);
         let sourceId = sourceIds.get(sourceKey);
@@ -287,10 +367,16 @@ export class AnalysisStore {
           sourceIds.set(sourceKey, sourceId);
         }
         const { source: _source, ...sharedItem } = item;
-        items.push({ ...sharedItem, index: index + 1, sourceId });
+        items.push({ ...sharedItem, label: publicItem.label, index: index + 1, sourceId });
       } else {
-        items.push({ ...item, index: index + 1, ...(inspect ? { inspect } : {}) });
+        items.push({
+          ...item,
+          label: publicItem.label,
+          index: index + 1,
+          ...(inspect ? { inspect } : {}),
+        });
       }
+      if (!hybridPreview) next = index + 1;
       return true;
     };
     if (hybridPreview) {
@@ -327,15 +413,13 @@ export class AnalysisStore {
       details: {
         version: 1,
         mode:
-          isSemanticMode(result.kind) ||
           result.kind === "concept" ||
           result.kind === "hybrid" ||
           result.kind === "structure" ||
           result.kind === "files" ||
           result.kind === "outline" ||
           result.kind === "imports" ||
-          result.kind === "tests" ||
-          result.kind === "impact"
+          result.kind === "tests"
             ? result.kind
             : "matches",
         status: result.partial ? "partial" : "complete",
@@ -343,7 +427,8 @@ export class AnalysisStore {
         totalMatches: result.items.length,
         storedMatches: result.items.length,
         returnedMatches: items.length,
-        totalFiles: new Set(result.items.map((item) => item.path)).size,
+        totalFiles: statistics.files,
+        statistics,
         cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
         ...(nextRequest ? { nextRequest } : {}),
         analysis: {
@@ -351,9 +436,9 @@ export class AnalysisStore {
           unit: result.unit,
           totalItems: result.items.length,
           returnedItems: items.length,
+          statistics,
           items,
           ...(sources.length ? { sources } : {}),
-          ...(hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}),
           reasons: result.reasons,
           ...(result.filesRead !== undefined ? { filesRead: result.filesRead } : {}),
           ...(result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {}),
@@ -367,7 +452,9 @@ export class AnalysisStore {
           ...(result.chunks !== undefined ? { chunks: result.chunks } : {}),
           ...(result.coverage ? { coverage: result.coverage } : {}),
           ...(result.stats ? { stats: result.stats } : {}),
+          ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
+          ...(hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}),
         },
         ...(result.scope ? { scope: result.scope } : {}),
         ...(result.redact ? { redactionRequested: true } : {}),
