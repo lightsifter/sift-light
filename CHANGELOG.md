@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [1.6.0] - 2026-09-14
+
+- Simplify interactive host output to the essential result statistics: match or item count, file count, completion state, budget state and continuation availability. File lists, source excerpts and raw failure diagnostics stay available to the model through structured evidence and inspect requests.
+- Keep model-facing evidence navigable with bounded match metadata, source inspection, semantic excerpts and explicit continuation requests. Recoverable request-contract failures remain actionable for the model without leaking their raw diagnostic text into the human-facing display.
+- Refresh Claude Code, Codex and Kimi MCP manifests to resolve the published `baoer_signal_grep@latest` package and keep all generated plugin artifacts on one release version.
+
 ## [2.1.0] - 2026-09-13
 
 - Accept only current configuration: `enforceSearch` uses `hard`, `prefer` or `off`; retired boolean values and unknown config keys fail explicitly. No compatibility aliases or silent ignored settings.

@@ -128,6 +128,7 @@ var ESTIMATED_CHARACTERS_PER_TOKEN = 4;
 var DEFAULT_SUMMARY_FILE_LIMIT = 30;
 var MAX_SELECTED_PATHS = 20;
 var MAX_INSPECT_TARGETS = 5;
+var MAX_DISPLAYED_OCCURRENCES = 20;
 var MAX_STORED_MATCHES = 50000;
 var MAX_STORED_OCCURRENCES = 200000;
 var MAX_SEARCH_STORAGE_BYTES = 32 * 1024 * 1024;
@@ -916,6 +917,111 @@ async function assertExistingPathInsideCwd(path, cwd) {
     throw new SignalGrepError("Path must stay within the working directory");
   }
 }
+class SourceBudgetTooSmallError extends SignalGrepError {
+  constructor() {
+    super("Source target line exceeds the available byte budget");
+    this.name = "SourceBudgetTooSmallError";
+  }
+}
+
+class SourceLineUnavailableError extends SignalGrepError {
+  constructor(line) {
+    super(`Source line ${String(line)} is beyond the end of the file`);
+    this.name = "SourceLineUnavailableError";
+  }
+}
+function sourceLineBytes(line) {
+  return Buffer.byteLength(`${String(line.line)}: ${line.text}`, "utf8");
+}
+function selectSourceWindow(rendered, targetIndex, maxBytes) {
+  let startIndex = targetIndex;
+  let endIndex = targetIndex;
+  const target = rendered[targetIndex];
+  if (!target)
+    throw new Error("Source target line is unavailable");
+  let bytes = sourceLineBytes(target);
+  if (bytes > maxBytes)
+    throw new SourceBudgetTooSmallError;
+  let canGrowBefore = true;
+  let canGrowAfter = true;
+  while (canGrowBefore || canGrowAfter) {
+    let grew = false;
+    if (canGrowBefore) {
+      const candidate = rendered[startIndex - 1];
+      if (candidate === undefined) {
+        canGrowBefore = false;
+      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
+        startIndex -= 1;
+        bytes += 1 + sourceLineBytes(candidate);
+        grew = true;
+      } else {
+        canGrowBefore = false;
+      }
+    }
+    if (canGrowAfter) {
+      const candidate = rendered[endIndex + 1];
+      if (candidate === undefined) {
+        canGrowAfter = false;
+      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
+        endIndex += 1;
+        bytes += 1 + sourceLineBytes(candidate);
+        grew = true;
+      } else {
+        canGrowAfter = false;
+      }
+    }
+    if (!grew && !canGrowBefore && !canGrowAfter)
+      break;
+  }
+  return { lines: rendered.slice(startIndex, endIndex + 1), startIndex, endIndex };
+}
+function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLine, options = {}) {
+  const maxBytes = options.maxBytes ?? MAX_SOURCE_RANGE_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_SOURCE_RANGE_BYTES)
+    throw new Error("Source range byte budget must be within the result body limit");
+  const lines = [];
+  let lineStart = 0;
+  for (let newline = content.indexOf(10);newline >= 0; newline = content.indexOf(10, lineStart)) {
+    lines.push(content.subarray(lineStart, newline));
+    lineStart = newline + 1;
+  }
+  lines.push(content.subarray(lineStart));
+  const boundedStart = Math.max(1, startLine);
+  if (boundedStart > lines.length) {
+    throw new SourceLineUnavailableError(targetLine);
+  }
+  const boundedEnd = Math.min(lines.length, Math.max(boundedStart, endLine));
+  if (targetLine < 1 || targetLine > lines.length) {
+    throw new SourceLineUnavailableError(targetLine);
+  }
+  const boundedTarget = Math.min(boundedEnd, Math.max(boundedStart, targetLine));
+  const rendered = Array.from({ length: boundedEnd - boundedStart + 1 }, (_, index) => {
+    const lineNumber = boundedStart + index;
+    const raw = lines[lineNumber - 1];
+    if (!raw)
+      throw new Error("Source line is unavailable");
+    const focus = lineNumber === targetLine ? options.focus : undefined;
+    const start2 = focus?.range.start.character ?? 0;
+    const end = focus?.range.end.character ?? start2;
+    const bytes = focus?.range.encoding === "utf-8" ? raw : undefined;
+    const excerpt = excerptText(raw.toString("utf8").replaceAll("\r", ""), bytes ? bytes.subarray(0, start2).toString("utf8").replaceAll("\r", "").length : start2, bytes ? bytes.subarray(0, end).toString("utf8").replaceAll("\r", "").length : end);
+    return { line: lineNumber, text: excerpt.text, truncated: excerpt.truncated };
+  });
+  const selected = selectSourceWindow(rendered, boundedTarget - boundedStart, maxBytes);
+  const omittedBefore = selected.startIndex;
+  const omittedAfter = rendered.length - selected.endIndex - 1;
+  return {
+    text: selected.lines.map((line) => `${String(line.line)}: ${line.text}`).join(`
+`),
+    lines: selected.lines,
+    startLine: boundedStart + selected.startIndex,
+    endLine: boundedStart + selected.endIndex,
+    truncated: omittedBefore > 0 || omittedAfter > 0,
+    omittedBefore,
+    omittedAfter,
+    truncatedLines: selected.lines.filter((line) => line.truncated).map((line) => line.line)
+  };
+}
 
 // src/scan-revisions.ts
 import { resolve as resolve3 } from "path";
@@ -1547,7 +1653,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "2.1.1",
+  version: "1.6.0",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -4896,9 +5002,6 @@ function createStatistics(unit, total, fileCounts, extraGroups = []) {
     topFilesOmitted: Math.max(0, rankedFiles.length - MAX_TOP_FILES)
   };
 }
-function statisticsForSnapshot(snapshot) {
-  return createStatistics("matches", snapshot.totalMatches, new Map(snapshot.fileCounts));
-}
 function statisticsForItems(items, total, unit, extraGroups = []) {
   return createStatistics(unit, total, fileCountsFromItems(items), extraGroups);
 }
@@ -4912,20 +5015,6 @@ function statisticsGroup(dimension, entries) {
     omitted: Math.max(0, ranked.length - MAX_BREAKDOWN_ENTRIES),
     total: ranked.reduce((sum, entry) => sum + entry.count, 0)
   };
-}
-function formatStatistics(statistics, options = {}) {
-  const lines = [
-    `Result: ${String(statistics.total)} ${statistics.unit} across ${String(statistics.files)} files and ${String(statistics.directories)} directories.`
-  ];
-  for (const breakdown of statistics.groups) {
-    const entries = breakdown.entries.map((entry) => `${entry.label}=${String(entry.count)}`).join(", ");
-    const omitted = breakdown.omitted > 0 ? `, +${String(breakdown.omitted)} other categories` : "";
-    lines.push(`By ${breakdown.dimension}: ${entries}${omitted}`);
-  }
-  if (options.includeTopFiles !== false && statistics.topFiles.length) {
-    lines.push(`Top files: ${statistics.topFiles.map((entry) => `${entry.label}=${String(entry.count)}`).join(", ")}${statistics.topFilesOmitted > 0 ? `, +${String(statistics.topFilesOmitted)} other files` : ""}`);
-  }
-  return lines;
 }
 function analysisExtraGroups(counts, termCounts, items) {
   const groups = [];
@@ -5186,52 +5275,69 @@ class AnalysisStore {
     const pagedTerms = result.termCounts && Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
     const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
+    const items = [];
+    const sources = [];
+    const sourceIds = new Map;
+    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
     const statistics = statisticsForItems(result.items, result.items.length, result.unit, analysisExtraGroups(result.counts, result.termCounts, result.items));
-    const publicItems = [];
-    const scope = result.scope ? `Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : undefined;
-    const coverage = result.coverage ? `Coverage: ${JSON.stringify(result.coverage)}.` : undefined;
-    const stats = result.stats ? `Stats: ${JSON.stringify(result.stats)}.` : undefined;
-    const header = [
-      `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}).`,
-      ...formatStatistics(statistics),
-      inlineTerms ? `Condition counts: ${JSON.stringify(inlineTerms)}.` : undefined,
-      termsRequest ? `Condition counts are paginated: ${JSON.stringify(termsRequest)}.` : undefined,
-      scope,
-      coverage,
-      stats
-    ].filter((line) => line !== undefined).join(`
-`);
-    const notice = result.reasons.length ? result.reasons.map((reason) => `[${reason}]`).join(`
-`) : undefined;
+    const scope = result.scope ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : "";
+    const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
+    const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
+    const hasItemDetails = result.items.some((item) => item.details !== undefined);
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
+    const notice = result.reasons.length ? `
+${result.reasons.map((reason) => `[${reason}]`).join(`
+`)}` : "";
     const rows = [];
-    let bytes = Buffer.byteLength(header) + Buffer.byteLength(notice ?? "") + 1200;
+    let bytes = Buffer.byteLength(header + notice) + 1200;
     let next = offset;
     const appendItem = (index) => {
       const item = result.items[index];
       if (!item)
         throw new Error("Analysis item unavailable");
       const publicItem = publicAnalysisItem(result, item, index, stored.id);
-      const row = `#${String(index + 1)} ${item.path}:${String(item.line)} ${publicItem.label}`;
+      const inspect = publicItem.inspect;
+      const exposeExcerpt = result.kind === "concept" || result.kind === "hybrid" && item.details?.source === "concept";
+      const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `
+${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `
+Inspect: ${JSON.stringify(inspect)}` : ""}`;
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
-        if (publicItems.length === 0)
-          throw new SignalGrepError("Analysis metadata exceeds the response limit; narrow the query");
+        if (items.length === 0)
+          throw new SignalGrepError("Analysis item exceeds the response limit; narrow its source");
         return false;
       }
       rows.push(row);
       bytes += rowBytes;
-      publicItems.push(publicItem);
+      if (hybridInspectCursor && item.source) {
+        const sourceKey = JSON.stringify(item.source);
+        let sourceId = sourceIds.get(sourceKey);
+        if (sourceId === undefined) {
+          sourceId = sources.length;
+          sources.push(item.source);
+          sourceIds.set(sourceKey, sourceId);
+        }
+        const { source: _source, ...sharedItem } = item;
+        items.push({ ...sharedItem, label: publicItem.label, index: index + 1, sourceId });
+      } else {
+        items.push({
+          ...item,
+          label: publicItem.label,
+          index: index + 1,
+          ...inspect ? { inspect } : {}
+        });
+      }
       if (!hybridPreview)
         next = index + 1;
       return true;
     };
     if (hybridPreview) {
       for (const index of hybridPreviewIndices(result.items)) {
-        if (publicItems.length >= 30 || !appendItem(index))
+        if (items.length >= 30 || !appendItem(index))
           break;
       }
     } else {
-      for (let index = offset;index < result.items.length && publicItems.length < 30; index += 1) {
+      for (let index = offset;index < result.items.length && items.length < 30; index += 1) {
         if (!appendItem(index))
           break;
       }
@@ -5241,13 +5347,13 @@ class AnalysisStore {
       ...result.redact ? { redact: true } : {}
     } : undefined);
     const text = [
-      header,
-      notice,
-      rows.length ? rows.join(`
-`) : "No retained item metadata is available.",
-      hybridMatchesRequest ? `Match metadata request: ${JSON.stringify(hybridMatchesRequest)}.` : undefined,
-      nextRequest ? `Next request: ${JSON.stringify(nextRequest)}` : undefined
-    ].filter((line) => line !== undefined && line.length > 0).join(`
+      header + notice,
+      ...rows,
+      ...hybridInspectCursor ? [
+        `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`
+      ] : [],
+      ...nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []
+    ].join(`
 
 `);
     if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
@@ -5261,7 +5367,7 @@ class AnalysisStore {
         snapshotComplete: !result.partial,
         totalMatches: result.items.length,
         storedMatches: result.items.length,
-        returnedMatches: publicItems.length,
+        returnedMatches: items.length,
         totalFiles: statistics.files,
         statistics,
         cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
@@ -5270,9 +5376,10 @@ class AnalysisStore {
           kind: result.kind,
           unit: result.unit,
           totalItems: result.items.length,
-          returnedItems: publicItems.length,
+          returnedItems: items.length,
           statistics,
-          items: publicItems,
+          items,
+          ...sources.length ? { sources } : {},
           reasons: result.reasons,
           ...result.filesRead !== undefined ? { filesRead: result.filesRead } : {},
           ...result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {},
@@ -5286,7 +5393,7 @@ class AnalysisStore {
           ...result.stats ? { stats: result.stats } : {},
           ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
           ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {},
-          ...hybridPreview ? { inspectCursor: `${stored.id}.analysis.0` } : {}
+          ...hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}
         },
         ...result.scope ? { scope: result.scope } : {},
         ...result.redact ? { redactionRequested: true } : {}
@@ -7206,6 +7313,68 @@ function subtractByteRange(ranges, returned) {
   }
   return remaining;
 }
+function utf8Boundary(document2, offset, direction) {
+  let byte = Math.max(0, Math.min(document2.bytes.length, offset));
+  while (byte > 0 && byte < document2.bytes.length) {
+    const value = document2.bytes[byte];
+    if (value === undefined || (value & 192) !== 128)
+      break;
+    byte += direction;
+  }
+  return byte;
+}
+function renderSourceFragment(fragment) {
+  const header = `[source bytes ${String(fragment.start)}..${String(fragment.end)}; ${String(fragment.startPosition.line)}:${String(fragment.startPosition.column)}\u2013${String(fragment.endPosition.line)}:${String(fragment.endPosition.column)}; UTF-8, end exclusive]`;
+  const lines = fragment.text.split(`
+`);
+  return [
+    header,
+    ...lines.map((text, index) => `${String(fragment.startPosition.line + index)}: ${text}`)
+  ].join(`
+`);
+}
+function sourcePage(document2, ranges, maxBytes, focus) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 256) {
+    throw new SignalGrepError("Source page budget must allow at least 256 bytes");
+  }
+  const gaps = mergeByteRanges(ranges);
+  const range = gaps.find((item) => focus !== undefined && item.start <= focus && focus < item.end) ?? gaps[0];
+  if (!range)
+    throw new SignalGrepError("Source range is already complete");
+  document2.checkRange(range);
+  document2.toCharacterOffset(range.start);
+  document2.toCharacterOffset(range.end);
+  const target = Math.max(range.start, Math.min(range.end, focus ?? range.start));
+  let available = Math.max(4, maxBytes - 160);
+  for (;; ) {
+    let start2 = range.start;
+    if (range.end - range.start > available && target - range.start > available / 2) {
+      start2 = utf8Boundary(document2, Math.floor(target - available / 2), 1);
+    }
+    start2 = Math.max(range.start, start2);
+    let end = utf8Boundary(document2, Math.min(range.end, start2 + available), -1);
+    if (end <= start2 && range.end > range.start)
+      end = utf8Boundary(document2, start2 + 1, 1);
+    const fragment = {
+      start: start2,
+      end,
+      text: document2.slice({ start: start2, end }),
+      startPosition: document2.positionAt(start2),
+      endPosition: document2.positionAt(end)
+    };
+    const text = renderSourceFragment(fragment);
+    if (Buffer.byteLength(text) <= maxBytes) {
+      return {
+        fragment,
+        remaining: subtractByteRange(gaps, fragment).filter((gap) => gap.start < gap.end),
+        text
+      };
+    }
+    if (available <= 4)
+      throw new SignalGrepError("Source metadata exceeds the page budget");
+    available = Math.max(4, Math.floor(available * 0.75));
+  }
+}
 
 // src/source-continuations.ts
 class SourceContinuations {
@@ -7314,6 +7483,12 @@ import { resolve as resolve17 } from "path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
+function hasBareCarriageReturn(bytes) {
+  for (let index = 0;index < bytes.length; index += 1)
+    if (bytes[index] === 13 && bytes[index + 1] !== 10)
+      return true;
+  return false;
+}
 function matchInspectionTarget(target) {
   return {
     path: target.path,
@@ -7398,6 +7573,76 @@ async function prepare(target, access, structure) {
   const boundary = target.range ? "requested-range" : details.status === "available" && details.range ? "syntax" : "line-window";
   document2.checkRange(range);
   return { target, document: document2, range, structure: details, boundary, focus };
+}
+function boundaryNote(block) {
+  if (block.boundary === "line-window" || block.boundary === "mixed") {
+    const fallback = block.prepared.find((prepared) => prepared.boundary === "line-window");
+    const status = fallback?.structure.status;
+    const provider = fallback?.structure.provider;
+    const diagnostic = status === "no-symbol" && provider === undefined ? "" : status ? " (" + status + (provider ? " via " + provider : "") + ")" : "";
+    return "; syntax boundary unavailable" + diagnostic + "; bounded line window";
+  }
+  return block.boundary === "requested-range" ? "; requested range; syntax boundary not inferred" : "";
+}
+function blockDetails(block) {
+  const starts = block.fragments.map((fragment) => fragment.start);
+  const ends = block.fragments.map((fragment) => fragment.end);
+  const start2 = starts.length > 0 ? Math.min(...starts) : block.ranges[0]?.start ?? 0;
+  const end = ends.length > 0 ? Math.max(...ends) : start2;
+  const nextRequest = block.continuation ? { mode: "inspect", sourceCursor: block.continuation } : undefined;
+  return {
+    range: {
+      startLine: block.document.lineAt(start2),
+      endLine: block.document.lineAt(Math.max(start2, end - 1))
+    },
+    omittedBefore: block.remaining.filter((range) => range.end <= start2).reduce((n, range) => n + block.document.lineAt(range.end) - block.document.lineAt(range.start), 0),
+    omittedAfter: block.remaining.filter((range) => range.start >= end).reduce((n, range) => n + block.document.lineAt(range.end) - block.document.lineAt(range.start), 0),
+    truncatedLines: [],
+    reference: block.document.reference,
+    targetRanges: block.ranges,
+    fragments: block.fragments,
+    remainingRanges: block.remaining,
+    complete: block.document.utf8 && block.remaining.length === 0,
+    ...block.boundary ? { boundary: block.boundary } : {},
+    ...nextRequest ? { nextRequest } : {}
+  };
+}
+function render(items, blocks, single) {
+  const rows = items.map((item) => `Target #${item.inputIndex} ${item.path ?? ""}:${item.line ?? ""}: ${item.status}${item.block ? `; Block #${item.block}` : ""}${item.structure && !(item.structure.status === "no-symbol" && item.structure.provider === undefined) ? ` [structure: ${item.structure.status}${item.structure.provider ? ` via ${item.structure.provider}` : ""}${item.structure.reason ? `; ${item.structure.reason}` : ""}]` : ""}${item.structure?.symbol ? ` ${item.structure.symbol.name} (${item.structure.symbol.kind}) lines ${item.structure.symbol.range.startLine}-${item.structure.symbol.range.endLine}` : ""}${item.error ? `; ${item.error}` : ""}${item.retry ? `
+Retry: ${JSON.stringify(item.retry)}` : ""}`);
+  const sourceRows = blocks.map((block, index) => {
+    const origin = block.document.reference.origin.kind === "git" ? "commit " + block.document.reference.origin.commit + "; blob " + block.document.reference.origin.blob : "source sha256 " + block.document.reference.origin.contentHash;
+    const completeness = block.remaining.length ? "PARTIAL; missing byte ranges " + JSON.stringify(block.remaining) : "complete for selected range";
+    const next = block.continuation ? `
+Next request: ` + JSON.stringify({ mode: "inspect", sourceCursor: block.continuation }) : "";
+    return "[Block #" + String(index + 1) + "] " + block.document.path + "; " + origin + `
+` + block.text.join(`
+`) + `
+[source ` + completeness + boundaryNote(block) + "; shared 16384-byte output limit]" + next;
+  });
+  return [
+    single ? "Source inspection (Inspection metadata)" : `Batch inspection (Inspection metadata): ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
+    ...rows,
+    ...sourceRows
+  ].join(`
+
+`);
+}
+function blockBoundary(block) {
+  const boundaries = [...new Set(block.prepared.map((prepared) => prepared.boundary))];
+  if (boundaries.length === 1)
+    return boundaries[0];
+  return boundaries.length > 1 ? "mixed" : undefined;
+}
+function fallbackContinuationRange(document2, ranges) {
+  const last = ranges.at(-1);
+  if (!last || last.end >= document2.bytes.length)
+    return;
+  const nextStartLine = document2.lineAt(last.end);
+  const nextFocusLine = Math.min(document2.lineStarts.length, nextStartLine + 10);
+  if (nextFocusLine <= nextStartLine)
+    return;
+  return document2.lineRange(nextStartLine, Math.min(document2.lineStarts.length, nextFocusLine + 10));
 }
 function metadataStructure(details) {
   return {
@@ -7497,20 +7742,227 @@ async function inspectDocumentsMetadata(targets, access, structure) {
     }
   };
 }
-function continueSourceMetadata(cursor, continuations) {
-  const state = continuations.resolve(cursor);
-  const remainingBytes = state.remaining.reduce((total, range) => total + range.end - range.start, 0);
+async function inspectDocuments(targets, access, continuations, structure) {
+  const items = [];
+  const blocks = [];
+  let metadataOnly = false;
+  for (const [index, target] of targets.entries()) {
+    try {
+      const prepared = await prepare(target, access, structure);
+      metadataOnly ||= !prepared.document.utf8 || hasBareCarriageReturn(prepared.document.bytes);
+      let blockIndex = blocks.findIndex((block) => block.document === prepared.document);
+      if (blockIndex < 0) {
+        blockIndex = blocks.length;
+        blocks.push({
+          document: prepared.document,
+          ranges: [],
+          targets: [],
+          prepared: [],
+          fragments: [],
+          remaining: [],
+          text: [],
+          boundary: undefined
+        });
+      }
+      const block = blocks[blockIndex];
+      if (!block)
+        throw new Error("Inspection block is unavailable");
+      block.ranges.push(prepared.range);
+      block.targets.push(index);
+      block.prepared.push(prepared);
+      items.push({
+        inputIndex: index + 1,
+        path: target.path,
+        line: target.line,
+        status: "returned",
+        ...target.matchIndex !== undefined ? { matchIndex: target.matchIndex } : {},
+        block: blockIndex + 1,
+        structure: prepared.structure
+      });
+    } catch (error) {
+      if (access.signal?.aborted || error instanceof Error && error.name === "AbortError")
+        throw abortError();
+      const status = errorStatus(error);
+      if (!status)
+        throw error;
+      items.push({
+        inputIndex: index + 1,
+        path: target.path,
+        line: target.line,
+        status: "error",
+        structure: { status },
+        error: error instanceof Error ? error.message : status
+      });
+    }
+  }
+  if (metadataOnly)
+    return inspectDocumentsMetadata(targets, access, structure);
+  for (const block of blocks) {
+    block.ranges = mergeByteRanges(block.ranges);
+    block.remaining = block.ranges;
+    block.boundary = blockBoundary(block);
+  }
+  const baseBytes = Buffer.byteLength(render(items, blocks, targets.length === 1));
+  let remainingResponseBytes = MAX_RESULT_BYTES - baseBytes - blocks.length * 400;
+  if (blocks.length && remainingResponseBytes < blocks.length * 256)
+    throw new SignalGrepError("Inspection selectors exceed the shared response limit; use fewer targets");
+  for (const [index, block] of blocks.entries()) {
+    const followingBlocks = blocks.length - index - 1;
+    let allowance = remainingResponseBytes - followingBlocks * 256;
+    if (!block.document.utf8) {
+      const target = block.prepared[0];
+      if (!target)
+        throw new Error("Missing lossy-source target");
+      const lineStart = block.document.lineStarts[target.target.line - 1] ?? 0;
+      const relativeFocus = target.focus - lineStart;
+      const preview = sourceRangeFromBytes(block.document.bytes, Math.max(1, target.target.line - 10), Math.min(block.document.lineStarts.length, target.target.line + 10), target.target.line, {
+        maxBytes: Math.min(MAX_RESULT_BYTES - 1024, Math.max(256, allowance - 300)),
+        focus: {
+          byteStart: relativeFocus,
+          byteEnd: relativeFocus,
+          range: {
+            start: { line: target.target.line - 1, character: relativeFocus },
+            end: { line: target.target.line - 1, character: relativeFocus },
+            encoding: "utf-8"
+          }
+        }
+      });
+      block.text.push(`[lossy UTF-8 preview only; original bytes are not fully representable; source continuation unavailable; lines may be clipped at 500 characters]
+${preview.text}`);
+      remainingResponseBytes -= Buffer.byteLength(block.text.at(-1) ?? "") + 1;
+      for (const targetIndex of block.targets) {
+        const item = items[targetIndex];
+        if (item)
+          item.source = {
+            range: { startLine: preview.startLine, endLine: preview.endLine },
+            omittedBefore: preview.omittedBefore,
+            omittedAfter: preview.omittedAfter,
+            truncatedLines: preview.truncatedLines,
+            complete: false,
+            ...block.boundary ? { boundary: block.boundary } : {},
+            reference: block.document.reference
+          };
+      }
+      continue;
+    }
+    const focuses = [...new Set(block.prepared.map((prepared) => prepared.focus))];
+    for (const [focusIndex, focus] of focuses.entries()) {
+      if (!block.remaining.some((range) => range.start <= focus && focus < range.end) || allowance < 256)
+        continue;
+      const missingBytes = block.remaining.reduce((total, range) => total + range.end - range.start, 0);
+      const budget = missingBytes + block.remaining.length * 200 < allowance ? allowance : Math.max(256, Math.floor(allowance / (focuses.length - focusIndex)));
+      const page = sourcePage(block.document, block.remaining, budget, focus);
+      block.fragments.push(page.fragment);
+      block.remaining = page.remaining;
+      block.text.push(page.text);
+      const pageBytes = Buffer.byteLength(page.text) + 1;
+      allowance -= pageBytes;
+      remainingResponseBytes -= pageBytes;
+    }
+    while (block.remaining.length && allowance >= 256) {
+      const page = sourcePage(block.document, block.remaining, allowance);
+      block.fragments.push(page.fragment);
+      block.remaining = page.remaining;
+      block.text.push(page.text);
+      const pageBytes = Buffer.byteLength(page.text) + 1;
+      allowance -= pageBytes;
+      remainingResponseBytes -= pageBytes;
+    }
+    const fallback = block.boundary === "line-window" || block.boundary === "mixed" ? fallbackContinuationRange(block.document, block.ranges) : undefined;
+    const continuationTarget = fallback ? [...block.ranges, fallback] : block.ranges;
+    const continuationGaps = fallback ? [...block.remaining, fallback] : block.remaining;
+    if (continuationGaps.length)
+      block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
+    if (block.document.reference.origin.kind === "worktree") {
+      const current = await getSourceRevision(resolve17(access.cwd, block.document.path));
+      if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
+        block.text = [];
+        block.fragments = [];
+        block.remaining = block.ranges;
+        delete block.continuation;
+        for (const targetIndex of block.targets) {
+          const item = items[targetIndex];
+          if (item) {
+            item.status = "error";
+            item.structure = { status: "source-changed" };
+            item.error = "Source changed during inspection; refresh the source";
+          }
+        }
+      }
+    }
+    for (const targetIndex of block.targets) {
+      const item = items[targetIndex];
+      if (item?.status === "returned")
+        item.source = blockDetails(block);
+    }
+    if (access.signal?.aborted)
+      throw abortError();
+    if (index >= 5)
+      throw new Error("Inspection target limit was not validated");
+  }
+  const text = render(items, blocks, targets.length === 1);
+  if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
+    throw new SignalGrepError("Inspection metadata exceeds the response byte limit");
+  const complete = items.every((item) => item.status === "returned") && blocks.every((block) => block.remaining.length === 0);
+  const first = items[0];
   return {
-    text: `Source continuation metadata (PARTIAL). Source content is not displayed; ${state.source.path} has ${String(state.remaining.length)} remaining range(s) and ${String(remainingBytes)} remaining byte(s).`,
+    text,
     details: {
       version: 1,
       mode: "inspect",
-      status: "partial",
-      snapshotComplete: false,
+      status: complete ? "complete" : "partial",
+      snapshotComplete: complete,
       totalMatches: 0,
       storedMatches: 0,
       returnedMatches: 0,
-      totalFiles: 1
+      totalFiles: blocks.length,
+      inspections: items,
+      sourceBlocks: blocks.map((block) => ({
+        path: block.document.path,
+        source: blockDetails(block)
+      })),
+      ...targets.length === 1 && first?.structure ? { structure: first.structure } : {},
+      ...targets.length === 1 && first?.source ? {
+        source: first.source,
+        ...first.source.nextRequest ? { nextRequest: first.source.nextRequest } : {}
+      } : {}
+    }
+  };
+}
+async function continueSource(cursor, access, continuations) {
+  const state = continuations.resolve(cursor);
+  const document2 = await access.load(state.source.path, state.source);
+  const page = sourcePage(document2, state.remaining, MAX_RESULT_BYTES - 1400);
+  const next = continuations.advance(cursor, page.fragment);
+  const block = {
+    document: document2,
+    ranges: state.target,
+    targets: [],
+    prepared: [],
+    fragments: [page.fragment],
+    remaining: page.remaining,
+    text: [page.text],
+    boundary: state.boundary,
+    ...next ? { continuation: next } : {}
+  };
+  const source = blockDetails(block);
+  const text = render([], [block], true);
+  if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
+    throw new SignalGrepError("Source continuation metadata exceeds the output limit");
+  return {
+    text,
+    details: {
+      version: 1,
+      mode: "inspect",
+      status: next ? "partial" : "complete",
+      snapshotComplete: !next,
+      totalMatches: 0,
+      storedMatches: 0,
+      returnedMatches: 0,
+      totalFiles: 1,
+      source,
+      sourceBlocks: [{ path: document2.path, source }],
+      ...source.nextRequest ? { nextRequest: source.nextRequest } : {}
     }
   };
 }
@@ -9384,11 +9836,11 @@ class EvidenceService {
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect")
         throw new SignalGrepError("sourceCursor requires mode=inspect");
-      return continueSourceMetadata(input.sourceCursor, this.#continuations);
+      return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
       const targets = this.#inspectionTargets(input, cwd);
-      return inspectDocumentsMetadata(targets, access, this.#structure);
+      return targets.some((target) => target.range !== undefined) ? inspectDocumentsMetadata(targets, access, this.#structure) : inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
@@ -9686,12 +10138,12 @@ class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const isStructural = item.details?.kind === "symbol" || item.details?.kind === "function";
+      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
-        ...isStructural ? { range: item.range } : { absoluteFocus: item.range.start }
+        ...metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }
       };
     }
     return {
@@ -9809,7 +10261,7 @@ class EvidenceService {
     if (document2.reference.origin.kind !== "worktree")
       return this.#analyses.page(this.#analyses.create({
         kind: input.mode === "imports" ? "imports" : "tests",
-        unit: input.mode === "imports" ? "relationships" : "evidence-items",
+        unit: "evidence-items",
         items: [],
         partial: true,
         reasons: [
@@ -9878,7 +10330,7 @@ class EvidenceService {
       partial: result.partial || files.partial,
       reasons: [...result.reasons, ...files.reasons],
       kind: input.mode === "imports" ? "imports" : "tests",
-      unit: input.mode === "imports" ? "relationships" : "evidence-items",
+      unit: "evidence-items",
       coverage: {
         navigation: result.partial || files.partial ? "partial" : "complete"
       },
@@ -9901,6 +10353,7 @@ import { resolve as resolve22 } from "path";
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/format.ts
+import { readFile as readFile3 } from "fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -9995,28 +10448,236 @@ async function formatMatchMetadataPage(snapshot, offset, signal, options = {}) {
     page.lastMatchIndex = lastMatchIndex;
   return page;
 }
+function compactLine(line) {
+  const clean = line.replaceAll("\r", "").trimEnd();
+  return excerptText(clean).text;
+}
+function matchLocationSuffix(match) {
+  if (match.occurrences.length === 0)
+    return "";
+  const displayed = match.occurrences.slice(0, MAX_DISPLAYED_OCCURRENCES);
+  const ranges = displayed.map(({ range }) => {
+    const start2 = range.start.character + 1;
+    const end = Math.max(start2, range.end.character);
+    const suffix = range.encoding === "utf-8" ? "b" : "";
+    return `${start2}-${end}${suffix}`;
+  });
+  const omitted = match.occurrences.length - displayed.length;
+  const notice = omitted > 0 ? ` [ranges: ${String(displayed.length)} of ${String(match.occurrences.length)} shown; ${String(omitted)} omitted; mode=inspect with this path/line for source]` : "";
+  return ` [${ranges.join(",")}]${notice}`;
+}
+function formatMatchLine(match, matchIndex) {
+  return ` ${match.lineNumber}: ${match.lineContent}${matchLocationSuffix(match)} {match #${String(matchIndex)}}${match.lineTruncated ? " [line excerpt truncated]" : ""}`;
+}
+async function loadContextLines(match, expectedRevision, cache, signal) {
+  const cached = cache.get(match.absolutePath);
+  if (cached)
+    return cached;
+  try {
+    if (signal?.aborted)
+      throw abortError();
+    if (!expectedRevision || expectedRevision.size > MAX_SOURCE_FILE_BYTES) {
+      const unavailable = { status: "unavailable" };
+      cache.set(match.absolutePath, unavailable);
+      return unavailable;
+    }
+    const beforeRevision = await getSourceRevision(match.absolutePath);
+    if (!beforeRevision || !sameSourceRevision(expectedRevision, beforeRevision)) {
+      const changed = { status: "changed" };
+      cache.set(match.absolutePath, changed);
+      return changed;
+    }
+    const content = await readFile3(match.absolutePath, { encoding: "utf8", signal });
+    const afterRevision = await getSourceRevision(match.absolutePath);
+    if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
+      const changed = { status: "changed" };
+      cache.set(match.absolutePath, changed);
+      return changed;
+    }
+    const available = {
+      status: "available",
+      lines: content.replaceAll("\r", "").split(`
+`)
+    };
+    cache.set(match.absolutePath, available);
+    return available;
+  } catch (error) {
+    if (signal?.aborted || error instanceof Error && error.name === "AbortError") {
+      throw abortError();
+    }
+    const unavailable = { status: "unavailable" };
+    cache.set(match.absolutePath, unavailable);
+    return unavailable;
+  }
+}
+function matchContextWindows(snapshot, include) {
+  const windows = new Map;
+  const context = Math.min(Math.max(0, snapshot.request.context), MAX_CONTEXT_LINES);
+  if (context === 0)
+    return windows;
+  const selectedFiles = new Map;
+  for (const [index, match] of snapshot.matches.entries()) {
+    if (include && !include(match, index))
+      continue;
+    const matches = selectedFiles.get(match.absolutePath) ?? [];
+    matches.push(match);
+    selectedFiles.set(match.absolutePath, matches);
+  }
+  for (const matches of selectedFiles.values()) {
+    const ordered = matches.toSorted((left, right) => left.lineNumber - right.lineNumber);
+    for (const [index, match] of ordered.entries()) {
+      const previous = ordered[index - 1];
+      const next = ordered[index + 1];
+      windows.set(match, {
+        startLine: Math.max(1, match.lineNumber - context, previous ? Math.floor((previous.lineNumber + match.lineNumber) / 2) + 1 : 1),
+        endLine: Math.min(match.lineNumber + context, next ? Math.floor((match.lineNumber + next.lineNumber) / 2) : Number.MAX_SAFE_INTEGER)
+      });
+    }
+  }
+  return windows;
+}
+async function formatBlock(match, matchIndex, expectedRevision, window2, cache, allMatchLines, signal) {
+  const matchingLine = formatMatchLine(match, matchIndex);
+  if (!window2)
+    return { text: matchingLine, contextStatus: "none" };
+  const contextLoad = await loadContextLines(match, expectedRevision, cache, signal);
+  if (contextLoad.status !== "available") {
+    return { text: matchingLine, contextStatus: contextLoad.status };
+  }
+  const { lines } = contextLoad;
+  const output = [];
+  for (let lineNumber = window2.startLine;lineNumber <= window2.endLine; lineNumber += 1) {
+    if (lineNumber === match.lineNumber) {
+      output.push(matchingLine);
+    } else if (lineNumber <= lines.length && !allMatchLines.get(match.absolutePath)?.has(lineNumber)) {
+      output.push(` ${lineNumber}- ${compactLine(lines[lineNumber - 1] ?? "")}`);
+    }
+  }
+  return { text: output.join(`
+`), contextStatus: "available" };
+}
+async function formatMatchPage(snapshot, offset, signal, options = {}) {
+  const maxPageBodyBytes = MAX_RESULT_BYTES - Math.max(RESULT_METADATA_RESERVE_BYTES, options.metadataReserveBytes ?? 0);
+  if (maxPageBodyBytes <= 0)
+    throw new Error("Continuation metadata exceeds the response byte budget; select fewer paths");
+  const maxPageBodyCharacters = pageBodyCharacterLimit(options.resultTokenBudget);
+  const cache = new Map;
+  const omittedFiles = new Set;
+  const changedFiles = new Set;
+  const output = [];
+  let returnedMatches = 0;
+  let nextOffset = offset;
+  let currentFile;
+  let outputBytes = 0;
+  let outputCharacters = 0;
+  let firstMatchIndex;
+  let lastMatchIndex;
+  let hasMatchRanges = false;
+  let hasByteRanges = false;
+  let occurrenceRangesOmitted = 0;
+  let occurrenceMatchesTruncated = 0;
+  const contextWindows = matchContextWindows(snapshot, options.include);
+  const allMatchLines = new Map;
+  if (contextWindows.size > 0) {
+    for (const match of snapshot.matches) {
+      const lines = allMatchLines.get(match.absolutePath) ?? new Set;
+      lines.add(match.lineNumber);
+      allMatchLines.set(match.absolutePath, lines);
+    }
+  }
+  while (nextOffset < snapshot.matches.length && returnedMatches < snapshot.request.pageSize) {
+    if (signal?.aborted)
+      throw abortError();
+    const matchIndex = nextOffset;
+    const match = snapshot.matches[matchIndex];
+    if (!match)
+      break;
+    nextOffset += 1;
+    if (options.include && !options.include(match, matchIndex))
+      continue;
+    let block = await formatBlock(match, matchIndex + 1, snapshot.sourceRevisions.get(match.absolutePath), contextWindows.get(match), cache, allMatchLines, signal);
+    const fileHeader = match.displayPath === currentFile ? "" : `${match.displayPath}
+`;
+    const separator = output.length === 0 ? "" : fileHeader.length === 0 ? `
+` : `
+
+`;
+    let addition = `${separator}${fileHeader}${block.text}`;
+    let additionBytes = Buffer.byteLength(addition);
+    let additionCharacters = addition.length;
+    const exceedsBudget = () => outputBytes + additionBytes > maxPageBodyBytes || outputCharacters + additionCharacters > maxPageBodyCharacters;
+    if (exceedsBudget()) {
+      if (returnedMatches > 0) {
+        nextOffset = matchIndex;
+        break;
+      }
+      block = { text: formatMatchLine(match, matchIndex + 1), contextStatus: "unavailable" };
+      addition = `${fileHeader}${block.text}`;
+      additionBytes = Buffer.byteLength(addition);
+      additionCharacters = addition.length;
+    }
+    if (additionBytes > maxPageBodyBytes) {
+      throw new Error("A single match exceeds the reserved result budget");
+    }
+    if (additionCharacters > maxPageBodyCharacters)
+      throw new MatchPageSoftLimitError;
+    output.push(addition);
+    outputBytes += additionBytes;
+    outputCharacters += additionCharacters;
+    currentFile = match.displayPath;
+    returnedMatches += 1;
+    hasMatchRanges ||= match.occurrences.length > 0;
+    hasByteRanges ||= match.occurrences.slice(0, MAX_DISPLAYED_OCCURRENCES).some(({ range }) => range.encoding === "utf-8");
+    const omittedRanges = Math.max(0, match.occurrences.length - MAX_DISPLAYED_OCCURRENCES);
+    occurrenceRangesOmitted += omittedRanges;
+    if (omittedRanges > 0)
+      occurrenceMatchesTruncated += 1;
+    if (block.contextStatus === "changed")
+      changedFiles.add(match.displayPath);
+    if (block.contextStatus === "unavailable")
+      omittedFiles.add(match.displayPath);
+    firstMatchIndex ??= matchIndex;
+    lastMatchIndex = matchIndex;
+  }
+  const hasNext = snapshot.matches.slice(nextOffset).some((match, index) => !options.include || options.include(match, nextOffset + index));
+  const page = {
+    body: output.join(""),
+    returnedMatches,
+    nextOffset,
+    hasNext,
+    hasMatchRanges,
+    hasByteRanges,
+    occurrenceRangesOmitted,
+    occurrenceMatchesTruncated,
+    contextOmittedFiles: [...omittedFiles].toSorted((left, right) => left.localeCompare(right)),
+    contextChangedFiles: [...changedFiles].toSorted((left, right) => left.localeCompare(right))
+  };
+  if (firstMatchIndex !== undefined)
+    page.firstMatchIndex = firstMatchIndex;
+  if (lastMatchIndex !== undefined)
+    page.lastMatchIndex = lastMatchIndex;
+  return page;
+}
 
 // src/summary.ts
-var METADATA_BYTES = 1024;
-var METADATA_CHARACTERS = 512;
+var METADATA_CHARACTERS = 2400;
+var METADATA_BYTES = 3584;
 function formatSummary(snapshot, fileLimit, offset = 0, resultTokenBudget = DEFAULT_RESULT_TOKEN_BUDGET) {
   if (!Number.isSafeInteger(fileLimit) || fileLimit <= 0)
     throw new Error("Summary file limit must be a positive safe integer");
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.fileCounts.size)
     throw new Error("Summary offset is outside the file summary");
-  if (!Number.isSafeInteger(resultTokenBudget) || resultTokenBudget <= 0)
-    throw new Error("Result token budget must be a positive safe integer");
-  const statistics = statisticsForSnapshot(snapshot);
-  const statisticsText = formatStatistics(statistics, { includeTopFiles: false });
   const files = [...snapshot.fileCounts.entries()].toSorted(([left, leftCount], [right, rightCount]) => rightCount - leftCount || left.localeCompare(right));
   const maxCharacters = Math.max(256, resultTokenBudget * ESTIMATED_CHARACTERS_PER_TOKEN - METADATA_CHARACTERS);
   const maxBytes = MAX_RESULT_BYTES - METADATA_BYTES;
   const rows = [];
   const shownPaths = [];
-  let bytes = Buffer.byteLength(statisticsText.join(`
-`));
-  let characters = statisticsText.join(`
-`).length;
+  const firstMatches = new Map;
+  for (const [index, match] of snapshot.matches.entries())
+    if (!firstMatches.has(match.displayPath))
+      firstMatches.set(match.displayPath, { match, index });
+  let bytes = 0;
+  let characters = 0;
   for (const [file, count] of files.slice(offset, offset + Math.min(30, fileLimit))) {
     const row = `${file}  ${String(count).padStart(6)}`;
     if (bytes + Buffer.byteLength(row) + 1 > maxBytes) {
@@ -10031,19 +10692,123 @@ function formatSummary(snapshot, fileLimit, offset = 0, resultTokenBudget = DEFA
     bytes += Buffer.byteLength(row) + 1;
     characters += row.length + 1;
   }
+  const previews = [];
+  const sampleIndices = [];
+  const sampleBudget = Math.max(0, Math.min(maxBytes - bytes, maxCharacters - characters));
+  let sampleBytes = 0;
+  for (const path of shownPaths.slice(0, 5)) {
+    const retained = firstMatches.get(path);
+    if (!retained)
+      continue;
+    const preview = `${path}:${retained.match.lineNumber} {match #${retained.index + 1}} ${retained.match.lineContent}`;
+    if (sampleBytes + Buffer.byteLength(preview) + 1 > sampleBudget)
+      continue;
+    previews.push(preview);
+    sampleIndices.push(retained.index + 1);
+    sampleBytes += Buffer.byteLength(preview) + 1;
+  }
   const nextOffset = offset + rows.length;
   return {
     body: rows.join(`
 `),
-    statistics,
-    statisticsText,
+    previews: previews.join(`
+`),
+    previewsShown: previews.length,
+    previewsOmitted: shownPaths.length - previews.length,
     shown: rows.length,
     offset,
     nextOffset,
     hasNext: nextOffset < files.length,
     omitted: files.length - nextOffset,
-    shownPaths
+    shownPaths,
+    sampleIndices,
+    previewByteBudget: sampleBudget
   };
+}
+
+// src/summary-previews.ts
+function hasBareCarriageReturn2(bytes) {
+  for (let index = 0;index < bytes.length; index += 1)
+    if (bytes[index] === 13 && bytes[index + 1] !== 10)
+      return true;
+  return false;
+}
+async function summarySourcePreviews(snapshot, paths, maxBytes, cwd, signal) {
+  const rows = [];
+  const indices = [];
+  let bytes = 0;
+  let filesRead = 0;
+  let windows = 0;
+  const reasons = [];
+  for (const path of paths) {
+    if (filesRead >= 5 || maxBytes - bytes < 256)
+      break;
+    const matches = snapshot.matches.flatMap((match, index) => match.displayPath === path ? [{ match, index }] : []);
+    const first = matches[0];
+    if (!first)
+      continue;
+    if (matches.some(({ match }) => match.lineContent.includes("\r"))) {
+      reasons.push(`${path}: preview skipped for non-standard line endings`);
+      continue;
+    }
+    if (matches.some(({ match }) => match.lineTruncated || match.occurrences.length > 20)) {
+      reasons.push(`${path}: preview skipped for dense or truncated matching lines`);
+      continue;
+    }
+    const revision = snapshot.sourceRevisions.get(first.match.absolutePath);
+    if (!revision || revision.size > MAX_SOURCE_FILE_BYTES) {
+      reasons.push(`${path}: preview source unverified or over 5 MiB`);
+      continue;
+    }
+    filesRead += 1;
+    try {
+      const document2 = await readWorkspaceDocument(path, cwd, signal);
+      if (document2.reference.origin.kind !== "worktree" || !sameSourceRevision(revision, document2.reference.origin.revision) || !document2.utf8) {
+        reasons.push(`${path}: preview source changed or is not lossless UTF-8`);
+        continue;
+      }
+      if (hasBareCarriageReturn2(document2.bytes)) {
+        reasons.push(`${path}: preview skipped for non-standard line endings`);
+        continue;
+      }
+      let lastEnd = 0;
+      let perFile = 0;
+      for (const { match, index } of matches) {
+        if (perFile >= 2)
+          break;
+        const start2 = Math.max(1, match.lineNumber - 3);
+        const end = Math.min(document2.lineStarts.length, start2 + 6);
+        if (start2 <= lastEnd)
+          continue;
+        const lineRows = [];
+        for (let line = start2;line <= end; line += 1) {
+          const value = document2.slice(document2.lineRange(line)).replace(/\n$/, "");
+          const excerpt = excerptText(value);
+          lineRows.push(`${line}: ${excerpt.text}${excerpt.truncated ? " [preview line truncated]" : ""}`);
+        }
+        const row = `${path}:${match.lineNumber} {match #${index + 1}} [source preview lines ${start2}-${end}]
+${lineRows.join(`
+`)}`;
+        if (bytes + Buffer.byteLength(row) + 2 > maxBytes)
+          continue;
+        rows.push(row);
+        indices.push(index + 1);
+        bytes += Buffer.byteLength(row) + 2;
+        windows += 1;
+        perFile += 1;
+        lastEnd = end;
+      }
+    } catch (error) {
+      if (signal?.aborted || error instanceof Error && error.name === "AbortError")
+        throw abortError();
+      if (!(error instanceof Error) || !(("code" in error) || error.name === "SourceDocumentError"))
+        throw error;
+      reasons.push(`${path}: preview unavailable`);
+    }
+  }
+  return { text: rows.join(`
+
+`), indices, windows, filesRead, reasons };
 }
 
 // src/snapshot-store.ts
@@ -10785,6 +11550,11 @@ function completenessNote(snapshot) {
   const reasons = snapshot.retention?.reasons.join("; ");
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
 }
+function lineExcerptNote(snapshot) {
+  return snapshot.truncatedLines > 0 ? `
+
+[Line excerpts truncated: ${String(snapshot.truncatedLines)} matching lines in this snapshot; maximum ${String(MAX_LINE_CHARACTERS)} source characters per line. Complete snapshot describes retained matches, not complete source text.]` : "";
+}
 function sourceVerificationNote(details) {
   return details.sourceUnverifiedFileCount ? `
 
@@ -10794,6 +11564,14 @@ function selectContextBudget(input, mode, candidate) {
   if (mode !== "auto" || input.limit !== undefined || input.cursor)
     return;
   return candidate;
+}
+function matchPageOptions(budget) {
+  if (!budget)
+    return {};
+  return { resultTokenBudget: budget.resultTokenBudget };
+}
+function pageMatchesOccurrences(snapshot, first, last) {
+  return snapshot.matches.slice(first, last + 1).reduce((total, match) => total + match.occurrences.length, 0);
 }
 function attachContextBudget(result, budget, totalMatches) {
   if (!budget || totalMatches === 0)
@@ -10998,10 +11776,27 @@ class SignalGrepService {
           text: emptyResultText(details.scope ?? searchScope2(snapshot.request)),
           details
         };
-      } else if (mode === "matches" || input.limit !== undefined) {
+      } else if (snapshot.matches.length === 0) {
+        result = await this.#summary(snapshot, mode, cwd, signal);
+      } else if (mode === "summary") {
+        result = await this.#summary(snapshot, mode, cwd, signal);
+      } else if (mode === "matches") {
         result = await this.#page(snapshot, 0, mode, signal);
       } else {
-        result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+        if (input.limit !== undefined) {
+          result = await this.#page(snapshot, 0, mode, signal);
+        } else if (contextBudget !== undefined && contextBudget.tier !== "full" && input.limit === undefined) {
+          result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+        } else {
+          try {
+            const page = await formatMatchPage(snapshot, 0, signal, matchPageOptions(input.limit === undefined ? contextBudget : undefined));
+            result = snapshot.snapshotComplete && page.nextOffset === snapshot.matches.length ? this.#pageResult(snapshot, 0, mode, page) : await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+          } catch (error) {
+            if (!(error instanceof MatchPageSoftLimitError))
+              throw error;
+            result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
+          }
+        }
       }
       result = {
         ...result,
@@ -11072,49 +11867,59 @@ class SignalGrepService {
     }
     return result;
   }
-  async#summary(snapshot, mode, _cwd, _signal, offset = 0, budget) {
+  async#summary(snapshot, mode, cwd, signal, offset = 0, budget) {
     this.#reusableSummarySnapshots.add(snapshot);
     const summary = formatSummary(snapshot, this.#summaryFileLimit, offset, budget?.resultTokenBudget);
     const details = baseDetails(snapshot, mode);
     const cursor = snapshot.fileCounts.size > 0 ? this.#snapshots.cursor(snapshot, summary.nextOffset, "summary") : undefined;
     const fileRange = summary.shown > 0 ? `Files ${String(summary.offset + 1)}-${String(summary.nextOffset)} of ${String(snapshot.fileCounts.size)}, ordered by match count.` : "No retained file summaries are available.";
-    const omitted = summary.omitted > 0 ? `+${String(summary.omitted)} lower-ranked files remain.` : undefined;
+    const omitted = summary.omitted > 0 ? `
+\u2026 ${String(summary.omitted)} lower-ranked files remain.` : "";
+    const preview = await summarySourcePreviews(snapshot, summary.shownPaths, summary.previewByteBudget, cwd, signal);
+    const sampleText = preview.text;
+    const indices = preview.indices;
+    const samples = sampleText ? `
+
+Samples: first retained match; bounded source windows; not relevance-ranked or exhaustive.
+${sampleText}` : "";
+    const sampleOmissions = `
+[Preview limits: at most 5 source files, 2 non-overlapping windows/file, 7 lines/window. File rows and navigation take priority; shown ${preview.text ? preview.windows : summary.previewsShown} previews.]${preview.reasons.length ? `
+[${preview.reasons.map((reason) => reason.slice(0, 200)).join("; ")}]` : ""}`;
     const redaction = snapshot.request.redact ? { redact: true } : {};
     const nextRequest = cursor && summary.hasNext ? { cursor, mode: "summary", ...redaction } : undefined;
+    const inspectRequest = cursor && indices.length ? {
+      mode: "inspect",
+      cursor,
+      matchIndices: indices.slice(0, MAX_INSPECT_TARGETS),
+      ...redaction
+    } : undefined;
     const matchesRequest = cursor && snapshot.matches.length > 0 && summary.shownPaths.length ? { cursor, paths: summary.shownPaths.slice(0, 1), ...redaction } : undefined;
-    const navigation = cursor ? [
-      `Snapshot cursor="${cursor}".`,
-      matchesRequest ? `Match metadata request: ${JSON.stringify(matchesRequest)}.` : undefined,
-      nextRequest ? `Next summary page: ${JSON.stringify(nextRequest)}.` : undefined
-    ].filter((line) => line !== undefined) : [];
-    const text = [
-      `Search summary (${snapshot.snapshotComplete ? "complete" : "PARTIAL"}).`,
-      ...summary.statisticsText,
-      `Scope: ${JSON.stringify(details.scope)}.`,
-      fileRange,
-      summary.body || "No retained file summaries are available.",
-      omitted,
-      ...navigation,
-      modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs),
-      sourceVerificationNote(details)
-    ].filter((line) => line !== undefined && line.length > 0).join(`
+    const followUp = cursor ? `
 
-`);
+Snapshot cursor="${cursor}". Snapshot cursor available: ${cursor}.${inspectRequest ? `
+Inspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `
+Retrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `
+Next request: ${JSON.stringify(nextRequest)}` : ""}` : "";
+    const text = `Search summary (${snapshot.snapshotComplete ? "complete" : "PARTIAL"}). ${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).
+${fileRange}
+
+${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
     return {
       text,
       details: {
         ...details,
         ...cursor ? { cursor } : {},
         ...nextRequest ? { nextRequest } : {},
-        statistics: summary.statistics,
         summaryOffset: summary.offset,
         summaryFilesShown: summary.shown,
-        summaryFilesOmitted: summary.omitted
+        summaryFilesOmitted: summary.omitted,
+        summaryPreviewsShown: preview.text ? preview.windows : summary.previewsShown,
+        summaryPreviewsOmitted: Math.max(0, summary.shown - (preview.text ? new Set(indices.map((index) => snapshot.matches[index - 1]?.displayPath)).size : summary.previewsShown))
       }
     };
   }
   async#page(snapshot, offset, mode, signal, selection) {
-    if (offset === snapshot.matches.length && snapshot.matches.length > 0) {
+    if (offset === snapshot.matches.length) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
     }
     const pageOptions = selection ? {
@@ -11145,55 +11950,65 @@ class SignalGrepService {
   }
   #pageResult(snapshot, offset, mode, page, selectedPaths, selectionMissingPaths = [], selectionKey = "all") {
     if (page.returnedMatches === 0) {
-      if (snapshot.matches.length > 0)
-        throw new SignalGrepError("The output budget could not fit a single match");
-      const details = baseDetails(snapshot, mode);
-      const statistics = statisticsForSnapshot(snapshot);
-      return {
-        text: [
-          `Match metadata 0-0 of ${String(snapshot.totalMatches)} (${completenessNote(snapshot)}).`,
-          ...formatStatistics(statistics, { includeTopFiles: false }),
-          "No retained match metadata is available; narrow the search to retrieve retained evidence.",
-          sourceVerificationNote(details)
-        ].filter((line) => line !== undefined && line.length > 0).join(`
-
-`),
-        details: { ...details, statistics }
-      };
+      throw new SignalGrepError("The output budget could not fit a single match");
     }
     const cursor = page.hasNext ? this.#snapshots.cursor(snapshot, page.nextOffset, "matches", selectionKey) : undefined;
     const firstMatch = page.firstMatchIndex ?? offset;
     const lastMatch = page.lastMatchIndex ?? firstMatch;
     const range = `${firstMatch + 1}-${lastMatch + 1}`;
     const selection = selectedPaths ? `; selected ${String(selectedPaths.length)} path(s)` : "";
-    const nextRequest = cursor ? {
-      cursor,
-      ...selectedPaths ? { paths: selectedPaths } : {},
+    const missingSelectionNote = selectionMissingPaths.length > 0 ? `
+
+[${String(selectionMissingPaths.length)} selected path(s) had no retained matches.]` : "";
+    const details = baseDetails(snapshot, mode);
+    const next = cursor ? `
+
+Continue with cursor="${cursor}".
+Next request: ${JSON.stringify({ cursor, ...selectedPaths ? { paths: selectedPaths } : {}, ...snapshot.request.redact ? { redact: true } : {} })}` : "";
+    const rangeNote = page.hasMatchRanges ? `
+
+[Match columns are 1-based UTF-16 positions${page.hasByteRanges ? "; b ranges use raw UTF-8 bytes" : ""}.]` : "";
+    const contextNotes = [];
+    if (page.contextChangedFiles.length > 0)
+      contextNotes.push(`Context omitted for ${String(page.contextChangedFiles.length)} changed file(s); refresh the search before relying on surrounding lines.`);
+    if (page.contextOmittedFiles.length > 0)
+      contextNotes.push(`Context unavailable for ${String(page.contextOmittedFiles.length)} file(s); retained matching lines are still shown.`);
+    const contextNote = contextNotes.length > 0 ? `
+
+[${contextNotes.join(" ")}]` : "";
+    const inspectRequest = snapshot.truncatedLines > 0 ? {
+      mode: "inspect",
+      cursor: this.#snapshots.cursor(snapshot, 0, "matches"),
+      matchIndex: firstMatch + 1,
       ...snapshot.request.redact ? { redact: true } : {}
     } : undefined;
-    const missingSelectionNote = selectionMissingPaths.length > 0 ? `${String(selectionMissingPaths.length)} selected path(s) had no retained matches.` : undefined;
-    const details = baseDetails(snapshot, mode);
-    const statistics = statisticsForSnapshot(snapshot);
-    const text = [
-      `Match metadata ${range} of ${String(snapshot.totalMatches)}${selection} (${completenessNote(snapshot)}).`,
-      ...formatStatistics(statistics, { includeTopFiles: false }),
-      page.body,
-      missingSelectionNote,
-      modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs),
-      nextRequest ? `Continue with match metadata: ${JSON.stringify(nextRequest)}.` : undefined,
-      sourceVerificationNote(details)
-    ].filter((line) => line !== undefined && line.length > 0).join(`
-
-`);
+    const inspectNote = inspectRequest ? `
+Inspect source (choose a visible matchIndex): ${JSON.stringify(inspectRequest)}` : "";
     return {
-      text,
+      text: `Match metadata ${range} of ${snapshot.totalMatches}${selection}; ${page.returnedMatches} returned.
+Occurrences: ${pageMatchesOccurrences(snapshot, firstMatch, lastMatch)} occurrences.
+
+${page.body}${rangeNote}${contextNote}${missingSelectionNote}
+
+[Matches ${range} of ${snapshot.totalMatches}${selection}; ${completenessNote(snapshot)}.]${lineExcerptNote(snapshot)}${inspectNote}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${next}${sourceVerificationNote(details)}`,
       details: {
         ...details,
-        statistics,
         returnedMatches: page.returnedMatches,
-        ...nextRequest ? { cursor: nextRequest.cursor, nextRequest } : {},
+        ...inspectRequest ? { inspectRequest } : {},
+        ...page.occurrenceRangesOmitted > 0 ? { occurrenceRangesOmitted: page.occurrenceRangesOmitted } : {},
+        ...page.occurrenceMatchesTruncated > 0 ? { occurrenceMatchesTruncated: page.occurrenceMatchesTruncated } : {},
+        ...cursor ? { cursor } : {},
+        ...cursor ? {
+          nextRequest: {
+            cursor,
+            ...selectedPaths ? { paths: selectedPaths } : {},
+            ...snapshot.request.redact ? { redact: true } : {}
+          }
+        } : {},
         ...selectedPaths ? { selectedPaths } : {},
-        ...selectionMissingPaths.length > 0 ? { selectionMissingPaths } : {}
+        ...selectionMissingPaths.length > 0 ? { selectionMissingPaths } : {},
+        ...page.contextOmittedFiles.length > 0 ? { contextOmittedFiles: page.contextOmittedFiles } : {},
+        ...page.contextChangedFiles.length > 0 ? { contextChangedFiles: page.contextChangedFiles } : {}
       }
     };
   }
@@ -13996,7 +14811,7 @@ var COPY = {
     cursorReady: "cursor ready",
     empty: "No matching lines were found.",
     error: "ERROR",
-    expandFullError: "expand for full error",
+    expandFullError: "retry or narrow the query",
     file: "file",
     files: "files",
     finalPage: "final page",
@@ -14047,7 +14862,7 @@ var COPY = {
     cursorReady: "\u53EF\u7EE7\u7EED\u7FFB\u9875",
     empty: "\u6CA1\u6709\u627E\u5230\u5339\u914D\u884C\u3002",
     error: "\u9519\u8BEF",
-    expandFullError: "\u5C55\u5F00\u67E5\u770B\u5B8C\u6574\u9519\u8BEF",
+    expandFullError: "\u8BF7\u91CD\u8BD5\u6216\u7F29\u5C0F\u641C\u7D22\u8303\u56F4",
     file: "\u4E2A\u6587\u4EF6",
     files: "\u4E2A\u6587\u4EF6",
     finalPage: "\u6700\u540E\u4E00\u9875",
@@ -14103,168 +14918,9 @@ function list2(value) {
     return;
   return (Array.isArray(value) ? value : [value]).map(safeLabel).join(", ");
 }
-function padVisible(value, width) {
-  const truncated = truncateToWidth(value, Math.max(1, width));
-  return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
-}
 function finish(lines, width) {
   const available = Math.max(1, width);
   return lines.map((line) => truncateToWidth(line, available));
-}
-function responsiveLimit(width, wide, medium, narrow) {
-  if (width >= 72)
-    return wide;
-  if (width >= 44)
-    return medium;
-  return narrow;
-}
-function title(text, theme) {
-  return `${theme.fg("borderMuted", "\u2500\u2500 ")}${theme.fg("toolTitle", theme.bold(text))}${theme.fg("borderMuted", " \u2500\u2500")}`;
-}
-function statusWord(presentation, copy, theme) {
-  return presentation.details.status === "complete" ? theme.fg("success", copy.complete) : theme.fg("warning", copy.partial);
-}
-function countLine(presentation, copy, theme, width) {
-  const { details } = presentation;
-  const fileUnit = details.totalFiles === 1 ? copy.file : copy.files;
-  const files = `${String(details.totalFiles)} ${fileUnit}`;
-  const total = theme.bold(String(details.totalMatches));
-  if (width < 44)
-    return `${total} \xB7 ${files} \xB7 ${statusWord(presentation, copy, theme)}`;
-  return `${total} ${copy.matches} \xB7 ${files} \xB7 ${statusWord(presentation, copy, theme)}`;
-}
-function partialLines(presentation, copy, theme, width) {
-  if (presentation.details.status !== "partial")
-    return [];
-  const retained = `! ${copy.retained} ${String(presentation.details.storedMatches)}/${String(presentation.details.totalMatches)}`;
-  const text = width < 44 ? retained : `${retained} \xB7 ${copy.partialEvidence}`;
-  return [theme.fg("warning", text)];
-}
-function budgetLine(presentation, copy, theme) {
-  const { details } = presentation;
-  if (!details.budgetTier || details.budgetTier === "full")
-    return;
-  let remainder = "";
-  if (details.contextRemainderPercent !== undefined) {
-    remainder = ` \xB7 ${String(details.contextRemainderPercent)}% ${copy.contextRemaining}`;
-  }
-  return theme.fg("dim", `${copy.budget} ${details.budgetTier}${remainder}`);
-}
-function summaryRow(row, maximum, width, theme) {
-  if (width < 44) {
-    const count = String(row.matches);
-    const pathWidth = Math.max(1, width - visibleWidth(count) - 2);
-    return `${theme.fg("accent", padVisible(row.path, pathWidth))}  ${theme.fg("muted", count)}`;
-  }
-  const count = String(row.matches);
-  const barWidth = width >= 72 ? 20 : 10;
-  const maxPathWidth = width >= 72 ? 32 : 20;
-  const pathWidth = Math.max(8, Math.min(maxPathWidth, width - barWidth - count.length - 5));
-  const filled = Math.max(1, Math.round(row.matches / maximum * barWidth));
-  const bar = `${"\u2588".repeat(filled)}${"\u2500".repeat(Math.max(0, barWidth - filled))}`;
-  return `${theme.fg("accent", padVisible(row.path, pathWidth))} ${theme.fg("success", bar)} ${theme.fg("muted", count)}`;
-}
-function renderSummary(presentation, copy, theme, width) {
-  const shownLimit = responsiveLimit(width, 6, 5, 4);
-  const visibleRows = presentation.rows.slice(0, shownLimit);
-  const maximum = Math.max(...visibleRows.map((row) => row.matches), 1);
-  const lines = [
-    title(presentation.details.status === "partial" ? copy.partialSummaryTitle : copy.summary, theme),
-    countLine(presentation, copy, theme, width),
-    ...partialLines(presentation, copy, theme, width),
-    "",
-    ...visibleRows.map((row) => summaryRow(row, maximum, width, theme))
-  ];
-  const hiddenRows = presentation.rows.length - visibleRows.length;
-  const omitted = presentation.details.summaryFilesOmitted ?? 0;
-  if (hiddenRows + omitted > 0) {
-    lines.push(theme.fg("dim", `\u2026 ${String(hiddenRows + omitted)} ${copy.moreFiles}`));
-  }
-  if (width >= 44 && presentation.previews.length > 0) {
-    lines.push("", theme.fg("dim", copy.samples));
-    lines.push(...presentation.previews.slice(0, 2).map((line) => theme.fg("toolOutput", safeLabel(line))));
-  }
-  const budget = budgetLine(presentation, copy, theme);
-  if (budget)
-    lines.push("", budget);
-  const pageStatus = presentation.details.cursor ? copy.cursorReady : copy.finalPage;
-  const footer = width < 44 ? pageStatus : `${copy.summary.toLowerCase()} \xB7 ${pageStatus} \xB7 ${copy.originalOnExpand}`;
-  lines.push(theme.fg("dim", footer));
-  return finish(lines, width);
-}
-function styleEvidenceLine(line, theme) {
-  if (/^ \d+:/.test(line))
-    return theme.fg("toolOutput", line);
-  if (/^ \d+-/.test(line))
-    return theme.fg("dim", line);
-  if (line.length > 0 && !line.startsWith(" "))
-    return theme.fg("accent", line);
-  return theme.fg("toolOutput", line);
-}
-function renderMatches(presentation, copy, theme, width) {
-  const lineLimit = responsiveLimit(width, 12, 8, 5);
-  const visibleBody = presentation.bodyLines.slice(0, lineLimit);
-  const lines = [
-    title(presentation.details.status === "partial" ? copy.partialMatchesTitle : copy.matchesTitle, theme),
-    countLine(presentation, copy, theme, width),
-    ...partialLines(presentation, copy, theme, width),
-    "",
-    ...visibleBody.map((line) => styleEvidenceLine(line, theme))
-  ];
-  if (presentation.bodyLines.length > visibleBody.length) {
-    lines.push(theme.fg("dim", `\u2026 ${String(presentation.bodyLines.length - visibleBody.length)} ${copy.moreLines}`));
-  }
-  let range = `${String(presentation.details.returnedMatches)} ${copy.returned}`;
-  if (presentation.firstMatch !== undefined && presentation.lastMatch !== undefined) {
-    range = `${String(presentation.firstMatch)}\u2013${String(presentation.lastMatch)}/${String(presentation.details.totalMatches)}`;
-  }
-  const footer = [range];
-  if (presentation.details.selectedPaths) {
-    footer.push(`${copy.selected} ${String(presentation.details.selectedPaths.length)} ${copy.paths}`);
-  }
-  footer.push(presentation.details.cursor ? copy.cursorReady : copy.finalPage);
-  lines.push("", theme.fg("dim", footer.join(" \xB7 ")));
-  if (presentation.details.selectionMissingPaths?.length) {
-    lines.push(theme.fg("warning", `! ${String(presentation.details.selectionMissingPaths.length)} ${copy.selectedNoMatches}`));
-  }
-  if (presentation.details.contextChangedFiles?.length) {
-    lines.push(theme.fg("warning", `! ${copy.contextChanged}: ${String(presentation.details.contextChangedFiles.length)} ${copy.files}`));
-  }
-  if (presentation.details.contextOmittedFiles?.length) {
-    lines.push(theme.fg("warning", `! ${copy.contextOmitted}: ${String(presentation.details.contextOmittedFiles.length)} ${copy.files}`));
-  }
-  return finish(lines, width);
-}
-function inspectHeading(presentation, copy) {
-  if (presentation.status === "source-changed")
-    return copy.sourceChanged;
-  if (presentation.status === "file-too-large")
-    return copy.sourceTooLarge;
-  if (presentation.status === "source-unavailable")
-    return copy.structureStatuses[presentation.status];
-  return copy.inspect;
-}
-function renderInspect(presentation, copy, theme, width) {
-  const blocked = presentation.status === "source-changed" || presentation.status === "file-too-large" || presentation.status === "source-unavailable";
-  const heading = inspectHeading(presentation, copy);
-  const lines = [title(heading, theme), theme.fg("accent", presentation.target)];
-  if (blocked) {
-    lines.push("", theme.fg("warning", `! ${copy.inspectBlocked}`));
-    return finish(lines, width);
-  }
-  if (presentation.descriptor) {
-    lines.push(theme.fg(presentation.status === "available" ? "success" : "warning", presentation.status === "no-symbol" ? copy.noSymbol : presentation.descriptor));
-  }
-  const sourceLimit = responsiveLimit(width, 12, 8, 5);
-  const visibleSource = presentation.sourceLines.slice(0, sourceLimit);
-  lines.push("", ...visibleSource.map((line) => theme.fg("toolOutput", line)));
-  if (presentation.sourceLines.length > visibleSource.length) {
-    lines.push(theme.fg("dim", `\u2026 ${String(presentation.sourceLines.length - visibleSource.length)} ${copy.moreLines}`));
-  }
-  const provider = presentation.details.structure?.provider;
-  const providerText = provider ? ` \xB7 ${safeLabel(provider)}` : "";
-  lines.push("", theme.fg("dim", `${copy.structure} ${copy.structureStatuses[presentation.status]}${providerText} \xB7 ${copy.originalOnExpand}`));
-  return finish(lines, width);
 }
 function signalGrepTitle(theme) {
   return theme.fg("toolTitle", theme.bold("baoer_signal_grep"));
@@ -14282,24 +14938,6 @@ function inspectCall(input, copy, theme) {
     primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", copy.inspect)} ${theme.fg("muted", target)}`,
     secondary: []
   };
-}
-function renderInspectBatch(presentation, copy, theme, width) {
-  const returned = presentation.items.filter((item) => item.status === "returned").length;
-  const deferred = presentation.items.filter((item) => item.status === "deferred").length;
-  const failed = presentation.items.filter((item) => item.status === "error").length;
-  const lines = [
-    title(copy.inspect, theme),
-    `${String(presentation.items.length)} ${copy.locations} \xB7 ${String(returned)} ${copy.returned}`
-  ];
-  for (const item of presentation.items) {
-    const target = item.path ? `${safeLabel(item.path)}:${String(item.line ?? "?")}` : `#${String(item.matchIndex ?? item.inputIndex)}`;
-    const label = item.status === "returned" ? copy.returned : item.status === "deferred" ? copy.deferred : copy.failed;
-    lines.push(theme.fg(item.status === "returned" ? "toolOutput" : "warning", `${String(item.inputIndex)}. ${target} \xB7 ${label}`));
-  }
-  if (deferred || failed)
-    lines.push(theme.fg("warning", `${String(deferred)} ${copy.deferred} \xB7 ${String(failed)} ${copy.failed}`));
-  lines.push(theme.fg("dim", copy.originalOnExpand));
-  return finish(lines, width);
 }
 function continuationCall(input, copy, theme) {
   const secondary = [input.mode ?? "auto"];
@@ -14363,27 +15001,6 @@ function renderSignalGrepCallLines(input, locale, theme, width) {
   if (width < 44)
     return finish([`${primary} \xB7 ${detail}`], width);
   return finish([primary, theme.fg("dim", detail)], width);
-}
-function renderSignalGrepPresentationLines(presentation, locale, theme, width) {
-  const copy = COPY[locale];
-  switch (presentation.kind) {
-    case "empty":
-      return finish([
-        title("SIGNAL GREP", theme),
-        `${theme.bold("0")} ${copy.matches} \xB7 ${theme.fg("success", copy.complete)}`,
-        theme.fg("dim", copy.empty)
-      ], width);
-    case "summary":
-      return renderSummary(presentation, copy, theme, width);
-    case "matches":
-      return renderMatches(presentation, copy, theme, width);
-    case "inspect":
-      return renderInspect(presentation, copy, theme, width);
-    case "inspect-batch":
-      return renderInspectBatch(presentation, copy, theme, width);
-    default:
-      throw new Error("Unsupported baoer_signal_grep presentation");
-  }
 }
 function localizedSearchingText(locale) {
   return COPY[locale].searching;
@@ -14595,21 +15212,30 @@ function component(render, fallbackText) {
     invalidate() {}
   };
 }
-function errorLines(text, options) {
-  const { copy, expanded, theme, width } = options;
-  if (expanded)
-    return textLines(text, width);
+function errorLines(options) {
+  const { copy, theme, width } = options;
   const available = Math.max(1, width);
-  const sourceLines = text.split(`
-`).filter((line) => line.length > 0);
-  const shown = sourceLines.slice(0, 4);
-  const lines = [
-    theme.fg("error", theme.bold(`\u2500\u2500 ${copy.title} \u2500\u2500`)),
-    ...shown.map((line) => theme.fg("error", line))
-  ];
-  if (sourceLines.length > shown.length)
-    lines.push(theme.fg("dim", `\u2026 ${copy.hint}`));
+  const lines = [theme.fg("error", theme.bold(`\u2500\u2500 ${copy.title} \u2500\u2500`)), theme.fg("dim", copy.hint)];
   return lines.map((line) => truncateToWidth(line, available));
+}
+function renderHumanStats(details, locale, theme, width) {
+  const chinese = locale === "zh-CN";
+  const title = chinese ? "\u7ED3\u679C" : "RESULT";
+  const status = details.status === "complete" ? chinese ? "\u5B8C\u6574" : "complete" : chinese ? "\u90E8\u5206" : "partial";
+  const count = details.analysis?.totalItems ?? details.totalMatches;
+  const files = details.totalFiles;
+  const unit = details.analysis ? chinese ? "\u9879" : "items" : chinese ? "\u5904\u5339\u914D" : "matches";
+  const lines = [
+    theme.fg("borderMuted", `\u2500\u2500 ${theme.bold(title)} \u2500\u2500`),
+    theme.fg("toolOutput", `${String(count)} ${unit} \xB7 ${String(files)} ${chinese ? "\u4E2A\u6587\u4EF6" : files === 1 ? "file" : "files"} \xB7 ${status}`)
+  ];
+  if (details.analysis?.statistics) {
+    const stats = details.analysis.statistics;
+    lines.push(theme.fg("dim", `${chinese ? "\u7EDF\u8BA1" : "stats"}: ${String(stats.total)} ${unit}`));
+  }
+  if (details.cursor || details.nextRequest)
+    lines.push(theme.fg("dim", chinese ? "\u53EF\u7EE7\u7EED" : "cursor ready"));
+  return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
 }
 function renderSignalGrepCall(input, locale, theme) {
   return component((width) => renderSignalGrepCallLines(input, locale, theme, width), "baoer_signal_grep");
@@ -14625,15 +15251,12 @@ function renderSignalGrepResult(result, options, locale, theme) {
     return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
   }
   if (options.isError) {
-    return component((width) => errorLines(text, {
+    return component((width) => errorLines({
       copy: localizedErrorText(locale),
-      expanded: options.expanded,
       theme,
       width
-    }), text);
+    }), locale === "zh-CN" ? "\u672C\u6B21\u64CD\u4F5C\u672A\u5B8C\u6210\u3002" : "Operation did not complete.");
   }
-  if (options.expanded)
-    return new Text(text, 0, 0);
   let presentation;
   try {
     presentation = recognizeSignalGrepResult(text, result.details);
@@ -14641,8 +15264,17 @@ function renderSignalGrepResult(result, options, locale, theme) {
     return new Text(text, 0, 0);
   }
   if (!presentation)
-    return new Text(text, 0, 0);
-  return component((width) => renderSignalGrepPresentationLines(presentation, locale, theme, width), text);
+    return component((width) => renderHumanStats(result.details ?? {
+      version: 1,
+      mode: "auto",
+      status: "complete",
+      totalMatches: 0,
+      storedMatches: 0,
+      totalFiles: 0,
+      returnedMatches: 0,
+      snapshotComplete: true
+    }, locale, theme, width), locale === "zh-CN" ? "\u7ED3\u679C" : "RESULT");
+  return component((width) => renderHumanStats(result.details ?? presentation.details, locale, theme, width), locale === "zh-CN" ? "\u7ED3\u679C" : "RESULT");
 }
 
 // src/search-policy-recovery.ts

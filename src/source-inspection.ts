@@ -61,6 +61,12 @@ function usesDocumentLineWindow(path: string): boolean {
   return /\.(?:md|markdown)$/iu.test(path);
 }
 
+function hasBareCarriageReturn(bytes: Uint8Array): boolean {
+  for (let index = 0; index < bytes.length; index += 1)
+    if (bytes[index] === 13 && bytes[index + 1] !== 10) return true;
+  return false;
+}
+
 export function matchInspectionTarget(target: InspectionTarget): SourceInspectionTarget {
   return {
     path: target.path,
@@ -298,8 +304,8 @@ function render(items: InspectBatchItemDetails[], blocks: SourceBlock[], single:
   });
   return [
     single
-      ? "Source inspection"
-      : `Batch inspection: ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
+      ? "Source inspection (Inspection metadata)"
+      : `Batch inspection (Inspection metadata): ${items.filter((item) => item.status === "returned").length} of ${items.length} targets returned; overlapping ranges merged before the shared 16384-byte budget.`,
     ...rows,
     ...sourceRows,
   ].join("\n\n");
@@ -446,10 +452,12 @@ export async function inspectDocuments(
 ): Promise<SignalGrepResult> {
   const items: InspectBatchItemDetails[] = [];
   const blocks: SourceBlock[] = [];
+  let metadataOnly = false;
   for (const [index, target] of targets.entries()) {
     try {
       // oxlint-disable-next-line no-await-in-loop -- targets share one bounded source/parse context and input-order response budget.
       const prepared = await prepare(target, access, structure);
+      metadataOnly ||= !prepared.document.utf8 || hasBareCarriageReturn(prepared.document.bytes);
       let blockIndex = blocks.findIndex((block) => block.document === prepared.document);
       if (blockIndex < 0) {
         blockIndex = blocks.length;
@@ -493,6 +501,7 @@ export async function inspectDocuments(
       });
     }
   }
+  if (metadataOnly) return inspectDocumentsMetadata(targets, access, structure);
   for (const block of blocks) {
     block.ranges = mergeByteRanges(block.ranges);
     block.remaining = block.ranges;

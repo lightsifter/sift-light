@@ -19,7 +19,7 @@ import {
   termCountRequest,
 } from "./analysis-term-pages.js";
 
-import { analysisExtraGroups, formatStatistics, statisticsForItems } from "./result-statistics.js";
+import { analysisExtraGroups, statisticsForItems } from "./result-statistics.js";
 interface StoredAnalysis {
   id: string;
   result: AnalysisResultSet;
@@ -318,60 +318,73 @@ export class AnalysisStore {
       Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
     const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
+    const items: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
+    const sources: NonNullable<SignalGrepResult["details"]["analysis"]>["sources"] = [];
+    const sourceIds = new Map<string, number>();
+    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
     const statistics = statisticsForItems(
       result.items,
       result.items.length,
       result.unit,
       analysisExtraGroups(result.counts, result.termCounts, result.items),
     );
-    const publicItems: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
     const scope = result.scope
-      ? `Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
-      : undefined;
-    const coverage = result.coverage ? `Coverage: ${JSON.stringify(result.coverage)}.` : undefined;
-    const stats = result.stats ? `Stats: ${JSON.stringify(result.stats)}.` : undefined;
-    const header = [
-      `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}).`,
-      ...formatStatistics(statistics),
-      inlineTerms ? `Condition counts: ${JSON.stringify(inlineTerms)}.` : undefined,
-      termsRequest ? `Condition counts are paginated: ${JSON.stringify(termsRequest)}.` : undefined,
-      scope,
-      coverage,
-      stats,
-    ]
-      .filter((line): line is string => line !== undefined)
-      .join("\n");
+      ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
+      : "";
+    const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
+    const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
+    const hasItemDetails = result.items.some((item) => item.details !== undefined);
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
     const notice = result.reasons.length
-      ? result.reasons.map((reason) => `[${reason}]`).join("\n")
-      : undefined;
+      ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
+      : "";
     const rows: string[] = [];
-    let bytes = Buffer.byteLength(header) + Buffer.byteLength(notice ?? "") + 1200;
+    let bytes = Buffer.byteLength(header + notice) + 1200;
     let next = offset;
     const appendItem = (index: number): boolean => {
       const item = result.items[index];
       if (!item) throw new Error("Analysis item unavailable");
       const publicItem = publicAnalysisItem(result, item, index, stored.id);
-      const row = `#${String(index + 1)} ${item.path}:${String(item.line)} ${publicItem.label}`;
+      const inspect = publicItem.inspect;
+      const exposeExcerpt =
+        result.kind === "concept" ||
+        (result.kind === "hybrid" && item.details?.source === "concept");
+      const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `\n${item.excerpt}` : ""}${inspect && !hybridInspectCursor ? `\nInspect: ${JSON.stringify(inspect)}` : ""}`;
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
-        if (publicItems.length === 0)
-          throw new SignalGrepError(
-            "Analysis metadata exceeds the response limit; narrow the query",
-          );
+        if (items.length === 0)
+          throw new SignalGrepError("Analysis item exceeds the response limit; narrow its source");
         return false;
       }
       rows.push(row);
       bytes += rowBytes;
-      publicItems.push(publicItem);
+      if (hybridInspectCursor && item.source) {
+        const sourceKey = JSON.stringify(item.source);
+        let sourceId = sourceIds.get(sourceKey);
+        if (sourceId === undefined) {
+          sourceId = sources.length;
+          sources.push(item.source);
+          sourceIds.set(sourceKey, sourceId);
+        }
+        const { source: _source, ...sharedItem } = item;
+        items.push({ ...sharedItem, label: publicItem.label, index: index + 1, sourceId });
+      } else {
+        items.push({
+          ...item,
+          label: publicItem.label,
+          index: index + 1,
+          ...(inspect ? { inspect } : {}),
+        });
+      }
       if (!hybridPreview) next = index + 1;
       return true;
     };
     if (hybridPreview) {
       for (const index of hybridPreviewIndices(result.items)) {
-        if (publicItems.length >= 30 || !appendItem(index)) break;
+        if (items.length >= 30 || !appendItem(index)) break;
       }
     } else {
-      for (let index = offset; index < result.items.length && publicItems.length < 30; index += 1) {
+      for (let index = offset; index < result.items.length && items.length < 30; index += 1) {
         if (!appendItem(index)) break;
       }
     }
@@ -384,16 +397,15 @@ export class AnalysisStore {
           }
         : undefined);
     const text = [
-      header,
-      notice,
-      rows.length ? rows.join("\n") : "No retained item metadata is available.",
-      hybridMatchesRequest
-        ? `Match metadata request: ${JSON.stringify(hybridMatchesRequest)}.`
-        : undefined,
-      nextRequest ? `Next request: ${JSON.stringify(nextRequest)}` : undefined,
-    ]
-      .filter((line): line is string => line !== undefined && line.length > 0)
-      .join("\n\n");
+      header + notice,
+      ...rows,
+      ...(hybridInspectCursor
+        ? [
+            `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`,
+          ]
+        : []),
+      ...(nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []),
+    ].join("\n\n");
     if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
       throw new SignalGrepError("Analysis metadata exceeds the output limit");
     return {
@@ -414,7 +426,7 @@ export class AnalysisStore {
         snapshotComplete: !result.partial,
         totalMatches: result.items.length,
         storedMatches: result.items.length,
-        returnedMatches: publicItems.length,
+        returnedMatches: items.length,
         totalFiles: statistics.files,
         statistics,
         cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
@@ -423,9 +435,10 @@ export class AnalysisStore {
           kind: result.kind,
           unit: result.unit,
           totalItems: result.items.length,
-          returnedItems: publicItems.length,
+          returnedItems: items.length,
           statistics,
-          items: publicItems,
+          items,
+          ...(sources.length ? { sources } : {}),
           reasons: result.reasons,
           ...(result.filesRead !== undefined ? { filesRead: result.filesRead } : {}),
           ...(result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {}),
@@ -441,7 +454,7 @@ export class AnalysisStore {
           ...(result.stats ? { stats: result.stats } : {}),
           ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
-          ...(hybridPreview ? { inspectCursor: `${stored.id}.analysis.0` } : {}),
+          ...(hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}),
         },
         ...(result.scope ? { scope: result.scope } : {}),
         ...(result.redact ? { redactionRequested: true } : {}),

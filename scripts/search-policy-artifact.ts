@@ -15,7 +15,6 @@ export const SEARCH_PLUGIN_FILES = [
   "syntax-worker.toml",
   ".codex-plugin/plugin.json",
   ".claude-plugin/plugin.json",
-  ".codex.mcp.json",
   "mcp-server.mjs",
   ".mcp.json",
   "kimi.plugin.json",
@@ -94,18 +93,16 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     ONNXRUNTIME_NODE_INSTALL_CUDA: "skip",
     BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE: "model",
   };
-  const localMcp = {
+  const mcp = {
     baoer_signal_grep: {
-      command: "node",
-      args: ["./mcp-server.mjs", "--stdio"],
-      cwd: "./",
-      env: mcpEnvironment,
-    },
-  };
-  const claudeMcp = {
-    baoer_signal_grep: {
-      command: "node",
-      args: ["${CLAUDE_PLUGIN_ROOT}/mcp-server.mjs", "--stdio"],
+      command: "npx",
+      args: [
+        "--yes",
+        "--package",
+        `${packageJson.name}@latest`,
+        "baoer_signal_grep_mcp",
+        "--stdio",
+      ],
       env: mcpEnvironment,
     },
   };
@@ -117,7 +114,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     "package.json": ompPackage,
     ".codex-plugin/plugin.json": {
       ...identity,
-      mcpServers: "./.codex.mcp.json",
+      mcpServers: "./.mcp.json",
       interface: {
         displayName: "baoer_signal_grep",
         shortDescription: "Enforced local code search",
@@ -129,9 +126,8 @@ export async function buildSearchPlugin(root: string): Promise<void> {
       },
     },
     ".claude-plugin/plugin.json": identity,
-    ".codex.mcp.json": { mcpServers: localMcp },
     "mcp-server.mjs": localMcpServer,
-    ".mcp.json": { mcpServers: claudeMcp },
+    ".mcp.json": { mcpServers: mcp },
     "hooks/hooks.json": {
       hooks: {
         PreToolUse: [
@@ -151,7 +147,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     },
     "kimi.plugin.json": {
       ...identity,
-      mcpServers: localMcp,
+      mcpServers: mcp,
       systemPrompt:
         "Use baoer_signal_grep for local content and filename searches. The plugin blocks conventional alternative search entries. Ordinary reads, edits, tests and builds remain available.",
       hooks: [

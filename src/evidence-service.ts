@@ -36,9 +36,10 @@ import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js
 import { SourceContinuations } from "./source-continuations.js";
 import { type ByteRange, type SourceDocument, type SourceReference } from "./source-document.js";
 import {
-  continueSourceMetadata,
-  inspectDocumentsMetadata,
+  continueSource,
+  inspectDocuments,
   matchInspectionTarget,
+  inspectDocumentsMetadata,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
 import { validateSavedEvidence } from "./evidence-validation.js";
@@ -384,11 +385,13 @@ export class EvidenceService {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect") throw new SignalGrepError("sourceCursor requires mode=inspect");
-      return continueSourceMetadata(input.sourceCursor, this.#continuations);
+      return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
       const targets = this.#inspectionTargets(input, cwd);
-      return inspectDocumentsMetadata(targets, access, this.#structure);
+      return targets.some((target) => target.range !== undefined)
+        ? inspectDocumentsMetadata(targets, access, this.#structure)
+        : inspectDocuments(targets, access, this.#continuations, this.#structure);
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
@@ -761,12 +764,12 @@ export class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const isStructural = item.details?.kind === "symbol" || item.details?.kind === "function";
+      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
-        ...(isStructural ? { range: item.range } : { absoluteFocus: item.range.start }),
+        ...(metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }),
       };
     }
     return {
@@ -906,7 +909,7 @@ export class EvidenceService {
       return this.#analyses.page(
         this.#analyses.create({
           kind: input.mode === "imports" ? "imports" : "tests",
-          unit: input.mode === "imports" ? "relationships" : "evidence-items",
+          unit: "evidence-items",
           items: [],
           partial: true,
           reasons: [
@@ -992,7 +995,7 @@ export class EvidenceService {
         partial: result.partial || files.partial,
         reasons: [...result.reasons, ...files.reasons],
         kind: input.mode === "imports" ? "imports" : "tests",
-        unit: input.mode === "imports" ? "relationships" : "evidence-items",
+        unit: "evidence-items",
         coverage: {
           navigation: result.partial || files.partial ? "partial" : "complete",
         },

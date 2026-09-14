@@ -4,6 +4,12 @@ import { readWorkspaceDocument } from "./source-document.js";
 import { sameSourceRevision } from "./source.js";
 import { MAX_SOURCE_FILE_BYTES, type SearchSnapshot } from "./types.js";
 
+function hasBareCarriageReturn(bytes: Uint8Array): boolean {
+  for (let index = 0; index < bytes.length; index += 1)
+    if (bytes[index] === 13 && bytes[index + 1] !== 10) return true;
+  return false;
+}
+
 /** At most five reads, two disjoint windows/file, seven lines/window. */
 export async function summarySourcePreviews(
   snapshot: SearchSnapshot,
@@ -25,6 +31,14 @@ export async function summarySourcePreviews(
     );
     const first = matches[0];
     if (!first) continue;
+    if (matches.some(({ match }) => match.lineContent.includes("\r"))) {
+      reasons.push(`${path}: preview skipped for non-standard line endings`);
+      continue;
+    }
+    if (matches.some(({ match }) => match.lineTruncated || match.occurrences.length > 20)) {
+      reasons.push(`${path}: preview skipped for dense or truncated matching lines`);
+      continue;
+    }
     const revision = snapshot.sourceRevisions.get(first.match.absolutePath);
     if (!revision || revision.size > MAX_SOURCE_FILE_BYTES) {
       reasons.push(`${path}: preview source unverified or over 5 MiB`);
@@ -40,6 +54,10 @@ export async function summarySourcePreviews(
         !document.utf8
       ) {
         reasons.push(`${path}: preview source changed or is not lossless UTF-8`);
+        continue;
+      }
+      if (hasBareCarriageReturn(document.bytes)) {
+        reasons.push(`${path}: preview skipped for non-standard line endings`);
         continue;
       }
       let lastEnd = 0;

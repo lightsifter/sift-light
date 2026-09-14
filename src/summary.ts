@@ -2,39 +2,24 @@ import {
   DEFAULT_RESULT_TOKEN_BUDGET,
   ESTIMATED_CHARACTERS_PER_TOKEN,
   MAX_RESULT_BYTES,
+  type MatchRecord,
+  type SearchSnapshot,
 } from "./types.js";
-import type { ResultStatistics, SearchSnapshot } from "./types.js";
-import { formatStatistics, statisticsForSnapshot } from "./result-statistics.js";
 
-const METADATA_BYTES = 1024;
-const METADATA_CHARACTERS = 512;
+const METADATA_CHARACTERS = 2_400;
+const METADATA_BYTES = 3_584;
 
-/** File navigation gets its budget before optional statistical sections. */
+/** File navigation gets its budget before optional source samples. */
 export function formatSummary(
   snapshot: SearchSnapshot,
   fileLimit: number,
   offset = 0,
   resultTokenBudget = DEFAULT_RESULT_TOKEN_BUDGET,
-): {
-  body: string;
-  statistics: ResultStatistics;
-  statisticsText: string[];
-  shown: number;
-  offset: number;
-  nextOffset: number;
-  hasNext: boolean;
-  omitted: number;
-  shownPaths: string[];
-} {
+) {
   if (!Number.isSafeInteger(fileLimit) || fileLimit <= 0)
     throw new Error("Summary file limit must be a positive safe integer");
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > snapshot.fileCounts.size)
     throw new Error("Summary offset is outside the file summary");
-  if (!Number.isSafeInteger(resultTokenBudget) || resultTokenBudget <= 0)
-    throw new Error("Result token budget must be a positive safe integer");
-
-  const statistics = statisticsForSnapshot(snapshot);
-  const statisticsText = formatStatistics(statistics, { includeTopFiles: false });
   const files = [...snapshot.fileCounts.entries()].toSorted(
     ([left, leftCount], [right, rightCount]) => rightCount - leftCount || left.localeCompare(right),
   );
@@ -45,8 +30,11 @@ export function formatSummary(
   const maxBytes = MAX_RESULT_BYTES - METADATA_BYTES;
   const rows: string[] = [];
   const shownPaths: string[] = [];
-  let bytes = Buffer.byteLength(statisticsText.join("\n"));
-  let characters = statisticsText.join("\n").length;
+  const firstMatches = new Map<string, { match: MatchRecord; index: number }>();
+  for (const [index, match] of snapshot.matches.entries())
+    if (!firstMatches.has(match.displayPath)) firstMatches.set(match.displayPath, { match, index });
+  let bytes = 0;
+  let characters = 0;
   for (const [file, count] of files.slice(offset, offset + Math.min(30, fileLimit))) {
     const row = `${file}  ${String(count).padStart(6)}`;
     if (bytes + Buffer.byteLength(row) + 1 > maxBytes) {
@@ -60,16 +48,32 @@ export function formatSummary(
     bytes += Buffer.byteLength(row) + 1;
     characters += row.length + 1;
   }
+  const previews: string[] = [];
+  const sampleIndices: number[] = [];
+  const sampleBudget = Math.max(0, Math.min(maxBytes - bytes, maxCharacters - characters));
+  let sampleBytes = 0;
+  for (const path of shownPaths.slice(0, 5)) {
+    const retained = firstMatches.get(path);
+    if (!retained) continue;
+    const preview = `${path}:${retained.match.lineNumber} {match #${retained.index + 1}} ${retained.match.lineContent}`;
+    if (sampleBytes + Buffer.byteLength(preview) + 1 > sampleBudget) continue;
+    previews.push(preview);
+    sampleIndices.push(retained.index + 1);
+    sampleBytes += Buffer.byteLength(preview) + 1;
+  }
   const nextOffset = offset + rows.length;
   return {
     body: rows.join("\n"),
-    statistics,
-    statisticsText,
+    previews: previews.join("\n"),
+    previewsShown: previews.length,
+    previewsOmitted: shownPaths.length - previews.length,
     shown: rows.length,
     offset,
     nextOffset,
     hasNext: nextOffset < files.length,
     omitted: files.length - nextOffset,
     shownPaths,
+    sampleIndices,
+    previewByteBudget: sampleBudget,
   };
 }

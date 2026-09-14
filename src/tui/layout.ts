@@ -1,5 +1,5 @@
 import type { Theme as PiTheme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { SignalGrepLocale } from "../config.js";
 import type { SignalGrepInput } from "../service.js";
 import type { StructureStatus } from "../types.js";
@@ -9,7 +9,6 @@ import type {
   MatchesPresentation,
   SignalGrepPresentation,
   SummaryPresentation,
-  SummaryRow,
 } from "./presentation.js";
 
 export type SignalGrepTheme = Pick<PiTheme, "bold" | "fg">;
@@ -70,7 +69,7 @@ const COPY = {
     cursorReady: "cursor ready",
     empty: "No matching lines were found.",
     error: "ERROR",
-    expandFullError: "expand for full error",
+    expandFullError: "retry or narrow the query",
     file: "file",
     files: "files",
     finalPage: "final page",
@@ -121,7 +120,7 @@ const COPY = {
     cursorReady: "可继续翻页",
     empty: "没有找到匹配行。",
     error: "错误",
-    expandFullError: "展开查看完整错误",
+    expandFullError: "请重试或缩小搜索范围",
     file: "个文件",
     files: "个文件",
     finalPage: "最后一页",
@@ -178,11 +177,6 @@ function quote(value: string): string {
 function list(value: string | string[] | undefined): string | undefined {
   if (value === undefined) return undefined;
   return (Array.isArray(value) ? value : [value]).map(safeLabel).join(", ");
-}
-
-function padVisible(value: string, width: number): string {
-  const truncated = truncateToWidth(value, Math.max(1, width));
-  return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
 function finish(lines: string[], width: number): string[] {
@@ -246,31 +240,12 @@ function budgetLine(
   return theme.fg("dim", `${copy.budget} ${details.budgetTier}${remainder}`);
 }
 
-function summaryRow(row: SummaryRow, maximum: number, width: number, theme: Theme): string {
-  if (width < 44) {
-    const count = String(row.matches);
-    const pathWidth = Math.max(1, width - visibleWidth(count) - 2);
-    return `${theme.fg("accent", padVisible(row.path, pathWidth))}  ${theme.fg("muted", count)}`;
-  }
-
-  const count = String(row.matches);
-  const barWidth = width >= 72 ? 20 : 10;
-  const maxPathWidth = width >= 72 ? 32 : 20;
-  const pathWidth = Math.max(8, Math.min(maxPathWidth, width - barWidth - count.length - 5));
-  const filled = Math.max(1, Math.round((row.matches / maximum) * barWidth));
-  const bar = `${"█".repeat(filled)}${"─".repeat(Math.max(0, barWidth - filled))}`;
-  return `${theme.fg("accent", padVisible(row.path, pathWidth))} ${theme.fg("success", bar)} ${theme.fg("muted", count)}`;
-}
-
 function renderSummary(
   presentation: SummaryPresentation,
   copy: TuiCopy,
   theme: Theme,
   width: number,
 ): string[] {
-  const shownLimit = responsiveLimit(width, 6, 5, 4);
-  const visibleRows = presentation.rows.slice(0, shownLimit);
-  const maximum = Math.max(...visibleRows.map((row) => row.matches), 1);
   const lines = [
     title(
       presentation.details.status === "partial" ? copy.partialSummaryTitle : copy.summary,
@@ -278,21 +253,7 @@ function renderSummary(
     ),
     countLine(presentation, copy, theme, width),
     ...partialLines(presentation, copy, theme, width),
-    "",
-    ...visibleRows.map((row) => summaryRow(row, maximum, width, theme)),
   ];
-
-  const hiddenRows = presentation.rows.length - visibleRows.length;
-  const omitted = presentation.details.summaryFilesOmitted ?? 0;
-  if (hiddenRows + omitted > 0) {
-    lines.push(theme.fg("dim", `… ${String(hiddenRows + omitted)} ${copy.moreFiles}`));
-  }
-  if (width >= 44 && presentation.previews.length > 0) {
-    lines.push("", theme.fg("dim", copy.samples));
-    lines.push(
-      ...presentation.previews.slice(0, 2).map((line) => theme.fg("toolOutput", safeLabel(line))),
-    );
-  }
   const budget = budgetLine(presentation, copy, theme);
   if (budget) lines.push("", budget);
   const pageStatus = presentation.details.cursor ? copy.cursorReady : copy.finalPage;

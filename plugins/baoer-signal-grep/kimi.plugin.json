@@ -1,6 +1,6 @@
 {
   "name": "baoer-signal-grep",
-  "version": "2.1.1",
+  "version": "1.6.0",
   "description": "Require baoer_signal_grep for conventional local searches while keeping development tools available.",
   "author": {
     "name": "宝儿"
@@ -9,12 +9,14 @@
   "license": "AGPL-3.0-only",
   "mcpServers": {
     "baoer_signal_grep": {
-      "command": "node",
+      "command": "npx",
       "args": [
-        "./mcp-server.mjs",
+        "--yes",
+        "--package",
+        "baoer_signal_grep@latest",
+        "baoer_signal_grep_mcp",
         "--stdio"
       ],
-      "cwd": "./",
       "env": {
         "npm_config_ignore_scripts": "true",
         "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",

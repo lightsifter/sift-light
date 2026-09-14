@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "baoer_signal_grep": {
-      "command": "node",
+      "command": "npx",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/mcp-server.mjs",
+        "--yes",
+        "--package",
+        "baoer_signal_grep@latest",
+        "baoer_signal_grep_mcp",
         "--stdio"
       ],
       "env": {
