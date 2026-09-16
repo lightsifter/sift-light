@@ -48,7 +48,7 @@ const SIGNAL_GREP_OUTPUT_SCHEMA: Tool["outputSchema"] = {
     text: {
       type: "string",
       description:
-        "Complete formatted metadata page, including statistics, coverage and continuation requests; source text is never included.",
+        "Complete formatted result page, including statistics, coverage and continuation requests; may contain bounded source excerpts or inspection windows.",
     },
     details: { type: "object" },
   },

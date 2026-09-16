@@ -1,163 +1,106 @@
-import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { type Component } from "@earendil-works/pi-tui";
 import type { SignalGrepLocale } from "../config.js";
 import type { SignalGrepInput } from "../service.js";
 import type { SignalGrepDetails } from "../types.js";
-import {
-  localizedErrorText,
-  renderSignalGrepCallLines,
-  localizedSearchingText,
-  type SignalGrepTheme,
-} from "./layout.js";
-import { recognizeSignalGrepResult } from "./presentation.js";
-
-type Theme = SignalGrepTheme;
-
-interface TextContent {
-  type: string;
-  text?: string;
-}
+import { dashboard } from "./dashboard.js";
+import { fit, renderDashboard, renderSignalGrepCallLines, type SignalGrepTheme } from "./layout.js";
 
 export interface SignalGrepToolResult {
-  content: TextContent[];
+  content: { type: string; text?: string }[];
   details?: SignalGrepDetails;
   isError?: boolean;
 }
-
 export interface SignalGrepRenderOptions {
   expanded: boolean;
   isError: boolean;
   isPartial: boolean;
 }
 
-function resultText(result: SignalGrepToolResult): string | undefined {
-  return result.content.find((item) => item.type === "text" && item.text !== undefined)?.text;
-}
-
-function textLines(text: string, width: number): string[] {
-  return new Text(text, 0, 0).render(Math.max(1, width));
-}
-
-function component(render: (width: number) => string[], fallbackText: string): Component {
+function component(render: (width: number) => string[], locale: SignalGrepLocale): Component {
   return {
     render(width) {
       try {
         return render(width);
       } catch {
-        return textLines(fallbackText, width);
+        return fit(
+          [locale === "zh-CN" ? "结果显示失败，请重试" : "Result display failed; retry"],
+          width,
+        );
       }
     },
     invalidate() {},
   };
 }
 
-interface ErrorLineOptions {
-  copy: { hint: string; title: string };
-  theme: Theme;
-  width: number;
-}
-
-function errorLines(options: ErrorLineOptions): string[] {
-  const { copy, theme, width } = options;
-  const available = Math.max(1, width);
-  const lines = [theme.fg("error", theme.bold(`── ${copy.title} ──`)), theme.fg("dim", copy.hint)];
-  return lines.map((line) => truncateToWidth(line, available));
-}
-
-function renderHumanStats(
-  details: SignalGrepDetails,
-  locale: SignalGrepLocale,
-  theme: Theme,
-  width: number,
-): string[] {
-  const chinese = locale === "zh-CN";
-  const title = chinese ? "结果" : "RESULT";
-  const status =
-    details.status === "complete" ? (chinese ? "完整" : "complete") : chinese ? "部分" : "partial";
-  const count = details.analysis?.totalItems ?? details.totalMatches;
-  const files = details.totalFiles;
-  const unit = details.analysis ? (chinese ? "项" : "items") : chinese ? "处匹配" : "matches";
-  const lines = [
-    theme.fg("borderMuted", `── ${theme.bold(title)} ──`),
-    theme.fg(
-      "toolOutput",
-      `${String(count)} ${unit} · ${String(files)} ${chinese ? "个文件" : files === 1 ? "file" : "files"} · ${status}`,
-    ),
-  ];
-  if (details.analysis?.statistics) {
-    const stats = details.analysis.statistics;
-    lines.push(theme.fg("dim", `${chinese ? "统计" : "stats"}: ${String(stats.total)} ${unit}`));
-  }
-  if (details.cursor || details.nextRequest)
-    lines.push(theme.fg("dim", chinese ? "可继续" : "cursor ready"));
-  return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
+function failure(text: string, locale: SignalGrepLocale): string {
+  const zh = locale === "zh-CN";
+  if (/expired|cursor.*invalid/i.test(text))
+    return zh ? "结果已过期，请重新搜索" : "Results expired; run the search again";
+  if (/permission|access denied|EACCES/i.test(text))
+    return zh ? "无法访问文件，请检查权限" : "Cannot access files; check permissions";
+  if (/not found|ENOENT/i.test(text))
+    return zh ? "未找到目标，请检查文件路径" : "Target not found; check the file path";
+  if (/cancel/i.test(text)) return zh ? "搜索已取消" : "Search cancelled";
+  if (/timeout|deadline/i.test(text))
+    return zh ? "搜索超时，请缩小范围重试" : "Search timed out; narrow the search";
+  return zh ? "搜索未完成，请检查搜索条件后重试" : "Search failed; check the query and retry";
 }
 
 export function renderSignalGrepCall(
   input: SignalGrepInput,
   locale: SignalGrepLocale,
-  theme: Theme,
+  theme: SignalGrepTheme,
 ): Component {
-  return component(
-    (width) => renderSignalGrepCallLines(input, locale, theme, width),
-    "baoer_signal_grep",
-  );
+  return component((width) => renderSignalGrepCallLines(input, locale, theme, width), locale);
 }
 
 export function renderSignalGrepResult(
   result: SignalGrepToolResult,
   options: SignalGrepRenderOptions,
   locale: SignalGrepLocale,
-  theme: Theme,
+  theme: SignalGrepTheme,
 ): Component {
-  const text = resultText(result);
-  if (text === undefined) return new Text("", 0, 0);
-
-  if (result.details?.operation && result.details.operation.state !== "complete") {
-    return new Text(theme.fg("warning", text), 0, 0);
-  }
-  if (options.isPartial) {
-    return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
-  }
-  if (options.isError) {
-    return component(
-      (width) =>
-        errorLines({
-          copy: localizedErrorText(locale),
-          theme,
-          width,
-        }),
-      locale === "zh-CN" ? "本次操作未完成。" : "Operation did not complete.",
-    );
-  }
-
-  let presentation;
-  try {
-    presentation = recognizeSignalGrepResult(text, result.details);
-  } catch {
-    return new Text(text, 0, 0);
-  }
-  if (!presentation)
-    return component(
-      (width) =>
-        renderHumanStats(
-          result.details ?? {
-            version: 1,
-            mode: "auto",
-            status: "complete",
-            totalMatches: 0,
-            storedMatches: 0,
-            totalFiles: 0,
-            returnedMatches: 0,
-            snapshotComplete: true,
-          },
-          locale,
-          theme,
-          width,
-        ),
-      locale === "zh-CN" ? "结果" : "RESULT",
-    );
-  return component(
-    (width) => renderHumanStats(result.details ?? presentation.details, locale, theme, width),
-    locale === "zh-CN" ? "结果" : "RESULT",
-  );
+  return component((width) => {
+    const zh = locale === "zh-CN";
+    const text = result.content
+      .filter((item) => item.type === "text")
+      .map((item) => item.text ?? "")
+      .join("\n");
+    const state = result.details?.operation?.state ?? result.details?.status;
+    if (
+      options.isError ||
+      result.isError ||
+      state === "failed" ||
+      state === "cancelled" ||
+      state === "expired"
+    ) {
+      return fit(
+        [
+          theme.fg("error", zh ? "! 搜索未完成" : "! Search incomplete"),
+          failure(state === "cancelled" || state === "expired" ? state : text, locale),
+        ],
+        width,
+      );
+    }
+    if (options.isPartial || state === "running" || state === "waiting") {
+      // The worker reports phase-local counts, not an overall completion percentage.
+      return fit(
+        [
+          theme.fg("accent", zh ? "◌ 正在搜索…" : "◌ Searching…"),
+          theme.fg("muted", zh ? "等待搜索结果" : "Waiting for results"),
+        ],
+        width,
+      );
+    }
+    const view = dashboard(text, result.details);
+    if (!view)
+      return fit(
+        [
+          theme.fg("warning", zh ? "无法展示结果统计" : "Result statistics unavailable"),
+          theme.fg("muted", zh ? "请重试搜索" : "Retry the search"),
+        ],
+        width,
+      );
+    return renderDashboard(view, locale, theme, width, options.expanded);
+  }, locale);
 }
