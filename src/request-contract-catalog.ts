@@ -131,7 +131,8 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   literal:
     "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
   path: "path must be an existing exact file or root; use mode=files+query for unknown names",
-  query: "files+query discovers unknown filenames/paths; concept/hybrid query is natural language",
+  query:
+    "files+query matches known filename/path text (not glob patterns); omit files query to list every file under path; concept/hybrid query is natural language",
   anyOf:
     "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
   allOf:

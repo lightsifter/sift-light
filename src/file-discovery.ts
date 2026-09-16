@@ -11,6 +11,8 @@ interface FileScore {
   reason: string;
 }
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** Bracket classes remain valid query text, so dynamic route names stay searchable. */
+const FILE_QUERY_GLOB_WILDCARD = /[*?]/u;
 
 function subsequenceScore(text: string, query: string): number | undefined {
   const characters = Array.from(graphemes.segment(text), (item) => item.segment);
@@ -72,6 +74,12 @@ export async function discoverFiles(
   if (query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
     throw new SignalGrepError(
       "File query must be well-formed single-line text of at most 256 characters",
+    );
+  // A wildcard query can never match filename text, so scoring it would discard
+  // every enumerated file and report an empty result as complete.
+  if (FILE_QUERY_GLOB_WILDCARD.test(query))
+    throw new SignalGrepError(
+      `File query ${JSON.stringify(query)} uses glob wildcards; mode=files matches filename and path text, not glob patterns. Omit query to retain every file under path, or use glob to filter by name pattern.`,
     );
   const request = normalizeRequest({ ...input, pattern: "" });
   const policy = new SearchPathPolicy(cwd);

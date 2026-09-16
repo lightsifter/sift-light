@@ -7176,6 +7176,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
 
 // src/file-discovery.ts
 var graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+var FILE_QUERY_GLOB_WILDCARD = /[*?]/u;
 function subsequenceScore(text, query) {
   const characters = Array.from(graphemes.segment(text), (item) => item.segment);
   const queryCharacters = Array.from(graphemes.segment(query), (item) => item.segment);
@@ -7229,6 +7230,8 @@ async function discoverFiles(input, cwd, signal) {
   const query = input.query ?? "";
   if (query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
     throw new SignalGrepError("File query must be well-formed single-line text of at most 256 characters");
+  if (FILE_QUERY_GLOB_WILDCARD.test(query))
+    throw new SignalGrepError(`File query ${JSON.stringify(query)} uses glob wildcards; mode=files matches filename and path text, not glob patterns. Omit query to retain every file under path, or use glob to filter by name pattern.`);
   const request = normalizeRequest({ ...input, pattern: "" });
   const policy = new SearchPathPolicy(cwd);
   const discoveryRoot = request.path ?? ".";
@@ -9307,7 +9310,7 @@ var REQUEST_FIELD_GUIDANCE = {
   pattern: "pattern is regex by default; literal=true matches source text exactly",
   literal: "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
   path: "path must be an existing exact file or root; use mode=files+query for unknown names",
-  query: "files+query discovers unknown filenames/paths; concept/hybrid query is natural language",
+  query: "files+query matches known filename/path text (not glob patterns); omit files query to list every file under path; concept/hybrid query is natural language",
   anyOf: "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
   allOf: "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
   context: "context is an output-context budget and is never silently dropped",
@@ -15279,9 +15282,10 @@ function renderSignalGrepResult(result, options, locale, theme) {
 
 // src/search-policy-recovery.ts
 import { isAbsolute as isAbsolute6, relative as relative9, resolve as resolve23, sep as sep5 } from "path";
-var MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
-function manual() {
-  return { kind: "manual", reason: MANUAL_REASON };
+var CONTENT_MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
+var FILE_MANUAL_REASON = "the command is not a plain `find <root> -type f` enumeration, so depth limits, multiple or case-insensitive name predicates, extra tests and other actions cannot be expressed as one files request with the same scope";
+function manual(kind) {
+  return { kind: "manual", reason: kind === "files" ? FILE_MANUAL_REASON : CONTENT_MANUAL_REASON };
 }
 function pushGlob(value, include, exclude, exclusionSeen) {
   if (value.length === 0 || value.startsWith("\\!") || value.startsWith("!!"))
@@ -15503,35 +15507,111 @@ function isRipgrepExecutable(executable, language) {
   const normalized = language === "powershell" || process.platform === "win32" ? name2.toLowerCase() : name2;
   return normalized === "rg" || normalized === "ripgrep" || (language === "powershell" || process.platform === "win32") && (normalized === "rg.exe" || normalized === "ripgrep.exe");
 }
+function isFindExecutable(executable, language) {
+  const name2 = executable.split(/[\\/]/u).at(-1) ?? executable;
+  const normalized = language === "powershell" || process.platform === "win32" ? name2.toLowerCase() : name2;
+  return normalized === "find" || (language === "powershell" || process.platform === "win32") && normalized === "find.exe";
+}
+function parseFindArguments(args2) {
+  let root;
+  let glob;
+  let typeFile = false;
+  for (let index = 0;index < args2.length; index += 1) {
+    const value = args2[index];
+    if (value === undefined)
+      return;
+    if (!value.startsWith("-") || value === "-") {
+      if (root !== undefined)
+        return;
+      root = value;
+      continue;
+    }
+    if (value === "-print" || value === "-print0")
+      continue;
+    if (value === "-type") {
+      const next = args2[index + 1];
+      if (next === undefined || next !== "f")
+        return;
+      index += 1;
+      typeFile = true;
+      continue;
+    }
+    if (value === "-name") {
+      const next = args2[index + 1];
+      if (next === undefined || glob !== undefined)
+        return;
+      index += 1;
+      glob = next;
+      continue;
+    }
+    return;
+  }
+  if (!typeFile || root === undefined || root.length === 0)
+    return;
+  return glob === undefined ? { root } : { root, glob };
+}
+function recoverFileEnumeration(argv, language, workingDirectory) {
+  const executable = argv[0];
+  if (executable === undefined || !isFindExecutable(executable, language))
+    return manual("files");
+  const parsed = parseFindArguments(argv.slice(1));
+  if (!parsed)
+    return manual("files");
+  if (hasNormalizationSensitivePath(parsed.root))
+    return manual("files");
+  const base = resolve23(workingDirectory);
+  const path = resolve23(base, parsed.root);
+  const localPath = relative9(base, path);
+  if (isAbsolute6(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
+    return manual("files");
+  if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git"))
+    return manual("files");
+  const filters = {
+    path,
+    ...parsed.glob === undefined ? {} : { glob: parsed.glob }
+  };
+  try {
+    validateRawSearchInput(filters);
+  } catch (error) {
+    if (error instanceof SignalGrepError)
+      return manual("files");
+    throw error;
+  }
+  return { kind: "concrete", request: JSON.stringify({ mode: "files", ...filters }) };
+}
 function recoverShellSearch(command, match, workingDirectory) {
-  if (!isStandalone(command, match) || workingDirectory === undefined || match.kind !== "content")
-    return manual();
+  if (workingDirectory === undefined)
+    return manual(match.kind);
   if (match.hasVariableAssignments || match.hasUntranslatedShellSyntax || match.hasSyntaxError)
-    return manual();
-  if (!match.argv.every((value) => value !== null))
-    return manual();
-  const argv = match.argv;
+    return manual(match.kind);
+  const argv = match.argv.filter((value) => value !== null);
+  if (argv.length !== match.argv.length)
+    return manual(match.kind);
+  if (match.kind === "files")
+    return recoverFileEnumeration(argv, match.language, workingDirectory);
+  if (!isStandalone(command, match))
+    return manual(match.kind);
   const executable = argv[0];
   if (executable === undefined || !isRipgrepExecutable(executable, match.language))
-    return manual();
+    return manual(match.kind);
   const parsed = parseRipgrepArguments(argv.slice(1));
   if (!parsed)
-    return manual();
+    return manual(match.kind);
   if (!parsed.noConfig && (process.env.RIPGREP_CONFIG_PATH?.length ?? 0) > 0)
-    return manual();
+    return manual(match.kind);
   if (!parsed.pathWasProvided)
-    return manual();
+    return manual(match.kind);
   if (parsed.path.length === 0)
-    return manual();
+    return manual(match.kind);
   if (hasNormalizationSensitivePath(parsed.path))
-    return manual();
+    return manual(match.kind);
   const base = resolve23(workingDirectory);
   const path = resolve23(base, parsed.path);
   const localPath = relative9(base, path);
   if (isAbsolute6(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
-    return manual();
+    return manual(match.kind);
   if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git"))
-    return manual();
+    return manual(match.kind);
   const glob = listValue(parsed.glob);
   const exclude = listValue(parsed.exclude);
   const request = {
@@ -15549,7 +15629,7 @@ function recoverShellSearch(command, match, workingDirectory) {
     validateRawSearchInput(request);
   } catch (error) {
     if (error instanceof SignalGrepError)
-      return manual();
+      return manual(match.kind);
     throw error;
   }
   return { kind: "concrete", request: JSON.stringify(request) };
@@ -19143,7 +19223,7 @@ function isInputRecord(input) {
   return typeof input === "object" && input !== null && !Array.isArray(input);
 }
 function recovery(kind) {
-  return kind === "files" ? '{"mode":"files","query":"<filename or path>","path":"<scope>"}' : '{"pattern":"<search text>","path":"<scope>","scope":"strict"}';
+  return kind === "files" ? '{"mode":"files","path":"<scope>"} (query is optional: omit it to list every file under path, supply it only to match known filename or path text, and use glob for name patterns)' : '{"pattern":"<search text>","path":"<scope>","scope":"strict"}';
 }
 function blockedMatch(command, match, workingDirectory) {
   const location = match.nestedDepth > 0 ? `nested ${match.language} command #${match.commandIndex}` : `${match.language} subcommand #${match.commandIndex}`;

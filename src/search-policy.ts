@@ -31,7 +31,7 @@ function isInputRecord(input: unknown): input is Record<string, unknown> {
 
 function recovery(kind: SearchKind): string {
   return kind === "files"
-    ? '{"mode":"files","query":"<filename or path>","path":"<scope>"}'
+    ? '{"mode":"files","path":"<scope>"} (query is optional: omit it to list every file under path, supply it only to match known filename or path text, and use glob for name patterns)'
     : '{"pattern":"<search text>","path":"<scope>","scope":"strict"}';
 }
 

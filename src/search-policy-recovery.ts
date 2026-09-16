@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import type { SearchKind } from "./search-policy-commands.js";
 import { SignalGrepError } from "./errors.js";
 import { validateRawSearchInput, type RawSearchInput } from "./request.js";
 import type { ShellSearchMatch } from "./search-policy-shell.js";
@@ -28,11 +29,18 @@ interface ParsedRipgrepRequest {
   pathWasProvided: boolean;
 }
 
-const MANUAL_REASON =
+const CONTENT_MANUAL_REASON =
   "the command is not one standalone static rg search using the supported option and single-target subset";
+const FILE_MANUAL_REASON =
+  "the command is not a plain `find <root> -type f` enumeration, so depth limits, multiple or case-insensitive name predicates, extra tests and other actions cannot be expressed as one files request with the same scope";
 
-function manual(): ManualSearchRecovery {
-  return { kind: "manual", reason: MANUAL_REASON };
+function manual(kind: SearchKind): ManualSearchRecovery {
+  return { kind: "manual", reason: kind === "files" ? FILE_MANUAL_REASON : CONTENT_MANUAL_REASON };
+}
+
+interface ParsedFindRequest {
+  root: string;
+  glob?: string;
 }
 
 function pushGlob(
@@ -252,32 +260,110 @@ function isRipgrepExecutable(executable: string, language: ShellSearchMatch["lan
   );
 }
 
+function isFindExecutable(executable: string, language: ShellSearchMatch["language"]): boolean {
+  const name = executable.split(/[\\/]/u).at(-1) ?? executable;
+  const normalized =
+    language === "powershell" || process.platform === "win32" ? name.toLowerCase() : name;
+  return (
+    normalized === "find" ||
+    ((language === "powershell" || process.platform === "win32") && normalized === "find.exe")
+  );
+}
+
+/** Accepts only `find <root> [-name <pattern>] -type f [-print|-print0]`, in any option order. */
+function parseFindArguments(args: readonly string[]): ParsedFindRequest | undefined {
+  let root: string | undefined;
+  let glob: string | undefined;
+  let typeFile = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === undefined) return undefined;
+    if (!value.startsWith("-") || value === "-") {
+      if (root !== undefined) return undefined;
+      root = value;
+      continue;
+    }
+    if (value === "-print" || value === "-print0") continue;
+    if (value === "-type") {
+      const next = args[index + 1];
+      if (next === undefined || next !== "f") return undefined;
+      index += 1;
+      typeFile = true;
+      continue;
+    }
+    if (value === "-name") {
+      const next = args[index + 1];
+      if (next === undefined || glob !== undefined) return undefined;
+      index += 1;
+      glob = next;
+      continue;
+    }
+    return undefined;
+  }
+  if (!typeFile || root === undefined || root.length === 0) return undefined;
+  return glob === undefined ? { root } : { root, glob };
+}
+
+function recoverFileEnumeration(
+  argv: readonly string[],
+  language: ShellSearchMatch["language"],
+  workingDirectory: string,
+): SearchRecovery {
+  const executable = argv[0];
+  if (executable === undefined || !isFindExecutable(executable, language)) return manual("files");
+  const parsed = parseFindArguments(argv.slice(1));
+  if (!parsed) return manual("files");
+  if (hasNormalizationSensitivePath(parsed.root)) return manual("files");
+  const base = resolve(workingDirectory);
+  const path = resolve(base, parsed.root);
+  const localPath = relative(base, path);
+  if (isAbsolute(localPath) || localPath === ".." || localPath.startsWith(`..${sep}`))
+    return manual("files");
+  if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git")) return manual("files");
+  const filters: RawSearchInput = {
+    path,
+    ...(parsed.glob === undefined ? {} : { glob: parsed.glob }),
+  };
+  try {
+    validateRawSearchInput(filters);
+  } catch (error) {
+    if (error instanceof SignalGrepError) return manual("files");
+    throw error;
+  }
+  return { kind: "concrete", request: JSON.stringify({ mode: "files", ...filters }) };
+}
+
 export function recoverShellSearch(
   command: string,
   match: ShellSearchMatch,
   workingDirectory: string | undefined,
 ): SearchRecovery {
-  if (!isStandalone(command, match) || workingDirectory === undefined || match.kind !== "content")
-    return manual();
+  if (workingDirectory === undefined) return manual(match.kind);
   if (match.hasVariableAssignments || match.hasUntranslatedShellSyntax || match.hasSyntaxError)
-    return manual();
-  if (!match.argv.every((value): value is string => value !== null)) return manual();
-  const argv = match.argv;
+    return manual(match.kind);
+  const argv: readonly string[] = match.argv.filter((value): value is string => value !== null);
+  if (argv.length !== match.argv.length) return manual(match.kind);
+  // File enumeration rewrites only the retained `find` expression, so a compound
+  // atomic call still reports that nothing ran and the two parts are replayed separately.
+  if (match.kind === "files") return recoverFileEnumeration(argv, match.language, workingDirectory);
+  if (!isStandalone(command, match)) return manual(match.kind);
   const executable = argv[0];
-  if (executable === undefined || !isRipgrepExecutable(executable, match.language)) return manual();
+  if (executable === undefined || !isRipgrepExecutable(executable, match.language))
+    return manual(match.kind);
   const parsed = parseRipgrepArguments(argv.slice(1));
-  if (!parsed) return manual();
-  if (!parsed.noConfig && (process.env.RIPGREP_CONFIG_PATH?.length ?? 0) > 0) return manual();
-  if (!parsed.pathWasProvided) return manual();
-  if (parsed.path.length === 0) return manual();
-  if (hasNormalizationSensitivePath(parsed.path)) return manual();
+  if (!parsed) return manual(match.kind);
+  if (!parsed.noConfig && (process.env.RIPGREP_CONFIG_PATH?.length ?? 0) > 0)
+    return manual(match.kind);
+  if (!parsed.pathWasProvided) return manual(match.kind);
+  if (parsed.path.length === 0) return manual(match.kind);
+  if (hasNormalizationSensitivePath(parsed.path)) return manual(match.kind);
 
   const base = resolve(workingDirectory);
   const path = resolve(base, parsed.path);
   const localPath = relative(base, path);
   if (isAbsolute(localPath) || localPath === ".." || localPath.startsWith(`..${sep}`))
-    return manual();
-  if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git")) return manual();
+    return manual(match.kind);
+  if (path.split(/[\\/]/u).some((part) => part.toLowerCase() === ".git")) return manual(match.kind);
 
   const glob = listValue(parsed.glob);
   const exclude = listValue(parsed.exclude);
@@ -295,7 +381,7 @@ export function recoverShellSearch(
   try {
     validateRawSearchInput(request);
   } catch (error) {
-    if (error instanceof SignalGrepError) return manual();
+    if (error instanceof SignalGrepError) return manual(match.kind);
     throw error;
   }
   return { kind: "concrete", request: JSON.stringify(request) };

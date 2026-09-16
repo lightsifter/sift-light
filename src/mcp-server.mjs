@@ -880,7 +880,7 @@ var REQUEST_FIELD_GUIDANCE = {
   pattern: "pattern is regex by default; literal=true matches source text exactly",
   literal: "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
   path: "path must be an existing exact file or root; use mode=files+query for unknown names",
-  query: "files+query discovers unknown filenames/paths; concept/hybrid query is natural language",
+  query: "files+query matches known filename/path text (not glob patterns); omit files query to list every file under path; concept/hybrid query is natural language",
   anyOf: "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
   allOf: "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
   context: "context is an output-context budget and is never silently dropped",
@@ -7605,6 +7605,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
 
 // src/file-discovery.ts
 var graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+var FILE_QUERY_GLOB_WILDCARD = /[*?]/u;
 function subsequenceScore(text, query) {
   const characters = Array.from(graphemes.segment(text), (item) => item.segment);
   const queryCharacters = Array.from(graphemes.segment(query), (item) => item.segment);
@@ -7658,6 +7659,8 @@ async function discoverFiles(input, cwd, signal) {
   const query = input.query ?? "";
   if (query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
     throw new SignalGrepError("File query must be well-formed single-line text of at most 256 characters");
+  if (FILE_QUERY_GLOB_WILDCARD.test(query))
+    throw new SignalGrepError(`File query ${JSON.stringify(query)} uses glob wildcards; mode=files matches filename and path text, not glob patterns. Omit query to retain every file under path, or use glob to filter by name pattern.`);
   const request = normalizeRequest({ ...input, pattern: "" });
   const policy = new SearchPathPolicy(cwd);
   const discoveryRoot = request.path ?? ".";
