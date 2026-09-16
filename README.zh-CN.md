@@ -36,16 +36,20 @@ Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: 
 
 需要只查某个文件夹时，可以明确告诉 Agent 限定范围。只记得文件名的一部分，也可以先找文件，再看内容。像先确定资料柜的哪一层，再逐步缩小到要找的那一份。
 
+`files` 多词查询要求每个词都在路径中按字面出现；单个缩写仍支持模糊匹配。业务意图使用 `hybrid` 或 `concept`。普通内容搜索保留零匹配后扩大范围的既有默认；需要限定目录时传 `scope: "strict"`。范围扩大的提示会先于证据显示。
+
 ### 看到了多少，说得清楚
 
 一页装不下的内容会分批展示，并提供继续查看的入口。原文发生变化时，也会提醒重新确认。像一位认真整理资料的助手，会把“已经看到的”和“还需要往后翻的”交代清楚。
+
+完整快照表示匹配保留完整，不代表源码正文没有截断。长行摘录会明确标记限制，并给出最后一页之后仍可执行的 `inspectRequest`。需要更多结果时沿游标继续，不要仅为翻页而修改 limit 重搜。
 Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已返回的新查询，区分完整、部分和未完成结果，并报告未取消的失败调用。cursor 与 operation 续接不会重复计入新查询。
 
 ### 先发现语言能力，再按需加载提供方
 
 使用 `mode: "capabilities"` 和项目根目录，可以获取紧凑的文件语言清单。JavaScript、TypeScript 和 TSX 支持 AST 结构、角色、outline、静态 imports 和关联测试候选；Go 支持 AST 结构和角色；Python 支持基于缩进的有界 outline。Swift 和其他语言仍可使用普通内容搜索、文件发现和源码 inspect。能力清单不会启动 parser 或 Concept 模型。
 
-2.1.0 移除语言服务导航：`definitions`、`references`、`implementations`、`callers`、`callees`、`dependencies`、`dependents`、`trace` 和 `impact`。这些模式会明确报错，不会以文本搜索伪装精确导航。插件不再启动 Pyright、SourceKit-LSP、gopls 或 TypeScript language service；TypeScript 仅作为开发期类型检查工具。
+语言服务导航不在范围内。请求 `definitions`、`references`、`implementations`、`callers`、`callees`、`dependencies`、`dependents`、`trace` 或 `impact` 都会明确报错——用文本搜索伪装精确导航，比直接说清楚更糟。使用期间不会启动任何语言服务。
 
 ### 校验已保存的源码证据
 
@@ -80,9 +84,9 @@ Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已
 
 ## 安装
 
-MCP 需要 Node.js 22.19+；Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun 1.4+。安装包通过固定版本的 `@vscode/ripgrep` 安装对应平台的 ripgrep 二进制，无需系统 `rg`、Shell 函数或额外设置 `PATH`。安装时请保留可选依赖。禁用安装脚本也能安装 ripgrep，搜索过程不会下载可执行文件。
+MCP 需要 Node.js 22.19+。Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun 1.4+。搜索引擎随包提供对应平台的版本，无需系统搜索工具、Shell 函数或额外设置 `PATH`，搜索过程也不会下载任何东西。安装时请保留可选依赖。
 
-如需使用自己的 ripgrep，在 MCP 服务或 Pi 进程的环境变量中设置 `BAOER_SIGNAL_GREP_RG_PATH` 为可执行文件的绝对路径（例如 `/opt/homebrew/bin/rg`），然后重启宿主。该设置统一作用于内容、文件名和 Git 源文件搜索，支持路径中的空格；不支持别名、Shell 函数、相对路径或 `~` 展开。配置无效时明确报错，不会另选程序。对应平台的依赖缺失或不可用时，请保留可选依赖重新安装，或配置自己的二进制。依赖故障期间原生搜索策略仍然生效；如果需要在修复安装期间关闭策略，请使用下文的宿主插件控制入口。
+如需使用自己的 ripgrep，在 MCP 服务或 Pi 进程的环境变量中设置 `BAOER_SIGNAL_GREP_RG_PATH` 为可执行文件的绝对路径，然后重启宿主。该设置统一作用于内容、文件名和 Git 源文件搜索。路径中的空格可用；不支持别名、Shell 函数、相对路径或 `~` 展开。配置无效时明确报错，不会另选程序。随包引擎缺失时，请保留可选依赖重新安装，或把该项指向自己的二进制。
 
 ### Pi
 
@@ -133,9 +137,3 @@ Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相
 本地搜索在你的机器上进行。请只允许 Agent 读取已获授权的文件。HTTP 服务对外开放前需要认证网关，详见[安全说明](SECURITY.md)。
 
 [更新记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [AGPL-3.0-only 许可证](LICENSE)
-
-### 2.1.0 搜索结果边界
-
-`files` 多词查询要求每个词都在路径中按字面出现；单个缩写仍支持模糊匹配。业务意图使用 `hybrid` 或 `concept`。普通内容搜索保留零匹配后扩大范围的既有默认；需要限定目录时传 `scope: "strict"`。范围扩大的提示会先于证据显示。
-
-完整快照表示匹配保留完整，不代表源码正文没有截断。长行摘录会明确标记限制，并给出最后一页之后仍可执行的 `inspectRequest`。需要更多结果时沿游标继续，不要仅为翻页而修改 limit 重搜。
