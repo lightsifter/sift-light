@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [1.6.3-1] - 2026-09-16
+
+- Stop advertising fields with the call-shaped `name={a,b,c}` notation that appeared in mode and selector guidance, and that could be copied into the arguments as a `{"mode":"files","files":{…}}` nested object no schema accepts. Field lists are prose again, mode guidance carries the field catalog exactly once instead of twice, and repeated name prefixes (`inspect=inspect={…}`, `pattern=pattern is regex…`) are gone. The advertised schema drops 468 characters and all 32 braces in the `mode` description without changing accepted requests.
+- Name the flat-field rule and the mode's accepted field names when a request is rejected for carrying a per-mode object or an unknown field, so one failure teaches the executable flat request. This text is emitted only on the failure path and adds nothing to the resident context.
+- Report the descriptive text as an explicit contract: the field catalog must stay single-sourced and no advertised description may reintroduce `name={a,b,c}`.
+
 ## [1.6.2] - 2026-09-16
 
 - Correct MCP initialization instructions and output-schema descriptions to document bounded source excerpts in automatic results, summaries and inspection, resolving #78 without removing model-facing evidence.

@@ -1653,7 +1653,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.2",
+  version: "1.6.3-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -9293,7 +9293,7 @@ function modeFields(mode) {
   return MODE_FIELDS_BY_MODE[mode];
 }
 function modeFieldSummary(mode) {
-  return `${mode}={${modeFields(mode).join(",")}}`;
+  return `${mode}: ${modeFields(mode).join(",")}`;
 }
 var MODE_SUMMARY_MODES = [
   "files",
@@ -9335,10 +9335,10 @@ var SEARCH_GUIDANCE_FIELDS = ["pattern", "literal", "path", "query"];
 var VARIANT_GUIDANCE_FIELDS = ["anyOf", "allOf"];
 var BUDGET_GUIDANCE_FIELDS = ["limit", "context"];
 var REQUEST_USAGE_GUIDANCE = [
-  `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => `${field}=${fieldGuidance(field)}`).join("; ")}`,
+  `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
   `variants: ${VARIANT_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
   `budgets: ${BUDGET_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
-  `selectors: inspect=${modeFieldSummary("inspect")}; hybrid=${modeFieldSummary("hybrid")}; files=${modeFieldSummary("files")}; capabilities=${modeFieldSummary("capabilities")}`,
+  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("files")}; ${modeFieldSummary("capabilities")}`,
   "use only the advertised names: exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODEL_USAGE_GUIDANCE = [
@@ -9348,7 +9348,7 @@ var MODEL_USAGE_GUIDANCE = [
   `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
   "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
   "outline supports JS/TS/TSX and bounded Python syntax; imports/tests are static candidates for JS/TS/TSX",
-  `selectors: inspect={${modeFields("inspect").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
+  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("capabilities")}`,
   "exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODE_CONTRACT_DESCRIPTION = [
@@ -9446,6 +9446,7 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
     });
   const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
   const reason = omitted > 0 ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)` : `mode=${mode} does not accept ${visibleFields}`;
+  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
   return new RequestContractError({
     code: "E_MODE_FIELDS",
     mode,
@@ -9456,9 +9457,9 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
       nextRequest
     } : {
       action: "manual",
-      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope.`
+      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`
     }
-  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
+  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
 }
 function selectorIssuesFor(input, mode) {
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof input.cursor === "string" && input.cursor.trim().length > 0 && !input.cursor.includes(".analysis")) {
@@ -19418,7 +19419,7 @@ var signalGrepSchema = _Object_({
     description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`
   })),
   mode: Optional(stringEnum(SIGNAL_GREP_MODES, {
-    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} Fields: ${MODE_FIELD_SUMMARY}`
+    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION}`
   })),
   line: Optional(Number2({
     description: "1-indexed source line for path inspection/navigation. Omit with matchIndex, matchIndices or targets."
