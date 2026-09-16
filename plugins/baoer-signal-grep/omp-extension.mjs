@@ -14856,63 +14856,156 @@ function fit(lines, width) {
     return [];
   return lines.map((line) => truncateToWidth(line, width));
 }
+var GUTTER = 2;
+var PATH_COLUMN_MAX = 56;
+var PATH_COLUMN_MIN = 16;
+function prefixWithin(text, width) {
+  let out2 = "";
+  let used = 0;
+  for (const character of text) {
+    const size = visibleWidth(character);
+    if (used + size > width)
+      break;
+    out2 += character;
+    used += size;
+  }
+  return out2;
+}
+function suffixWithin(text, width) {
+  const characters = Array.from(text);
+  let out2 = "";
+  let used = 0;
+  for (let index = characters.length - 1;index >= 0; index -= 1) {
+    const character = characters[index] ?? "";
+    const size = visibleWidth(character);
+    if (used + size > width)
+      break;
+    out2 = character + out2;
+    used += size;
+  }
+  return out2;
+}
+function truncatePath(text, width) {
+  if (width <= 0)
+    return "";
+  if (visibleWidth(text) <= width)
+    return text;
+  if (width <= 2)
+    return prefixWithin(text, width);
+  const budget = width - 1;
+  const head = Math.ceil(budget * 0.4);
+  return `${prefixWithin(text, head)}\u2026${suffixWithin(text, budget - head)}`;
+}
+function indent(lines, gutter) {
+  if (gutter <= 0)
+    return lines;
+  const pad = " ".repeat(gutter);
+  return lines.map((line) => line.length === 0 ? line : pad + line);
+}
 function renderDashboard(view, locale, theme, width, expanded) {
+  if (width <= 0)
+    return [];
+  const gutter = width > GUTTER ? GUTTER : 0;
+  const content = width - gutter;
   const zh = locale === "zh-CN";
   const units = zh ? { matches: "\u5904\u5339\u914D", items: "\u9879\u7ED3\u679C", files: "\u4E2A\u6587\u4EF6", locations: "\u4E2A\u4F4D\u7F6E" } : { matches: "matches", items: "items", files: "files", locations: "locations" };
   const state = view.partial ? zh ? "\u90E8\u5206\u7ED3\u679C" : "Partial results" : zh ? "\u641C\u7D22\u5B8C\u6210" : "Search complete";
-  const lines = [view.partial ? theme.fg("warning", `! ${state}`) : candy(theme, 3, `\u2713 ${state}`)];
+  const lines = [
+    view.partial ? theme.fg("warning", `! ${state}`) : candy(theme, 3, `\u2713 ${state}`),
+    ""
+  ];
   const number = String(view.total);
   const digitWidth = number.length * 4;
   const metrics = [
     `${number} ${units[view.unit]}`,
     `${String(view.files)} ${zh ? "\u4E2A\u6587\u4EF6" : "files"}`
   ];
-  if (width >= digitWidth + 22 && width >= 44) {
-    for (let row = 0;row < 3; row++) {
-      const glyph = Array.from(number, (digit, index) => candy(theme, index, DIGITS[Number(digit)]?.[row] ?? "   ")).join(" ");
-      lines.push(`${glyph}   ${row === 0 ? metrics[0] : row === 1 ? metrics[1] : ""}`);
+  const limit = expanded ? 30 : content >= 60 ? 6 : 3;
+  const rows = view.rows.slice(0, limit);
+  const max = Math.max(...view.rows.map((row) => row.matches), 1);
+  const countWidth = Math.max(...rows.map((row) => String(row.matches).length), 1);
+  const barWidth = content >= 44 ? Math.min(18, Math.floor(content / 4)) : 0;
+  const reserved = countWidth + barWidth + (barWidth ? 6 : 4);
+  const pathCap = Math.max(PATH_COLUMN_MIN, Math.min(PATH_COLUMN_MAX, Math.floor(content / 2)));
+  const pathWidth = Math.max(1, Math.min(content - reserved, pathCap));
+  const tableWidth = 2 + pathWidth + 2 + countWidth + 2 + barWidth;
+  const strip = (cells) => {
+    const shown = rows.reduce((sum, row) => sum + row.matches, 0);
+    const denominator = Math.max(view.pageOnly ? shown : view.total, shown, 1);
+    let cumulative = 0;
+    let occupied = 0;
+    const segments = rows.map((row, index) => {
+      cumulative += row.matches;
+      const end = Math.round(cumulative / denominator * cells);
+      const segment = candy(theme, index, "\u2501".repeat(end - occupied));
+      occupied = end;
+      return segment;
+    });
+    return segments.join("") + theme.fg("borderMuted", "\u2500".repeat(cells - occupied));
+  };
+  const title = view.pageOnly ? zh ? "\u672C\u9875\u6587\u4EF6\u5206\u5E03" : "Files on this page" : zh ? "\u6587\u4EF6\u5206\u5E03" : "File distribution";
+  const numerals = [];
+  if (content >= digitWidth + 22 && content >= 44) {
+    for (let index = 0;index < 3; index += 1) {
+      const glyph = Array.from(number, (digit, position) => candy(theme, position, DIGITS[Number(digit)]?.[index] ?? "   ")).join(" ");
+      numerals.push(`${glyph}   ${index === 0 ? metrics[0] : index === 1 ? metrics[1] : ""}`);
     }
   } else
-    lines.push(theme.bold(metrics.join(" \xB7 ")));
+    numerals.push(theme.bold(metrics.join(" \xB7 ")));
+  const overview = (() => {
+    if (rows.length === 0 || view.inspection || barWidth === 0)
+      return;
+    const leftWidth = Math.max(...numerals.map((line) => visibleWidth(line)));
+    const rightWidth = Math.min(tableWidth, content) - leftWidth - 3;
+    if (rightWidth < 24)
+      return;
+    const right = [theme.fg("text", title), strip(rightWidth), ""];
+    return numerals.map((line, index) => {
+      const pad = " ".repeat(Math.max(0, leftWidth - visibleWidth(line)));
+      return `${line}${pad}   ${right[index] ?? ""}`.trimEnd();
+    });
+  })();
+  if (overview)
+    lines.push(...overview, "");
+  else {
+    lines.push(...numerals);
+    if (rows.length > 0) {
+      lines.push("", theme.fg("text", title));
+      if (content >= 44 && !view.inspection)
+        lines.push(strip(Math.min(content, tableWidth)), "");
+    }
+  }
   if (view.partial) {
     lines.push(theme.fg("warning", zh ? "\u7ED3\u679C\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7F29\u5C0F\u8303\u56F4\u91CD\u8BD5" : "Incomplete results; narrow the search"));
     if (view.unit === "matches")
       lines.push(theme.fg("warning", `${zh ? "\u5DF2\u4FDD\u7559" : "Retained"} ${String(view.stored)}/${number}`));
   }
-  const limit = expanded ? 30 : width >= 60 ? 6 : 3;
-  const rows = view.rows.slice(0, limit);
   if (rows.length) {
-    lines.push("", theme.fg("text", view.pageOnly ? zh ? "\u672C\u9875\u6587\u4EF6\u5206\u5E03" : "Files on this page" : zh ? "\u6587\u4EF6\u5206\u5E03" : "File distribution"));
-    if (width >= 44 && !view.inspection) {
-      const cells = Math.min(48, width);
-      const shown = rows.reduce((sum, row) => sum + row.matches, 0);
-      const denominator = Math.max(view.pageOnly ? shown : view.total, shown, 1);
-      let cumulative = 0;
-      let occupied = 0;
-      const segments = rows.map((row, index) => {
-        cumulative += row.matches;
-        const end = Math.round(cumulative / denominator * cells);
-        const segment = candy(theme, index, "\u2501".repeat(end - occupied));
-        occupied = end;
-        return segment;
-      });
-      lines.push(segments.join("") + theme.fg("borderMuted", "\u2500".repeat(cells - occupied)), "");
-    }
-    const max = Math.max(...view.rows.map((row) => row.matches), 1);
-    const countWidth = Math.max(...rows.map((row) => String(row.matches).length));
-    const barWidth = width >= 44 ? Math.min(18, Math.floor(width / 4)) : 0;
-    const pathWidth = Math.max(1, width - countWidth - barWidth - (barWidth ? 6 : 4));
     for (const [index, row] of rows.entries()) {
-      const name2 = truncateToWidth(safeLabel(row.path), pathWidth);
+      const name2 = truncatePath(safeLabel(row.path), pathWidth);
       const label = name2 + " ".repeat(Math.max(0, pathWidth - visibleWidth(name2)));
       const count = String(row.matches).padStart(countWidth);
       const bar = barWidth ? `  ${"\u2588".repeat(Math.max(row.matches > 0 ? 1 : 0, Math.round(row.matches / max * barWidth)))}` : "";
       lines.push(`${candy(theme, index, "\u258E")} ${label}  ${theme.bold(count)}${candy(theme, index, bar)}`);
     }
-    if (view.rows.length > rows.length)
-      lines.push(theme.fg("text", `${zh ? "\u53E6\u6709" : "Another"} ${String(view.rows.length - rows.length)} ${zh ? "\u4E2A\u6587\u4EF6\uFF1B\u5C55\u5F00\u67E5\u770B\u66F4\u591A" : "files; expand to see more"}`));
+    const hidden = view.rows.length - rows.length;
+    const parts2 = [];
+    if (hidden > 0)
+      parts2.push(`${zh ? "\u53E6\u6709" : "Another"} ${String(hidden)} ${zh ? "\u4E2A\u6587\u4EF6\u672A\u5C55\u793A" : "files not shown"}`);
     if (view.files > view.rows.length)
-      lines.push(theme.fg("text", `${zh ? "\u6587\u4EF6\u7EDF\u8BA1\u5C55\u793A" : "File statistics shown"} ${String(view.rows.length)}/${String(view.files)}`));
+      parts2.push(zh ? `\u5DF2\u5C55\u793A ${String(view.rows.length)}/${String(view.files)} \u4E2A\u6587\u4EF6` : `Showing ${String(view.rows.length)}/${String(view.files)} files`);
+    if (parts2.length > 0) {
+      const hint = hidden > 0 ? zh ? "\u5C55\u5F00\u67E5\u770B\u66F4\u591A" : "expand to see more" : "";
+      const full = [...parts2, ...hint ? [hint] : []].join(" \xB7 ");
+      const short = parts2.join(" \xB7 ");
+      lines.push("");
+      if (visibleWidth(full) <= content)
+        lines.push(theme.fg("text", full));
+      else if (visibleWidth(short) <= content)
+        lines.push(theme.fg("text", short));
+      else
+        lines.push(...parts2.map((part) => theme.fg("text", part)));
+    }
   } else if (view.total === 0)
     lines.push(theme.fg("text", zh ? "\u6CA1\u6709\u627E\u5230\u5339\u914D\u7ED3\u679C" : "No results found"));
   else
@@ -14920,15 +15013,18 @@ function renderDashboard(view, locale, theme, width, expanded) {
   if (view.unavailable)
     lines.push(theme.fg("warning", `${String(view.unavailable)} ${zh ? "\u4E2A\u4F4D\u7F6E\u672A\u80FD\u5B8C\u6210\u8BFB\u53D6" : "locations could not be read"}`));
   lines.push("", theme.fg("text", view.more ? zh ? "\u8FD8\u6709\u7ED3\u679C\u53EF\u7EE7\u7EED\u67E5\u770B" : "More results available" : view.partial ? zh ? "\u672C\u6B21\u641C\u7D22\u672A\u8986\u76D6\u5168\u90E8\u7ED3\u679C" : "Search coverage is incomplete" : zh ? "\u672C\u6B21\u8FD4\u56DE\u5DF2\u7ED3\u675F" : "End of this result"));
-  return fit(lines, width);
+  return fit(indent(lines, gutter), width);
 }
 function renderSignalGrepCallLines(input, locale, theme, width) {
   const zh = locale === "zh-CN";
   const action = input.mode === "inspect" ? zh ? "\u67E5\u770B\u6587\u4EF6" : "Inspect files" : input.cursor || input.sourceCursor || input.mode === "await" ? zh ? "\u7EE7\u7EED\u67E5\u770B" : "Continue search" : input.mode === "cancel" ? zh ? "\u505C\u6B62\u641C\u7D22" : "Stop search" : zh ? "\u641C\u7D22" : "Search";
-  return fit([
+  if (width <= 0)
+    return [];
+  const gutter = width > GUTTER ? GUTTER : 0;
+  return fit(indent([
     `${theme.fg("accent", theme.bold("baoer_signal_grep"))}  ${action}`,
     ...input.path ? [theme.fg("text", safeLabel(input.path))] : []
-  ], width);
+  ], gutter), width);
 }
 
 // src/tui/renderers.ts
