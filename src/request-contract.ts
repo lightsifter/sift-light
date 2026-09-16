@@ -15,6 +15,7 @@ import {
   SUPPORTED_OUTLINE_EXTENSIONS,
   type RequestField,
   type SignalGrepMode,
+  modeFields,
   outlineExtension,
 } from "./request-contract-catalog.js";
 
@@ -160,6 +161,11 @@ function fieldsError(
     omitted > 0
       ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)`
       : `mode=${mode} does not accept ${visibleFields}`;
+  // A field named after its own mode (for example `files` under mode=files) is
+  // the signature of arguments shaped as a per-mode object, which the flat
+  // schema never advertises. Naming the accepted fields replaces an otherwise
+  // puzzling rejection with the rule and the valid names.
+  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
   return new RequestContractError(
     {
       code: "E_MODE_FIELDS",
@@ -173,12 +179,12 @@ function fieldsError(
           }
         : {
             action: "manual",
-            reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope.`,
+            reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`,
           },
     },
     nextRequest
       ? `${reason}; retry the exact nextRequest without repeating the original query.`
-      : `${reason}; no semantics-preserving automatic request is available. Preserve valid path, filters, redact and cursor fields when choosing the next request.`,
+      : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`,
   );
 }
 

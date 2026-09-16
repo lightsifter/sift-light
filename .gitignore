@@ -22,6 +22,7 @@ APPEND_SYSTEM.md
 .agents/*
 !.agents/plugins/
 .agents/plugins/*
+.workbuddy/
 !.agents/plugins/marketplace.json
 .aiatom/
 .cursor/

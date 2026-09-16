@@ -105,8 +105,13 @@ export function modeFields(mode: SignalGrepMode): readonly RequestField[] {
   return MODE_FIELDS_BY_MODE[mode];
 }
 
+/**
+ * Prose field list for one mode. It deliberately avoids `name={a,b,c}`, whose
+ * shape mimics the call syntax a host would accept and can be copied into the
+ * arguments as a nonexistent nested field.
+ */
 export function modeFieldSummary(mode: SignalGrepMode): string {
-  return `${mode}={${modeFields(mode).join(",")}}`;
+  return `${mode}: ${modeFields(mode).join(",")}`;
 }
 
 /** Compact schema-facing summary derived from the runtime field catalog. */
@@ -164,10 +169,12 @@ const VARIANT_GUIDANCE_FIELDS = ["anyOf", "allOf"] as const;
 const BUDGET_GUIDANCE_FIELDS = ["limit", "context"] as const;
 
 export const REQUEST_USAGE_GUIDANCE = [
-  `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => `${field}=${fieldGuidance(field)}`).join("; ")}`,
+  // Each guidance sentence already names its field, so prefixing it again
+  // produced `pattern=pattern is regex…` and `literal=literal=true makes…`.
+  `search: ${SEARCH_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
   `variants: ${VARIANT_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
   `budgets: ${BUDGET_GUIDANCE_FIELDS.map((field) => fieldGuidance(field)).join("; ")}`,
-  `selectors: inspect=${modeFieldSummary("inspect")}; hybrid=${modeFieldSummary("hybrid")}; files=${modeFieldSummary("files")}; capabilities=${modeFieldSummary("capabilities")}`,
+  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("files")}; ${modeFieldSummary("capabilities")}`,
   "use only the advertised names: exact, any-of and max_results are not parameters",
 ].join("; ");
 
@@ -178,7 +185,7 @@ export const MODEL_USAGE_GUIDANCE = [
   `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
   "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
   "outline supports JS/TS/TSX and bounded Python syntax; imports/tests are static candidates for JS/TS/TSX",
-  `selectors: inspect={${modeFields("inspect").join(",")}}; hybrid={${modeFields("hybrid").join(",")}}; capabilities={${modeFields("capabilities").join(",")}}`,
+  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("capabilities")}`,
   "exact, any-of and max_results are not parameters",
 ].join("; ");
 
