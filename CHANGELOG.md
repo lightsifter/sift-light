@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## [1.6.2] - 2026-09-16
+
+- Correct MCP initialization instructions and output-schema descriptions to document bounded source excerpts in automatic results, summaries and inspection, resolving #78 without removing model-facing evidence.
+- Introduce a responsive neon statistics dashboard for Pi and OMP with warm candy colors, host-aware light/dark palettes, file distributions and expanded file statistics.
+- Keep source code and protocol diagnostics out of terminal presentation, including error and background-operation paths; preserve full tool result data for model consumers.
+- Distinguish partial results, pagination and failed or cancelled searches without fabricating completion percentages.
+
 ## [1.6.1] - 2026-09-16
 
 - Reject `mode=files` queries that contain `*` or `?` glob wildcards with an actionable error, instead of scoring every enumerated file out and reporting `0 retained files` as a complete result. Omitting the query still lists every file under the requested path, and `glob` remains the name-pattern filter; bracket characters stay valid query text.

@@ -1653,7 +1653,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.1",
+  version: "1.6.2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -12018,25 +12018,283 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
 }
 
 // src/prompt-guidelines.ts
+var SOURCE_OUTPUT_GUIDANCE = "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 function signalGrepPromptGuidelines(structuredOutput = true) {
   return [
-    `Use baoer_signal_grep for read-only content search. Results are metadata-only: never expect source lines, excerpts, AST text, signatures or diffs. Omit mode and limit for a compact statistical summary; use mode="matches" or a cursor only when file and line metadata is needed.`,
+    `Use baoer_signal_grep for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
-    `Search output includes counts, categories, ranked paths, coverage and continuation metadata, but never echoes the raw pattern or query. Use the host read capability separately when source text is explicitly required for an edit or verification.`,
+    `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
-    `Mode="inspect" verifies a selected location and returns only path, line, parser status and source-revision metadata; it does not return source. Do not use inspection merely to obtain a citation.`,
+    `Mode="inspect" with a direct path/line or ordinary retained match returns bounded source windows and source-revision metadata. Some retained analysis selectors return only revision metadata; use direct path/line or the host read capability when source is needed. Do not use inspection merely to obtain a citation.`,
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrence statistics.`,
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
-    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path to get symbol counts and locations without names or signatures, mode:"imports" for static relationship counts, and mode:"tests" for related-test candidate counts. These modes do not expose source text.`,
+    `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path for symbol counts and locations, mode:"imports" for static relationships, and mode:"tests" for related-test candidates. Their text pages summarize metadata; structured details can retain source evidence.`,
     `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
-    `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; the result reports structural counts and locations without source text.`,
-    `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Results expose candidate counts, score statistics and paths, never ranked passages. Similarity scores identify candidates, not correctness.`,
-    `Use mode:"hybrid" plus query when wording may differ from the source. It reports exact and semantic counts separately, removes overlap, and retains one pageable metadata snapshot. conceptLimit changes only the semantic candidate count; it never causes source text to be returned.`,
+    `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; the text page reports structural counts and locations; structured details can retain matched source evidence.`,
+    `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Results expose candidate counts, score statistics, paths and the bounded ranked passage behind each candidate. Similarity scores identify candidates, not correctness.`,
+    `Use mode:"hybrid" plus query when wording may differ from the source. It reports exact and semantic counts separately, removes overlap, and retains one pageable evidence snapshot. conceptLimit changes only the semantic candidate count; retained candidates keep their bounded source passages.`,
     `If an operation is waiting or partial, follow its visible continuation request and read coverage/reasons. Never treat a partial result as complete, and never restart solely to obtain source text.`,
     `If a request is rejected, keep the strongest applicable mode and follow its repair instruction exactly once. Do not paste the error or rejected request into the retry, repeat an unchanged request, or switch to a weaker search because of a fixable argument error. Only an explicit capability-unavailable result permits a bounded alternative, which remains partial and must not be presented as complete.`,
     structuredOutput ? `When status=partial, read details.analysis.coverage to see which conclusion is incomplete; an exact occurrence count may remain complete even when syntax or related-test analysis is partial.` : `When status=partial, read the visible Coverage and bracketed reasons to see which conclusion is incomplete; an exact occurrence count may remain complete even when syntax or related-test analysis is partial.`
   ];
+}
+
+// src/tui/presentation.ts
+var STRUCTURE_STATUSES = new Set([
+  "available",
+  "no-symbol",
+  "provider-unavailable",
+  "source-unavailable",
+  "parse-error",
+  "file-too-large",
+  "source-changed"
+]);
+var SEARCH_MODES = new Set(["auto", "summary", "matches", "inspect"]);
+function isNonNegativeSafeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+function hasRecognizableDetails(details) {
+  if (!details || details.version !== 1 || details.analysis !== undefined)
+    return false;
+  if (!SEARCH_MODES.has(details.mode))
+    return false;
+  if (details.status !== "complete" && details.status !== "partial")
+    return false;
+  const counts = [
+    details.totalMatches,
+    details.storedMatches,
+    details.totalFiles,
+    details.returnedMatches
+  ];
+  if (counts.some((value) => !isNonNegativeSafeInteger(value)))
+    return false;
+  if (details.storedMatches > details.totalMatches)
+    return false;
+  if (details.snapshotComplete !== (details.status === "complete"))
+    return false;
+  return !details.snapshotComplete || details.storedMatches === details.totalMatches;
+}
+function parseSummaryRows(text, expectedRows) {
+  if (!isNonNegativeSafeInteger(expectedRows))
+    return;
+  if (expectedRows === 0)
+    return;
+  const lines = text.split(`
+`);
+  const rangeIndex = lines.findIndex((line) => /^Files \d+-\d+ of \d+, ordered by match count\.$/.test(line));
+  if (rangeIndex < 0 || lines[rangeIndex + 1] !== "")
+    return;
+  const rows = [];
+  for (const line of lines.slice(rangeIndex + 2, rangeIndex + 2 + expectedRows)) {
+    const match = /^(\S(?:.*\S)?) {2,}(\d+)$/.exec(line);
+    if (!match)
+      return;
+    const path = match[1];
+    const countText = match[2];
+    if (!path || !countText)
+      return;
+    const count = Number(countText);
+    if (!Number.isSafeInteger(count) || count < 1)
+      return;
+    rows.push({ path, matches: count });
+  }
+  return rows.length === expectedRows ? rows : undefined;
+}
+function splitMatchBody(text) {
+  const markers = [
+    `
+
+[Match columns `,
+    `
+
+[Context omitted `,
+    `
+
+[Context unavailable `,
+    `
+
+[Matches `
+  ];
+  let bodyEnd = text.length;
+  for (const marker of markers) {
+    const index = text.indexOf(marker);
+    if (index >= 0)
+      bodyEnd = Math.min(bodyEnd, index);
+  }
+  const body2 = text.slice(0, bodyEnd);
+  if (body2.length === 0 || !text.includes(`
+
+[Matches `))
+    return;
+  return body2.split(`
+`);
+}
+function parseMatchRange(text) {
+  const match = /\[Matches (\d+)-(\d+) of \d+/.exec(text);
+  if (!match)
+    return {};
+  const firstMatch = Number(match[1]);
+  const lastMatch = Number(match[2]);
+  if (!Number.isSafeInteger(firstMatch) || !Number.isSafeInteger(lastMatch) || firstMatch < 1 || lastMatch < firstMatch) {
+    return {};
+  }
+  return { firstMatch, lastMatch };
+}
+function parseInspect(text, details) {
+  const structure = details.structure;
+  if (!structure || !STRUCTURE_STATUSES.has(structure.status))
+    return;
+  const lines = text.split(`
+`);
+  const target = lines[0];
+  if (!target)
+    return;
+  if (structure.status === "source-changed" || structure.status === "file-too-large" || structure.status === "source-unavailable") {
+    return {
+      kind: "inspect",
+      details,
+      text,
+      target,
+      sourceLines: [],
+      status: structure.status
+    };
+  }
+  const descriptor = lines[1] || undefined;
+  const structureMarker = text.lastIndexOf(`
+
+[structure: `);
+  if (!descriptor || structureMarker < 0)
+    return;
+  const sourceStart = text.indexOf(`
+
+`, target.length + 1);
+  if (sourceStart < 0 || sourceStart >= structureMarker)
+    return;
+  const sourceLines = text.slice(sourceStart + 2, structureMarker).split(`
+`);
+  return {
+    kind: "inspect",
+    details,
+    text,
+    target,
+    descriptor,
+    sourceLines,
+    status: structure.status
+  };
+}
+function recognizeSignalGrepResult(text, details) {
+  if (!hasRecognizableDetails(details))
+    return;
+  if (details.mode === "inspect") {
+    if (details.inspections) {
+      if (details.inspections.length === 0 || details.inspections.some((item) => !Number.isSafeInteger(item.inputIndex) || item.inputIndex < 1 || !["returned", "deferred", "error"].includes(item.status)))
+        return;
+      return { kind: "inspect-batch", details, text, items: details.inspections };
+    }
+    return parseInspect(text, details);
+  }
+  if (details.totalMatches === 0) {
+    return { kind: "empty", details, text };
+  }
+  if (details.summaryFilesShown !== undefined) {
+    const rows = parseSummaryRows(text, details.summaryFilesShown);
+    if (!rows)
+      return;
+    const lines = text.split(`
+`);
+    const sampleHeading = lines.findIndex((line) => line.startsWith("Samples: first retained match"));
+    const sampleCount = details.summaryPreviewsShown ?? 0;
+    const previews = sampleHeading >= 0 && isNonNegativeSafeInteger(sampleCount) ? lines.slice(sampleHeading + 1, sampleHeading + 1 + sampleCount) : [];
+    return { kind: "summary", details, text, rows, previews };
+  }
+  if (details.returnedMatches > 0) {
+    const bodyLines = splitMatchBody(text);
+    if (!bodyLines)
+      return;
+    return {
+      kind: "matches",
+      details,
+      text,
+      bodyLines,
+      ...parseMatchRange(text)
+    };
+  }
+  return;
+}
+
+// src/tui/dashboard.ts
+function validCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+function grouped(paths) {
+  const counts = new Map;
+  for (const path of paths)
+    counts.set(path, (counts.get(path) ?? 0) + 1);
+  return Array.from(counts, ([path, matches]) => ({ path, matches }));
+}
+function dashboard(text, details) {
+  if (!details || details.version !== 1 || !["complete", "partial"].includes(details.status))
+    return;
+  if (![
+    details.totalMatches,
+    details.storedMatches,
+    details.totalFiles,
+    details.returnedMatches
+  ].every(validCount))
+    return;
+  const statistics = details.analysis?.statistics ?? details.statistics;
+  const inspection = details.mode === "inspect";
+  let total = details.analysis?.totalItems ?? details.totalMatches;
+  let rows = [];
+  let pageOnly = false;
+  let unavailable = 0;
+  const presentation = recognizeSignalGrepResult(text, details);
+  if (presentation?.kind === "summary") {
+    rows = presentation.rows;
+  } else if (statistics && !inspection) {
+    rows = statistics.topFiles.map(({ label, count }) => ({ path: label, matches: count }));
+  } else if (details.analysis) {
+    rows = grouped(details.analysis.items.map((item) => item.path));
+    pageOnly = true;
+  } else if (inspection) {
+    const items = details.inspections;
+    const paths = items?.flatMap((item) => item.path ? [item.path] : []) ?? details.sourceBlocks?.map((block) => block.path) ?? (details.source?.reference ? [details.source.reference.path] : []);
+    if (paths.length === 0) {
+      if (presentation?.kind === "inspect")
+        paths.push(presentation.target.replace(/:\d+$/, ""));
+    }
+    rows = grouped(paths);
+    total = items?.length ?? paths.length;
+    unavailable = items?.filter((item) => item.status !== "returned").length ?? (details.status === "partial" ? total : 0);
+  } else {
+    if (presentation?.kind === "matches") {
+      const paths = [];
+      let path;
+      for (const line of presentation.bodyLines) {
+        if (line && !/^\s/.test(line))
+          path = line;
+        else if (path && /^ \d+:/.test(line))
+          paths.push(path);
+      }
+      rows = grouped(paths);
+      pageOnly = true;
+    }
+  }
+  if (!validCount(total) || rows.some((row) => !validCount(row.matches)))
+    return;
+  return {
+    total,
+    files: details.totalFiles,
+    unit: inspection ? "locations" : details.analysis?.unit === "files" ? "files" : details.analysis ? "items" : "matches",
+    rows,
+    pageOnly,
+    inspection,
+    unavailable,
+    partial: details.status === "partial" || !details.snapshotComplete || unavailable > 0,
+    more: Boolean(details.cursor || details.nextRequest || details.source?.nextRequest || details.analysis?.termCountsNextRequest),
+    stored: details.storedMatches
+  };
 }
 
 // node_modules/marked/lib/marked.esm.js
@@ -13478,7 +13736,6 @@ var terminalSpacingMarkRegex = /^(?:[\p{Spacing_Mark}--[\u1734\u302E\u302F]]|[\u
 var rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
 var WIDTH_CACHE_SIZE = 512;
 var widthCache = new Map;
-var cjkBreakRegex = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u;
 function isPrintableAscii(str) {
   for (let i2 = 0;i2 < str.length; i2++) {
     const code = str.charCodeAt(i2);
@@ -13917,216 +14174,6 @@ class AnsiCodeTracker {
     return result;
   }
 }
-function updateTrackerFromText(text, tracker) {
-  let i2 = 0;
-  while (i2 < text.length) {
-    const ansiResult = extractAnsiCode(text, i2);
-    if (ansiResult) {
-      tracker.process(ansiResult.code);
-      i2 += ansiResult.length;
-    } else {
-      i2++;
-    }
-  }
-}
-function splitIntoTokensWithAnsi(text) {
-  const tokens = [];
-  let current = "";
-  let pendingAnsi = "";
-  let currentKind = null;
-  let i2 = 0;
-  const flushCurrent = () => {
-    if (!current) {
-      return;
-    }
-    tokens.push(current);
-    current = "";
-    currentKind = null;
-  };
-  while (i2 < text.length) {
-    const ansiResult = extractAnsiCode(text, i2);
-    if (ansiResult) {
-      pendingAnsi += ansiResult.code;
-      i2 += ansiResult.length;
-      continue;
-    }
-    let end = i2;
-    while (end < text.length && !extractAnsiCode(text, end)) {
-      end++;
-    }
-    for (const { segment } of graphemeSegmenter.segment(text.slice(i2, end))) {
-      const segmentIsSpace = segment === " ";
-      if (!segmentIsSpace && cjkBreakRegex.test(segment)) {
-        flushCurrent();
-        const token = pendingAnsi + segment;
-        pendingAnsi = "";
-        tokens.push(token);
-        continue;
-      }
-      const segmentKind = segmentIsSpace ? "space" : "word";
-      if (current && currentKind !== segmentKind) {
-        flushCurrent();
-      }
-      if (pendingAnsi) {
-        current += pendingAnsi;
-        pendingAnsi = "";
-      }
-      currentKind = segmentKind;
-      current += segment;
-    }
-    i2 = end;
-  }
-  if (pendingAnsi) {
-    if (current) {
-      current += pendingAnsi;
-    } else if (tokens.length > 0) {
-      tokens[tokens.length - 1] += pendingAnsi;
-    } else {
-      current = pendingAnsi;
-    }
-  }
-  if (current) {
-    tokens.push(current);
-  }
-  return tokens;
-}
-function wrapTextWithAnsi(text, width) {
-  if (!text) {
-    return [""];
-  }
-  const inputLines = text.split(/\r\n|\r|\n/);
-  const result = [];
-  const tracker = new AnsiCodeTracker;
-  for (const inputLine of inputLines) {
-    const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
-    const wrappedLines = wrapSingleLine(prefix + inputLine, width);
-    for (const wrappedLine of wrappedLines) {
-      result.push(wrappedLine);
-    }
-    updateTrackerFromText(inputLine, tracker);
-  }
-  return result.length > 0 ? result : [""];
-}
-function wrapSingleLine(line, width) {
-  if (!line) {
-    return [""];
-  }
-  const visibleLength = visibleWidth(line);
-  if (visibleLength <= width) {
-    return [line];
-  }
-  const wrapped = [];
-  const tracker = new AnsiCodeTracker;
-  const tokens = splitIntoTokensWithAnsi(line);
-  let currentLine = "";
-  let currentVisibleLength = 0;
-  for (const token of tokens) {
-    const tokenVisibleLength = visibleWidth(token);
-    const isWhitespace = token.trim() === "";
-    if (tokenVisibleLength > width && !isWhitespace) {
-      if (currentLine) {
-        const lineEndReset = tracker.getLineEndReset();
-        if (lineEndReset) {
-          currentLine += lineEndReset;
-        }
-        wrapped.push(currentLine);
-        currentLine = "";
-        currentVisibleLength = 0;
-      }
-      const broken = breakLongWord(token, width, tracker);
-      for (let i2 = 0;i2 < broken.length - 1; i2++) {
-        wrapped.push(broken[i2]);
-      }
-      currentLine = broken[broken.length - 1];
-      currentVisibleLength = visibleWidth(currentLine);
-      continue;
-    }
-    const totalNeeded = currentVisibleLength + tokenVisibleLength;
-    if (totalNeeded > width && currentVisibleLength > 0) {
-      let lineToWrap = currentLine.trimEnd();
-      const lineEndReset = tracker.getLineEndReset();
-      if (lineEndReset) {
-        lineToWrap += lineEndReset;
-      }
-      wrapped.push(lineToWrap);
-      if (isWhitespace) {
-        currentLine = tracker.getActiveCodes();
-        currentVisibleLength = 0;
-      } else {
-        currentLine = tracker.getActiveCodes() + token;
-        currentVisibleLength = tokenVisibleLength;
-      }
-    } else {
-      currentLine += token;
-      currentVisibleLength += tokenVisibleLength;
-    }
-    updateTrackerFromText(token, tracker);
-  }
-  if (currentLine) {
-    wrapped.push(currentLine);
-  }
-  return wrapped.length > 0 ? wrapped.map((line) => line.trimEnd()) : [""];
-}
-function breakLongWord(word, width, tracker) {
-  const lines = [];
-  let currentLine = tracker.getActiveCodes();
-  let currentWidth = 0;
-  let i2 = 0;
-  const segments = [];
-  while (i2 < word.length) {
-    const ansiResult = extractAnsiCode(word, i2);
-    if (ansiResult) {
-      segments.push({ type: "ansi", value: ansiResult.code });
-      i2 += ansiResult.length;
-    } else {
-      let end = i2;
-      while (end < word.length) {
-        const nextAnsi = extractAnsiCode(word, end);
-        if (nextAnsi)
-          break;
-        end++;
-      }
-      const textPortion = word.slice(i2, end);
-      for (const seg of graphemeSegmenter.segment(textPortion)) {
-        segments.push({ type: "grapheme", value: seg.segment });
-      }
-      i2 = end;
-    }
-  }
-  for (const seg of segments) {
-    if (seg.type === "ansi") {
-      currentLine += seg.value;
-      tracker.process(seg.value);
-      continue;
-    }
-    const grapheme = seg.value;
-    if (!grapheme)
-      continue;
-    const graphemeWidth = visibleWidth(grapheme);
-    if (currentWidth + graphemeWidth > width) {
-      const lineEndReset = tracker.getLineEndReset();
-      if (lineEndReset) {
-        currentLine += lineEndReset;
-      }
-      lines.push(currentLine);
-      currentLine = tracker.getActiveCodes();
-      currentWidth = 0;
-    }
-    currentLine += grapheme;
-    currentWidth += graphemeWidth;
-  }
-  if (currentLine) {
-    lines.push(currentLine);
-  }
-  return lines.length > 0 ? lines : [""];
-}
-function applyBackgroundToLine(line, width, bgFn) {
-  const visibleLen = visibleWidth(line);
-  const paddingNeeded = Math.max(0, width - visibleLen);
-  const padding = " ".repeat(paddingNeeded);
-  const withPadding = line + padding;
-  return bgFn(withPadding);
-}
 function truncateToWidth(text, maxWidth, ellipsis = "...", pad = false) {
   if (maxWidth <= 0) {
     return "";
@@ -14333,80 +14380,6 @@ var KITTY_FUNCTIONAL_KEY_EQUIVALENTS = new Map([
   [57426, FUNCTIONAL_CODEPOINTS.delete]
 ]);
 var KITTY_PRINTABLE_ALLOWED_MODIFIERS = MODIFIERS.shift | LOCK_MASK;
-
-// node_modules/@earendil-works/pi-tui/dist/components/text.js
-class Text {
-  text;
-  paddingX;
-  paddingY;
-  customBgFn;
-  cachedText;
-  cachedWidth;
-  cachedLines;
-  constructor(text = "", paddingX = 1, paddingY = 1, customBgFn) {
-    this.text = text;
-    this.paddingX = paddingX;
-    this.paddingY = paddingY;
-    this.customBgFn = customBgFn;
-  }
-  setText(text) {
-    this.text = text;
-    this.cachedText = undefined;
-    this.cachedWidth = undefined;
-    this.cachedLines = undefined;
-  }
-  setCustomBgFn(customBgFn) {
-    this.customBgFn = customBgFn;
-    this.cachedText = undefined;
-    this.cachedWidth = undefined;
-    this.cachedLines = undefined;
-  }
-  invalidate() {
-    this.cachedText = undefined;
-    this.cachedWidth = undefined;
-    this.cachedLines = undefined;
-  }
-  render(width) {
-    if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
-      return this.cachedLines;
-    }
-    if (!this.text || this.text.trim() === "") {
-      const result = [];
-      this.cachedText = this.text;
-      this.cachedWidth = width;
-      this.cachedLines = result;
-      return result;
-    }
-    const normalizedText = this.text.replace(/\t/g, "   ");
-    const paddingX = Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2)));
-    const contentWidth = Math.max(1, width - paddingX * 2);
-    const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
-    const leftMargin = " ".repeat(paddingX);
-    const rightMargin = " ".repeat(paddingX);
-    const contentLines = [];
-    for (const line of wrappedLines) {
-      const lineWithMargins = leftMargin + line + rightMargin;
-      if (this.customBgFn) {
-        contentLines.push(applyBackgroundToLine(lineWithMargins, width, this.customBgFn));
-      } else {
-        const visibleLen = visibleWidth(lineWithMargins);
-        const paddingNeeded = Math.max(0, width - visibleLen);
-        contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
-      }
-    }
-    const emptyLine = " ".repeat(width);
-    const emptyLines = [];
-    for (let i2 = 0;i2 < this.paddingY; i2++) {
-      const line = this.customBgFn ? applyBackgroundToLine(emptyLine, width, this.customBgFn) : emptyLine;
-      emptyLines.push(line);
-    }
-    const result = [...emptyLines, ...contentLines, ...emptyLines];
-    this.cachedText = this.text;
-    this.cachedWidth = width;
-    this.cachedLines = result;
-    return result.length > 0 ? result : [""];
-  }
-}
 // node_modules/@earendil-works/pi-tui/dist/terminal-image.js
 var kittyImageMetadata = new Map;
 var KITTY_PLACEMENT_CONTROL_KEYS = new Set([
@@ -14802,482 +14775,217 @@ var segmenter2 = getGraphemeSegmenter();
 var MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES = 32 * 1024 * 1024;
 var MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 var wordSegmenter4 = getWordSegmenter();
-// src/tui/layout.ts
-var COPY = {
-  en: {
-    budget: "budget",
-    complete: "complete",
-    contextChanged: "changed context omitted",
-    contextOmitted: "context unavailable",
-    contextRemaining: "context remaining",
-    continueSnapshot: "continue snapshot",
-    cursorReady: "cursor ready",
-    empty: "No matching lines were found.",
-    error: "ERROR",
-    expandFullError: "retry or narrow the query",
-    file: "file",
-    files: "files",
-    finalPage: "final page",
-    inspect: "INSPECT",
-    inspectBlocked: "Current source was not mixed with retained evidence.",
-    matches: "matches",
-    matchesTitle: "MATCHES",
-    moreFiles: "more files",
-    moreLines: "more lines",
-    noSymbol: "no enclosing symbol",
-    originalOnExpand: "expand for original result",
-    partial: "partial",
-    partialMatchesTitle: "PARTIAL MATCHES",
-    partialSummaryTitle: "PARTIAL SEARCH",
-    partialEvidence: "retained evidence only; narrow the search before treating it as complete",
-    paths: "paths",
-    retained: "retained",
-    retainedMatch: "retained match",
-    returned: "returned",
-    searching: "Searching\u2026",
-    selected: "selected",
-    selectedNoMatches: "selected paths had no retained matches",
-    sourceChanged: "SOURCE CHANGED",
-    sourceTooLarge: "SOURCE TOO LARGE",
-    structure: "structure",
-    structureStatuses: {
-      available: "available",
-      "file-too-large": "file too large",
-      "no-symbol": "no symbol",
-      "parse-error": "parse error",
-      "provider-unavailable": "provider unavailable",
-      "source-changed": "source changed",
-      "source-unavailable": "source unavailable"
-    },
-    summary: "SUMMARY",
-    samples: "match samples",
-    locations: "locations",
-    deferred: "deferred",
-    failed: "failed"
-  },
-  "zh-CN": {
-    budget: "\u9884\u7B97",
-    complete: "\u5B8C\u6574",
-    contextChanged: "\u5DF2\u7701\u7565\u53D8\u5316\u540E\u7684\u4E0A\u4E0B\u6587",
-    contextOmitted: "\u4E0A\u4E0B\u6587\u4E0D\u53EF\u7528",
-    contextRemaining: "\u4E0A\u4E0B\u6587\u5269\u4F59",
-    continueSnapshot: "\u7EE7\u7EED\u5FEB\u7167",
-    cursorReady: "\u53EF\u7EE7\u7EED\u7FFB\u9875",
-    empty: "\u6CA1\u6709\u627E\u5230\u5339\u914D\u884C\u3002",
-    error: "\u9519\u8BEF",
-    expandFullError: "\u8BF7\u91CD\u8BD5\u6216\u7F29\u5C0F\u641C\u7D22\u8303\u56F4",
-    file: "\u4E2A\u6587\u4EF6",
-    files: "\u4E2A\u6587\u4EF6",
-    finalPage: "\u6700\u540E\u4E00\u9875",
-    inspect: "\u6E90\u7801\u68C0\u67E5",
-    inspectBlocked: "\u672A\u5C06\u5F53\u524D\u6E90\u7801\u4E0E\u5FEB\u7167\u8BC1\u636E\u6DF7\u5408\u5C55\u793A\u3002",
-    matches: "\u5904\u5339\u914D",
-    matchesTitle: "\u5339\u914D\u7ED3\u679C",
-    moreFiles: "\u4E2A\u5176\u4ED6\u6587\u4EF6",
-    moreLines: "\u884C\u5176\u4F59\u5185\u5BB9",
-    noSymbol: "\u672A\u627E\u5230\u6240\u5C5E\u7B26\u53F7",
-    originalOnExpand: "\u5C55\u5F00\u67E5\u770B\u539F\u59CB\u7ED3\u679C",
-    partial: "\u90E8\u5206",
-    partialMatchesTitle: "\u90E8\u5206\u4FDD\u7559\u5339\u914D",
-    partialSummaryTitle: "\u90E8\u5206\u4FDD\u7559\u641C\u7D22",
-    partialEvidence: "\u4EC5\u5305\u542B\u5DF2\u4FDD\u7559\u8BC1\u636E\uFF1B\u8BF7\u7F29\u5C0F\u641C\u7D22\u8303\u56F4\u540E\u518D\u4F5C\u5B8C\u6574\u6027\u5224\u65AD",
-    paths: "\u4E2A\u8DEF\u5F84",
-    retained: "\u5DF2\u4FDD\u7559",
-    retainedMatch: "\u4FDD\u7559\u5339\u914D",
-    returned: "\u672C\u9875\u8FD4\u56DE",
-    searching: "\u6B63\u5728\u641C\u7D22\u2026",
-    selected: "\u5DF2\u9009\u62E9",
-    selectedNoMatches: "\u4E2A\u6240\u9009\u8DEF\u5F84\u6CA1\u6709\u4FDD\u7559\u5339\u914D",
-    sourceChanged: "\u6E90\u7801\u5DF2\u53D8\u5316",
-    sourceTooLarge: "\u6E90\u7801\u8FC7\u5927",
-    structure: "\u7ED3\u6784",
-    structureStatuses: {
-      available: "\u53EF\u7528",
-      "file-too-large": "\u6587\u4EF6\u8FC7\u5927",
-      "no-symbol": "\u672A\u627E\u5230\u7B26\u53F7",
-      "parse-error": "\u89E3\u6790\u5931\u8D25",
-      "provider-unavailable": "\u7ED3\u6784\u63D0\u4F9B\u5668\u4E0D\u53EF\u7528",
-      "source-changed": "\u6E90\u7801\u5DF2\u53D8\u5316",
-      "source-unavailable": "\u6E90\u7801\u4E0D\u53EF\u7528"
-    },
-    summary: "\u6458\u8981",
-    samples: "\u547D\u4E2D\u6837\u672C",
-    locations: "\u4E2A\u4F4D\u7F6E",
-    deferred: "\u5F85\u7EED\u67E5",
-    failed: "\u5931\u8D25"
-  }
-};
-function safeLabel(value) {
-  return Array.from(value, (character) => {
-    const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint < 32 || codePoint >= 127 && codePoint <= 159 ? "\uFFFD" : character;
-  }).join("");
-}
-function quote(value) {
-  return JSON.stringify(safeLabel(value));
-}
-function list2(value) {
-  if (value === undefined)
+// src/tui/palette.ts
+var DARK = [
+  [255, 95, 175],
+  [255, 135, 0],
+  [255, 215, 0],
+  [95, 255, 95],
+  [0, 215, 255],
+  [175, 135, 255]
+];
+var LIGHT = [
+  [215, 0, 95],
+  [215, 95, 0],
+  [175, 135, 0],
+  [0, 135, 0],
+  [0, 135, 175],
+  [135, 0, 255]
+];
+var TOKENS = [
+  "syntaxKeyword",
+  "syntaxType",
+  "accent",
+  "syntaxString",
+  "syntaxNumber",
+  "syntaxFunction"
+];
+function brightness(ansi) {
+  if (!ansi.startsWith("\x1B["))
     return;
-  return (Array.isArray(value) ? value : [value]).map(safeLabel).join(", ");
+  const rgb = /^\[(?:38|48);2;(\d+);(\d+);(\d+)m/u.exec(ansi.slice(1));
+  if (rgb)
+    return (Number(rgb[1]) * 299 + Number(rgb[2]) * 587 + Number(rgb[3]) * 114) / 255000;
+  const indexed = /^\[(?:38|48);5;(\d+)m/u.exec(ansi.slice(1));
+  if (!indexed)
+    return;
+  const n = Number(indexed[1]);
+  if (n >= 232)
+    return (8 + (n - 232) * 10) / 255;
+  if (n < 16)
+    return;
+  const levels = [0, 95, 135, 175, 215, 255];
+  const index = n - 16;
+  return ((levels[Math.floor(index / 36)] ?? 0) * 299 + (levels[Math.floor(index / 6) % 6] ?? 0) * 587 + (levels[index % 6] ?? 0) * 114) / 255000;
 }
-function finish(lines, width) {
-  const available = Math.max(1, width);
-  return lines.map((line) => truncateToWidth(line, available));
+function candy(theme, index, text) {
+  const background = theme.getBgAnsi ? brightness(theme.getBgAnsi("toolSuccessBg")) : undefined;
+  const foreground = theme.getFgAnsi ? brightness(theme.getFgAnsi("text")) : undefined;
+  const light = background === undefined ? foreground === undefined ? undefined : foreground < 0.5 : background > 0.5;
+  const slot = index % DARK.length;
+  if (light === undefined)
+    return theme.fg(TOKENS[slot] ?? "accent", text);
+  const [r, g, b] = (light ? LIGHT : DARK)[slot] ?? DARK[0];
+  if (theme.getColorMode?.() === "truecolor")
+    return `\x1B[38;2;${String(r)};${String(g)};${String(b)}m${text}\x1B[39m`;
+  const levels = [0, 95, 135, 175, 215, 255];
+  const nearest = (value) => levels.reduce((best, level, i2) => Math.abs(level - value) < Math.abs((levels[best] ?? 0) - value) ? i2 : best, 0);
+  const color = 16 + nearest(r) * 36 + nearest(g) * 6 + nearest(b);
+  return `\x1B[38;5;${String(color)}m${text}\x1B[39m`;
 }
-function signalGrepTitle(theme) {
-  return theme.fg("toolTitle", theme.bold("baoer_signal_grep"));
+
+// src/tui/layout.ts
+var DIGITS = [
+  ["\u2588\u2580\u2588", "\u2588 \u2588", "\u2588\u2584\u2588"],
+  ["\u2584\u2588 ", " \u2588 ", "\u2584\u2588\u2584"],
+  ["\u2580\u2580\u2588", "\u2584\u2580\u2580", "\u2588\u2584\u2584"],
+  ["\u2580\u2580\u2588", " \u2580\u2588", "\u2584\u2584\u2588"],
+  ["\u2588 \u2588", "\u2580\u2580\u2588", "  \u2588"],
+  ["\u2588\u2580\u2580", "\u2580\u2580\u2588", "\u2584\u2584\u2588"],
+  ["\u2588\u2580\u2580", "\u2588\u2580\u2588", "\u2588\u2584\u2588"],
+  ["\u2580\u2580\u2588", "  \u2588", "  \u2588"],
+  ["\u2588\u2580\u2588", "\u2588\u2580\u2588", "\u2588\u2584\u2588"],
+  ["\u2588\u2580\u2588", "\u2580\u2580\u2588", "\u2584\u2584\u2588"]
+];
+function safeLabel(value) {
+  return value.replace(/[\p{Cc}\p{Cf}]/gu, "\uFFFD");
 }
-function inspectCall(input, copy, theme) {
-  if (input.matchIndices || input.targets) {
-    const count = input.matchIndices?.length ?? input.targets?.length ?? 0;
-    return {
-      primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", copy.inspect)} ${String(count)} ${copy.locations}`,
-      secondary: []
-    };
-  }
-  const target = input.matchIndex === undefined ? `${safeLabel(input.path ?? "?")}:${String(input.line ?? "?")}` : `${copy.retainedMatch} #${String(input.matchIndex)}`;
-  return {
-    primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", copy.inspect)} ${theme.fg("muted", target)}`,
-    secondary: []
-  };
+function fit(lines, width) {
+  if (width <= 0)
+    return [];
+  return lines.map((line) => truncateToWidth(line, width));
 }
-function continuationCall(input, copy, theme) {
-  const secondary = [input.mode ?? "auto"];
-  if (input.paths?.length) {
-    secondary.push(`${copy.selected} ${String(input.paths.length)} ${copy.paths}`);
-  } else if (input.path) {
-    secondary.push(safeLabel(input.path));
-  }
-  return {
-    primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", copy.continueSnapshot)}`,
-    secondary
-  };
-}
-function searchCall(input, theme) {
-  const terms = input.anyOf ?? input.allOf;
-  const secondary = [
-    safeLabel(input.path ?? "."),
-    input.mode ?? "auto",
-    terms ? input.anyOf ? "any-of literals" : "all-of literals" : input.literal ? "literal" : "regex"
+function renderDashboard(view, locale, theme, width, expanded) {
+  const zh = locale === "zh-CN";
+  const units = zh ? { matches: "\u5904\u5339\u914D", items: "\u9879\u7ED3\u679C", files: "\u4E2A\u6587\u4EF6", locations: "\u4E2A\u4F4D\u7F6E" } : { matches: "matches", items: "items", files: "files", locations: "locations" };
+  const state = view.partial ? zh ? "\u90E8\u5206\u7ED3\u679C" : "Partial results" : zh ? "\u641C\u7D22\u5B8C\u6210" : "Search complete";
+  const lines = [view.partial ? theme.fg("warning", `! ${state}`) : candy(theme, 3, `\u2713 ${state}`)];
+  const number = String(view.total);
+  const digitWidth = number.length * 4;
+  const metrics = [
+    `${number} ${units[view.unit]}`,
+    `${String(view.files)} ${zh ? "\u4E2A\u6587\u4EF6" : "files"}`
   ];
-  if (input.ignoreCase === true)
-    secondary.push("ignore-case");
-  else if (input.ignoreCase === false)
-    secondary.push("case-sensitive");
-  else
-    secondary.push("smart-case");
-  if (input.context !== undefined)
-    secondary.push(`context ${String(input.context)}`);
-  const glob = list2(input.glob);
-  const exclude = list2(input.exclude);
-  if (glob)
-    secondary.push(`include ${glob}`);
-  if (exclude)
-    secondary.push(`exclude ${exclude}`);
-  return {
-    primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", terms ? terms.map(quote).join(input.anyOf ? " | " : " & ") : quote(input.pattern ?? ""))}`,
-    secondary
-  };
-}
-function callView(input, copy, theme) {
-  if (input.mode === "inspect")
-    return inspectCall(input, copy, theme);
-  if (input.cursor)
-    return continuationCall(input, copy, theme);
-  if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "files" || input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure") {
-    return {
-      primary: `${signalGrepTitle(theme)}  ${theme.fg("accent", safeLabel(input.mode))} ${theme.fg("muted", safeLabel(input.query ?? input.pattern ?? input.symbol ?? input.path ?? "."))}`,
-      secondary: [
-        safeLabel(input.path ?? "."),
-        ...input.line === undefined ? [] : [String(input.line)]
-      ]
-    };
+  if (width >= digitWidth + 22 && width >= 44) {
+    for (let row = 0;row < 3; row++) {
+      const glyph = Array.from(number, (digit, index) => candy(theme, index, DIGITS[Number(digit)]?.[row] ?? "   ")).join(" ");
+      lines.push(`${glyph}   ${row === 0 ? metrics[0] : row === 1 ? metrics[1] : ""}`);
+    }
+  } else
+    lines.push(theme.bold(metrics.join(" \xB7 ")));
+  if (view.partial) {
+    lines.push(theme.fg("warning", zh ? "\u7ED3\u679C\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u7F29\u5C0F\u8303\u56F4\u91CD\u8BD5" : "Incomplete results; narrow the search"));
+    if (view.unit === "matches")
+      lines.push(theme.fg("warning", `${zh ? "\u5DF2\u4FDD\u7559" : "Retained"} ${String(view.stored)}/${number}`));
   }
-  return searchCall(input, theme);
+  const limit = expanded ? 30 : width >= 60 ? 6 : 3;
+  const rows = view.rows.slice(0, limit);
+  if (rows.length) {
+    lines.push("", theme.fg("text", view.pageOnly ? zh ? "\u672C\u9875\u6587\u4EF6\u5206\u5E03" : "Files on this page" : zh ? "\u6587\u4EF6\u5206\u5E03" : "File distribution"));
+    if (width >= 44 && !view.inspection) {
+      const cells = Math.min(48, width);
+      const shown = rows.reduce((sum, row) => sum + row.matches, 0);
+      const denominator = Math.max(view.pageOnly ? shown : view.total, shown, 1);
+      let cumulative = 0;
+      let occupied = 0;
+      const segments = rows.map((row, index) => {
+        cumulative += row.matches;
+        const end = Math.round(cumulative / denominator * cells);
+        const segment = candy(theme, index, "\u2501".repeat(end - occupied));
+        occupied = end;
+        return segment;
+      });
+      lines.push(segments.join("") + theme.fg("borderMuted", "\u2500".repeat(cells - occupied)), "");
+    }
+    const max = Math.max(...view.rows.map((row) => row.matches), 1);
+    const countWidth = Math.max(...rows.map((row) => String(row.matches).length));
+    const barWidth = width >= 44 ? Math.min(18, Math.floor(width / 4)) : 0;
+    const pathWidth = Math.max(1, width - countWidth - barWidth - (barWidth ? 6 : 4));
+    for (const [index, row] of rows.entries()) {
+      const name2 = truncateToWidth(safeLabel(row.path), pathWidth);
+      const label = name2 + " ".repeat(Math.max(0, pathWidth - visibleWidth(name2)));
+      const count = String(row.matches).padStart(countWidth);
+      const bar = barWidth ? `  ${"\u2588".repeat(Math.max(row.matches > 0 ? 1 : 0, Math.round(row.matches / max * barWidth)))}` : "";
+      lines.push(`${candy(theme, index, "\u258E")} ${label}  ${theme.bold(count)}${candy(theme, index, bar)}`);
+    }
+    if (view.rows.length > rows.length)
+      lines.push(theme.fg("text", `${zh ? "\u53E6\u6709" : "Another"} ${String(view.rows.length - rows.length)} ${zh ? "\u4E2A\u6587\u4EF6\uFF1B\u5C55\u5F00\u67E5\u770B\u66F4\u591A" : "files; expand to see more"}`));
+    if (view.files > view.rows.length)
+      lines.push(theme.fg("text", `${zh ? "\u6587\u4EF6\u7EDF\u8BA1\u5C55\u793A" : "File statistics shown"} ${String(view.rows.length)}/${String(view.files)}`));
+  } else if (view.total === 0)
+    lines.push(theme.fg("text", zh ? "\u6CA1\u6709\u627E\u5230\u5339\u914D\u7ED3\u679C" : "No results found"));
+  else
+    lines.push(theme.fg("text", zh ? "\u672C\u6B21\u672A\u63D0\u4F9B\u6587\u4EF6\u5206\u5E03" : "File distribution unavailable"));
+  if (view.unavailable)
+    lines.push(theme.fg("warning", `${String(view.unavailable)} ${zh ? "\u4E2A\u4F4D\u7F6E\u672A\u80FD\u5B8C\u6210\u8BFB\u53D6" : "locations could not be read"}`));
+  lines.push("", theme.fg("text", view.more ? zh ? "\u8FD8\u6709\u7ED3\u679C\u53EF\u7EE7\u7EED\u67E5\u770B" : "More results available" : view.partial ? zh ? "\u672C\u6B21\u641C\u7D22\u672A\u8986\u76D6\u5168\u90E8\u7ED3\u679C" : "Search coverage is incomplete" : zh ? "\u672C\u6B21\u8FD4\u56DE\u5DF2\u7ED3\u675F" : "End of this result"));
+  return fit(lines, width);
 }
 function renderSignalGrepCallLines(input, locale, theme, width) {
-  const { primary, secondary } = callView(input, COPY[locale], theme);
-  if (secondary.length === 0)
-    return finish([primary], width);
-  const detail = secondary.join(" \xB7 ");
-  if (width < 44)
-    return finish([`${primary} \xB7 ${detail}`], width);
-  return finish([primary, theme.fg("dim", detail)], width);
-}
-function localizedSearchingText(locale) {
-  return COPY[locale].searching;
-}
-function localizedErrorText(locale) {
-  const copy = COPY[locale];
-  return { hint: copy.expandFullError, title: copy.error };
-}
-
-// src/tui/presentation.ts
-var STRUCTURE_STATUSES = new Set([
-  "available",
-  "no-symbol",
-  "provider-unavailable",
-  "source-unavailable",
-  "parse-error",
-  "file-too-large",
-  "source-changed"
-]);
-var SEARCH_MODES = new Set(["auto", "summary", "matches", "inspect"]);
-function isNonNegativeSafeInteger(value) {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-function hasRecognizableDetails(details) {
-  if (!details || details.version !== 1 || details.analysis !== undefined)
-    return false;
-  if (!SEARCH_MODES.has(details.mode))
-    return false;
-  if (details.status !== "complete" && details.status !== "partial")
-    return false;
-  const counts = [
-    details.totalMatches,
-    details.storedMatches,
-    details.totalFiles,
-    details.returnedMatches
-  ];
-  if (counts.some((value) => !isNonNegativeSafeInteger(value)))
-    return false;
-  if (details.storedMatches > details.totalMatches)
-    return false;
-  if (details.snapshotComplete !== (details.status === "complete"))
-    return false;
-  return !details.snapshotComplete || details.storedMatches === details.totalMatches;
-}
-function parseSummaryRows(text, expectedRows) {
-  if (!isNonNegativeSafeInteger(expectedRows))
-    return;
-  if (expectedRows === 0)
-    return;
-  const lines = text.split(`
-`);
-  const rangeIndex = lines.findIndex((line) => /^Files \d+-\d+ of \d+, ordered by match count\.$/.test(line));
-  if (rangeIndex < 0 || lines[rangeIndex + 1] !== "")
-    return;
-  const rows = [];
-  for (const line of lines.slice(rangeIndex + 2, rangeIndex + 2 + expectedRows)) {
-    const match = /^(\S(?:.*\S)?) {2,}(\d+)$/.exec(line);
-    if (!match)
-      return;
-    const path = match[1];
-    const countText = match[2];
-    if (!path || !countText)
-      return;
-    const count = Number(countText);
-    if (!Number.isSafeInteger(count) || count < 1)
-      return;
-    rows.push({ path, matches: count });
-  }
-  return rows.length === expectedRows ? rows : undefined;
-}
-function splitMatchBody(text) {
-  const markers = [
-    `
-
-[Match columns `,
-    `
-
-[Context omitted `,
-    `
-
-[Context unavailable `,
-    `
-
-[Matches `
-  ];
-  let bodyEnd = text.length;
-  for (const marker of markers) {
-    const index = text.indexOf(marker);
-    if (index >= 0)
-      bodyEnd = Math.min(bodyEnd, index);
-  }
-  const body2 = text.slice(0, bodyEnd);
-  if (body2.length === 0 || !text.includes(`
-
-[Matches `))
-    return;
-  return body2.split(`
-`);
-}
-function parseMatchRange(text) {
-  const match = /\[Matches (\d+)-(\d+) of \d+/.exec(text);
-  if (!match)
-    return {};
-  const firstMatch = Number(match[1]);
-  const lastMatch = Number(match[2]);
-  if (!Number.isSafeInteger(firstMatch) || !Number.isSafeInteger(lastMatch) || firstMatch < 1 || lastMatch < firstMatch) {
-    return {};
-  }
-  return { firstMatch, lastMatch };
-}
-function parseInspect(text, details) {
-  const structure = details.structure;
-  if (!structure || !STRUCTURE_STATUSES.has(structure.status))
-    return;
-  const lines = text.split(`
-`);
-  const target = lines[0];
-  if (!target)
-    return;
-  if (structure.status === "source-changed" || structure.status === "file-too-large" || structure.status === "source-unavailable") {
-    return {
-      kind: "inspect",
-      details,
-      text,
-      target,
-      sourceLines: [],
-      status: structure.status
-    };
-  }
-  const descriptor = lines[1] || undefined;
-  const structureMarker = text.lastIndexOf(`
-
-[structure: `);
-  if (!descriptor || structureMarker < 0)
-    return;
-  const sourceStart = text.indexOf(`
-
-`, target.length + 1);
-  if (sourceStart < 0 || sourceStart >= structureMarker)
-    return;
-  const sourceLines = text.slice(sourceStart + 2, structureMarker).split(`
-`);
-  return {
-    kind: "inspect",
-    details,
-    text,
-    target,
-    descriptor,
-    sourceLines,
-    status: structure.status
-  };
-}
-function recognizeSignalGrepResult(text, details) {
-  if (!hasRecognizableDetails(details))
-    return;
-  if (details.mode === "inspect") {
-    if (details.inspections) {
-      if (details.inspections.length === 0 || details.inspections.some((item) => !Number.isSafeInteger(item.inputIndex) || item.inputIndex < 1 || !["returned", "deferred", "error"].includes(item.status)))
-        return;
-      return { kind: "inspect-batch", details, text, items: details.inspections };
-    }
-    return parseInspect(text, details);
-  }
-  if (details.totalMatches === 0) {
-    return { kind: "empty", details, text };
-  }
-  if (details.summaryFilesShown !== undefined) {
-    const rows = parseSummaryRows(text, details.summaryFilesShown);
-    if (!rows)
-      return;
-    const lines = text.split(`
-`);
-    const sampleHeading = lines.findIndex((line) => line.startsWith("Samples: first retained match"));
-    const sampleCount = details.summaryPreviewsShown ?? 0;
-    const previews = sampleHeading >= 0 && isNonNegativeSafeInteger(sampleCount) ? lines.slice(sampleHeading + 1, sampleHeading + 1 + sampleCount) : [];
-    return { kind: "summary", details, text, rows, previews };
-  }
-  if (details.returnedMatches > 0) {
-    const bodyLines = splitMatchBody(text);
-    if (!bodyLines)
-      return;
-    return {
-      kind: "matches",
-      details,
-      text,
-      bodyLines,
-      ...parseMatchRange(text)
-    };
-  }
-  return;
+  const zh = locale === "zh-CN";
+  const action = input.mode === "inspect" ? zh ? "\u67E5\u770B\u6587\u4EF6" : "Inspect files" : input.cursor || input.sourceCursor || input.mode === "await" ? zh ? "\u7EE7\u7EED\u67E5\u770B" : "Continue search" : input.mode === "cancel" ? zh ? "\u505C\u6B62\u641C\u7D22" : "Stop search" : zh ? "\u641C\u7D22" : "Search";
+  return fit([
+    `${theme.fg("accent", theme.bold("baoer_signal_grep"))}  ${action}`,
+    ...input.path ? [theme.fg("text", safeLabel(input.path))] : []
+  ], width);
 }
 
 // src/tui/renderers.ts
-function resultText(result) {
-  return result.content.find((item) => item.type === "text" && item.text !== undefined)?.text;
-}
-function textLines(text, width) {
-  return new Text(text, 0, 0).render(Math.max(1, width));
-}
-function component(render, fallbackText) {
+function component(render, locale) {
   return {
     render(width) {
       try {
         return render(width);
       } catch {
-        return textLines(fallbackText, width);
+        return fit([locale === "zh-CN" ? "\u7ED3\u679C\u663E\u793A\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5" : "Result display failed; retry"], width);
       }
     },
     invalidate() {}
   };
 }
-function errorLines(options) {
-  const { copy, theme, width } = options;
-  const available = Math.max(1, width);
-  const lines = [theme.fg("error", theme.bold(`\u2500\u2500 ${copy.title} \u2500\u2500`)), theme.fg("dim", copy.hint)];
-  return lines.map((line) => truncateToWidth(line, available));
-}
-function renderHumanStats(details, locale, theme, width) {
-  const chinese = locale === "zh-CN";
-  const title = chinese ? "\u7ED3\u679C" : "RESULT";
-  const status = details.status === "complete" ? chinese ? "\u5B8C\u6574" : "complete" : chinese ? "\u90E8\u5206" : "partial";
-  const count = details.analysis?.totalItems ?? details.totalMatches;
-  const files = details.totalFiles;
-  const unit = details.analysis ? chinese ? "\u9879" : "items" : chinese ? "\u5904\u5339\u914D" : "matches";
-  const lines = [
-    theme.fg("borderMuted", `\u2500\u2500 ${theme.bold(title)} \u2500\u2500`),
-    theme.fg("toolOutput", `${String(count)} ${unit} \xB7 ${String(files)} ${chinese ? "\u4E2A\u6587\u4EF6" : files === 1 ? "file" : "files"} \xB7 ${status}`)
-  ];
-  if (details.analysis?.statistics) {
-    const stats = details.analysis.statistics;
-    lines.push(theme.fg("dim", `${chinese ? "\u7EDF\u8BA1" : "stats"}: ${String(stats.total)} ${unit}`));
-  }
-  if (details.cursor || details.nextRequest)
-    lines.push(theme.fg("dim", chinese ? "\u53EF\u7EE7\u7EED" : "cursor ready"));
-  return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
+function failure2(text, locale) {
+  const zh = locale === "zh-CN";
+  if (/expired|cursor.*invalid/i.test(text))
+    return zh ? "\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u641C\u7D22" : "Results expired; run the search again";
+  if (/permission|access denied|EACCES/i.test(text))
+    return zh ? "\u65E0\u6CD5\u8BBF\u95EE\u6587\u4EF6\uFF0C\u8BF7\u68C0\u67E5\u6743\u9650" : "Cannot access files; check permissions";
+  if (/not found|ENOENT/i.test(text))
+    return zh ? "\u672A\u627E\u5230\u76EE\u6807\uFF0C\u8BF7\u68C0\u67E5\u6587\u4EF6\u8DEF\u5F84" : "Target not found; check the file path";
+  if (/cancel/i.test(text))
+    return zh ? "\u641C\u7D22\u5DF2\u53D6\u6D88" : "Search cancelled";
+  if (/timeout|deadline/i.test(text))
+    return zh ? "\u641C\u7D22\u8D85\u65F6\uFF0C\u8BF7\u7F29\u5C0F\u8303\u56F4\u91CD\u8BD5" : "Search timed out; narrow the search";
+  return zh ? "\u641C\u7D22\u672A\u5B8C\u6210\uFF0C\u8BF7\u68C0\u67E5\u641C\u7D22\u6761\u4EF6\u540E\u91CD\u8BD5" : "Search failed; check the query and retry";
 }
 function renderSignalGrepCall(input, locale, theme) {
-  return component((width) => renderSignalGrepCallLines(input, locale, theme, width), "baoer_signal_grep");
+  return component((width) => renderSignalGrepCallLines(input, locale, theme, width), locale);
 }
 function renderSignalGrepResult(result, options, locale, theme) {
-  const text = resultText(result);
-  if (text === undefined)
-    return new Text("", 0, 0);
-  if (result.details?.operation && result.details.operation.state !== "complete") {
-    return new Text(theme.fg("warning", text), 0, 0);
-  }
-  if (options.isPartial) {
-    return new Text(theme.fg("warning", localizedSearchingText(locale)), 0, 0);
-  }
-  if (options.isError) {
-    return component((width) => errorLines({
-      copy: localizedErrorText(locale),
-      theme,
-      width
-    }), locale === "zh-CN" ? "\u672C\u6B21\u64CD\u4F5C\u672A\u5B8C\u6210\u3002" : "Operation did not complete.");
-  }
-  let presentation;
-  try {
-    presentation = recognizeSignalGrepResult(text, result.details);
-  } catch {
-    return new Text(text, 0, 0);
-  }
-  if (!presentation)
-    return component((width) => renderHumanStats(result.details ?? {
-      version: 1,
-      mode: "auto",
-      status: "complete",
-      totalMatches: 0,
-      storedMatches: 0,
-      totalFiles: 0,
-      returnedMatches: 0,
-      snapshotComplete: true
-    }, locale, theme, width), locale === "zh-CN" ? "\u7ED3\u679C" : "RESULT");
-  return component((width) => renderHumanStats(result.details ?? presentation.details, locale, theme, width), locale === "zh-CN" ? "\u7ED3\u679C" : "RESULT");
+  return component((width) => {
+    const zh = locale === "zh-CN";
+    const text = result.content.filter((item) => item.type === "text").map((item) => item.text ?? "").join(`
+`);
+    const state = result.details?.operation?.state ?? result.details?.status;
+    if (options.isError || result.isError || state === "failed" || state === "cancelled" || state === "expired") {
+      return fit([
+        theme.fg("error", zh ? "! \u641C\u7D22\u672A\u5B8C\u6210" : "! Search incomplete"),
+        failure2(state === "cancelled" || state === "expired" ? state : text, locale)
+      ], width);
+    }
+    if (options.isPartial || state === "running" || state === "waiting") {
+      return fit([
+        theme.fg("accent", zh ? "\u25CC \u6B63\u5728\u641C\u7D22\u2026" : "\u25CC Searching\u2026"),
+        theme.fg("muted", zh ? "\u7B49\u5F85\u641C\u7D22\u7ED3\u679C" : "Waiting for results")
+      ], width);
+    }
+    const view = dashboard(text, result.details);
+    if (!view)
+      return fit([
+        theme.fg("warning", zh ? "\u65E0\u6CD5\u5C55\u793A\u7ED3\u679C\u7EDF\u8BA1" : "Result statistics unavailable"),
+        theme.fg("muted", zh ? "\u8BF7\u91CD\u8BD5\u641C\u7D22" : "Retry the search")
+      ], width);
+    return renderDashboard(view, locale, theme, width, options.expanded);
+  }, locale);
 }
 
 // src/search-policy-recovery.ts
