@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [1.6.1] - 2026-09-16
+
+- Reject `mode=files` queries that contain `*` or `?` glob wildcards with an actionable error, instead of scoring every enumerated file out and reporting `0 retained files` as a complete result. Omitting the query still lists every file under the requested path, and `glob` remains the name-pattern filter; bracket characters stay valid query text.
+- Offer an executable repair when the hard search policy blocks a bare directory enumeration: plain `find <root> [-name <pattern>] -type f` commands, including inside a compound atomic call, translate to one concrete `{"mode":"files",…}` request with `-name` mapped to `glob`.
+- Present `{"mode":"files","path":"<scope>"}` with query documented as optional as the blocked-file-search template, and give untranslatable `find` forms (depth limits, case-insensitive or repeated name predicates, other tests and actions) a manual-recovery reason that names those forms instead of the ripgrep-specific one.
+
 ## [1.6.0] - 2026-09-14
 
 - Simplify interactive host output to the essential result statistics: match or item count, file count, completion state, budget state and continuation availability. File lists, source excerpts and raw failure diagnostics stay available to the model through structured evidence and inspect requests.
