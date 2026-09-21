@@ -93,17 +93,18 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     ONNXRUNTIME_NODE_INSTALL_CUDA: "skip",
     BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE: "model",
   };
+  const mcpConnection = {
+    command: "npx",
+    args: ["--yes", "--package", `${packageJson.name}@latest`, "baoer_signal_grep_mcp", "--stdio"],
+    env: mcpEnvironment,
+  };
   const mcp = {
+    baoer_signal_grep: mcpConnection,
+  };
+  const sharedMcp = {
     baoer_signal_grep: {
-      command: "npx",
-      args: [
-        "--yes",
-        "--package",
-        `${packageJson.name}@latest`,
-        "baoer_signal_grep_mcp",
-        "--stdio",
-      ],
-      env: mcpEnvironment,
+      ...mcpConnection,
+      env_vars: ["BAOER_SIGNAL_GREP_CONFIG", "TYPESAFE_API_KEY"],
     },
   };
   const localMcpServer = [
@@ -127,7 +128,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     },
     ".claude-plugin/plugin.json": identity,
     "mcp-server.mjs": localMcpServer,
-    ".mcp.json": { mcpServers: mcp },
+    ".mcp.json": { mcpServers: sharedMcp },
     "hooks/hooks.json": {
       hooks: {
         PreToolUse: [
