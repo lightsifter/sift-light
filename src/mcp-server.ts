@@ -8,8 +8,11 @@ import {
   createDefaultSignalGrepMcpService,
   startSignalGrepMcpServer,
 } from "./mcp.js";
-import { DEFAULT_SEMANTIC_JUDGE_CONFIG, readSignalGrepConfigFile } from "./config-reader.js";
-import { createSemanticJudgeIntegration, type SemanticJudgeIntegration } from "./semantic-judge.js";
+import {
+  createMcpSemanticJudgeIntegration,
+  mcpSemanticJudgeConfigSource,
+} from "./mcp-semantic-judge.js";
+import type { SemanticJudgeIntegration } from "./semantic-judge.js";
 import { parseSignalGrepMcpTransport, BAOER_SIGNAL_GREP_MCP_USAGE } from "./mcp-cli.js";
 import { parseSignalGrepMcpOutputMode, type SignalGrepMcpOutputMode } from "./mcp-output.js";
 import { startSignalGrepMcpStdioServer } from "./mcp-stdio.js";
@@ -38,11 +41,15 @@ function allowedOrigins(): string[] {
     .filter((origin) => origin.length > 0);
 }
 
-async function configuredSemanticJudge(): Promise<SemanticJudgeIntegration | undefined> {
-  const configPath = process.env.BAOER_SIGNAL_GREP_CONFIG;
-  if (!configPath) return undefined;
-  const config = await readSignalGrepConfigFile(configPath);
-  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
+async function configuredSemanticJudge(): Promise<SemanticJudgeIntegration> {
+  return createMcpSemanticJudgeIntegration();
+}
+
+function logSemanticJudgeStatus(integration: SemanticJudgeIntegration): void {
+  const status = integration.config.enabled ? "enabled" : "disabled";
+  process.stderr.write(
+    `baoer_signal_grep MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}\n`,
+  );
 }
 
 async function runHttpServer(
@@ -134,6 +141,7 @@ async function main(): Promise<void> {
   }
   const outputMode = parseSignalGrepMcpOutputMode(process.env.BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE);
   const semanticJudge = await configuredSemanticJudge();
+  logSemanticJudgeStatus(semanticJudge);
   if (transport === "stdio") {
     await runStdioServer(outputMode, semanticJudge);
     return;

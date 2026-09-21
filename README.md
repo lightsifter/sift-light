@@ -140,7 +140,13 @@ codex mcp add baoer_signal_grep -- npx -y --package baoer_signal_grep@latest bao
 
 `@latest` follows the newest published version when MCP starts. Restart the host to load updates. The server searches the active project; `BAOER_SIGNAL_GREP_MCP_CWD` can select a different root. An MCP-only connection adds the tool without disabling other search tools.
 
-The standalone MCP server keeps semantic judging disabled unless `BAOER_SIGNAL_GREP_CONFIG` points to a valid configuration file with `semanticJudge.enabled` set to `true`. This lets MCP use the same bounded, explicit configuration without enabling network access merely because a credential exists in the environment.
+Pi and OMP load their host-scoped configuration by default. Set `BAOER_SIGNAL_GREP_CONFIG` in the actual host process environment when all hosts should share one explicit file; it overrides the host-scoped path for Pi and OMP as well as MCP. Claude Code, Codex and Kimi all start the same standalone MCP server, so add this variable to each host's MCP `env` map rather than relying only on a shell startup file:
+
+```text
+BAOER_SIGNAL_GREP_CONFIG=/absolute/path/to/baoer_signal_grep.json
+```
+
+Keep `TYPESAFE_API_KEY` in the MCP process environment or its secret manager; never put the credential value in the configuration file or a checked-in host manifest. The standalone MCP server keeps semantic judging disabled when this path is absent, and fails at startup when an explicit path is missing or an enabled configuration has no key. It never silently claims that Jev ran. Startup diagnostics are written to stderr, and hybrid results expose `semanticJudge.status`; `complete` with `judgedCandidates > 0` is the runtime evidence that the layer actually ran.
 
 MCP returns readable text plus structured evidence by default. If a host serializes both forms into the model context, set `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model` in that MCP server's environment and restart it. Model mode omits `structuredContent` and its advertised output schema, advertises concise workflow guidance, and selects the smaller of the standard page and a compact view of the same retained analysis snapshot. Repeated paths and inspect requests are shared, hybrid does not concatenate separate literal and Concept bodies, and outline excerpts are deferred to version-checked inspection. Counts, coverage, partial status, reasons and continuation requests remain visible. Use `text` to omit structured output while preserving the complete standard text and full usage guidance, or retain the default `structured` mode for programmatic consumers and clients that expose only structured results. Any other value fails at startup. The bundled Claude Code, Codex and Kimi native plugins select `model`; direct MCP connections retain the structured default unless configured explicitly.
 

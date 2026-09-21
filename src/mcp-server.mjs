@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.6",
+  version: "1.6.7",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -303,7 +303,7 @@ function compactMetadata(details, analysis) {
     analysis.stats ? `Stats: ${JSON.stringify(analysis.stats)}` : undefined,
     analysis.sourceGeneration ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}` : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
-    analysis.kind === "outline" ? "[Outline names withheld; item locations and structure status are available.]" : undefined,
+    analysis.kind === "outline" && analysis.modelOutput ? "[Outline signatures are deferred; use version-checked inspection for source excerpts.]" : undefined,
     ...analysis.reasons.map((reason) => `[${reason}]`),
     details.redactionApplied ? "[Display redaction applied.]" : undefined
   ].filter((line) => line !== undefined);
@@ -316,7 +316,8 @@ function compactRows(analysis) {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    rows.push(`#${String(item.index)} L${String(item.line)} metadata`);
+    const label = analysis.kind === "outline" && analysis.modelOutput ? item.label : "metadata";
+    rows.push(`#${String(item.index)} L${String(item.line)} ${label}`);
   }
   return rows;
 }
@@ -5557,7 +5558,7 @@ function publicStructureDetails(item) {
     ...typeof details.signatureTruncated === "boolean" ? { signatureTruncated: details.signatureTruncated } : {}
   };
 }
-function publicAnalysisItem(result, item, index, storedId) {
+function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   const inspect = item.source && item.range ? {
     mode: "inspect",
     cursor: `${storedId}.analysis.0`,
@@ -5568,7 +5569,7 @@ function publicAnalysisItem(result, item, index, storedId) {
   return {
     path: item.path,
     line: item.line,
-    label: publicAnalysisLabel(result),
+    label: result.kind === "outline" && modelOutput ? item.label : publicAnalysisLabel(result),
     index: index + 1,
     ...inspect ? { inspect } : {},
     ...publicDetails ? { details: publicDetails } : {}
@@ -5695,7 +5696,7 @@ class AnalysisStore {
       throw new CursorError("Analysis item is outside the retained result");
     return structuredClone(item);
   }
-  page(cursor) {
+  page(cursor, modelOutput = false) {
     const { stored, offset, kind } = this.resolve(cursor);
     const { result } = stored;
     if (kind === "analysis-terms")
@@ -5726,7 +5727,7 @@ ${result.reasons.map((reason) => `[${reason}]`).join(`
       const item = result.items[index];
       if (!item)
         throw new Error("Analysis item unavailable");
-      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const publicItem = publicAnalysisItem(result, item, index, stored.id, modelOutput);
       const inspect = publicItem.inspect;
       const exposeExcerpt = result.kind === "concept" || result.kind === "hybrid" && item.details?.source === "concept";
       const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `
@@ -5808,6 +5809,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           unit: result.unit,
           totalItems: result.items.length,
           returnedItems: items.length,
+          ...modelOutput ? { modelOutput: true } : {},
           statistics,
           items,
           ...sources.length ? { sources } : {},
@@ -10139,7 +10141,7 @@ class EvidenceService {
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis));
+      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
     }
     if (input.mode === "hybrid") {
       const query = validateConceptQuery(input.query);
@@ -10195,22 +10197,22 @@ class EvidenceService {
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
       }));
-      return this.#analyses.page(cursor);
+      return this.#analyses.page(cursor, options.modelOutput);
     }
     if (input.mode === "structure") {
-      return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
+      return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)), options.modelOutput);
     }
     if (input.mode === "files") {
-      return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
+      return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)), options.modelOutput);
     }
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError("Analysis cursor cannot continue in the requested mode", "E_CURSOR_WRONG_KIND");
-      return this.#analyses.page(input.cursor);
+      return this.#analyses.page(input.cursor, options.modelOutput);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
-      return this.#navigate(input, access);
+      return this.#navigate(input, access, options);
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (input.pattern !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
@@ -10300,7 +10302,7 @@ class EvidenceService {
       };
       return this.#analyses.page(this.#analyses.create(result, (retainedItems) => ({
         termCounts: retainedTermCounts(anyOf, retainedItems)
-      })));
+      })), options.modelOutput);
     }
     const terms = validateTerms(input);
     if (input.roles !== undefined && (!input.roles.length || input.roles.some((role) => ![
@@ -10403,7 +10405,7 @@ class EvidenceService {
         budgetExhausted: result.reasons.some((reason) => reason.includes("limit") || reason.includes("budget-exhausted"))
       };
     }
-    return this.#analyses.page(this.#analyses.create(result));
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
   }
   #inspectionTargets(input, cwd) {
     if (input.targets !== undefined && input.matchIndices !== undefined)
@@ -10446,7 +10448,7 @@ class EvidenceService {
       ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}
     };
   }
-  async#navigate(input, access) {
+  async#navigate(input, access, options = {}) {
     const navigationStarted = performance.now();
     let path = input.path;
     let reference;
@@ -10551,7 +10553,7 @@ class EvidenceService {
           budgetExhausted: false
         },
         redact: input.redact ?? false
-      }));
+      }), options.modelOutput);
     }
     if (document.reference.origin.kind !== "worktree")
       return this.#analyses.page(this.#analyses.create({
@@ -10562,7 +10564,7 @@ class EvidenceService {
         reasons: [
           "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree"
         ]
-      }));
+      }), options.modelOutput);
     const root = await navigationRoot(access.cwd, document.path, access.signal);
     const filters = navigationFilters(input);
     if (input.mode === "tests" && isPython)
@@ -10587,7 +10589,7 @@ class EvidenceService {
         coverage: { navigation: "not-applicable" },
         scope: await navigationScope(access.cwd, root, document.path, filters),
         redact: input.redact ?? false
-      }));
+      }), options.modelOutput);
     const files = await listWorkspaceFiles(access.cwd, access.signal, {
       path: root,
       glob: filters.glob,
@@ -10637,7 +10639,7 @@ class EvidenceService {
       },
       scope: await navigationScope(access.cwd, root, document.path, filters),
       redact: input.redact ?? false
-    }));
+    }), options.modelOutput);
   }
 }
 
@@ -12044,7 +12046,7 @@ class SignalGrepService {
       throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");
     }
     if (input.cursor)
-      return this.#continue(input, cwd, signal);
+      return this.#continue(input, cwd, signal, options);
     if (input.paths !== undefined) {
       throw new SignalGrepError("paths can only select retained files from a cursor");
     }
@@ -12076,10 +12078,10 @@ class SignalGrepService {
       } else if (mode === "summary") {
         result = await this.#summary(snapshot, mode, cwd, signal);
       } else if (mode === "matches") {
-        result = await this.#page(snapshot, 0, mode, signal);
+        result = await this.#page(snapshot, 0, mode, signal, undefined, options);
       } else {
         if (input.limit !== undefined) {
-          result = await this.#page(snapshot, 0, mode, signal);
+          result = await this.#page(snapshot, 0, mode, signal, undefined, options);
         } else if (contextBudget !== undefined && contextBudget.tier !== "full" && input.limit === undefined) {
           result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
         } else {
@@ -12129,7 +12131,7 @@ class SignalGrepService {
   get storedMatches() {
     return this.#snapshots.storedMatches;
   }
-  async#continue(input, cwd, signal) {
+  async#continue(input, cwd, signal, options = {}) {
     const cursor = input.cursor;
     if (!cursor)
       throw new CursorError("A cursor is required to continue a search");
@@ -12153,7 +12155,7 @@ class SignalGrepService {
       throw new CursorError("A match cursor must continue with the same path selection.", "E_CURSOR_OPTIONS_CONFLICT");
     }
     const pageOffset = kind === "summary" ? 0 : offset;
-    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection);
+    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection, options);
     return this.#finalize(snapshot, result, kind === "summary" || selection !== undefined);
   }
   #finalize(snapshot, result, retainSnapshot = false) {
@@ -12213,7 +12215,7 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
       }
     };
   }
-  async#page(snapshot, offset, mode, signal, selection) {
+  async#page(snapshot, offset, mode, signal, selection, options = {}) {
     if (offset === snapshot.matches.length) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
     }
@@ -12221,7 +12223,18 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
       metadataReserveBytes: 1536 + Buffer.byteLength(JSON.stringify({ paths: selection.labels })),
       include: (match) => selection.absolutePaths.has(match.absolutePath)
     } : {};
-    const page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    let page;
+    if (!options.modelSource) {
+      page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    } else {
+      try {
+        page = await formatMatchPage(snapshot, offset, signal, pageOptions);
+      } catch (error) {
+        if (!(error instanceof MatchPageSoftLimitError))
+          throw error;
+        page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+      }
+    }
     if (page.returnedMatches === 0 && selection) {
       throw new CursorError("No retained matches exist for the selected paths.");
     }
@@ -12306,6 +12319,150 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
         ...page.contextChangedFiles.length > 0 ? { contextChangedFiles: page.contextChangedFiles } : {}
       }
     };
+  }
+}
+
+// src/config-reader.ts
+import { readFile as readFile3 } from "node:fs/promises";
+var SIGNAL_GREP_CONFIG_ENV = "BAOER_SIGNAL_GREP_CONFIG";
+var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
+  enabled: false,
+  provider: "jev",
+  endpoint: "https://api.typesafe.ai/v1/systemone",
+  apiKeyEnv: "TYPESAFE_API_KEY",
+  model: "jev-latest",
+  timeoutMs: 120000,
+  maxCandidates: 20,
+  maxRetries: 2
+};
+var DEFAULT_SIGNAL_GREP_CONFIG = {
+  locale: "en",
+  enforceSearch: "hard",
+  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
+};
+function hasErrorCode(error, codes) {
+  return error instanceof Error && "code" in error && codes.includes(String(error.code));
+}
+function isMissingFile(error) {
+  return hasErrorCode(error, ["ENOENT"]);
+}
+function isRawSignalGrepConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isRawSemanticJudgeConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedInteger2(value, fallback, minimum, maximum, field) {
+  const candidate = value ?? fallback;
+  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new Error(`Invalid baoer_signal_grep ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`);
+  }
+  return candidate;
+}
+function parseSemanticJudge(value, path) {
+  if (value === undefined)
+    return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
+  if (!isRawSemanticJudgeConfig(value)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge must be an object`);
+  }
+  const unknown = Object.keys(value).filter((key) => ![
+    "enabled",
+    "provider",
+    "endpoint",
+    "apiKeyEnv",
+    "model",
+    "timeoutMs",
+    "maxCandidates",
+    "maxRetries"
+  ].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`);
+  }
+  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.enabled must be a boolean`);
+  }
+  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
+  if (provider !== "jev") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.provider must be "jev"`);
+  }
+  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
+  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
+  }
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch (error) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`, { cause: error });
+  }
+  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`);
+  }
+  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
+  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
+  }
+  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.model must be bounded single-line text`);
+  }
+  return {
+    enabled,
+    provider,
+    endpoint,
+    apiKeyEnv,
+    model,
+    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
+    maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
+    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
+  };
+}
+function parseConfig(value, path) {
+  if (!isRawSignalGrepConfig(value)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
+  }
+  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "semanticJudge"].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`);
+  }
+  const { locale, enforceSearch } = value;
+  if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
+  }
+  const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
+  return {
+    locale: locale ?? DEFAULT_SIGNAL_GREP_CONFIG.locale,
+    enforceSearch: enforcement,
+    semanticJudge: parseSemanticJudge(value.semanticJudge, path)
+  };
+}
+function normalizeSearchEnforcement(value, source) {
+  if (value === undefined || value === "hard")
+    return "hard";
+  if (value === "prefer")
+    return "prefer";
+  if (value === "off")
+    return "off";
+  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
+}
+async function readSignalGrepConfigFile(path, options = {}) {
+  try {
+    const content = await readFile3(path, "utf8");
+    return parseConfig(JSON.parse(content), path);
+  } catch (error) {
+    if (isMissingFile(error)) {
+      if (options.missing === "error") {
+        throw new Error(`baoer_signal_grep config was not found at ${path}; create it or unset ${SIGNAL_GREP_CONFIG_ENV}`, { cause: error });
+      }
+      return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
+        cause: error
+      });
+    }
+    throw error;
   }
 }
 
@@ -12552,10 +12709,11 @@ function signalGrepTool(outputMode) {
   return tool;
 }
 function createDefaultSignalGrepMcpService(semanticJudge) {
+  const resolvedSemanticJudge = semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SignalGrepService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
-    ...semanticJudge ? { semanticJudge } : {}
+    semanticJudge: resolvedSemanticJudge
   });
 }
 function errorMessage2(error) {
@@ -12614,7 +12772,10 @@ function createSignalGrepMcpServer(service, cwd, outputMode = DEFAULT_MCP_OUTPUT
     }
     try {
       const input = parseSignalGrepInput(request.params.arguments ?? {});
-      const result = await service.search(input, cwd, extra.signal);
+      const result = await service.search(input, cwd, extra.signal, {
+        modelOutput: resolvedOutputMode === "model",
+        modelSource: resolvedOutputMode === "model" && (input.cursor !== undefined || input.limit !== undefined)
+      });
       const text = resolvedOutputMode === "model" ? compactMcpModelText(result) : result.text;
       const content = [{ type: "text", text }];
       if (resolvedOutputMode !== "structured")
@@ -12969,143 +13130,20 @@ async function startSignalGrepMcpServer(options = {}) {
   };
 }
 
-// src/config-reader.ts
-import { readFile as readFile3 } from "node:fs/promises";
-var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
-  enabled: false,
-  provider: "jev",
-  endpoint: "https://api.typesafe.ai/v1/systemone",
-  apiKeyEnv: "TYPESAFE_API_KEY",
-  model: "jev-latest",
-  timeoutMs: 120000,
-  maxCandidates: 20,
-  maxRetries: 2
-};
-var DEFAULT_SIGNAL_GREP_CONFIG = {
-  locale: "en",
-  enforceSearch: "hard",
-  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
-};
-function hasErrorCode(error, codes) {
-  return error instanceof Error && "code" in error && codes.includes(String(error.code));
+// src/mcp-semantic-judge.ts
+function configuredPath(environment) {
+  const value = environment[SIGNAL_GREP_CONFIG_ENV]?.trim();
+  return value || undefined;
 }
-function isMissingFile(error) {
-  return hasErrorCode(error, ["ENOENT"]);
+async function createMcpSemanticJudgeIntegration(environment = process.env) {
+  const path = configuredPath(environment);
+  if (!path)
+    return createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
+  const config = await readSignalGrepConfigFile(path, { missing: "error" });
+  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG, environment);
 }
-function isRawSignalGrepConfig(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function isRawSemanticJudgeConfig(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function boundedInteger2(value, fallback, minimum, maximum, field) {
-  const candidate = value ?? fallback;
-  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
-    throw new Error(`Invalid baoer_signal_grep ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`);
-  }
-  return candidate;
-}
-function parseSemanticJudge(value, path) {
-  if (value === undefined)
-    return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
-  if (!isRawSemanticJudgeConfig(value)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge must be an object`);
-  }
-  const unknown = Object.keys(value).filter((key) => ![
-    "enabled",
-    "provider",
-    "endpoint",
-    "apiKeyEnv",
-    "model",
-    "timeoutMs",
-    "maxCandidates",
-    "maxRetries"
-  ].includes(key));
-  if (unknown.length > 0) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`);
-  }
-  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
-  if (typeof enabled !== "boolean") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.enabled must be a boolean`);
-  }
-  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
-  if (provider !== "jev") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.provider must be "jev"`);
-  }
-  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
-  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
-  }
-  let parsedEndpoint;
-  try {
-    parsedEndpoint = new URL(endpoint);
-  } catch (error) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`, { cause: error });
-  }
-  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`);
-  }
-  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
-  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
-  }
-  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
-  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.model must be bounded single-line text`);
-  }
-  return {
-    enabled,
-    provider,
-    endpoint,
-    apiKeyEnv,
-    model,
-    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
-    maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
-    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
-  };
-}
-function parseConfig(value, path) {
-  if (!isRawSignalGrepConfig(value)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
-  }
-  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "semanticJudge"].includes(key));
-  if (unknown.length > 0) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`);
-  }
-  const { locale, enforceSearch } = value;
-  if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
-  }
-  const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
-  return {
-    locale: locale ?? DEFAULT_SIGNAL_GREP_CONFIG.locale,
-    enforceSearch: enforcement,
-    semanticJudge: parseSemanticJudge(value.semanticJudge, path)
-  };
-}
-function normalizeSearchEnforcement(value, source) {
-  if (value === undefined || value === "hard")
-    return "hard";
-  if (value === "prefer")
-    return "prefer";
-  if (value === "off")
-    return "off";
-  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
-}
-async function readSignalGrepConfigFile(path) {
-  try {
-    const content = await readFile3(path, "utf8");
-    return parseConfig(JSON.parse(content), path);
-  } catch (error) {
-    if (isMissingFile(error))
-      return { ...DEFAULT_SIGNAL_GREP_CONFIG };
-    if (error instanceof SyntaxError) {
-      throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
-        cause: error
-      });
-    }
-    throw error;
-  }
+function mcpSemanticJudgeConfigSource(environment = process.env) {
+  return configuredPath(environment) ? "explicit-config" : "not-configured";
 }
 
 // src/mcp-cli.ts
@@ -13217,11 +13255,12 @@ function allowedOrigins() {
   return (process.env.BAOER_SIGNAL_GREP_MCP_ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter((origin) => origin.length > 0);
 }
 async function configuredSemanticJudge() {
-  const configPath = process.env.BAOER_SIGNAL_GREP_CONFIG;
-  if (!configPath)
-    return;
-  const config = await readSignalGrepConfigFile(configPath);
-  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
+  return createMcpSemanticJudgeIntegration();
+}
+function logSemanticJudgeStatus(integration) {
+  const status = integration.config.enabled ? "enabled" : "disabled";
+  process.stderr.write(`baoer_signal_grep MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}
+`);
 }
 async function runHttpServer(outputMode, semanticJudge) {
   const running = await startSignalGrepMcpServer({
@@ -13296,6 +13335,7 @@ async function main() {
   }
   const outputMode = parseSignalGrepMcpOutputMode(process.env.BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE);
   const semanticJudge = await configuredSemanticJudge();
+  logSemanticJudgeStatus(semanticJudge);
   if (transport === "stdio") {
     await runStdioServer(outputMode, semanticJudge);
     return;

@@ -84,6 +84,7 @@ export interface AnalysisDetails {
     | "evidence-items";
   totalItems: number;
   returnedItems: number;
+  modelOutput?: boolean;
   semanticJudge?: SemanticJudgeDetails;
   statistics?: ResultStatistics;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SignalGrepInput })[];

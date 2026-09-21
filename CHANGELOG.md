@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## [1.6.7] - 2026-09-21
+
+- Make the optional Jev semantic-judgment configuration resolve consistently across Pi, OMP and standalone MCP, with explicit-path failures and startup diagnostics instead of silent disablement.
+- Keep Jev opt-in: local literal and Concept search remain the default, and an enabled provider is contacted only for retained hybrid semantic candidates.
+- Preserve semantic-judgment status, provider identity, candidate counts and partial failures in hybrid evidence so callers can distinguish a real completed judgment from an unavailable or skipped provider.
+- Keep MCP model-mode source visibility, pagination, inspection identity and structured evidence aligned across the bundled host integrations.
+- Refresh the published platform artifacts and documentation so the four supported host paths use the same release metadata and configuration contract.
+
 ## [1.6.6] - 2026-09-21
 
 - Add an opt-in semantic judge boundary for hybrid searches. Local search and Concept retrieval remain the default; a configured provider is never contacted unless `semanticJudge.enabled` is explicitly true.

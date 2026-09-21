@@ -90,6 +90,8 @@ export interface SignalGrepServiceOptions {
 
 export interface SignalGrepSearchOptions {
   contextBudget?: ContextBudget;
+  modelOutput?: boolean;
+  modelSource?: boolean;
   onProgress?: (progress: OperationProgress) => void;
 }
 
@@ -507,7 +509,7 @@ export class SignalGrepService {
     if (input.maxFilesToParse !== undefined) {
       throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");
     }
-    if (input.cursor) return this.#continue(input, cwd, signal);
+    if (input.cursor) return this.#continue(input, cwd, signal, options);
     if (input.paths !== undefined) {
       throw new SignalGrepError("paths can only select retained files from a cursor");
     }
@@ -544,10 +546,10 @@ export class SignalGrepService {
       } else if (mode === "summary") {
         result = await this.#summary(snapshot, mode, cwd, signal);
       } else if (mode === "matches") {
-        result = await this.#page(snapshot, 0, mode, signal);
+        result = await this.#page(snapshot, 0, mode, signal, undefined, options);
       } else {
         if (input.limit !== undefined) {
-          result = await this.#page(snapshot, 0, mode, signal);
+          result = await this.#page(snapshot, 0, mode, signal, undefined, options);
         } else if (
           contextBudget !== undefined &&
           contextBudget.tier !== "full" &&
@@ -616,6 +618,7 @@ export class SignalGrepService {
     input: SignalGrepInput,
     cwd: string,
     signal?: AbortSignal,
+    options: SignalGrepSearchOptions = {},
   ): Promise<SignalGrepResult> {
     const cursor = input.cursor;
     if (!cursor) throw new CursorError("A cursor is required to continue a search");
@@ -646,7 +649,7 @@ export class SignalGrepService {
       );
     }
     const pageOffset = kind === "summary" ? 0 : offset;
-    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection);
+    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection, options);
     return this.#finalize(snapshot, result, kind === "summary" || selection !== undefined);
   }
 
@@ -752,6 +755,7 @@ export class SignalGrepService {
     mode: SearchMode,
     signal?: AbortSignal,
     selection?: PathSelection,
+    options: SignalGrepSearchOptions = {},
   ): Promise<SignalGrepResult> {
     if (offset === snapshot.matches.length) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
@@ -765,7 +769,17 @@ export class SignalGrepService {
             selection.absolutePaths.has(match.absolutePath),
         }
       : {};
-    const page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    let page: Awaited<ReturnType<typeof formatMatchMetadataPage>>;
+    if (!options.modelSource) {
+      page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    } else {
+      try {
+        page = await formatMatchPage(snapshot, offset, signal, pageOptions);
+      } catch (error) {
+        if (!(error instanceof MatchPageSoftLimitError)) throw error;
+        page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+      }
+    }
     if (page.returnedMatches === 0 && selection) {
       throw new CursorError("No retained matches exist for the selected paths.");
     }

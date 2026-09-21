@@ -27,8 +27,16 @@ import {
 } from "./request-contract.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
-import { SignalGrepService, type SignalGrepInput } from "./service.js";
-import type { SemanticJudgeIntegration } from "./semantic-judge.js";
+import {
+  SignalGrepService,
+  type SignalGrepInput,
+  type SignalGrepSearchOptions,
+} from "./service.js";
+import {
+  createDisabledSemanticJudgeIntegration,
+  type SemanticJudgeIntegration,
+} from "./semantic-judge.js";
+import { DEFAULT_SEMANTIC_JUDGE_CONFIG } from "./config-reader.js";
 import { signalGrepMcpInstructions } from "./prompt-guidelines.js";
 import {
   SIGNAL_GREP_DESCRIPTION,
@@ -78,17 +86,24 @@ function signalGrepTool(outputMode: SignalGrepMcpOutputMode): Tool {
 }
 
 export interface SignalGrepMcpService {
-  search(input: SignalGrepInput, cwd: string, signal?: AbortSignal): Promise<SignalGrepResult>;
+  search(
+    input: SignalGrepInput,
+    cwd: string,
+    signal?: AbortSignal,
+    options?: SignalGrepSearchOptions,
+  ): Promise<SignalGrepResult>;
   shutdown(): Promise<void>;
 }
 
 export function createDefaultSignalGrepMcpService(
   semanticJudge?: SemanticJudgeIntegration,
 ): SignalGrepMcpService {
+  const resolvedSemanticJudge =
+    semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SignalGrepService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
-    ...(semanticJudge ? { semanticJudge } : {}),
+    semanticJudge: resolvedSemanticJudge,
   });
 }
 
@@ -169,7 +184,12 @@ export function createSignalGrepMcpServer(
     }
     try {
       const input = parseSignalGrepInput(request.params.arguments ?? {});
-      const result = await service.search(input, cwd, extra.signal);
+      const result = await service.search(input, cwd, extra.signal, {
+        modelOutput: resolvedOutputMode === "model",
+        modelSource:
+          resolvedOutputMode === "model" &&
+          (input.cursor !== undefined || input.limit !== undefined),
+      });
       const text = resolvedOutputMode === "model" ? compactMcpModelText(result) : result.text;
       const content = [{ type: "text" as const, text }];
       if (resolvedOutputMode !== "structured") return { content };
