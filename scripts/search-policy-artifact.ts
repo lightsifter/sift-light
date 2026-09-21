@@ -99,7 +99,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     args: [
       "--yes",
       "--package",
-      `${packageJson.name}@${packageJson.version}`,
+      `baoer-signal-grep-runtime@npm:${packageJson.name}@${packageJson.version}`,
       "baoer_signal_grep_mcp",
       "--stdio",
     ],
