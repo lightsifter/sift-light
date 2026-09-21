@@ -22,8 +22,8 @@ function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails):
       ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}`
       : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
-    analysis.kind === "outline"
-      ? "[Outline names withheld; item locations and structure status are available.]"
+    analysis.kind === "outline" && analysis.modelOutput
+      ? "[Outline signatures are deferred; use version-checked inspection for source excerpts.]"
       : undefined,
     ...analysis.reasons.map((reason) => `[${reason}]`),
     details.redactionApplied ? "[Display redaction applied.]" : undefined,
@@ -38,7 +38,8 @@ function compactRows(analysis: AnalysisDetails): string[] {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    rows.push(`#${String(item.index)} L${String(item.line)} metadata`);
+    const label = analysis.kind === "outline" && analysis.modelOutput ? item.label : "metadata";
+    rows.push(`#${String(item.index)} L${String(item.line)} ${label}`);
   }
   return rows;
 }

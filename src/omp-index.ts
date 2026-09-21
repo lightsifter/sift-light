@@ -4,7 +4,8 @@ import {
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
   normalizeSearchEnforcement,
   readSignalGrepConfigFile,
-  SIGNAL_GREP_CONFIG_FILE,
+  resolveSignalGrepConfigPath,
+  SIGNAL_GREP_CONFIG_ENV,
   type SignalGrepConfig,
 } from "./config-reader.js";
 import { resolveContextBudget } from "./context-budget.js";
@@ -175,7 +176,10 @@ export async function registerOmpSignalGrepExtension(
 ): Promise<void> {
   const policy = new SearchPolicy(searchPolicyAssets);
   const resolvedConfig =
-    config ?? (await readSignalGrepConfigFile(join(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE)));
+    config ??
+    (await readSignalGrepConfigFile(resolveSignalGrepConfigPath(ompAgentDir()), {
+      missing: process.env[SIGNAL_GREP_CONFIG_ENV]?.trim() ? "error" : "defaults",
+    }));
   const semanticJudge = createSemanticJudgeIntegration(
     resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
   );

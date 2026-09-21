@@ -96,6 +96,7 @@ export function isEvidenceRequest(input: SignalGrepInput): boolean {
 }
 
 export interface EvidenceSearchOptions {
+  modelOutput?: boolean;
   onProgress?: (progress: OperationProgress) => void;
 }
 
@@ -399,7 +400,7 @@ export class EvidenceService {
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis));
+      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
     }
     if (input.mode === "hybrid") {
       const query = validateConceptQuery(input.query);
@@ -466,13 +467,19 @@ export class EvidenceService {
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items),
       }));
-      return this.#analyses.page(cursor);
+      return this.#analyses.page(cursor, options.modelOutput);
     }
     if (input.mode === "structure") {
-      return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
+      return this.#analyses.page(
+        this.#analyses.create(await structuralSearch(input, access)),
+        options.modelOutput,
+      );
     }
     if (input.mode === "files") {
-      return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
+      return this.#analyses.page(
+        this.#analyses.create(await discoverFiles(input, cwd, signal)),
+        options.modelOutput,
+      );
     }
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
@@ -481,10 +488,10 @@ export class EvidenceService {
           "Analysis cursor cannot continue in the requested mode",
           "E_CURSOR_WRONG_KIND",
         );
-      return this.#analyses.page(input.cursor);
+      return this.#analyses.page(input.cursor, options.modelOutput);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
-      return this.#navigate(input, access);
+      return this.#navigate(input, access, options);
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (
@@ -602,6 +609,7 @@ export class EvidenceService {
         this.#analyses.create(result, (retainedItems) => ({
           termCounts: retainedTermCounts(anyOf, retainedItems),
         })),
+        options.modelOutput,
       );
     }
     const terms = validateTerms(input);
@@ -735,7 +743,7 @@ export class EvidenceService {
         ),
       };
     }
-    return this.#analyses.page(this.#analyses.create(result));
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
   }
 
   #inspectionTargets(input: SignalGrepInput, cwd: string): SourceInspectionTarget[] {
@@ -785,7 +793,11 @@ export class EvidenceService {
     };
   }
 
-  async #navigate(input: SignalGrepInput, access: SourceAccess): Promise<SignalGrepResult> {
+  async #navigate(
+    input: SignalGrepInput,
+    access: SourceAccess,
+    options: EvidenceSearchOptions = {},
+  ): Promise<SignalGrepResult> {
     const navigationStarted = performance.now();
     let path = input.path;
     let reference: SourceReference | undefined;
@@ -910,6 +922,7 @@ export class EvidenceService {
           },
           redact: input.redact ?? false,
         }),
+        options.modelOutput,
       );
     }
     if (document.reference.origin.kind !== "worktree")
@@ -923,6 +936,7 @@ export class EvidenceService {
             "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree",
           ],
         }),
+        options.modelOutput,
       );
     const root = await navigationRoot(access.cwd, document.path, access.signal);
     const filters = navigationFilters(input);
@@ -950,6 +964,7 @@ export class EvidenceService {
           scope: await navigationScope(access.cwd, root, document.path, filters),
           redact: input.redact ?? false,
         }),
+        options.modelOutput,
       );
     const files = await listWorkspaceFiles(access.cwd, access.signal, {
       path: root,
@@ -1015,6 +1030,7 @@ export class EvidenceService {
         scope: await navigationScope(access.cwd, root, document.path, filters),
         redact: input.redact ?? false,
       }),
+      options.modelOutput,
     );
   }
 }

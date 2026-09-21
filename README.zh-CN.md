@@ -140,7 +140,13 @@ codex mcp add baoer_signal_grep -- npx -y --package baoer_signal_grep@latest bao
 
 `@latest` 会在 MCP 启动时跟随最新发布版本，更新后重启宿主即可加载。服务器默认搜索当前项目，可用 `BAOER_SIGNAL_GREP_MCP_CWD` 指定其他根目录。仅连接 MCP 会添加工具，不会禁用其他搜索工具。
 
-独立 MCP 服务只有在 `BAOER_SIGNAL_GREP_CONFIG` 指向有效配置文件，且其中将 `semanticJudge.enabled` 明确设为 `true` 时，才会启用语义判断。这样 MCP 与其他宿主使用同一套有界、显式配置；仅因为环境中存在凭据不会自动发起网络请求。
+Pi 和 OMP 默认读取各自宿主的配置文件。如果希望所有宿主共用一份明确配置，可以在实际宿主进程环境中设置 `BAOER_SIGNAL_GREP_CONFIG`；它会同时覆盖 Pi、OMP 和 MCP 的宿主默认路径。Claude Code、Codex 和 Kimi 都是启动同一个独立 MCP 服务，因此要把这个变量放进各自 MCP 条目的 `env` 中，不能只依赖 Shell 启动文件：
+
+```text
+BAOER_SIGNAL_GREP_CONFIG=/absolute/path/to/baoer_signal_grep.json
+```
+
+`TYPESAFE_API_KEY` 应保存在 MCP 进程环境或宿主的密钥管理中；不要把凭据值写进配置文件或提交到版本库的宿主清单。没有这个路径时，独立 MCP 会明确保持语义判断 disabled；路径被显式设置但文件不存在，或配置已启用但缺少 key 时，会在启动阶段失败，不会静默声称 Jev 已运行。启动诊断写入 stderr，hybrid 结果会暴露 `semanticJudge.status`；只有看到 `complete` 且 `judgedCandidates > 0`，才是该次运行真的调用了 Jev 的证据。
 
 MCP 默认同时返回可读文本和结构化证据。如果宿主会把两种形式一起序列化进模型上下文，请在该 MCP 服务的环境中设置 `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model`，然后重启。模型模式不返回 `structuredContent`，也不声明结构化输出 schema；它会提供精简的工作流说明，并在标准页和同一个已保留分析快照的紧凑视图中选择较小者。紧凑视图共享重复路径和 inspect 请求，hybrid 不会拼接两份独立的 literal 与 Concept 正文，并把 outline 签名延后到版本校验过的源码检查。计数、覆盖范围、部分状态、原因和续读请求仍然可见。`text` 模式只省略结构化输出，逐字保留标准文本和完整兼容说明；程序消费者或只展示结构化结果的客户端应继续使用默认的 `structured` 模式。其他取值会在启动时明确失败。捆绑的 Claude Code、Codex 和 Kimi 原生插件会选择 `model`；直接 MCP 连接仍保留兼容默认值，除非显式配置。
 

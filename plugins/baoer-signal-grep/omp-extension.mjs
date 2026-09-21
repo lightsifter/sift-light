@@ -50,11 +50,13 @@ var init_lib = __esm(() => {
 
 // src/omp-index.ts
 import { homedir as homedir3 } from "os";
-import { join as join5 } from "path";
+import { join as join6 } from "path";
 
 // src/config-reader.ts
 import { readFile } from "fs/promises";
+import { join } from "path";
 var SIGNAL_GREP_CONFIG_FILE = "baoer_signal_grep.json";
+var SIGNAL_GREP_CONFIG_ENV = "BAOER_SIGNAL_GREP_CONFIG";
 var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
   enabled: false,
   provider: "jev",
@@ -70,6 +72,10 @@ var DEFAULT_SIGNAL_GREP_CONFIG = {
   enforceSearch: "hard",
   semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
 };
+function resolveSignalGrepConfigPath(agentDirectory, environment = process.env) {
+  const configured = environment[SIGNAL_GREP_CONFIG_ENV]?.trim();
+  return configured || join(agentDirectory, SIGNAL_GREP_CONFIG_FILE);
+}
 function hasErrorCode(error, codes) {
   return error instanceof Error && "code" in error && codes.includes(String(error.code));
 }
@@ -176,13 +182,17 @@ function normalizeSearchEnforcement(value, source) {
     return "off";
   throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
 }
-async function readSignalGrepConfigFile(path) {
+async function readSignalGrepConfigFile(path, options = {}) {
   try {
     const content = await readFile(path, "utf8");
     return parseConfig(JSON.parse(content), path);
   } catch (error) {
-    if (isMissingFile(error))
+    if (isMissingFile(error)) {
+      if (options.missing === "error") {
+        throw new Error(`baoer_signal_grep config was not found at ${path}; create it or unset ${SIGNAL_GREP_CONFIG_ENV}`, { cause: error });
+      }
       return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+    }
     if (error instanceof SyntaxError) {
       throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
         cause: error
@@ -493,7 +503,7 @@ async function consumeCappedLines(stream, onLine, options = {}) {
 // src/path-policy.ts
 import { realpath } from "fs/promises";
 import { homedir } from "os";
-import { isAbsolute, join, relative, resolve, sep } from "path";
+import { isAbsolute, join as join2, relative, resolve, sep } from "path";
 var POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"];
 var PORTABLE_CREDENTIAL_DIRECTORY_NAMES = [
   ".ssh",
@@ -552,25 +562,25 @@ function isPathInsideCwd(path, cwd) {
 }
 function defaultSensitiveRoots() {
   const home = homedir();
-  const roots = [...HOME_CREDENTIAL_DIRECTORIES, ...HOME_CREDENTIAL_FILES].map((parts2) => join(home, ...parts2));
+  const roots = [...HOME_CREDENTIAL_DIRECTORIES, ...HOME_CREDENTIAL_FILES].map((parts2) => join2(home, ...parts2));
   if (process.platform !== "win32")
     roots.push(...POSIX_SPECIAL_ROOTS);
   if (process.platform === "darwin") {
-    roots.push(...DARWIN_CREDENTIAL_DIRECTORIES.map((parts2) => join(home, ...parts2)));
+    roots.push(...DARWIN_CREDENTIAL_DIRECTORIES.map((parts2) => join2(home, ...parts2)));
   } else if (process.platform === "linux") {
-    roots.push(...LINUX_CREDENTIAL_DIRECTORIES.map((parts2) => join(home, ...parts2)));
+    roots.push(...LINUX_CREDENTIAL_DIRECTORIES.map((parts2) => join2(home, ...parts2)));
   } else if (process.platform === "win32") {
     const { APPDATA, LOCALAPPDATA, ProgramData, SystemRoot } = process.env;
     if (APPDATA) {
-      roots.push(join(APPDATA, "Microsoft", "Credentials"), join(APPDATA, "Microsoft", "Protect"), join(APPDATA, "gnupg"));
+      roots.push(join2(APPDATA, "Microsoft", "Credentials"), join2(APPDATA, "Microsoft", "Protect"), join2(APPDATA, "gnupg"));
     }
     if (LOCALAPPDATA) {
-      roots.push(join(LOCALAPPDATA, "Google", "Chrome", "User Data"), join(LOCALAPPDATA, "Chromium", "User Data"), join(LOCALAPPDATA, "Microsoft", "Edge", "User Data"), join(LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"));
+      roots.push(join2(LOCALAPPDATA, "Google", "Chrome", "User Data"), join2(LOCALAPPDATA, "Chromium", "User Data"), join2(LOCALAPPDATA, "Microsoft", "Edge", "User Data"), join2(LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"));
     }
     if (ProgramData)
-      roots.push(join(ProgramData, "Microsoft", "Crypto", "RSA", "MachineKeys"));
+      roots.push(join2(ProgramData, "Microsoft", "Crypto", "RSA", "MachineKeys"));
     if (SystemRoot)
-      roots.push(join(SystemRoot, "System32", "config"));
+      roots.push(join2(SystemRoot, "System32", "config"));
   }
   return [...new Set(roots.map((root) => resolve(root)))];
 }
@@ -1734,7 +1744,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.6",
+  version: "1.6.7",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -2092,7 +2102,7 @@ class OwnedTaskQueue {
 
 // src/concept-search.ts
 import { dirname as dirname3 } from "path";
-import { join as join4 } from "path";
+import { join as join5 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { StringDecoder } from "string_decoder";
 import { mkdir as mkdir2 } from "fs/promises";
@@ -2101,7 +2111,7 @@ import { randomUUID } from "crypto";
 
 // src/concept-model.ts
 import { homedir as homedir2 } from "os";
-import { join as join2, resolve as resolve6 } from "path";
+import { join as join3, resolve as resolve6 } from "path";
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
@@ -2115,7 +2125,7 @@ var CONCEPT_TIMEOUT_ENV = "BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS";
 var MAX_CONCEPT_WORKER_INPUT_BYTES = 64 * 1024 * 1024;
 var MAX_CONCEPT_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024;
 function conceptCacheDirectory() {
-  return resolve6(process.env.SIGNAL_GREP_MODEL_DIR ?? join2(homedir2(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+  return resolve6(process.env.SIGNAL_GREP_MODEL_DIR ?? join3(homedir2(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
 }
 function resolveConceptTimeoutMs(environment = process.env) {
   const raw = environment[CONCEPT_TIMEOUT_ENV];
@@ -2253,7 +2263,7 @@ var MAX_HYBRID_CONCEPT_LIMIT = 20;
 import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "fs/promises";
 import { constants as constants2 } from "fs";
 import { tmpdir } from "os";
-import { dirname, join as join3, parse, relative as relative4, resolve as resolve8 } from "path";
+import { dirname, join as join4, parse, relative as relative4, resolve as resolve8 } from "path";
 
 // src/workspace-files.ts
 import { relative as relative3, resolve as resolve7, sep as sep2 } from "path";
@@ -2388,7 +2398,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
   const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
   if (bounded.length === 0)
     return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
-  const root = await mkdtemp(join3(tmpdir(), "baoer_signal_grep-paths-"));
+  const root = await mkdtemp(join4(tmpdir(), "baoer_signal_grep-paths-"));
   const absoluteCwd = resolve8(cwd);
   const volumeRoot = parse(absoluteCwd).root;
   const ignoreFiles = [];
@@ -2400,7 +2410,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       for (const name2 of [".ignore", ".rgignore"]) {
         if (signal?.aborted)
           throw abortError();
-        const path = join3(directory, name2);
+        const path = join4(directory, name2);
         let discovered = false;
         try {
           const before = await lstat(path);
@@ -2446,8 +2456,8 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
     }
     const visible = new Set;
     for (const [index, group] of partitionPaths(bounded).entries()) {
-      const tree = join3(root, String(index));
-      const target = join3(tree, relative4(volumeRoot, absoluteCwd));
+      const tree = join4(root, String(index));
+      const target = join4(tree, relative4(volumeRoot, absoluteCwd));
       await mkdir(target, { recursive: true });
       for (const path of group) {
         const safe = workspaceRelativePath(absoluteCwd, path);
@@ -2456,7 +2466,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
         await writeFile(placeholder, "");
       }
       for (const ignore of ignoreFiles) {
-        const destination = join3(tree, ignore.local);
+        const destination = join4(tree, ignore.local);
         await mkdir(dirname(destination), { recursive: true });
         await writeFile(destination, ignore.bytes);
       }
@@ -4597,7 +4607,7 @@ async function similarities(query, passages, parent, onProgress) {
   const worker = fileURLToPath2(new URL("./concept-worker.mjs", import.meta.url));
   const config = fileURLToPath2(new URL("./syntax-worker.toml", import.meta.url));
   const env = scriptRuntimeEnvironment();
-  const stagingRoot = join4(conceptCacheDirectory(), ".staging", randomUUID());
+  const stagingRoot = join5(conceptCacheDirectory(), ".staging", randomUUID());
   await mkdir2(stagingRoot, { recursive: true });
   let bytes = 0;
   let lineBuffer = "";
@@ -5208,7 +5218,7 @@ function publicStructureDetails(item) {
     ...typeof details.signatureTruncated === "boolean" ? { signatureTruncated: details.signatureTruncated } : {}
   };
 }
-function publicAnalysisItem(result, item, index, storedId) {
+function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   const inspect = item.source && item.range ? {
     mode: "inspect",
     cursor: `${storedId}.analysis.0`,
@@ -5219,7 +5229,7 @@ function publicAnalysisItem(result, item, index, storedId) {
   return {
     path: item.path,
     line: item.line,
-    label: publicAnalysisLabel(result),
+    label: result.kind === "outline" && modelOutput ? item.label : publicAnalysisLabel(result),
     index: index + 1,
     ...inspect ? { inspect } : {},
     ...publicDetails ? { details: publicDetails } : {}
@@ -5346,7 +5356,7 @@ class AnalysisStore {
       throw new CursorError("Analysis item is outside the retained result");
     return structuredClone(item);
   }
-  page(cursor) {
+  page(cursor, modelOutput = false) {
     const { stored, offset, kind } = this.resolve(cursor);
     const { result } = stored;
     if (kind === "analysis-terms")
@@ -5377,7 +5387,7 @@ ${result.reasons.map((reason) => `[${reason}]`).join(`
       const item = result.items[index];
       if (!item)
         throw new Error("Analysis item unavailable");
-      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const publicItem = publicAnalysisItem(result, item, index, stored.id, modelOutput);
       const inspect = publicItem.inspect;
       const exposeExcerpt = result.kind === "concept" || result.kind === "hybrid" && item.details?.source === "concept";
       const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `
@@ -5459,6 +5469,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           unit: result.unit,
           totalItems: result.items.length,
           returnedItems: items.length,
+          ...modelOutput ? { modelOutput: true } : {},
           statistics,
           items,
           ...sources.length ? { sources } : {},
@@ -10275,7 +10286,7 @@ class EvidenceService {
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis));
+      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
     }
     if (input.mode === "hybrid") {
       const query = validateConceptQuery(input.query);
@@ -10331,22 +10342,22 @@ class EvidenceService {
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
       }));
-      return this.#analyses.page(cursor);
+      return this.#analyses.page(cursor, options.modelOutput);
     }
     if (input.mode === "structure") {
-      return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)));
+      return this.#analyses.page(this.#analyses.create(await structuralSearch(input, access)), options.modelOutput);
     }
     if (input.mode === "files") {
-      return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)));
+      return this.#analyses.page(this.#analyses.create(await discoverFiles(input, cwd, signal)), options.modelOutput);
     }
     if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
       this.#analyses.resolve(input.cursor);
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError("Analysis cursor cannot continue in the requested mode", "E_CURSOR_WRONG_KIND");
-      return this.#analyses.page(input.cursor);
+      return this.#analyses.page(input.cursor, options.modelOutput);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
-      return this.#navigate(input, access);
+      return this.#navigate(input, access, options);
     const anyOf = validateAnyOf(input.anyOf);
     if (anyOf) {
       if (input.pattern !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
@@ -10436,7 +10447,7 @@ class EvidenceService {
       };
       return this.#analyses.page(this.#analyses.create(result, (retainedItems) => ({
         termCounts: retainedTermCounts(anyOf, retainedItems)
-      })));
+      })), options.modelOutput);
     }
     const terms = validateTerms(input);
     if (input.roles !== undefined && (!input.roles.length || input.roles.some((role) => ![
@@ -10539,7 +10550,7 @@ class EvidenceService {
         budgetExhausted: result.reasons.some((reason) => reason.includes("limit") || reason.includes("budget-exhausted"))
       };
     }
-    return this.#analyses.page(this.#analyses.create(result));
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
   }
   #inspectionTargets(input, cwd) {
     if (input.targets !== undefined && input.matchIndices !== undefined)
@@ -10582,7 +10593,7 @@ class EvidenceService {
       ...input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}
     };
   }
-  async#navigate(input, access) {
+  async#navigate(input, access, options = {}) {
     const navigationStarted = performance.now();
     let path = input.path;
     let reference;
@@ -10687,7 +10698,7 @@ class EvidenceService {
           budgetExhausted: false
         },
         redact: input.redact ?? false
-      }));
+      }), options.modelOutput);
     }
     if (document2.reference.origin.kind !== "worktree")
       return this.#analyses.page(this.#analyses.create({
@@ -10698,7 +10709,7 @@ class EvidenceService {
         reasons: [
           "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree"
         ]
-      }));
+      }), options.modelOutput);
     const root = await navigationRoot(access.cwd, document2.path, access.signal);
     const filters = navigationFilters(input);
     if (input.mode === "tests" && isPython)
@@ -10723,7 +10734,7 @@ class EvidenceService {
         coverage: { navigation: "not-applicable" },
         scope: await navigationScope(access.cwd, root, document2.path, filters),
         redact: input.redact ?? false
-      }));
+      }), options.modelOutput);
     const files = await listWorkspaceFiles(access.cwd, access.signal, {
       path: root,
       glob: filters.glob,
@@ -10773,7 +10784,7 @@ class EvidenceService {
       },
       scope: await navigationScope(access.cwd, root, document2.path, filters),
       redact: input.redact ?? false
-    }));
+    }), options.modelOutput);
   }
 }
 
@@ -12180,7 +12191,7 @@ class SignalGrepService {
       throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");
     }
     if (input.cursor)
-      return this.#continue(input, cwd, signal);
+      return this.#continue(input, cwd, signal, options);
     if (input.paths !== undefined) {
       throw new SignalGrepError("paths can only select retained files from a cursor");
     }
@@ -12212,10 +12223,10 @@ class SignalGrepService {
       } else if (mode === "summary") {
         result = await this.#summary(snapshot, mode, cwd, signal);
       } else if (mode === "matches") {
-        result = await this.#page(snapshot, 0, mode, signal);
+        result = await this.#page(snapshot, 0, mode, signal, undefined, options);
       } else {
         if (input.limit !== undefined) {
-          result = await this.#page(snapshot, 0, mode, signal);
+          result = await this.#page(snapshot, 0, mode, signal, undefined, options);
         } else if (contextBudget !== undefined && contextBudget.tier !== "full" && input.limit === undefined) {
           result = await this.#summary(snapshot, mode, cwd, signal, 0, contextBudget);
         } else {
@@ -12265,7 +12276,7 @@ class SignalGrepService {
   get storedMatches() {
     return this.#snapshots.storedMatches;
   }
-  async#continue(input, cwd, signal) {
+  async#continue(input, cwd, signal, options = {}) {
     const cursor = input.cursor;
     if (!cursor)
       throw new CursorError("A cursor is required to continue a search");
@@ -12289,7 +12300,7 @@ class SignalGrepService {
       throw new CursorError("A match cursor must continue with the same path selection.", "E_CURSOR_OPTIONS_CONFLICT");
     }
     const pageOffset = kind === "summary" ? 0 : offset;
-    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection);
+    const result = await this.#page(snapshot, pageOffset, "matches", signal, selection, options);
     return this.#finalize(snapshot, result, kind === "summary" || selection !== undefined);
   }
   #finalize(snapshot, result, retainSnapshot = false) {
@@ -12349,7 +12360,7 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
       }
     };
   }
-  async#page(snapshot, offset, mode, signal, selection) {
+  async#page(snapshot, offset, mode, signal, selection, options = {}) {
     if (offset === snapshot.matches.length) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
     }
@@ -12357,7 +12368,18 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
       metadataReserveBytes: 1536 + Buffer.byteLength(JSON.stringify({ paths: selection.labels })),
       include: (match) => selection.absolutePaths.has(match.absolutePath)
     } : {};
-    const page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    let page;
+    if (!options.modelSource) {
+      page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+    } else {
+      try {
+        page = await formatMatchPage(snapshot, offset, signal, pageOptions);
+      } catch (error) {
+        if (!(error instanceof MatchPageSoftLimitError))
+          throw error;
+        page = await formatMatchMetadataPage(snapshot, offset, signal, pageOptions);
+      }
+    }
     if (page.returnedMatches === 0 && selection) {
       throw new CursorError("No retained matches exist for the selected paths.");
     }
@@ -20065,7 +20087,7 @@ function expandTilde(path) {
   if (path === "~")
     return homedir3();
   if (path.startsWith("~/"))
-    return join5(homedir3(), path.slice(2));
+    return join6(homedir3(), path.slice(2));
   return path;
 }
 function ompProfile() {
@@ -20085,7 +20107,7 @@ function ompAgentDir() {
     return expandTilde(configured);
   const configDir = process.env.PI_CONFIG_DIR || ".omp";
   const profile = ompProfile();
-  return profile ? join5(homedir3(), configDir, "profiles", profile, "agent") : join5(homedir3(), configDir, "agent");
+  return profile ? join6(homedir3(), configDir, "profiles", profile, "agent") : join6(homedir3(), configDir, "agent");
 }
 function selectSearchTools(pi, replaceAlternatives) {
   const current = pi.getActiveTools();
@@ -20102,7 +20124,9 @@ function resultOptions(options, result) {
 }
 async function registerOmpSignalGrepExtension(pi, searchPolicyAssets = new URL("../plugins/baoer-signal-grep/hooks/", import.meta.url), config) {
   const policy = new SearchPolicy(searchPolicyAssets);
-  const resolvedConfig = config ?? await readSignalGrepConfigFile(join5(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE));
+  const resolvedConfig = config ?? await readSignalGrepConfigFile(resolveSignalGrepConfigPath(ompAgentDir()), {
+    missing: process.env[SIGNAL_GREP_CONFIG_ENV]?.trim() ? "error" : "defaults"
+  });
   const semanticJudge = createSemanticJudgeIntegration(resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
   const runtime = new SignalGrepRuntime(new SignalGrepService({
     runRipgrep: createRipgrepRunner(),

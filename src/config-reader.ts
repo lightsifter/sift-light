@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export const SIGNAL_GREP_CONFIG_FILE = "baoer_signal_grep.json";
+export const SIGNAL_GREP_CONFIG_ENV = "BAOER_SIGNAL_GREP_CONFIG";
 
 export type SignalGrepLocale = "en" | "zh-CN";
 export type SearchEnforcementMode = "hard" | "prefer" | "off";
@@ -47,6 +49,18 @@ interface RawSignalGrepConfig {
   locale?: unknown;
   enforceSearch?: unknown;
   semanticJudge?: unknown;
+}
+
+export interface ReadSignalGrepConfigOptions {
+  missing?: "defaults" | "error";
+}
+
+export function resolveSignalGrepConfigPath(
+  agentDirectory: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  const configured = environment[SIGNAL_GREP_CONFIG_ENV]?.trim();
+  return configured || join(agentDirectory, SIGNAL_GREP_CONFIG_FILE);
 }
 
 interface RawSemanticJudgeConfig {
@@ -241,12 +255,23 @@ export function readNativeSearchEnforcement(
 }
 
 /** Read and validate one host-selected config path. */
-export async function readSignalGrepConfigFile(path: string): Promise<SignalGrepConfig> {
+export async function readSignalGrepConfigFile(
+  path: string,
+  options: ReadSignalGrepConfigOptions = {},
+): Promise<SignalGrepConfig> {
   try {
     const content = await readFile(path, "utf8");
     return parseConfig(JSON.parse(content), path);
   } catch (error) {
-    if (isMissingFile(error)) return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+    if (isMissingFile(error)) {
+      if (options.missing === "error") {
+        throw new Error(
+          `baoer_signal_grep config was not found at ${path}; create it or unset ${SIGNAL_GREP_CONFIG_ENV}`,
+          { cause: error },
+        );
+      }
+      return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+    }
     if (error instanceof SyntaxError) {
       throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
         cause: error,

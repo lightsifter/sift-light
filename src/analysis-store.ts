@@ -135,6 +135,7 @@ function publicAnalysisItem(
   item: AnalysisItem,
   index: number,
   storedId: string,
+  modelOutput: boolean,
 ): NonNullable<SignalGrepResult["details"]["analysis"]>["items"][number] {
   const inspect =
     item.source && item.range
@@ -149,7 +150,7 @@ function publicAnalysisItem(
   return {
     path: item.path,
     line: item.line,
-    label: publicAnalysisLabel(result),
+    label: result.kind === "outline" && modelOutput ? item.label : publicAnalysisLabel(result),
     index: index + 1,
     ...(inspect ? { inspect } : {}),
     ...(publicDetails ? { details: publicDetails } : {}),
@@ -305,7 +306,7 @@ export class AnalysisStore {
     return structuredClone(item);
   }
 
-  page(cursor: string): SignalGrepResult {
+  page(cursor: string, modelOutput = false): SignalGrepResult {
     const { stored, offset, kind } = this.resolve(cursor);
     const { result } = stored;
     if (kind === "analysis-terms") return analysisTermPage(result, stored.id, offset);
@@ -347,7 +348,7 @@ export class AnalysisStore {
     const appendItem = (index: number): boolean => {
       const item = result.items[index];
       if (!item) throw new Error("Analysis item unavailable");
-      const publicItem = publicAnalysisItem(result, item, index, stored.id);
+      const publicItem = publicAnalysisItem(result, item, index, stored.id, modelOutput);
       const inspect = publicItem.inspect;
       const exposeExcerpt =
         result.kind === "concept" ||
@@ -439,6 +440,7 @@ export class AnalysisStore {
           unit: result.unit,
           totalItems: result.items.length,
           returnedItems: items.length,
+          ...(modelOutput ? { modelOutput: true } : {}),
           statistics,
           items,
           ...(sources.length ? { sources } : {}),
