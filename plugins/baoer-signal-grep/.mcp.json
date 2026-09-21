@@ -5,7 +5,7 @@
       "args": [
         "--yes",
         "--package",
-        "baoer_signal_grep@latest",
+        "baoer_signal_grep@1.6.8-1",
         "baoer_signal_grep_mcp",
         "--stdio"
       ],
@@ -16,7 +16,8 @@
       },
       "env_vars": [
         "BAOER_SIGNAL_GREP_CONFIG",
-        "TYPESAFE_API_KEY"
+        "TYPESAFE_API_KEY",
+        "BAOER_SIGNAL_GREP_JEV_API_KEY"
       ]
     }
   }

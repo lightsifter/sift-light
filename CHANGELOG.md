@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [1.6.8-1] - 2026-09-21
+
+- Pin bundled native MCP hosts to the matching release package and forward the supported Jev credential environment variables so new sessions load the intended search server.
+- Keep Jev requests and public hybrid evidence bounded: remote classification receives excerpts without local paths, while model output retains validated aggregate and per-candidate judgments.
+- Treat NUL-bearing binary Concept sources as explicit normal skips, preserve source navigation and custom credential-variable compatibility, and reject unsafe remote HTTP endpoints.
+
 ## [1.6.7] - 2026-09-21
 
 - Make the optional Jev semantic-judgment configuration resolve consistently across Pi, OMP and standalone MCP, with explicit-path failures and startup diagnostics instead of silent disablement.

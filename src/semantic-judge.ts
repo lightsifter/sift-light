@@ -1,26 +1,18 @@
 import type { SemanticJudgeConfig } from "./config-reader.js";
-import type {
-  AnalysisItem,
-  AnalysisResultSet,
-  SemanticJudgeClassification,
-  SemanticJudgeDetails,
-  SemanticJudgeJudgment,
+import {
+  SEMANTIC_JUDGE_CLASSIFICATIONS,
+  SEMANTIC_JUDGE_NON_PROOF_CLAIM,
+  type AnalysisItem,
+  type AnalysisResultSet,
+  type SemanticJudgeClassification,
+  type SemanticJudgeDetails,
+  type SemanticJudgeJudgment,
 } from "./analysis-types.js";
 import { SignalGrepError } from "./errors.js";
 
 const MAX_CANDIDATE_CHARS = 4_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_ERROR_CHARS = 512;
-
-const CLASSIFICATIONS: readonly SemanticJudgeClassification[] = [
-  "implementation-candidate",
-  "caller-candidate",
-  "mention-only",
-  "documentation",
-  "test-only",
-  "irrelevant",
-  "uncertain",
-];
 
 const CLASSIFICATION_PRIORITY: Readonly<Record<SemanticJudgeClassification, number>> = {
   "implementation-candidate": 0,
@@ -34,10 +26,7 @@ const CLASSIFICATION_PRIORITY: Readonly<Record<SemanticJudgeClassification, numb
 
 export interface SemanticJudgeCandidate {
   id: string;
-  path: string;
-  line: number;
   excerpt: string;
-  sourceKind?: string;
 }
 
 export interface SemanticJudgeResult {
@@ -95,7 +84,10 @@ function boundedError(error: unknown): string {
 }
 
 function isClassification(value: unknown): value is SemanticJudgeClassification {
-  return typeof value === "string" && (CLASSIFICATIONS as readonly string[]).includes(value);
+  return (
+    typeof value === "string" &&
+    SEMANTIC_JUDGE_CLASSIFICATIONS.some((classification) => classification === value)
+  );
 }
 
 function probability(value: unknown, field: string): number {
@@ -157,12 +149,9 @@ function requestBody(
   return {
     state: {
       query,
-      candidates: candidates.map(({ id, path, line, excerpt, sourceKind }) => ({
+      candidates: candidates.map(({ id, excerpt }) => ({
         id,
-        path,
-        line,
         excerpt,
-        ...(sourceKind ? { sourceKind } : {}),
       })),
     },
     model,
@@ -292,13 +281,31 @@ function createJevRunner(
         const judgments = candidates.map((candidate, index) =>
           parseJudgment(answers[candidate.id], index),
         );
-        const model =
-          typeof raw.model === "string" && raw.model.length > 0 ? raw.model : config.model;
+        const model = raw.model ?? config.model;
+        if (
+          typeof model !== "string" ||
+          model.length === 0 ||
+          model.length > 128 ||
+          /[\r\n\0]/u.test(model)
+        ) {
+          throw new SemanticJudgeRequestError(
+            "Semantic judge response model must be bounded single-line text",
+            false,
+          );
+        }
         const usage = isRecord(raw.usage) ? raw.usage : undefined;
         const inputTokens =
-          typeof usage?.input_tokens === "number" ? usage.input_tokens : undefined;
+          typeof usage?.input_tokens === "number" &&
+          Number.isSafeInteger(usage.input_tokens) &&
+          usage.input_tokens >= 0
+            ? usage.input_tokens
+            : undefined;
         const outputTokens =
-          typeof usage?.output_tokens === "number" ? usage.output_tokens : undefined;
+          typeof usage?.output_tokens === "number" &&
+          Number.isSafeInteger(usage.output_tokens) &&
+          usage.output_tokens >= 0
+            ? usage.output_tokens
+            : undefined;
         return {
           model,
           judgments,
@@ -358,11 +365,6 @@ function baseDetails(config: SemanticJudgeConfig): SemanticJudgeDetails {
   };
 }
 
-function candidateDetails(item: AnalysisItem): string {
-  const source = typeof item.details?.source === "string" ? item.details.source : undefined;
-  return source ?? (typeof item.details?.kind === "string" ? item.details.kind : "candidate");
-}
-
 export async function applySemanticJudge(
   result: AnalysisResultSet,
   query: string,
@@ -375,10 +377,7 @@ export async function applySemanticJudge(
   }
   const candidates = result.items.slice(0, config.maxCandidates).map((item, index) => ({
     id: `candidate-${String(index + 1)}`,
-    path: item.path,
-    line: item.line,
     excerpt: (item.excerpt ?? "").slice(0, MAX_CANDIDATE_CHARS),
-    sourceKind: candidateDetails(item),
   }));
   const initial = baseDetails(config);
   initial.candidatesConsidered = candidates.length;
@@ -429,8 +428,7 @@ export async function applySemanticJudge(
             probability: judgment.probability,
             ...(judgment.confidence === undefined ? {} : { confidence: judgment.confidence }),
             model: judged.model,
-            claim:
-              "semantic classification only; local static and runtime verification is not asserted",
+            claim: SEMANTIC_JUDGE_NON_PROOF_CLAIM,
           },
         }),
       });

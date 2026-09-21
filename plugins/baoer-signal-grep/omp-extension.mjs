@@ -57,11 +57,15 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 var SIGNAL_GREP_CONFIG_FILE = "baoer_signal_grep.json";
 var SIGNAL_GREP_CONFIG_ENV = "BAOER_SIGNAL_GREP_CONFIG";
+var SEMANTIC_JUDGE_API_KEY_ENVS = [
+  "TYPESAFE_API_KEY",
+  "BAOER_SIGNAL_GREP_JEV_API_KEY"
+];
 var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
   enabled: false,
   provider: "jev",
   endpoint: "https://api.typesafe.ai/v1/systemone",
-  apiKeyEnv: "TYPESAFE_API_KEY",
+  apiKeyEnv: SEMANTIC_JUDGE_API_KEY_ENVS[0],
   model: "jev-latest",
   timeoutMs: 120000,
   maxCandidates: 20,
@@ -132,8 +136,10 @@ function parseSemanticJudge(value, path) {
   } catch (error) {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`, { cause: error });
   }
-  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`);
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const secureEndpoint = parsedEndpoint.protocol === "https:" || parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname);
+  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`);
   }
   const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
   if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
@@ -1744,7 +1750,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.7",
+  version: "1.6.8-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -4420,6 +4426,7 @@ async function createConceptSourceGeneration(access, filters) {
   const documents = [];
   const reasons = [...files.reasons];
   let filesSkippedEmpty = 0;
+  let filesSkippedBinary = 0;
   let filesUnavailable = 0;
   let budgetError;
   for (const path of files.paths) {
@@ -4430,6 +4437,17 @@ async function createConceptSourceGeneration(access, filters) {
     }
     try {
       const document2 = await access.load(path);
+      if (document2.bytes.includes(0)) {
+        inventory.push({
+          path,
+          status: "binary",
+          reference: document2.reference,
+          ...document2.reference.origin.kind === "worktree" ? { contentHash: document2.reference.origin.contentHash } : {},
+          reason: "Binary source contains NUL bytes"
+        });
+        filesSkippedBinary += 1;
+        continue;
+      }
       if (!document2.utf8)
         throw new SourceDocumentError("encoding", "Not lossless UTF-8");
       if (!document2.text.trim()) {
@@ -4483,6 +4501,7 @@ async function createConceptSourceGeneration(access, filters) {
     partial: files.partial || filesUnavailable > 0,
     reasons,
     filesSkippedEmpty,
+    filesSkippedBinary,
     filesUnavailable,
     startedAt,
     inventoryHash
@@ -4497,6 +4516,7 @@ function conceptSourceSummary(generation) {
     filesEnumerated: generation.files.paths.length,
     filesAdmitted: generation.documents.length,
     filesSkippedEmpty: generation.filesSkippedEmpty,
+    filesSkippedBinary: generation.filesSkippedBinary,
     filesUnavailable: generation.filesUnavailable
   };
 }
@@ -4768,6 +4788,7 @@ async function runConceptSearch(input, access, infer, onProgress) {
   onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
   const filesAdmitted = documents.length;
   const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
+  const filesSkippedBinary = sourceGeneration.filesSkippedBinary;
   const filesUnavailable = sourceGeneration.filesUnavailable;
   if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
     result.reasons.push(`Concept enumerated ${String(files.paths.length)} files; narrow path or glob for faster interactive retrieval`);
@@ -4776,6 +4797,7 @@ async function runConceptSearch(input, access, infer, onProgress) {
     filesEnumerated: files.paths.length,
     filesAdmitted,
     filesSkippedEmpty,
+    filesSkippedBinary,
     filesUnavailable,
     passagesQueued: passages.length
   };
@@ -4958,6 +4980,18 @@ import { dirname as dirname4, extname as extname3, resolve as resolve20 } from "
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "crypto";
+
+// src/analysis-types.ts
+var SEMANTIC_JUDGE_CLASSIFICATIONS = [
+  "implementation-candidate",
+  "caller-candidate",
+  "mention-only",
+  "documentation",
+  "test-only",
+  "irrelevant",
+  "uncertain"
+];
+var SEMANTIC_JUDGE_NON_PROOF_CLAIM = "semantic classification only; local static and runtime verification is not asserted";
 
 // src/analysis-term-pages.ts
 var MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
@@ -5218,6 +5252,37 @@ function publicStructureDetails(item) {
     ...typeof details.signatureTruncated === "boolean" ? { signatureTruncated: details.signatureTruncated } : {}
   };
 }
+function publicSemanticJudgeDetails(item) {
+  const value = item.details?.semanticJudge;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return;
+  const classification = Reflect.get(value, "classification");
+  const probability = Reflect.get(value, "probability");
+  const confidence = Reflect.get(value, "confidence");
+  const model = Reflect.get(value, "model");
+  const claim = Reflect.get(value, "claim");
+  if (typeof classification !== "string" || !SEMANTIC_JUDGE_CLASSIFICATIONS.some((candidate) => candidate === classification) || typeof probability !== "number" || !Number.isFinite(probability) || probability < 0 || probability > 1 || confidence !== undefined && (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) || typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model) || claim !== SEMANTIC_JUDGE_NON_PROOF_CLAIM)
+    return;
+  return {
+    classification,
+    probability,
+    ...confidence === undefined ? {} : { confidence },
+    model,
+    claim
+  };
+}
+function publicItemDetails(item) {
+  const structure = publicStructureDetails(item);
+  const semanticJudge = publicSemanticJudgeDetails(item);
+  const source = item.details?.source === "literal" || item.details?.source === "concept" ? item.details.source : undefined;
+  if (!structure && !semanticJudge && !source)
+    return;
+  return {
+    ...structure,
+    ...source ? { source } : {},
+    ...semanticJudge ? { semanticJudge } : {}
+  };
+}
 function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   const inspect = item.source && item.range ? {
     mode: "inspect",
@@ -5225,7 +5290,7 @@ function publicAnalysisItem(result, item, index, storedId, modelOutput) {
     matchIndex: index + 1,
     ...result.redact ? { redact: true } : {}
   } : undefined;
-  const publicDetails = publicStructureDetails(item);
+  const publicDetails = publicItemDetails(item);
   return {
     path: item.path,
     line: item.line,
@@ -5375,7 +5440,7 @@ class AnalysisStore {
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
     const semanticJudge = result.semanticJudge ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.` : "";
-    const hasItemDetails = result.items.some((item) => item.details !== undefined);
+    const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
     const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${scope}${coverage}${stats}`;
     const notice = result.reasons.length ? `
 ${result.reasons.map((reason) => `[${reason}]`).join(`
@@ -5401,16 +5466,24 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
       }
       rows.push(row);
       bytes += rowBytes;
-      if (hybridInspectCursor && item.source) {
-        const sourceKey = JSON.stringify(item.source);
-        let sourceId = sourceIds.get(sourceKey);
-        if (sourceId === undefined) {
-          sourceId = sources.length;
-          sources.push(item.source);
-          sourceIds.set(sourceKey, sourceId);
+      if (hybridInspectCursor) {
+        const { inspect: _inspect, ...sharedPublicItem } = publicItem;
+        const publicHybridItem = {
+          ...sharedPublicItem,
+          ...item.excerpt ? { excerpt: item.excerpt } : {}
+        };
+        if (item.source) {
+          const sourceKey = JSON.stringify(item.source);
+          let sourceId = sourceIds.get(sourceKey);
+          if (sourceId === undefined) {
+            sourceId = sources.length;
+            sources.push(item.source);
+            sourceIds.set(sourceKey, sourceId);
+          }
+          items.push({ ...publicHybridItem, sourceId });
+        } else {
+          items.push(publicHybridItem);
         }
-        const { source: _source, ...sharedItem } = item;
-        items.push({ ...sharedItem, label: publicItem.label, index: index + 1, sourceId });
       } else {
         items.push({
           ...item,
@@ -8911,15 +8984,6 @@ import { resolve as resolve19 } from "path";
 var MAX_CANDIDATE_CHARS = 4000;
 var MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 var MAX_ERROR_CHARS = 512;
-var CLASSIFICATIONS = [
-  "implementation-candidate",
-  "caller-candidate",
-  "mention-only",
-  "documentation",
-  "test-only",
-  "irrelevant",
-  "uncertain"
-];
 var CLASSIFICATION_PRIORITY = {
   "implementation-candidate": 0,
   "caller-candidate": 1,
@@ -8953,7 +9017,7 @@ function boundedError(error) {
   return message.slice(0, MAX_ERROR_CHARS);
 }
 function isClassification(value) {
-  return typeof value === "string" && CLASSIFICATIONS.includes(value);
+  return typeof value === "string" && SEMANTIC_JUDGE_CLASSIFICATIONS.some((classification) => classification === value);
 }
 function probability(value, field) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
@@ -8999,12 +9063,9 @@ function requestBody(query, candidates, model) {
   return {
     state: {
       query,
-      candidates: candidates.map(({ id, path, line, excerpt, sourceKind }) => ({
+      candidates: candidates.map(({ id, excerpt }) => ({
         id,
-        path,
-        line,
-        excerpt,
-        ...sourceKind ? { sourceKind } : {}
+        excerpt
       }))
     },
     model,
@@ -9100,10 +9161,13 @@ function createJevRunner(config, key, fetcher) {
         }
         const answers = raw.answers;
         const judgments = candidates.map((candidate, index) => parseJudgment(answers[candidate.id], index));
-        const model = typeof raw.model === "string" && raw.model.length > 0 ? raw.model : config.model;
+        const model = raw.model ?? config.model;
+        if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
+          throw new SemanticJudgeRequestError("Semantic judge response model must be bounded single-line text", false);
+        }
         const usage = isRecord3(raw.usage) ? raw.usage : undefined;
-        const inputTokens = typeof usage?.input_tokens === "number" ? usage.input_tokens : undefined;
-        const outputTokens = typeof usage?.output_tokens === "number" ? usage.output_tokens : undefined;
+        const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
+        const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
         return {
           model,
           judgments,
@@ -9152,10 +9216,6 @@ function baseDetails(config) {
     classificationCounts: {}
   };
 }
-function candidateDetails(item) {
-  const source = typeof item.details?.source === "string" ? item.details.source : undefined;
-  return source ?? (typeof item.details?.kind === "string" ? item.details.kind : "candidate");
-}
 async function applySemanticJudge(result, query, integration, signal) {
   const config = integration?.config;
   if (!config || !config.enabled || !integration.runner) {
@@ -9163,10 +9223,7 @@ async function applySemanticJudge(result, query, integration, signal) {
   }
   const candidates = result.items.slice(0, config.maxCandidates).map((item, index) => ({
     id: `candidate-${String(index + 1)}`,
-    path: item.path,
-    line: item.line,
-    excerpt: (item.excerpt ?? "").slice(0, MAX_CANDIDATE_CHARS),
-    sourceKind: candidateDetails(item)
+    excerpt: (item.excerpt ?? "").slice(0, MAX_CANDIDATE_CHARS)
   }));
   const initial = baseDetails(config);
   initial.candidatesConsidered = candidates.length;
@@ -9217,7 +9274,7 @@ async function applySemanticJudge(result, query, integration, signal) {
           probability: judgment.probability,
           ...judgment.confidence === undefined ? {} : { confidence: judgment.confidence },
           model: judged.model,
-          claim: "semantic classification only; local static and runtime verification is not asserted"
+          claim: SEMANTIC_JUDGE_NON_PROOF_CLAIM
         }
       })
     });

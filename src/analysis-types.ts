@@ -6,14 +6,20 @@ import type { ConceptSourceSummary } from "./concept-source-generation.js";
 
 export type CoverageStatus = "complete" | "partial" | "skipped" | "not-applicable";
 
-export type SemanticJudgeClassification =
-  | "implementation-candidate"
-  | "caller-candidate"
-  | "mention-only"
-  | "documentation"
-  | "test-only"
-  | "irrelevant"
-  | "uncertain";
+export const SEMANTIC_JUDGE_CLASSIFICATIONS = [
+  "implementation-candidate",
+  "caller-candidate",
+  "mention-only",
+  "documentation",
+  "test-only",
+  "irrelevant",
+  "uncertain",
+] as const;
+
+export type SemanticJudgeClassification = (typeof SEMANTIC_JUDGE_CLASSIFICATIONS)[number];
+
+export const SEMANTIC_JUDGE_NON_PROOF_CLAIM =
+  "semantic classification only; local static and runtime verification is not asserted";
 
 export type SemanticJudgeStatus = "disabled" | "complete" | "partial" | "failed";
 

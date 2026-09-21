@@ -4050,6 +4050,20 @@ class SearchPolicy {
 
 // src/config-reader.ts
 var SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
+var SEMANTIC_JUDGE_API_KEY_ENVS = [
+  "TYPESAFE_API_KEY",
+  "BAOER_SIGNAL_GREP_JEV_API_KEY"
+];
+var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
+  enabled: false,
+  provider: "jev",
+  endpoint: "https://api.typesafe.ai/v1/systemone",
+  apiKeyEnv: SEMANTIC_JUDGE_API_KEY_ENVS[0],
+  model: "jev-latest",
+  timeoutMs: 120000,
+  maxCandidates: 20,
+  maxRetries: 2
+};
 function normalizeSearchEnforcement(value, source) {
   if (value === undefined || value === "hard")
     return "hard";

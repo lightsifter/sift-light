@@ -17,6 +17,11 @@ export interface SignalGrepConfig {
 
 export type SemanticJudgeProvider = "jev";
 
+export const SEMANTIC_JUDGE_API_KEY_ENVS = [
+  "TYPESAFE_API_KEY",
+  "BAOER_SIGNAL_GREP_JEV_API_KEY",
+] as const;
+
 export interface SemanticJudgeConfig {
   enabled: boolean;
   provider: SemanticJudgeProvider;
@@ -32,7 +37,7 @@ export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
   enabled: false,
   provider: "jev",
   endpoint: "https://api.typesafe.ai/v1/systemone",
-  apiKeyEnv: "TYPESAFE_API_KEY",
+  apiKeyEnv: SEMANTIC_JUDGE_API_KEY_ENVS[0],
   model: "jev-latest",
   timeoutMs: 120_000,
   maxCandidates: 20,
@@ -161,9 +166,13 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
       { cause: error },
     );
   }
-  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const secureEndpoint =
+    parsedEndpoint.protocol === "https:" ||
+    (parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname));
+  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`,
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`,
     );
   }
   const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;

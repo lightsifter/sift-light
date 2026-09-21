@@ -356,6 +356,7 @@ async function runConceptSearch(
   onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
   const filesAdmitted = documents.length;
   const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
+  const filesSkippedBinary = sourceGeneration.filesSkippedBinary;
   const filesUnavailable = sourceGeneration.filesUnavailable;
   if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
     result.reasons.push(
@@ -366,6 +367,7 @@ async function runConceptSearch(
     filesEnumerated: files.paths.length,
     filesAdmitted,
     filesSkippedEmpty,
+    filesSkippedBinary,
     filesUnavailable,
     passagesQueued: passages.length,
   };
