@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [1.6.8-2] - 2026-09-21
+
+- Resolve native MCP releases through a dedicated npm alias so the exact package is installed even when the current project is the package's own source repository.
+
 ## [1.6.8-1] - 2026-09-21
 
 - Pin bundled native MCP hosts to the matching release package and forward the supported Jev credential environment variables so new sessions load the intended search server.
