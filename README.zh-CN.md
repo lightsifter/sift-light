@@ -104,6 +104,30 @@ omp install npm:baoer_signal_grep@latest
 
 安装或更新后重启 OMP。安装包声明了 OMP 原生扩展并注册 `baoer_signal_grep`。默认 hard 模式会从活动工具集中移除 OMP 内置的 `grep` 和 `glob`，并在执行前阻止直接搜索命令，同时保留读取、编辑、测试、构建和其他开发工具。prefer 模式会同时保留专用工具与其他搜索工具，加入模型指引，但不拒绝 shell 搜索。OMP 当前 profile 会被正确识别：默认配置文件是 `~/.omp/agent/baoer_signal_grep.json`，命名 profile 使用 `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`。在当前文件中将 `enforceSearch` 设置为 `"hard"`（默认）、`"prefer"` 或 `"off"` 后重启 OMP；布尔值及未知配置字段会直接报错。设置 `"locale": "zh-CN"` 可启用中文界面。
 
+### 可选语义判断
+
+Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保留的概念候选进行分类并改善排序，但不会替代本地匹配、源码检查、分页或验证。
+
+只有在配置中明确设置 `semanticJudge.enabled` 为 `true` 时才会启用。仅定义环境变量不会激活网络请求。凭据应保留在进程环境变量中，不要把凭据值写进配置文件：
+
+```json
+{
+  "locale": "zh-CN",
+  "enforceSearch": "hard",
+  "semanticJudge": {
+    "enabled": false,
+    "provider": "jev",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "timeoutMs": 120000,
+    "maxCandidates": 20,
+    "maxRetries": 2
+  }
+}
+```
+
+启用后，配置的端点只会收到查询和有界的候选摘录。缺少密钥或提供方失败时会明确标记为部分结果；本地候选仍然保留，语义分类也不等同于运行时证明。
+
 ### Claude Code 或 Codex：连接 MCP
 
 ```bash
@@ -115,6 +139,8 @@ codex mcp add baoer_signal_grep -- npx -y --package baoer_signal_grep@latest bao
 ```
 
 `@latest` 会在 MCP 启动时跟随最新发布版本，更新后重启宿主即可加载。服务器默认搜索当前项目，可用 `BAOER_SIGNAL_GREP_MCP_CWD` 指定其他根目录。仅连接 MCP 会添加工具，不会禁用其他搜索工具。
+
+独立 MCP 服务只有在 `BAOER_SIGNAL_GREP_CONFIG` 指向有效配置文件，且其中将 `semanticJudge.enabled` 明确设为 `true` 时，才会启用语义判断。这样 MCP 与其他宿主使用同一套有界、显式配置；仅因为环境中存在凭据不会自动发起网络请求。
 
 MCP 默认同时返回可读文本和结构化证据。如果宿主会把两种形式一起序列化进模型上下文，请在该 MCP 服务的环境中设置 `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model`，然后重启。模型模式不返回 `structuredContent`，也不声明结构化输出 schema；它会提供精简的工作流说明，并在标准页和同一个已保留分析快照的紧凑视图中选择较小者。紧凑视图共享重复路径和 inspect 请求，hybrid 不会拼接两份独立的 literal 与 Concept 正文，并把 outline 签名延后到版本校验过的源码检查。计数、覆盖范围、部分状态、原因和续读请求仍然可见。`text` 模式只省略结构化输出，逐字保留标准文本和完整兼容说明；程序消费者或只展示结构化结果的客户端应继续使用默认的 `structured` 模式。其他取值会在启动时明确失败。捆绑的 Claude Code、Codex 和 Kimi 原生插件会选择 `model`；直接 MCP 连接仍保留兼容默认值，除非显式配置。
 

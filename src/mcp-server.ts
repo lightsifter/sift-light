@@ -5,8 +5,11 @@ import {
   DEFAULT_MCP_PORT,
   DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
   BAOER_SIGNAL_GREP_MCP_PATH,
+  createDefaultSignalGrepMcpService,
   startSignalGrepMcpServer,
 } from "./mcp.js";
+import { DEFAULT_SEMANTIC_JUDGE_CONFIG, readSignalGrepConfigFile } from "./config-reader.js";
+import { createSemanticJudgeIntegration, type SemanticJudgeIntegration } from "./semantic-judge.js";
 import { parseSignalGrepMcpTransport, BAOER_SIGNAL_GREP_MCP_USAGE } from "./mcp-cli.js";
 import { parseSignalGrepMcpOutputMode, type SignalGrepMcpOutputMode } from "./mcp-output.js";
 import { startSignalGrepMcpStdioServer } from "./mcp-stdio.js";
@@ -35,11 +38,22 @@ function allowedOrigins(): string[] {
     .filter((origin) => origin.length > 0);
 }
 
-async function runHttpServer(outputMode: SignalGrepMcpOutputMode): Promise<void> {
+async function configuredSemanticJudge(): Promise<SemanticJudgeIntegration | undefined> {
+  const configPath = process.env.BAOER_SIGNAL_GREP_CONFIG;
+  if (!configPath) return undefined;
+  const config = await readSignalGrepConfigFile(configPath);
+  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
+}
+
+async function runHttpServer(
+  outputMode: SignalGrepMcpOutputMode,
+  semanticJudge: SemanticJudgeIntegration | undefined,
+): Promise<void> {
   const running = await startSignalGrepMcpServer({
     cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.cwd(),
     host: process.env.BAOER_SIGNAL_GREP_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("BAOER_SIGNAL_GREP_MCP_PORT", DEFAULT_MCP_PORT, 0, 65_535),
+    createService: () => createDefaultSignalGrepMcpService(semanticJudge),
     maxSessions: environmentInteger(
       "BAOER_SIGNAL_GREP_MCP_MAX_SESSIONS",
       DEFAULT_MCP_MAX_SESSIONS,
@@ -84,10 +98,14 @@ async function runHttpServer(outputMode: SignalGrepMcpOutputMode): Promise<void>
   process.once("SIGTERM", shutdown);
 }
 
-async function runStdioServer(outputMode: SignalGrepMcpOutputMode): Promise<void> {
+async function runStdioServer(
+  outputMode: SignalGrepMcpOutputMode,
+  semanticJudge: SemanticJudgeIntegration | undefined,
+): Promise<void> {
   const running = await startSignalGrepMcpStdioServer({
     cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
+    createService: () => createDefaultSignalGrepMcpService(semanticJudge),
   });
   process.stderr.write("baoer_signal_grep MCP serving one local client over stdio\n");
   process.stderr.write(`baoer_signal_grep MCP working directory: ${running.cwd}\n`);
@@ -115,11 +133,12 @@ async function main(): Promise<void> {
     return;
   }
   const outputMode = parseSignalGrepMcpOutputMode(process.env.BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE);
+  const semanticJudge = await configuredSemanticJudge();
   if (transport === "stdio") {
-    await runStdioServer(outputMode);
+    await runStdioServer(outputMode, semanticJudge);
     return;
   }
-  await runHttpServer(outputMode);
+  await runHttpServer(outputMode, semanticJudge);
 }
 
 try {

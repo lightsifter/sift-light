@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.3-1",
+  version: "1.6.6",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -5713,8 +5713,9 @@ class AnalysisStore {
     const scope = result.scope ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : "";
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
+    const semanticJudge = result.semanticJudge ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.` : "";
     const hasItemDetails = result.items.some((item) => item.details !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${scope}${coverage}${stats}`;
     const notice = result.reasons.length ? `
 ${result.reasons.map((reason) => `[${reason}]`).join(`
 `)}` : "";
@@ -5811,6 +5812,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           items,
           ...sources.length ? { sources } : {},
           reasons: result.reasons,
+          ...result.semanticJudge ? { semanticJudge: result.semanticJudge } : {},
           ...result.filesRead !== undefined ? { filesRead: result.filesRead } : {},
           ...result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {},
           ...result.changes ? { changes: result.changes } : {},
@@ -9242,6 +9244,339 @@ function parsePythonOutline(document) {
 
 // src/hybrid-search.ts
 import { resolve as resolve19 } from "node:path";
+
+// src/semantic-judge.ts
+var MAX_CANDIDATE_CHARS = 4000;
+var MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+var MAX_ERROR_CHARS = 512;
+var CLASSIFICATIONS = [
+  "implementation-candidate",
+  "caller-candidate",
+  "mention-only",
+  "documentation",
+  "test-only",
+  "irrelevant",
+  "uncertain"
+];
+var CLASSIFICATION_PRIORITY = {
+  "implementation-candidate": 0,
+  "caller-candidate": 1,
+  "mention-only": 2,
+  documentation: 3,
+  "test-only": 4,
+  uncertain: 5,
+  irrelevant: 6
+};
+
+class SemanticJudgeConfigurationError extends SignalGrepError {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "SemanticJudgeConfigurationError";
+  }
+}
+
+class SemanticJudgeRequestError extends SignalGrepError {
+  retryable;
+  constructor(message, retryable, options) {
+    super(message, options);
+    this.name = "SemanticJudgeRequestError";
+    this.retryable = retryable;
+  }
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, MAX_ERROR_CHARS);
+}
+function isClassification(value) {
+  return typeof value === "string" && CLASSIFICATIONS.includes(value);
+}
+function probability(value, field) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new SemanticJudgeRequestError(`Semantic judge response has an invalid ${field}`, false);
+  }
+  return value;
+}
+function choiceProbability(answer, choice) {
+  const probabilities = answer.probabilities;
+  if (!isRecord3(probabilities))
+    return probability(answer.confidence, "confidence");
+  return probability(probabilities[choice], `probabilities.${choice}`);
+}
+function parseJudgment(value, candidateIndex) {
+  if (!isRecord3(value) || value.type !== "choice" || !isClassification(value.choice)) {
+    throw new SemanticJudgeRequestError(`Semantic judge response is missing choice answer ${String(candidateIndex + 1)}`, false);
+  }
+  const confidence = value.confidence === undefined ? undefined : probability(value.confidence, "confidence");
+  return {
+    candidateIndex,
+    classification: value.choice,
+    probability: choiceProbability(value, value.choice),
+    ...confidence === undefined ? {} : { confidence }
+  };
+}
+function requestBody(query, candidates, model) {
+  const questions = {};
+  for (const candidate of candidates) {
+    questions[candidate.id] = {
+      type: "choice",
+      instructions: "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      criteria: {
+        "implementation-candidate": "The excerpt appears to implement the requested behavior or its core decision/side effect.",
+        "caller-candidate": "The excerpt invokes or wires an implementation but does not implement the behavior itself.",
+        "mention-only": "The excerpt mentions the topic without implementing or invoking the behavior.",
+        documentation: "The excerpt is documentation or explanatory prose rather than executable behavior.",
+        "test-only": "The excerpt is test or fixture code that describes or checks the behavior.",
+        irrelevant: "The excerpt is not meaningfully related to the requested behavior.",
+        uncertain: "The excerpt is too incomplete or ambiguous to classify confidently."
+      }
+    };
+  }
+  return {
+    state: {
+      query,
+      candidates: candidates.map(({ id, path, line, excerpt, sourceKind }) => ({
+        id,
+        path,
+        line,
+        excerpt,
+        ...sourceKind ? { sourceKind } : {}
+      }))
+    },
+    model,
+    questions
+  };
+}
+async function responseText(response) {
+  if (!response.body) {
+    const contentLength = response.headers.get("content-length");
+    if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
+      throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
+    }
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES) {
+      throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done)
+        break;
+      const chunk = result.value;
+      bytes += chunk.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(all);
+}
+function retryDelay(attempt) {
+  return Math.min(20000, 400 * 2 ** attempt);
+}
+async function waitForRetry(delayMs, signal) {
+  if (signal?.aborted)
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  await new Promise((resolve, reject) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function createJevRunner(config, key, fetcher) {
+  return async (query, candidates, parentSignal) => {
+    const startedAt = performance.now();
+    const body = JSON.stringify(requestBody(query, candidates, config.model));
+    for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
+      const controller = new AbortController;
+      const onParentAbort = () => controller.abort(parentSignal?.reason);
+      parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(new Error("Semantic judge request timed out")), config.timeoutMs);
+      try {
+        const response = await fetcher(config.endpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${key}`
+          },
+          body,
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          const retryable = response.status === 408 || response.status === 429 || response.status === 529 || response.status >= 500;
+          throw new SemanticJudgeRequestError(`Semantic judge returned HTTP ${String(response.status)}`, retryable);
+        }
+        const raw = JSON.parse(await responseText(response));
+        if (!isRecord3(raw) || !isRecord3(raw.answers)) {
+          throw new SemanticJudgeRequestError("Semantic judge response did not contain answers", false);
+        }
+        const answers = raw.answers;
+        const judgments = candidates.map((candidate, index) => parseJudgment(answers[candidate.id], index));
+        const model = typeof raw.model === "string" && raw.model.length > 0 ? raw.model : config.model;
+        const usage = isRecord3(raw.usage) ? raw.usage : undefined;
+        const inputTokens = typeof usage?.input_tokens === "number" ? usage.input_tokens : undefined;
+        const outputTokens = typeof usage?.output_tokens === "number" ? usage.output_tokens : undefined;
+        return {
+          model,
+          judgments,
+          ...inputTokens === undefined ? {} : { inputTokens },
+          ...outputTokens === undefined ? {} : { outputTokens },
+          elapsedMs: Math.round(performance.now() - startedAt)
+        };
+      } catch (error) {
+        if (parentSignal?.aborted)
+          throw error;
+        const retryable = error instanceof SemanticJudgeRequestError ? error.retryable : true;
+        if (!retryable || attempt >= config.maxRetries)
+          throw error;
+        await waitForRetry(retryDelay(attempt), parentSignal);
+      } finally {
+        clearTimeout(timeout);
+        parentSignal?.removeEventListener("abort", onParentAbort);
+      }
+    }
+    throw new SemanticJudgeRequestError("Semantic judge request failed", false);
+  };
+}
+function createDisabledSemanticJudgeIntegration(config) {
+  return { config: { ...config, enabled: false } };
+}
+function createSemanticJudgeIntegration(config, environment = process.env, fetcher = fetch) {
+  if (!config.enabled)
+    return createDisabledSemanticJudgeIntegration(config);
+  const key = environment[config.apiKeyEnv]?.trim();
+  if (!key) {
+    throw new SemanticJudgeConfigurationError(`Semantic judge is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`);
+  }
+  if (config.provider !== "jev") {
+    throw new SemanticJudgeConfigurationError(`Unsupported semantic judge provider: ${String(config.provider)}`);
+  }
+  return { config, runner: createJevRunner(config, key, fetcher) };
+}
+function baseDetails(config) {
+  return {
+    enabled: config.enabled,
+    provider: config.provider,
+    status: config.enabled ? "partial" : "disabled",
+    maxCandidates: config.maxCandidates,
+    candidatesConsidered: 0,
+    judgedCandidates: 0,
+    classificationCounts: {}
+  };
+}
+function candidateDetails(item) {
+  const source = typeof item.details?.source === "string" ? item.details.source : undefined;
+  return source ?? (typeof item.details?.kind === "string" ? item.details.kind : "candidate");
+}
+async function applySemanticJudge(result, query, integration, signal) {
+  const config = integration?.config;
+  if (!config || !config.enabled || !integration.runner) {
+    return { ...result, ...config ? { semanticJudge: baseDetails(config) } : {} };
+  }
+  const candidates = result.items.slice(0, config.maxCandidates).map((item, index) => ({
+    id: `candidate-${String(index + 1)}`,
+    path: item.path,
+    line: item.line,
+    excerpt: (item.excerpt ?? "").slice(0, MAX_CANDIDATE_CHARS),
+    sourceKind: candidateDetails(item)
+  }));
+  const initial = baseDetails(config);
+  initial.candidatesConsidered = candidates.length;
+  if (candidates.length === 0) {
+    return { ...result, semanticJudge: { ...initial, status: "complete", model: config.model } };
+  }
+  let judged;
+  try {
+    judged = await integration.runner(query, candidates, signal);
+  } catch (error) {
+    if (signal?.aborted)
+      throw error;
+    const reason = `Semantic judge unavailable; local semantic candidates retained without behavior classification: ${boundedError(error)}`;
+    return {
+      ...result,
+      partial: true,
+      reasons: [...result.reasons, reason],
+      semanticJudge: {
+        ...initial,
+        status: "failed",
+        reason,
+        model: config.model
+      }
+    };
+  }
+  const judgments = new Map(judged.judgments.map((item) => [item.candidateIndex, item]));
+  const counts = {};
+  for (const judgment of judged.judgments)
+    counts[judgment.classification] = (counts[judgment.classification] ?? 0) + 1;
+  const order = result.items.map((_item, index) => index);
+  order.sort((left, right) => {
+    const leftJudgment = judgments.get(left);
+    const rightJudgment = judgments.get(right);
+    if (!leftJudgment || !rightJudgment)
+      return left - right;
+    const priority = CLASSIFICATION_PRIORITY[leftJudgment.classification] - CLASSIFICATION_PRIORITY[rightJudgment.classification];
+    return priority || rightJudgment.probability - leftJudgment.probability || left - right;
+  });
+  const reordered = order.map((index) => {
+    const item = result.items[index];
+    const judgment = judgments.get(index);
+    if (!item || !judgment)
+      return item;
+    return Object.assign({}, item, {
+      details: Object.assign({}, item.details, {
+        semanticJudge: {
+          classification: judgment.classification,
+          probability: judgment.probability,
+          ...judgment.confidence === undefined ? {} : { confidence: judgment.confidence },
+          model: judged.model,
+          claim: "semantic classification only; local static and runtime verification is not asserted"
+        }
+      })
+    });
+  }).filter((item) => item !== undefined);
+  return {
+    ...result,
+    items: reordered,
+    semanticJudge: {
+      ...initial,
+      status: "complete",
+      model: judged.model,
+      judgedCandidates: judged.judgments.length,
+      classificationCounts: counts,
+      ...judged.inputTokens === undefined ? {} : { inputTokens: judged.inputTokens },
+      ...judged.outputTokens === undefined ? {} : { outputTokens: judged.outputTokens },
+      elapsedMs: judged.elapsedMs
+    }
+  };
+}
+
+// src/hybrid-search.ts
 class HybridSourceChangedError extends ConceptSourceChangedError {
   constructor(message = "Hybrid source changed while exact and concept evidence were being merged") {
     super(message);
@@ -9373,7 +9708,7 @@ function isLiteralOverlap(item, rangesByPath) {
     return false;
   return (rangesByPath.get(item.path) ?? []).some((range) => rangesOverlap(range, itemRange));
 }
-async function combineHybridSearch(scan, execution, access, conceptLimit) {
+async function combineHybridSearch(scan, execution, access, conceptLimit, query, semanticJudge, signal) {
   const concept = execution.analysis;
   if (concept.kind !== "concept")
     throw new Error("Hybrid search requires concept evidence");
@@ -9405,20 +9740,23 @@ async function combineHybridSearch(scan, execution, access, conceptLimit) {
     return true;
   });
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
-  const selectedConcept = [];
-  for (const item of eligibleConcept.slice(0, conceptLimit)) {
-    selectedConcept.push({
-      ...item,
-      details: { ...item.details, source: "concept" }
-    });
-  }
+  const judgedConcept = await applySemanticJudge({
+    kind: "hybrid",
+    unit: "evidence-items",
+    items: eligibleConcept,
+    partial: false,
+    reasons: []
+  }, query, semanticJudge, signal);
+  const selectedConcept = judgedConcept.items.slice(0, conceptLimit).map((item) => Object.assign({}, item, {
+    details: Object.assign({}, item.details, { source: "concept" })
+  }));
   const conceptCandidatesOmitted = Math.max(0, eligibleConcept.length - selectedConcept.length);
   const literalOccurrencesRetained = scan.matches.reduce((total, match) => total + match.occurrences.length, 0);
   const literalCoverage = scan.snapshotComplete ? "complete" : "partial";
   const conceptCoverage = concept.coverage?.conceptCandidates ?? (concept.partial ? "partial" : "complete");
   const conceptSourceCoverage = execution.sourceGeneration.partial ? "partial" : "complete";
   const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
-  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial";
+  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
   return {
     kind: "hybrid",
@@ -9430,7 +9768,8 @@ async function combineHybridSearch(scan, execution, access, conceptLimit) {
       ...concept.reasons,
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
-      ...selectionReason ? [selectionReason] : []
+      ...selectionReason ? [selectionReason] : [],
+      ...judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
     bytesRead: (concept.bytesRead ?? 0) + access.bytesRead,
@@ -9445,7 +9784,11 @@ async function combineHybridSearch(scan, execution, access, conceptLimit) {
       conceptCandidatesSelected: selectedConcept.length,
       conceptCandidatesOmitted,
       literalItemsRetained: literal.items.length,
-      conceptItemsRetained: selectedConcept.length
+      conceptItemsRetained: selectedConcept.length,
+      ...judgedConcept.semanticJudge ? {
+        semanticJudgeCandidatesConsidered: judgedConcept.semanticJudge.candidatesConsidered,
+        semanticJudgeCandidatesJudged: judgedConcept.semanticJudge.judgedCandidates
+      } : {}
     },
     ...concept.scope ? { scope: concept.scope } : {},
     coverage: {
@@ -9458,7 +9801,8 @@ async function combineHybridSearch(scan, execution, access, conceptLimit) {
     },
     ...concept.stats ? { stats: concept.stats } : {},
     ...concept.redact !== undefined ? { redact: concept.redact } : {},
-    ...concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {}
+    ...concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {},
+    ...judgedConcept.semanticJudge ? { semanticJudge: judgedConcept.semanticJudge } : {}
   };
 }
 function retainedHybridCounts(original, items) {
@@ -9698,14 +10042,16 @@ class EvidenceService {
   #snapshots;
   #structure;
   #conceptSearch;
+  #semanticJudge;
   #queue = new SyntaxQueue;
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
-  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch) {
+  constructor(runner, snapshots, structure, runConceptSearch = conceptSearch, semanticJudge) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    this.#semanticJudge = semanticJudge;
   }
   clear() {
     this.#analyses.clear();
@@ -9844,7 +10190,7 @@ class EvidenceService {
         throw new HybridSourceChangedError("Literal source evidence changed while concept evidence was being computed");
       }
       const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, literalAccess, limit);
+      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, literalAccess, limit, query, this.#semanticJudge, signal);
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
@@ -11446,7 +11792,7 @@ function cursorPathSelection(input, cwd) {
   const key = createHash4("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
-function baseDetails(snapshot, mode) {
+function baseDetails2(snapshot, mode) {
   const sourceUnverifiedFileCount = new Set(snapshot.matches.filter((match) => !snapshot.sourceRevisions.has(match.absolutePath)).map((match) => match.absolutePath)).size;
   return {
     version: 1,
@@ -11574,7 +11920,7 @@ class SignalGrepService {
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
-    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch);
+    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
@@ -11720,7 +12066,7 @@ class SignalGrepService {
     try {
       let result;
       if (snapshot.totalMatches === 0) {
-        const details = baseDetails(snapshot, mode);
+        const details = baseDetails2(snapshot, mode);
         result = {
           text: emptyResultText(details.scope ?? searchScope2(snapshot.request)),
           details
@@ -11819,7 +12165,7 @@ class SignalGrepService {
   async#summary(snapshot, mode, cwd, signal, offset = 0, budget) {
     this.#reusableSummarySnapshots.add(snapshot);
     const summary = formatSummary(snapshot, this.#summaryFileLimit, offset, budget?.resultTokenBudget);
-    const details = baseDetails(snapshot, mode);
+    const details = baseDetails2(snapshot, mode);
     const cursor = snapshot.fileCounts.size > 0 ? this.#snapshots.cursor(snapshot, summary.nextOffset, "summary") : undefined;
     const fileRange = summary.shown > 0 ? `Files ${String(summary.offset + 1)}-${String(summary.nextOffset)} of ${String(snapshot.fileCounts.size)}, ordered by match count.` : "No retained file summaries are available.";
     const omitted = summary.omitted > 0 ? `
@@ -11909,7 +12255,7 @@ ${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)
     const missingSelectionNote = selectionMissingPaths.length > 0 ? `
 
 [${String(selectionMissingPaths.length)} selected path(s) had no retained matches.]` : "";
-    const details = baseDetails(snapshot, mode);
+    const details = baseDetails2(snapshot, mode);
     const next = cursor ? `
 
 Continue with cursor="${cursor}".
@@ -12012,12 +12358,12 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 var SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var signalGrepSchema = Type.Object({
   query: Type.Optional(Type.String({
     maxLength: 256,
-    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model.`
+    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
   })),
   scope: Type.Optional(stringEnum(["strict", "expand"], {
     description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
@@ -12205,10 +12551,11 @@ function signalGrepTool(outputMode) {
     tool.outputSchema = SIGNAL_GREP_OUTPUT_SCHEMA;
   return tool;
 }
-function createDefaultSignalGrepMcpService() {
+function createDefaultSignalGrepMcpService(semanticJudge) {
   return new SignalGrepService({
     runRipgrep: createRipgrepRunner(),
-    structure: createCtagsStructureProvider()
+    structure: createCtagsStructureProvider(),
+    ...semanticJudge ? { semanticJudge } : {}
   });
 }
 function errorMessage2(error) {
@@ -12622,6 +12969,145 @@ async function startSignalGrepMcpServer(options = {}) {
   };
 }
 
+// src/config-reader.ts
+import { readFile as readFile3 } from "node:fs/promises";
+var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
+  enabled: false,
+  provider: "jev",
+  endpoint: "https://api.typesafe.ai/v1/systemone",
+  apiKeyEnv: "TYPESAFE_API_KEY",
+  model: "jev-latest",
+  timeoutMs: 120000,
+  maxCandidates: 20,
+  maxRetries: 2
+};
+var DEFAULT_SIGNAL_GREP_CONFIG = {
+  locale: "en",
+  enforceSearch: "hard",
+  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
+};
+function hasErrorCode(error, codes) {
+  return error instanceof Error && "code" in error && codes.includes(String(error.code));
+}
+function isMissingFile(error) {
+  return hasErrorCode(error, ["ENOENT"]);
+}
+function isRawSignalGrepConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isRawSemanticJudgeConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedInteger2(value, fallback, minimum, maximum, field) {
+  const candidate = value ?? fallback;
+  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new Error(`Invalid baoer_signal_grep ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`);
+  }
+  return candidate;
+}
+function parseSemanticJudge(value, path) {
+  if (value === undefined)
+    return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
+  if (!isRawSemanticJudgeConfig(value)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge must be an object`);
+  }
+  const unknown = Object.keys(value).filter((key) => ![
+    "enabled",
+    "provider",
+    "endpoint",
+    "apiKeyEnv",
+    "model",
+    "timeoutMs",
+    "maxCandidates",
+    "maxRetries"
+  ].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`);
+  }
+  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.enabled must be a boolean`);
+  }
+  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
+  if (provider !== "jev") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.provider must be "jev"`);
+  }
+  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
+  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
+  }
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch (error) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`, { cause: error });
+  }
+  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`);
+  }
+  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
+  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
+  }
+  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge.model must be bounded single-line text`);
+  }
+  return {
+    enabled,
+    provider,
+    endpoint,
+    apiKeyEnv,
+    model,
+    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
+    maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
+    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
+  };
+}
+function parseConfig(value, path) {
+  if (!isRawSignalGrepConfig(value)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
+  }
+  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "semanticJudge"].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`);
+  }
+  const { locale, enforceSearch } = value;
+  if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
+  }
+  const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
+  return {
+    locale: locale ?? DEFAULT_SIGNAL_GREP_CONFIG.locale,
+    enforceSearch: enforcement,
+    semanticJudge: parseSemanticJudge(value.semanticJudge, path)
+  };
+}
+function normalizeSearchEnforcement(value, source) {
+  if (value === undefined || value === "hard")
+    return "hard";
+  if (value === "prefer")
+    return "prefer";
+  if (value === "off")
+    return "off";
+  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
+}
+async function readSignalGrepConfigFile(path) {
+  try {
+    const content = await readFile3(path, "utf8");
+    return parseConfig(JSON.parse(content), path);
+  } catch (error) {
+    if (isMissingFile(error))
+      return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+    if (error instanceof SyntaxError) {
+      throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
+        cause: error
+      });
+    }
+    throw error;
+  }
+}
+
 // src/mcp-cli.ts
 var BAOER_SIGNAL_GREP_MCP_USAGE = `Usage: baoer_signal_grep_mcp [--http | --stdio]
 
@@ -12730,11 +13216,19 @@ function environmentInteger(name, fallback, minimum, maximum) {
 function allowedOrigins() {
   return (process.env.BAOER_SIGNAL_GREP_MCP_ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter((origin) => origin.length > 0);
 }
-async function runHttpServer(outputMode) {
+async function configuredSemanticJudge() {
+  const configPath = process.env.BAOER_SIGNAL_GREP_CONFIG;
+  if (!configPath)
+    return;
+  const config = await readSignalGrepConfigFile(configPath);
+  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
+}
+async function runHttpServer(outputMode, semanticJudge) {
   const running = await startSignalGrepMcpServer({
     cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.cwd(),
     host: process.env.BAOER_SIGNAL_GREP_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("BAOER_SIGNAL_GREP_MCP_PORT", DEFAULT_MCP_PORT, 0, 65535),
+    createService: () => createDefaultSignalGrepMcpService(semanticJudge),
     maxSessions: environmentInteger("BAOER_SIGNAL_GREP_MCP_MAX_SESSIONS", DEFAULT_MCP_MAX_SESSIONS, 1, Number.MAX_SAFE_INTEGER),
     sessionIdleTimeoutMs: environmentInteger("BAOER_SIGNAL_GREP_MCP_SESSION_IDLE_MS", DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS, 1, Number.MAX_SAFE_INTEGER),
     allowedOrigins: allowedOrigins(),
@@ -12768,10 +13262,11 @@ async function runHttpServer(outputMode) {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-async function runStdioServer(outputMode) {
+async function runStdioServer(outputMode, semanticJudge) {
   const running = await startSignalGrepMcpStdioServer({
     cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
-    outputMode
+    outputMode,
+    createService: () => createDefaultSignalGrepMcpService(semanticJudge)
   });
   process.stderr.write(`baoer_signal_grep MCP serving one local client over stdio
 `);
@@ -12800,11 +13295,12 @@ async function main() {
     return;
   }
   const outputMode = parseSignalGrepMcpOutputMode(process.env.BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE);
+  const semanticJudge = await configuredSemanticJudge();
   if (transport === "stdio") {
-    await runStdioServer(outputMode);
+    await runStdioServer(outputMode, semanticJudge);
     return;
   }
-  await runHttpServer(outputMode);
+  await runHttpServer(outputMode, semanticJudge);
 }
 try {
   await main();

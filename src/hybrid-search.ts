@@ -11,6 +11,7 @@ import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import { SourceDocumentError, type ByteRange, type SourceDocument } from "./source-document.js";
 import { sameSourceRevision } from "./source.js";
 import type { SearchScan } from "./types.js";
+import { applySemanticJudge, type SemanticJudgeIntegration } from "./semantic-judge.js";
 
 export class HybridSourceChangedError extends ConceptSourceChangedError {
   constructor(
@@ -186,6 +187,9 @@ export async function combineHybridSearch(
   execution: ConceptSearchExecution,
   access: SourceAccess,
   conceptLimit: number,
+  query: string,
+  semanticJudge?: SemanticJudgeIntegration,
+  signal?: AbortSignal,
 ): Promise<AnalysisResultSet> {
   const concept = execution.analysis;
   if (concept.kind !== "concept") throw new Error("Hybrid search requires concept evidence");
@@ -215,13 +219,23 @@ export async function combineHybridSearch(
     return true;
   });
   const duplicateConceptCandidates = concept.items.length - eligibleConcept.length;
-  const selectedConcept: AnalysisItem[] = [];
-  for (const item of eligibleConcept.slice(0, conceptLimit)) {
-    selectedConcept.push({
-      ...item,
-      details: { ...item.details, source: "concept" },
-    });
-  }
+  const judgedConcept = await applySemanticJudge(
+    {
+      kind: "hybrid",
+      unit: "evidence-items",
+      items: eligibleConcept,
+      partial: false,
+      reasons: [],
+    },
+    query,
+    semanticJudge,
+    signal,
+  );
+  const selectedConcept = judgedConcept.items.slice(0, conceptLimit).map((item) =>
+    Object.assign({}, item, {
+      details: Object.assign({}, item.details, { source: "concept" }),
+    }),
+  );
   const conceptCandidatesOmitted = Math.max(0, eligibleConcept.length - selectedConcept.length);
   const literalOccurrencesRetained = scan.matches.reduce(
     (total, match) => total + match.occurrences.length,
@@ -245,7 +259,8 @@ export async function combineHybridSearch(
     conceptCoverage === "skipped" ||
     conceptSourceCoverage === "partial" ||
     literal.sourceCoverage === "partial" ||
-    deduplicationCoverage === "partial";
+    deduplicationCoverage === "partial" ||
+    judgedConcept.semanticJudge?.status === "failed";
   const selectionReason = conceptCandidatesOmitted
     ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates`
     : undefined;
@@ -260,6 +275,7 @@ export async function combineHybridSearch(
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
       ...(selectionReason ? [selectionReason] : []),
+      ...(judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []),
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
     bytesRead: (concept.bytesRead ?? 0) + access.bytesRead,
@@ -275,6 +291,12 @@ export async function combineHybridSearch(
       conceptCandidatesOmitted,
       literalItemsRetained: literal.items.length,
       conceptItemsRetained: selectedConcept.length,
+      ...(judgedConcept.semanticJudge
+        ? {
+            semanticJudgeCandidatesConsidered: judgedConcept.semanticJudge.candidatesConsidered,
+            semanticJudgeCandidatesJudged: judgedConcept.semanticJudge.judgedCandidates,
+          }
+        : {}),
     },
     ...(concept.scope ? { scope: concept.scope } : {}),
     coverage: {
@@ -288,6 +310,7 @@ export async function combineHybridSearch(
     ...(concept.stats ? { stats: concept.stats } : {}),
     ...(concept.redact !== undefined ? { redact: concept.redact } : {}),
     ...(concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {}),
+    ...(judgedConcept.semanticJudge ? { semanticJudge: judgedConcept.semanticJudge } : {}),
   };
 }
 

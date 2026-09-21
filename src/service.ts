@@ -25,6 +25,7 @@ import { redactSignalGrepResult } from "./redaction.js";
 import type { RipgrepRunner } from "./rg.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { ConceptWorkerExitError, type ConceptSearchRunner } from "./concept-search.js";
+import type { SemanticJudgeIntegration } from "./semantic-judge.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import {
@@ -84,6 +85,7 @@ export interface SignalGrepServiceOptions {
   summaryFileLimit?: number;
   structure?: CodeStructureProvider;
   conceptSearch?: ConceptSearchRunner;
+  semanticJudge?: SemanticJudgeIntegration;
 }
 
 export interface SignalGrepSearchOptions {
@@ -336,6 +338,7 @@ export class SignalGrepService {
       this.#snapshots,
       options.structure,
       options.conceptSearch,
+      options.semanticJudge,
     );
   }
 

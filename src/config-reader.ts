@@ -10,16 +10,54 @@ export const SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
 export interface SignalGrepConfig {
   locale: SignalGrepLocale;
   enforceSearch?: SearchEnforcementMode;
+  semanticJudge?: SemanticJudgeConfig;
 }
+
+export type SemanticJudgeProvider = "jev";
+
+export interface SemanticJudgeConfig {
+  enabled: boolean;
+  provider: SemanticJudgeProvider;
+  endpoint: string;
+  apiKeyEnv: string;
+  model: string;
+  timeoutMs: number;
+  maxCandidates: number;
+  maxRetries: number;
+}
+
+export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
+  enabled: false,
+  provider: "jev",
+  endpoint: "https://api.typesafe.ai/v1/systemone",
+  apiKeyEnv: "TYPESAFE_API_KEY",
+  model: "jev-latest",
+  timeoutMs: 120_000,
+  maxCandidates: 20,
+  maxRetries: 2,
+};
 
 export const DEFAULT_SIGNAL_GREP_CONFIG: Readonly<SignalGrepConfig> = {
   locale: "en",
   enforceSearch: "hard",
+  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG,
 };
 
 interface RawSignalGrepConfig {
   locale?: unknown;
   enforceSearch?: unknown;
+  semanticJudge?: unknown;
+}
+
+interface RawSemanticJudgeConfig {
+  enabled?: unknown;
+  provider?: unknown;
+  endpoint?: unknown;
+  apiKeyEnv?: unknown;
+  model?: unknown;
+  timeoutMs?: unknown;
+  maxCandidates?: unknown;
+  maxRetries?: unknown;
 }
 
 function hasErrorCode(error: unknown, codes: string[]): boolean {
@@ -34,14 +72,143 @@ function isRawSignalGrepConfig(value: unknown): value is RawSignalGrepConfig {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isRawSemanticJudgeConfig(value: unknown): value is RawSemanticJudgeConfig {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedInteger(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  field: string,
+): number {
+  const candidate = value ?? fallback;
+  if (
+    typeof candidate !== "number" ||
+    !Number.isSafeInteger(candidate) ||
+    candidate < minimum ||
+    candidate > maximum
+  ) {
+    throw new Error(
+      `Invalid baoer_signal_grep ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`,
+    );
+  }
+  return candidate;
+}
+
+function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
+  if (value === undefined) return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
+  if (!isRawSemanticJudgeConfig(value)) {
+    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge must be an object`);
+  }
+  const unknown = Object.keys(value).filter(
+    (key) =>
+      ![
+        "enabled",
+        "provider",
+        "endpoint",
+        "apiKeyEnv",
+        "model",
+        "timeoutMs",
+        "maxCandidates",
+        "maxRetries",
+      ].includes(key),
+  );
+  if (unknown.length > 0) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`,
+    );
+  }
+  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.enabled must be a boolean`,
+    );
+  }
+  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
+  if (provider !== "jev") {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.provider must be "jev"`,
+    );
+  }
+  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
+  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2_048) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a nonempty URL`,
+    );
+  }
+  let parsedEndpoint: URL;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch (error) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`,
+      { cause: error },
+    );
+  }
+  if (parsedEndpoint.protocol !== "https:" && parsedEndpoint.protocol !== "http:") {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use http or https`,
+    );
+  }
+  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
+  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`,
+    );
+  }
+  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
+  if (
+    typeof model !== "string" ||
+    model.length === 0 ||
+    model.length > 128 ||
+    /[\r\n\0]/u.test(model)
+  ) {
+    throw new Error(
+      `Invalid baoer_signal_grep config at ${path}: semanticJudge.model must be bounded single-line text`,
+    );
+  }
+  return {
+    enabled,
+    provider,
+    endpoint,
+    apiKeyEnv,
+    model,
+    timeoutMs: boundedInteger(
+      value.timeoutMs,
+      DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs,
+      1_000,
+      1_200_000,
+      `config at ${path}: semanticJudge.timeoutMs`,
+    ),
+    maxCandidates: boundedInteger(
+      value.maxCandidates,
+      DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates,
+      1,
+      20,
+      `config at ${path}: semanticJudge.maxCandidates`,
+    ),
+    maxRetries: boundedInteger(
+      value.maxRetries,
+      DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries,
+      0,
+      5,
+      `config at ${path}: semanticJudge.maxRetries`,
+    ),
+  };
+}
+
 function parseConfig(value: unknown, path: string): SignalGrepConfig {
   if (!isRawSignalGrepConfig(value)) {
     throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
   }
-  const unknown = Object.keys(value).filter((key) => key !== "locale" && key !== "enforceSearch");
+  const unknown = Object.keys(value).filter(
+    (key) => !["locale", "enforceSearch", "semanticJudge"].includes(key),
+  );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale and enforceSearch are accepted`,
+      `Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`,
     );
   }
   const { locale, enforceSearch } = value;
@@ -52,6 +219,7 @@ function parseConfig(value: unknown, path: string): SignalGrepConfig {
   return {
     locale: locale ?? DEFAULT_SIGNAL_GREP_CONFIG.locale,
     enforceSearch: enforcement,
+    semanticJudge: parseSemanticJudge(value.semanticJudge, path),
   };
 }
 

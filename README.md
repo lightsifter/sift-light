@@ -104,6 +104,30 @@ omp install npm:baoer_signal_grep@latest
 
 Restart OMP after installing or updating. The package declares its native OMP extension and registers `baoer_signal_grep`. In the default hard mode it removes OMP's built-in `grep` and `glob` entries from the active tool set and blocks direct search commands while leaving reads, edits, tests, builds and other development tools available. Prefer mode keeps both the dedicated and alternative tools active, adds model guidance, and does not deny shell searches. OMP's active profile is respected; the default configuration file is `~/.omp/agent/baoer_signal_grep.json`, and a named profile uses `~/.omp/profiles/<profile>/agent/baoer_signal_grep.json`. Set `enforceSearch` to `"hard"` (default), `"prefer"`, or `"off"` in the active file, then restart OMP. Only these current string values are accepted; boolean values and unknown configuration fields are rejected. Set `"locale": "zh-CN"` to use the Chinese interface.
 
+### Optional semantic judge
+
+Hybrid search remains local-only by default. An optional semantic judge can classify retained concept candidates and improve ordering, but it never replaces local matching, source inspection, pagination, or verification.
+
+The feature is enabled only when `semanticJudge.enabled` is explicitly set to `true`. Merely defining the environment variable does not activate network access. Keep the credential in the process environment; do not put the credential value in this file:
+
+```json
+{
+  "locale": "en",
+  "enforceSearch": "hard",
+  "semanticJudge": {
+    "enabled": false,
+    "provider": "jev",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "timeoutMs": 120000,
+    "maxCandidates": 20,
+    "maxRetries": 2
+  }
+}
+```
+
+When enabled, the configured endpoint receives only the query and bounded candidate excerpts. A missing key or provider failure is reported as an explicit partial result; local candidates remain available, and semantic classification is not runtime proof.
+
 ### Claude Code or Codex: MCP connection
 
 ```bash
@@ -115,6 +139,8 @@ codex mcp add baoer_signal_grep -- npx -y --package baoer_signal_grep@latest bao
 ```
 
 `@latest` follows the newest published version when MCP starts. Restart the host to load updates. The server searches the active project; `BAOER_SIGNAL_GREP_MCP_CWD` can select a different root. An MCP-only connection adds the tool without disabling other search tools.
+
+The standalone MCP server keeps semantic judging disabled unless `BAOER_SIGNAL_GREP_CONFIG` points to a valid configuration file with `semanticJudge.enabled` set to `true`. This lets MCP use the same bounded, explicit configuration without enabling network access merely because a credential exists in the environment.
 
 MCP returns readable text plus structured evidence by default. If a host serializes both forms into the model context, set `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model` in that MCP server's environment and restart it. Model mode omits `structuredContent` and its advertised output schema, advertises concise workflow guidance, and selects the smaller of the standard page and a compact view of the same retained analysis snapshot. Repeated paths and inspect requests are shared, hybrid does not concatenate separate literal and Concept bodies, and outline excerpts are deferred to version-checked inspection. Counts, coverage, partial status, reasons and continuation requests remain visible. Use `text` to omit structured output while preserving the complete standard text and full usage guidance, or retain the default `structured` mode for programmatic consumers and clients that expose only structured results. Any other value fails at startup. The bundled Claude Code, Codex and Kimi native plugins select `model`; direct MCP connections retain the structured default unless configured explicitly.
 

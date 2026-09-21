@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  DEFAULT_SEMANTIC_JUDGE_CONFIG,
   normalizeSearchEnforcement,
   readSignalGrepConfigFile,
   SIGNAL_GREP_CONFIG_FILE,
@@ -25,6 +26,7 @@ import {
 } from "./search-policy.js";
 import { signalGrepSchema } from "./tool-schema.js";
 import { modelErrorText } from "./model-error.js";
+import { createSemanticJudgeIntegration } from "./semantic-judge.js";
 
 const SIGNAL_GREP_LABEL = "baoer_signal_grep";
 const OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
@@ -171,15 +173,19 @@ export async function registerOmpSignalGrepExtension(
   searchPolicyAssets = new URL("../plugins/baoer-signal-grep/hooks/", import.meta.url),
   config?: SignalGrepConfig,
 ): Promise<void> {
+  const policy = new SearchPolicy(searchPolicyAssets);
+  const resolvedConfig =
+    config ?? (await readSignalGrepConfigFile(join(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE)));
+  const semanticJudge = createSemanticJudgeIntegration(
+    resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
+  );
   const runtime = new SignalGrepRuntime(
     new SignalGrepService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
+      semanticJudge,
     }),
   );
-  const policy = new SearchPolicy(searchPolicyAssets);
-  const resolvedConfig =
-    config ?? (await readSignalGrepConfigFile(join(ompAgentDir(), SIGNAL_GREP_CONFIG_FILE)));
   const { locale } = resolvedConfig;
   const enforcement = normalizeSearchEnforcement(
     resolvedConfig.enforceSearch,
