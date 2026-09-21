@@ -8,7 +8,12 @@ import {
   MAX_ANALYSIS_SNAPSHOTS,
   MAX_ANALYSIS_STORAGE_BYTES,
 } from "./analysis-limits.js";
-import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
+import {
+  SEMANTIC_JUDGE_CLASSIFICATIONS,
+  SEMANTIC_JUDGE_NON_PROOF_CLAIM,
+  type AnalysisItem,
+  type AnalysisResultSet,
+} from "./analysis-types.js";
 import { CursorError, SignalGrepError } from "./errors.js";
 import type { SignalGrepResult } from "./types.js";
 import { MAX_RESULT_BYTES } from "./types.js";
@@ -130,6 +135,57 @@ function publicStructureDetails(item: AnalysisItem): Record<string, unknown> | u
   };
 }
 
+function publicSemanticJudgeDetails(item: AnalysisItem): Record<string, unknown> | undefined {
+  const value = item.details?.semanticJudge;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const classification = Reflect.get(value, "classification");
+  const probability = Reflect.get(value, "probability");
+  const confidence = Reflect.get(value, "confidence");
+  const model = Reflect.get(value, "model");
+  const claim = Reflect.get(value, "claim");
+  if (
+    typeof classification !== "string" ||
+    !SEMANTIC_JUDGE_CLASSIFICATIONS.some((candidate) => candidate === classification) ||
+    typeof probability !== "number" ||
+    !Number.isFinite(probability) ||
+    probability < 0 ||
+    probability > 1 ||
+    (confidence !== undefined &&
+      (typeof confidence !== "number" ||
+        !Number.isFinite(confidence) ||
+        confidence < 0 ||
+        confidence > 1)) ||
+    typeof model !== "string" ||
+    model.length === 0 ||
+    model.length > 128 ||
+    /[\r\n\0]/u.test(model) ||
+    claim !== SEMANTIC_JUDGE_NON_PROOF_CLAIM
+  )
+    return undefined;
+  return {
+    classification,
+    probability,
+    ...(confidence === undefined ? {} : { confidence }),
+    model,
+    claim,
+  };
+}
+
+function publicItemDetails(item: AnalysisItem): Record<string, unknown> | undefined {
+  const structure = publicStructureDetails(item);
+  const semanticJudge = publicSemanticJudgeDetails(item);
+  const source =
+    item.details?.source === "literal" || item.details?.source === "concept"
+      ? item.details.source
+      : undefined;
+  if (!structure && !semanticJudge && !source) return undefined;
+  return {
+    ...structure,
+    ...(source ? { source } : {}),
+    ...(semanticJudge ? { semanticJudge } : {}),
+  };
+}
+
 function publicAnalysisItem(
   result: AnalysisResultSet,
   item: AnalysisItem,
@@ -146,7 +202,7 @@ function publicAnalysisItem(
           ...(result.redact ? { redact: true } : {}),
         }
       : undefined;
-  const publicDetails = publicStructureDetails(item);
+  const publicDetails = publicItemDetails(item);
   return {
     path: item.path,
     line: item.line,
@@ -337,7 +393,7 @@ export class AnalysisStore {
     const semanticJudge = result.semanticJudge
       ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.`
       : "";
-    const hasItemDetails = result.items.some((item) => item.details !== undefined);
+    const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
     const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${scope}${coverage}${stats}`;
     const notice = result.reasons.length
       ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
@@ -362,16 +418,24 @@ export class AnalysisStore {
       }
       rows.push(row);
       bytes += rowBytes;
-      if (hybridInspectCursor && item.source) {
-        const sourceKey = JSON.stringify(item.source);
-        let sourceId = sourceIds.get(sourceKey);
-        if (sourceId === undefined) {
-          sourceId = sources.length;
-          sources.push(item.source);
-          sourceIds.set(sourceKey, sourceId);
+      if (hybridInspectCursor) {
+        const { inspect: _inspect, ...sharedPublicItem } = publicItem;
+        const publicHybridItem = {
+          ...sharedPublicItem,
+          ...(item.excerpt ? { excerpt: item.excerpt } : {}),
+        };
+        if (item.source) {
+          const sourceKey = JSON.stringify(item.source);
+          let sourceId = sourceIds.get(sourceKey);
+          if (sourceId === undefined) {
+            sourceId = sources.length;
+            sources.push(item.source);
+            sourceIds.set(sourceKey, sourceId);
+          }
+          items.push({ ...publicHybridItem, sourceId });
+        } else {
+          items.push(publicHybridItem);
         }
-        const { source: _source, ...sharedItem } = item;
-        items.push({ ...sharedItem, label: publicItem.label, index: index + 1, sourceId });
       } else {
         items.push({
           ...item,

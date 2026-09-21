@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
+import { SEMANTIC_JUDGE_API_KEY_ENVS, SIGNAL_GREP_CONFIG_ENV } from "../src/config-reader.js";
 import { buildConceptWorker } from "./concept-worker-artifact.js";
 import { buildSyntaxWorker } from "./syntax-worker-artifact.js";
 
@@ -95,7 +96,13 @@ export async function buildSearchPlugin(root: string): Promise<void> {
   };
   const mcpConnection = {
     command: "npx",
-    args: ["--yes", "--package", `${packageJson.name}@latest`, "baoer_signal_grep_mcp", "--stdio"],
+    args: [
+      "--yes",
+      "--package",
+      `${packageJson.name}@${packageJson.version}`,
+      "baoer_signal_grep_mcp",
+      "--stdio",
+    ],
     env: mcpEnvironment,
   };
   const mcp = {
@@ -104,7 +111,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
   const sharedMcp = {
     baoer_signal_grep: {
       ...mcpConnection,
-      env_vars: ["BAOER_SIGNAL_GREP_CONFIG", "TYPESAFE_API_KEY"],
+      env_vars: [SIGNAL_GREP_CONFIG_ENV, ...SEMANTIC_JUDGE_API_KEY_ENVS],
     },
   };
   const localMcpServer = [

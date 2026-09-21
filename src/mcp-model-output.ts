@@ -2,6 +2,11 @@ import type { AnalysisDetails } from "./analysis-types.js";
 import type { SignalGrepDetails, SignalGrepResult } from "./types.js";
 
 import { formatStatistics } from "./result-statistics.js";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails): string[] {
   return [
     ...(analysis.statistics ? formatStatistics(analysis.statistics) : []),
@@ -21,6 +26,9 @@ function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails):
     analysis.sourceGeneration
       ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}`
       : undefined,
+    analysis.semanticJudge
+      ? `Semantic judge: ${JSON.stringify(analysis.semanticJudge)}`
+      : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline" && analysis.modelOutput
       ? "[Outline signatures are deferred; use version-checked inspection for source excerpts.]"
@@ -39,7 +47,15 @@ function compactRows(analysis: AnalysisDetails): string[] {
       previousPath = item.path;
     }
     const label = analysis.kind === "outline" && analysis.modelOutput ? item.label : "metadata";
-    rows.push(`#${String(item.index)} L${String(item.line)} ${label}`);
+    const semanticJudge = item.details?.semanticJudge;
+    const judgment =
+      isRecord(semanticJudge) &&
+      typeof semanticJudge.classification === "string" &&
+      typeof semanticJudge.probability === "number" &&
+      typeof semanticJudge.model === "string"
+        ? ` Jev: ${semanticJudge.classification}; probability=${String(semanticJudge.probability)};${typeof semanticJudge.confidence === "number" ? ` confidence=${String(semanticJudge.confidence)};` : ""} model=${JSON.stringify(semanticJudge.model)}.`
+        : "";
+    rows.push(`#${String(item.index)} L${String(item.line)} ${label}${judgment}`);
   }
   return rows;
 }
@@ -99,5 +115,6 @@ export function compactMcpModelText(result: SignalGrepResult): string {
     ...(nextRequest ? [`Next request: ${nextRequest}`] : []),
   ].join("\n");
   const standard = result.text.replace(" Structured output retains per-item evidence details.", "");
+  if (analysis.semanticJudge) return compact;
   return Buffer.byteLength(compact) < Buffer.byteLength(standard) ? compact : standard;
 }

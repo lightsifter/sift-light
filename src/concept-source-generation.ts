@@ -17,7 +17,7 @@ export interface ConceptSourceFilters {
 
 export interface ConceptSourceInventoryEntry {
   path: string;
-  status: "admitted" | "empty" | "unavailable";
+  status: "admitted" | "empty" | "binary" | "unavailable";
   reference?: SourceReference;
   contentHash?: string;
   reason?: string;
@@ -31,6 +31,7 @@ export interface ConceptSourceSummary {
   filesEnumerated: number;
   filesAdmitted: number;
   filesSkippedEmpty: number;
+  filesSkippedBinary: number;
   filesUnavailable: number;
 }
 
@@ -43,6 +44,7 @@ export interface ConceptSourceGeneration {
   readonly partial: boolean;
   readonly reasons: readonly string[];
   readonly filesSkippedEmpty: number;
+  readonly filesSkippedBinary: number;
   readonly filesUnavailable: number;
   readonly startedAt: number;
   readonly inventoryHash: string;
@@ -84,6 +86,7 @@ export async function createConceptSourceGeneration(
   const documents: SourceDocument[] = [];
   const reasons = [...files.reasons];
   let filesSkippedEmpty = 0;
+  let filesSkippedBinary = 0;
   let filesUnavailable = 0;
   let budgetError: SourceBudgetError | undefined;
   for (const path of files.paths) {
@@ -95,6 +98,19 @@ export async function createConceptSourceGeneration(
     try {
       // oxlint-disable-next-line no-await-in-loop -- SourceAccess serializes a bounded source budget.
       const document = await access.load(path);
+      if (document.bytes.includes(0)) {
+        inventory.push({
+          path,
+          status: "binary",
+          reference: document.reference,
+          ...(document.reference.origin.kind === "worktree"
+            ? { contentHash: document.reference.origin.contentHash }
+            : {}),
+          reason: "Binary source contains NUL bytes",
+        });
+        filesSkippedBinary += 1;
+        continue;
+      }
       if (!document.utf8) throw new SourceDocumentError("encoding", "Not lossless UTF-8");
       if (!document.text.trim()) {
         inventory.push({
@@ -153,6 +169,7 @@ export async function createConceptSourceGeneration(
     partial: files.partial || filesUnavailable > 0,
     reasons,
     filesSkippedEmpty,
+    filesSkippedBinary,
     filesUnavailable,
     startedAt,
     inventoryHash,
@@ -168,6 +185,7 @@ export function conceptSourceSummary(generation: ConceptSourceGeneration): Conce
     filesEnumerated: generation.files.paths.length,
     filesAdmitted: generation.documents.length,
     filesSkippedEmpty: generation.filesSkippedEmpty,
+    filesSkippedBinary: generation.filesSkippedBinary,
     filesUnavailable: generation.filesUnavailable,
   };
 }
