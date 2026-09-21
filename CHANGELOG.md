@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## [1.6.6] - 2026-09-21
+
+- Add an opt-in semantic judge boundary for hybrid searches. Local search and Concept retrieval remain the default; a configured provider is never contacted unless `semanticJudge.enabled` is explicitly true.
+- Keep API credentials out of configuration files. The configuration names the environment variable to read, and missing credentials fail clearly when the feature is enabled.
+- Classify semantic candidates as implementation-candidate, caller-candidate, mention-only, documentation, test-only, irrelevant or uncertain, preserving the classification, probability, model and provider status in the analysis evidence.
+- Use bounded candidate input, response size, timeout and retry limits. Provider failures remain visible as partial hybrid evidence and never become a successful verified claim.
+- Preserve the existing hybrid snapshot, exact-first evidence, cursors, source references, revision checks and pagination contract.
+
 ## [1.6.3-1] - 2026-09-16
 
 - Stop advertising fields with the call-shaped `name={a,b,c}` notation that appeared in mode and selector guidance, and that could be copied into the arguments as a `{"mode":"files","files":{…}}` nested object no schema accepts. Field lists are prose again, mode guidance carries the field catalog exactly once instead of twice, and repeated name prefixes (`inspect=inspect={…}`, `pattern=pattern is regex…`) are gone. The advertised schema drops 468 characters and all 32 braces in the `mode` description without changing accepted requests.

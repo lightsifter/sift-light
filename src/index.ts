@@ -3,6 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   normalizeSearchEnforcement,
   readSignalGrepConfig,
+  DEFAULT_SEMANTIC_JUDGE_CONFIG,
   type SignalGrepConfig,
 } from "./config.js";
 import { resolveContextBudget } from "./context-budget.js";
@@ -16,6 +17,7 @@ import type { SignalGrepDetails } from "./types.js";
 import { renderSignalGrepCall, renderSignalGrepResult } from "./tui/renderers.js";
 import { registerPiSearchPolicy } from "./pi-search-policy.js";
 import { modelErrorText } from "./model-error.js";
+import { createSemanticJudgeIntegration } from "./semantic-judge.js";
 
 const SIGNAL_GREP_LABEL = "baoer_signal_grep";
 
@@ -25,10 +27,14 @@ export async function registerSignalGrepExtension(
   pi: ExtensionAPI,
   config: SignalGrepConfig,
 ): Promise<void> {
+  const semanticJudge = createSemanticJudgeIntegration(
+    config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
+  );
   const runtime = new SignalGrepRuntime(
     new SignalGrepService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
+      semanticJudge,
     }),
   );
   const { locale } = config;

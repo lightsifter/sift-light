@@ -28,6 +28,7 @@ import {
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
 import { SignalGrepService, type SignalGrepInput } from "./service.js";
+import type { SemanticJudgeIntegration } from "./semantic-judge.js";
 import { signalGrepMcpInstructions } from "./prompt-guidelines.js";
 import {
   SIGNAL_GREP_DESCRIPTION,
@@ -81,10 +82,13 @@ export interface SignalGrepMcpService {
   shutdown(): Promise<void>;
 }
 
-export function createDefaultSignalGrepMcpService(): SignalGrepMcpService {
+export function createDefaultSignalGrepMcpService(
+  semanticJudge?: SemanticJudgeIntegration,
+): SignalGrepMcpService {
   return new SignalGrepService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
+    ...(semanticJudge ? { semanticJudge } : {}),
   });
 }
 

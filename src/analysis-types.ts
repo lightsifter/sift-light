@@ -6,6 +6,39 @@ import type { ConceptSourceSummary } from "./concept-source-generation.js";
 
 export type CoverageStatus = "complete" | "partial" | "skipped" | "not-applicable";
 
+export type SemanticJudgeClassification =
+  | "implementation-candidate"
+  | "caller-candidate"
+  | "mention-only"
+  | "documentation"
+  | "test-only"
+  | "irrelevant"
+  | "uncertain";
+
+export type SemanticJudgeStatus = "disabled" | "complete" | "partial" | "failed";
+
+export interface SemanticJudgeJudgment {
+  candidateIndex: number;
+  classification: SemanticJudgeClassification;
+  probability: number;
+  confidence?: number;
+}
+
+export interface SemanticJudgeDetails {
+  enabled: boolean;
+  provider: string;
+  status: SemanticJudgeStatus;
+  model?: string;
+  maxCandidates: number;
+  candidatesConsidered: number;
+  judgedCandidates: number;
+  classificationCounts: Record<string, number>;
+  inputTokens?: number;
+  outputTokens?: number;
+  elapsedMs?: number;
+  reason?: string;
+}
+
 export interface ConceptScoreProfile {
   count: number;
   top: number;
@@ -51,6 +84,7 @@ export interface AnalysisDetails {
     | "evidence-items";
   totalItems: number;
   returnedItems: number;
+  semanticJudge?: SemanticJudgeDetails;
   statistics?: ResultStatistics;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SignalGrepInput })[];
   sources?: SourceReference[];
@@ -101,6 +135,7 @@ export interface AnalysisResultSet {
   items: AnalysisItem[];
   partial: boolean;
   reasons: string[];
+  semanticJudge?: SemanticJudgeDetails;
   filesRead?: number;
   bytesRead?: number;
   counts?: Record<string, number>;

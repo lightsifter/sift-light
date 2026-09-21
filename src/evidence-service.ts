@@ -59,6 +59,7 @@ import { validationResult } from "./validation-output.js";
 import type { OperationProgress } from "./operation-lifecycle.js";
 import { outlineCapabilityError } from "./request-contract.js";
 import { realpath } from "node:fs/promises";
+import type { SemanticJudgeIntegration } from "./semantic-judge.js";
 import {
   MAX_ANY_OF_TERMS,
   MAX_CONFIGURABLE_STRUCTURE_FILES,
@@ -263,6 +264,7 @@ export class EvidenceService {
   readonly #snapshots: SnapshotStore;
   readonly #structure: CodeStructureProvider | undefined;
   readonly #conceptSearch: ConceptSearchRunner;
+  readonly #semanticJudge: SemanticJudgeIntegration | undefined;
   readonly #queue = new SyntaxQueue();
   readonly #analyses = new AnalysisStore();
   readonly #continuations = new SourceContinuations();
@@ -271,11 +273,13 @@ export class EvidenceService {
     snapshots: SnapshotStore,
     structure?: CodeStructureProvider,
     runConceptSearch: ConceptSearchRunner = conceptSearch,
+    semanticJudge?: SemanticJudgeIntegration,
   ) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     this.#conceptSearch = runConceptSearch;
+    this.#semanticJudge = semanticJudge;
   }
   clear(): void {
     this.#analyses.clear();
@@ -454,6 +458,9 @@ export class EvidenceService {
         conceptResult,
         literalAccess,
         limit,
+        query,
+        this.#semanticJudge,
+        signal,
       );
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
