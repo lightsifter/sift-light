@@ -38,6 +38,11 @@ export interface SemanticJudgeDetails {
   maxCandidates: number;
   candidatesConsidered: number;
   judgedCandidates: number;
+  candidatesUnjudged: number;
+  batchesAttempted: number;
+  batchesCompleted: number;
+  batchesFailed: number;
+  batchesSplit: number;
   classificationCounts: Record<string, number>;
   inputTokens?: number;
   outputTokens?: number;

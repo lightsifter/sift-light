@@ -260,7 +260,8 @@ export async function combineHybridSearch(
     conceptSourceCoverage === "partial" ||
     literal.sourceCoverage === "partial" ||
     deduplicationCoverage === "partial" ||
-    judgedConcept.semanticJudge?.status === "failed";
+    judgedConcept.semanticJudge?.status === "failed" ||
+    judgedConcept.semanticJudge?.status === "partial";
   const selectionReason = conceptCandidatesOmitted
     ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates`
     : undefined;

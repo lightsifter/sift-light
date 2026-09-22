@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [1.7.0-1] - 2026-09-22
+
+- Process optional semantic judgments in bounded batches, split oversized requests automatically, and preserve successful classifications when another batch fails.
+- Report complete and partial semantic coverage with explicit judged, unjudged, completed, failed and split batch counts while retaining local result order for unjudged candidates.
+- Ignore OMP host intent metadata before strict search-input validation so supported host requests keep the same public search contract.
+
 ## [1.6.8-2] - 2026-09-21
 
 - Resolve native MCP releases through a dedicated npm alias so the exact package is installed even when the current project is the package's own source repository.
