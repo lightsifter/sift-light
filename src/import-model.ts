@@ -2,7 +2,7 @@ import { posix } from "node:path";
 import { realpath } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import { MAX_STRUCTURE_BYTES, MAX_STRUCTURE_FILES } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import {
   SourceDocumentError,
   type ByteRange,
@@ -96,7 +96,7 @@ export function navigationPath(path: string): string {
     normalized.startsWith("/") ||
     /^[A-Za-z]:/.test(normalized)
   ) {
-    throw new SignalGrepError("Navigation paths must stay inside the workspace");
+    throw new SiftlightError("Navigation paths must stay inside the workspace");
   }
   return normalized.replace(/^\.\//, "");
 }

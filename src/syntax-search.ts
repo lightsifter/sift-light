@@ -1,7 +1,7 @@
 import { MAX_ANALYSIS_RESULTS } from "./analysis-limits.js";
 import { sourceEvidence } from "./analysis-evidence.js";
 import type { AnalysisItem } from "./analysis-types.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import type { ByteRange, SourceDocument } from "./source-document.js";
 import type { SyntaxAnalysis, SyntaxRole, SyntaxRoleName, SyntaxSymbol } from "./syntax.js";
 
@@ -310,7 +310,7 @@ export function findFunctionConjunctions(
     };
   }
   if (terms.length === 0)
-    throw new SignalGrepError("Function conjunction requires normalized terms");
+    throw new SiftlightError("Function conjunction requires normalized terms");
   for (const range of changedRanges ?? []) document.checkRange(range);
   const changed = changedRanges ? merge(changedRanges) : undefined;
   const context = implementationRanges(document, analysis);

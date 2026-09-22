@@ -1,5 +1,5 @@
 import type { AnalysisResultSet } from "./analysis-types.js";
-import type { SignalGrepResult } from "./types.js";
+import type { SiftlightResult } from "./types.js";
 
 export const MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
 
@@ -15,7 +15,7 @@ export function analysisTermPage(
   result: AnalysisResultSet,
   id: string,
   offset: number,
-): SignalGrepResult {
+): SiftlightResult {
   const all = result.termCounts ?? [];
   const terms: { term: string; retainedOccurrences: number }[] = [];
   const rows: string[] = [];

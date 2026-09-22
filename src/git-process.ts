@@ -1,4 +1,4 @@
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { MAX_PROTOCOL_LINE_BYTES } from "./types.js";
 
@@ -45,7 +45,7 @@ export function gitReadEnvironment(): NodeJS.ProcessEnv {
 
 export function supportsNoLazyFetch(version: string): boolean {
   const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(version.trim());
-  if (!match) throw new SignalGrepError("Git returned an unrecognized version string");
+  if (!match) throw new SiftlightError("Git returned an unrecognized version string");
   const actual = [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
   for (let index = 0; index < MINIMUM_NO_LAZY_FETCH_VERSION.length; index += 1) {
     const difference = (actual[index] ?? 0) - (MINIMUM_NO_LAZY_FETCH_VERSION[index] ?? 0);
@@ -75,7 +75,7 @@ async function gitReadArguments(
         for await (const chunk of stdout) versionChunks.push(Buffer.from(chunk));
       },
     );
-    if (version.code !== 0) throw new SignalGrepError("Unable to determine the Git version");
+    if (version.code !== 0) throw new SiftlightError("Unable to determine the Git version");
     supports = supportsNoLazyFetch(Buffer.concat(versionChunks).toString("utf8"));
     gitCapabilities.set(capabilityKey, supports);
   }
@@ -105,12 +105,12 @@ async function gitReadArguments(
     },
   );
   if (partial.code === 0) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Git 2.45 or newer is required for non-fetching reads from a partial/promisor clone",
     );
   }
   if (partial.code !== 1) {
-    throw new SignalGrepError("Unable to verify whether this older Git repository is partial");
+    throw new SiftlightError("Unable to verify whether this older Git repository is partial");
   }
   return [...GIT_READ_ARGUMENTS];
 }
@@ -124,7 +124,7 @@ export async function runGitRead(
 ): Promise<{ output: Buffer; code: number }> {
   const chunks: Buffer[] = [];
   if (options.input && options.input.byteLength > MAX_PROTOCOL_LINE_BYTES) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `Git input exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`,
     );
   }
@@ -148,7 +148,7 @@ export async function runGitRead(
       for await (const chunk of stdout) {
         bytes += chunk.byteLength;
         if (bytes > maxBytes) {
-          throw new SignalGrepError(
+          throw new SiftlightError(
             `Git ${command} output exceeds the ${String(maxBytes)} byte limit`,
           );
         }
@@ -157,7 +157,7 @@ export async function runGitRead(
     },
   );
   if (result.code === null || !(options.allowedCodes ?? [0]).includes(result.code)) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `Git ${command} failed: ${result.stderr.trim() || `exit ${String(result.code)}`}`,
     );
   }
@@ -167,7 +167,7 @@ export async function runGitRead(
 export function decodeGitPath(bytes: Buffer): string {
   const value = bytes.toString("utf8");
   if (!Buffer.from(value, "utf8").equals(bytes)) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Git path is not valid UTF-8; path-based source access is unavailable",
     );
   }
@@ -177,7 +177,7 @@ export function decodeGitPath(bytes: Buffer): string {
 export function splitGitRecords(output: Buffer): Buffer[] {
   if (output.length === 0) return [];
   if (output[output.length - 1] !== 0) {
-    throw new SignalGrepError("Git names protocol ended without a NUL delimiter");
+    throw new SiftlightError("Git names protocol ended without a NUL delimiter");
   }
   const records: Buffer[] = [];
   let offset = 0;

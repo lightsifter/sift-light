@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_PARSE_TIME_MS, MAX_STRUCTURE_BYTES, MAX_SYNTAX_NODES } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { scriptRuntimeEnvironment } from "./script-runtime.js";
 import { deriveSyntaxFacts } from "./syntax-facts.js";
@@ -61,7 +61,7 @@ function emptyAnalysis(status: SyntaxStatus, language?: SyntaxLanguage): SyntaxA
 }
 
 function invalidProtocol(): never {
-  throw new SignalGrepError("Invalid syntax parser protocol");
+  throw new SiftlightError("Invalid syntax parser protocol");
 }
 
 function readNode(
@@ -208,14 +208,14 @@ export async function parseSyntax(
         for await (const chunk of stdout) {
           bytes += chunk.byteLength;
           if (bytes > MAX_STRUCTURE_BYTES)
-            throw new SignalGrepError("Syntax parser output exceeds protocol limit");
+            throw new SiftlightError("Syntax parser output exceeds protocol limit");
           chunks.push(Buffer.from(chunk));
         }
       },
     );
     if (signal?.aborted) throw abortError();
     if (result.code !== 0) {
-      throw new SignalGrepError(
+      throw new SiftlightError(
         `Syntax parser process failed (${String(result.code)}): ${result.stderr.trim()}`,
       );
     }

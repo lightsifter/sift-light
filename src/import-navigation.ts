@@ -1,5 +1,5 @@
 import { MAX_IMPORT_FILES } from "./analysis-limits.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import {
   NavigationContext,
   moduleRange,
@@ -30,9 +30,9 @@ export async function navigateImports(
   input: NavigationInput,
 ): Promise<NavigationResult> {
   if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-    throw new SignalGrepError("Navigation line must be a positive integer");
+    throw new SiftlightError("Navigation line must be a positive integer");
   if (input.symbol !== undefined && input.symbol.trim().length === 0)
-    throw new SignalGrepError("Navigation symbol must be nonempty");
+    throw new SiftlightError("Navigation symbol must be nonempty");
   const context = new NavigationContext(host, MAX_IMPORT_FILES);
   let facts;
   try {

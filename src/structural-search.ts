@@ -1,8 +1,8 @@
 import { rangeEvidence } from "./analysis-evidence.js";
 import type { AnalysisResultSet } from "./analysis-types.js";
 import { MAX_ANALYSIS_RESULTS, MAX_ANALYSIS_STORAGE_BYTES } from "./analysis-limits.js";
-import { SignalGrepError } from "./errors.js";
-import type { SignalGrepInput } from "./service.js";
+import { SiftlightError } from "./errors.js";
+import type { SiftlightInput } from "./service.js";
 import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import { SourceDocumentError } from "./source-document.js";
 import { syntaxLanguage } from "./syntax.js";
@@ -10,7 +10,7 @@ import { normalizeRequest } from "./request.js";
 import { listWorkspaceFiles } from "./workspace-files.js";
 
 export async function structuralSearch(
-  input: SignalGrepInput,
+  input: SiftlightInput,
   access: SourceAccess,
 ): Promise<AnalysisResultSet> {
   if (
@@ -18,7 +18,7 @@ export async function structuralSearch(
     Buffer.byteLength(input.pattern) > 4_096 ||
     !input.pattern.isWellFormed()
   )
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Structural pattern must be nonempty, well-formed and at most 4 KiB; ast-grep $NAME/$$$ARGS metavariables are supported",
     );
   const request = normalizeRequest({ ...input, pattern: "" });
@@ -39,7 +39,7 @@ export async function structuralSearch(
   let retainedBytes = 0;
   const supported = files.paths.filter((path) => syntaxLanguage(path));
   if (files.paths.length && !supported.length)
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Structural patterns require admitted JS/TS/TSX/Go source; no supported source files were found",
     );
   result.stats = {
@@ -117,6 +117,7 @@ export async function structuralSearch(
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden,
+    ignorePolicy: request.ignorePolicy ?? "respect",
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide",
   };

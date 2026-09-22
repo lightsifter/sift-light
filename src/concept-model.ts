@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 
 export const CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 export const CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
@@ -16,7 +16,7 @@ export const CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 export const CONCEPT_TIMEOUT_MS = 10 * 60_000;
 export const MIN_CONCEPT_TIMEOUT_MS = 1_000;
 export const MAX_CONCEPT_TIMEOUT_MS = 60 * 60_000;
-export const CONCEPT_TIMEOUT_ENV = "BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS";
+export const CONCEPT_TIMEOUT_ENV = "SIFTLIGHT_CONCEPT_TIMEOUT_MS";
 export const MAX_CONCEPT_WORKER_INPUT_BYTES = 64 * 1024 * 1024;
 export const MAX_CONCEPT_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const CONCEPT_ASSETS = [
@@ -43,14 +43,14 @@ export const CONCEPT_ASSETS = [
 ] as const;
 export function conceptModelDirectory(): string {
   return resolve(
-    process.env.SIGNAL_GREP_MODEL_DIR ?? join(homedir(), ".cache", "baoer_signal_grep", "models"),
+    process.env.SIFTLIGHT_MODEL_DIR ?? join(homedir(), ".cache", "siftlight", "models"),
     CONCEPT_REVISION,
   );
 }
 
 export function conceptCacheDirectory(): string {
   return resolve(
-    process.env.SIGNAL_GREP_MODEL_DIR ?? join(homedir(), ".cache", "baoer_signal_grep", "models"),
+    process.env.SIFTLIGHT_MODEL_DIR ?? join(homedir(), ".cache", "siftlight", "models"),
     "concept-cache",
     `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`,
   );
@@ -66,7 +66,7 @@ export function resolveConceptTimeoutMs(environment: NodeJS.ProcessEnv = process
     value < MIN_CONCEPT_TIMEOUT_MS ||
     value > MAX_CONCEPT_TIMEOUT_MS
   ) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `${CONCEPT_TIMEOUT_ENV} must be an integer from ${String(MIN_CONCEPT_TIMEOUT_MS)} through ${String(MAX_CONCEPT_TIMEOUT_MS)}`,
     );
   }
@@ -87,8 +87,8 @@ export async function verifyConceptModel(directory = conceptModelDirectory()): P
       if (size !== asset.bytes || hash.digest("hex") !== asset.sha256)
         throw new Error("Pinned hash mismatch");
     } catch (error) {
-      throw new SignalGrepError(
-        `Local concept model is missing or invalid (${asset.path}); run baoer_signal_grep_model --install-model explicitly`,
+      throw new SiftlightError(
+        `Local concept model is missing or invalid (${asset.path}); run siftlight_model --install-model explicitly`,
         { cause: error },
       );
     }

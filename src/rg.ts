@@ -1,5 +1,5 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import { abortError, RipgrepInputError, SignalGrepError } from "./errors.js";
+import { abortError, RipgrepInputError, SiftlightError } from "./errors.js";
 import { excerptText } from "./excerpt.js";
 import { SearchRetention } from "./search-retention.js";
 import { consumeCappedLines } from "./capped-lines.js";
@@ -105,7 +105,7 @@ function decodeRgText(value: RgText, field: string): DecodedRgText {
     const bytes = Buffer.from(value.bytes, "base64");
     return { text: bytes.toString("utf8"), bytes, encoding: "utf-8" };
   }
-  throw new SignalGrepError(`ripgrep JSON event omitted ${field}`);
+  throw new SiftlightError(`ripgrep JSON event omitted ${field}`);
 }
 
 function displayPath(rawPath: string, cwd: string): { absolutePath: string; displayPath: string } {
@@ -189,7 +189,7 @@ async function assertSearchTargetIdentity(
 ): Promise<void> {
   const currentCanonical = await policy.resolveExistingPath(path);
   if (currentCanonical !== expectedCanonical) {
-    throw new SignalGrepError("Search target changed during validation; retry the search");
+    throw new SiftlightError("Search target changed during validation; retry the search");
   }
 }
 
@@ -216,7 +216,7 @@ function byteOffsetToCharacter(
   encoding: "utf-8" | "utf-16",
 ): number {
   if (byteOffset < 0 || byteOffset > bytes.length) {
-    throw new SignalGrepError("ripgrep emitted a submatch outside its matching line");
+    throw new SiftlightError("ripgrep emitted a submatch outside its matching line");
   }
   if (encoding === "utf-8") return byteOffset;
   const prefix = bytes.subarray(0, byteOffset).toString("utf8").replaceAll("\r", "");
@@ -236,7 +236,7 @@ function createOccurrences(
   const occurrences: MatchOccurrence[] = [];
   for (const submatch of submatches) {
     if (submatch.end > decodedLine.bytes.length) {
-      throw new SignalGrepError("ripgrep emitted a submatch outside its matching line");
+      throw new SiftlightError("ripgrep emitted a submatch outside its matching line");
     }
     occurrences.push({
       byteStart: submatch.start,
@@ -258,9 +258,12 @@ function createOccurrences(
 }
 
 export function fileScopeArguments(
-  request: Pick<SearchRequest, "hidden" | "glob" | "exclude">,
+  request: Pick<SearchRequest, "hidden" | "glob" | "exclude"> & {
+    ignorePolicy?: "respect" | "include";
+  },
 ): string[] {
   const args: string[] = [];
+  if (request.ignorePolicy === "include") args.push("--no-ignore", "--no-ignore-parent");
   if (request.hidden) args.push("--hidden");
   for (const glob of request.glob) args.push("--glob", glob);
   for (const excluded of request.exclude) {
@@ -286,6 +289,7 @@ export function buildRipgrepArguments(
     "--line-number",
     "--color=never",
     "--no-heading",
+    ...(request.binaryAsText ? ["--text"] : []),
     ...fileScopeArguments(request),
     ...policy.ripgrepGlobArguments(searchPath),
   ];
@@ -351,11 +355,12 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       try {
         event = JSON.parse(line);
       } catch (error) {
-        throw new SignalGrepError("Failed to parse ripgrep JSON output", { cause: error });
+        throw new SiftlightError("Failed to parse ripgrep JSON output", { cause: error });
       }
-      if (!isRecord(event) || event.type !== "match") return;
+      if (!isRecord(event)) return;
+      if (event.type !== "match") return;
       if (!isRgMatchEvent(event)) {
-        throw new SignalGrepError("ripgrep emitted an invalid match event");
+        throw new SiftlightError("ripgrep emitted an invalid match event");
       }
 
       const rawPath = decodeRgText(event.data.path, "path");
@@ -378,7 +383,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       if (rawPath.encoding === "utf-8") lossyPaths.add(path.absolutePath);
       const submatches = event.data.submatches ?? [];
       if (submatches.some((match) => match.end > rawContent.bytes.length))
-        throw new SignalGrepError("ripgrep emitted a submatch outside its matching line");
+        throw new SiftlightError("ripgrep emitted a submatch outside its matching line");
       const primaryOccurrence = submatches[0];
       let focusStart = 0;
       let focusEnd = 0;
@@ -430,11 +435,70 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         signal,
         request.redact,
       );
+      let ignoredFileCount = 0;
+      let ignoredFileSamples: string[] = [];
+      let filesystemCoverage: SearchScan["filesystemCoverage"] = "complete";
+      const filesystemCoverageReasons = new Set<string>();
+      if (before.enumerationTruncated) {
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(
+          `Filesystem coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`,
+        );
+      }
+      if (before.invalidPathCount > 0) {
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(
+          `${String(before.invalidPathCount)} candidate path(s) were not valid UTF-8`,
+        );
+      }
+      if (request.ignorePolicy !== "include") {
+        const allCandidates = await captureCandidateRevisions(
+          executable,
+          [
+            "--no-config",
+            "--files",
+            "--null",
+            ...fileScopeArguments({ ...request, ignorePolicy: "include" }),
+            ...policy.ripgrepGlobArguments(validatedSearchPath),
+            "--",
+            searchTarget,
+          ],
+          cwd,
+          maxSourceRevisionFiles,
+          signal,
+          request.redact,
+        );
+        const ignored = [...allCandidates.revisions.keys()].filter(
+          (path) => !before.revisions.has(path),
+        );
+        ignoredFileCount = ignored.length;
+        ignoredFileSamples = ignored.slice(0, 20).map((path) => displayPath(path, cwd).displayPath);
+        if (ignoredFileCount > 0) filesystemCoverage = "policy-filtered";
+        if (allCandidates.unreadable.length > 0) {
+          filesystemCoverage = "partial";
+          retention.noteLimit(describeUnreadableDiagnostics(allCandidates.unreadable));
+        }
+        if (allCandidates.enumerationTruncated) {
+          filesystemCoverage = "partial";
+          filesystemCoverageReasons.add(
+            `Include-ignored coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`,
+          );
+        }
+        if (allCandidates.invalidPathCount > 0) {
+          filesystemCoverage = "partial";
+          filesystemCoverageReasons.add(
+            `${String(allCandidates.invalidPathCount)} include-ignored candidate path(s) were not valid UTF-8`,
+          );
+        }
+      }
       if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
-        throw new SignalGrepError(describeUnreadableDiagnostics(before.unreadable));
+        throw new SiftlightError(describeUnreadableDiagnostics(before.unreadable));
       candidateRevisions = before.revisions;
       if (before.unreadable.length > 0)
         retention.noteLimit(describeUnreadableDiagnostics(before.unreadable));
+      if (before.unreadable.length > 0) filesystemCoverage = "partial";
+      if (before.unreadable.length > 0)
+        filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
       await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
       const { code, stderr } = await runOwnedProcess(
         { executable, args, cwd, ...(signal ? { signal } : {}) },
@@ -456,11 +520,14 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       const inputError = createRipgrepInputError(stderr, request.redact);
       if (inputError) throw inputError;
       if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
-        throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
+        throw new SiftlightError(describeUnreadableDiagnostics(diagnostics.unreadable));
       if (diagnostics.unreadable.length > 0)
         retention.noteLimit(describeUnreadableDiagnostics(diagnostics.unreadable));
+      if (diagnostics.unreadable.length > 0) filesystemCoverage = "partial";
+      if (diagnostics.unreadable.length > 0)
+        filesystemCoverageReasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
       if (code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0)) {
-        throw new SignalGrepError(stderr.trim() || `ripgrep exited with status ${String(code)}`);
+        throw new SiftlightError(stderr.trim() || `ripgrep exited with status ${String(code)}`);
       }
       await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
       const retainedPaths = new Set(
@@ -483,6 +550,11 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           matches.length === totalMatches &&
           !modificationTimeFilterIncomplete &&
           retention.details.reasons.length === 0,
+        filesystemCoverage,
+        filesystemCoverageReasons: [...filesystemCoverageReasons],
+        ignoredFileCount,
+        ignoredFileSamples,
+        searchedFileCount: before.revisions.size,
         truncatedLines,
         retention: retention.details,
       };
@@ -494,7 +566,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       const message = executableMissing
         ? `ripgrep executable not found: ${boundedRipgrepDiagnostic(executable, request.redact)}`
         : boundedRipgrepDiagnostic(cause.message, request.redact);
-      throw new SignalGrepError(message, { cause });
+      throw new SiftlightError(message, { cause });
     }
   };
 }

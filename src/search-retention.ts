@@ -1,4 +1,4 @@
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import {
   MAX_SEARCH_STORAGE_BYTES,
   MAX_STORED_OCCURRENCES,
@@ -20,7 +20,7 @@ export class SearchRetention {
     this.maxOccurrences = maxOccurrences;
     for (const value of [maxBytes, maxOccurrences]) {
       if (!Number.isSafeInteger(value) || value < 1)
-        throw new SignalGrepError("Search retention limits must be positive safe integers");
+        throw new SiftlightError("Search retention limits must be positive safe integers");
     }
   }
 

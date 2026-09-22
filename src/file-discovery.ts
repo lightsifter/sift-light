@@ -1,6 +1,6 @@
 import { basename as platformBasename, posix, relative, resolve, sep } from "node:path";
 import type { AnalysisResultSet } from "./analysis-types.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { normalizeRequest, type RawSearchInput } from "./request.js";
 import { listWorkspaceFiles } from "./workspace-files.js";
@@ -72,13 +72,13 @@ export async function discoverFiles(
 ): Promise<AnalysisResultSet> {
   const query = input.query ?? "";
   if (query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "File query must be well-formed single-line text of at most 256 characters",
     );
   // A wildcard query can never match filename text, so scoring it would discard
   // every enumerated file and report an empty result as complete.
   if (FILE_QUERY_GLOB_WILDCARD.test(query))
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `File query ${JSON.stringify(query)} uses glob wildcards; mode=files matches filename and path text, not glob patterns. Omit query to retain every file under path, or use glob to filter by name pattern.`,
     );
   const request = normalizeRequest({ ...input, pattern: "" });
@@ -135,6 +135,7 @@ export async function discoverFiles(
       glob: request.glob,
       exclude: request.exclude,
       hidden: request.hidden,
+      ignorePolicy: request.ignorePolicy ?? "respect",
       expandedToProjectRoot: false,
       assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide",
       ...(request.modifiedAfterMs !== undefined

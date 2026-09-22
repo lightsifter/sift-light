@@ -9,7 +9,7 @@ import {
 } from "./analysis-limits.js";
 import { sourceEvidence } from "./analysis-evidence.js";
 import type { AnalysisItem } from "./analysis-types.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import type { EvidenceCandidateFile } from "./evidence-candidates.js";
 import { literalOccurrences } from "./literal-search.js";
 
@@ -29,7 +29,7 @@ export function validateAnyOf(value: string[] | undefined): string[] | undefined
     ) ||
     new Set(value).size !== value.length
   ) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `anyOf requires ${String(MIN_ANY_OF_TERMS)}–${String(MAX_ANY_OF_TOTAL_TERMS)} distinct, nonempty, well-formed, single-line literal terms of at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes; requests above ${String(MAX_ANY_OF_TERMS)} terms are safely chunked`,
     );
   }

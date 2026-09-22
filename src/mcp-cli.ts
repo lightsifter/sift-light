@@ -1,15 +1,15 @@
-export type SignalGrepMcpTransport = "http" | "stdio";
+export type SiftlightMcpTransport = "http" | "stdio";
 
-export const BAOER_SIGNAL_GREP_MCP_USAGE = `Usage: baoer_signal_grep_mcp [--http | --stdio]
+export const SIFTLIGHT_MCP_USAGE = `Usage: siftlight_mcp [--http | --stdio]
 
 Transports:
   --http   Start the Streamable HTTP server (default)
   --stdio  Serve one local MCP client over stdin/stdout
 `;
 
-export function parseSignalGrepMcpTransport(
+export function parseSiftlightMcpTransport(
   arguments_: readonly string[],
-): SignalGrepMcpTransport | "help" {
+): SiftlightMcpTransport | "help" {
   if (arguments_.length === 0 || (arguments_.length === 1 && arguments_[0] === "--http")) {
     return "http";
   }
@@ -17,5 +17,5 @@ export function parseSignalGrepMcpTransport(
   if (arguments_.length === 1 && (arguments_[0] === "--help" || arguments_[0] === "-h")) {
     return "help";
   }
-  throw new Error(`Unknown arguments: ${arguments_.join(" ")}\n${BAOER_SIGNAL_GREP_MCP_USAGE}`);
+  throw new Error(`Unknown arguments: ${arguments_.join(" ")}\n${SIFTLIGHT_MCP_USAGE}`);
 }

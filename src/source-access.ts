@@ -5,7 +5,7 @@ import {
   MAX_SYNTAX_CACHE_ENTRIES,
   MAX_SYNTAX_CACHE_NODES,
 } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { readGitSource } from "./git-source.js";
 import {
   readWorkspaceDocument,
@@ -99,7 +99,7 @@ export class SyntaxQueue {
   }
 }
 
-export class SourceBudgetError extends SignalGrepError {
+export class SourceBudgetError extends SiftlightError {
   readonly reason = "structural-read-budget-exhausted";
 }
 
@@ -158,7 +158,7 @@ export class SourceAccess {
   async load(path: string, expected?: SourceReference): Promise<SourceDocument> {
     if (this.signal?.aborted) throw abortError();
     if (expected && resolve(this.cwd, expected.path) !== resolve(this.cwd, path)) {
-      throw new SignalGrepError("Source reference path does not match the requested file");
+      throw new SiftlightError("Source reference path does not match the requested file");
     }
     const key = JSON.stringify([resolve(this.cwd, path), expected?.origin]);
     const existing = this.#documents.get(key);

@@ -16,10 +16,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 // src/errors.ts
-class SignalGrepError extends Error {
+class SiftlightError extends Error {
   constructor(message, options) {
     super(message, options);
-    this.name = "SignalGrepError";
+    this.name = "SiftlightError";
   }
 }
 
@@ -59,10 +59,10 @@ var CONCEPT_ASSETS = [
   }
 ];
 function conceptModelDirectory() {
-  return resolve(process.env.SIGNAL_GREP_MODEL_DIR ?? join(homedir(), ".cache", "baoer_signal_grep", "models"), CONCEPT_REVISION);
+  return resolve(process.env.SIFTLIGHT_MODEL_DIR ?? join(homedir(), ".cache", "siftlight", "models"), CONCEPT_REVISION);
 }
 function conceptCacheDirectory() {
-  return resolve(process.env.SIGNAL_GREP_MODEL_DIR ?? join(homedir(), ".cache", "baoer_signal_grep", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+  return resolve(process.env.SIFTLIGHT_MODEL_DIR ?? join(homedir(), ".cache", "siftlight", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
 }
 async function verifyConceptModel(directory = conceptModelDirectory()) {
   for (const asset of CONCEPT_ASSETS) {
@@ -79,7 +79,7 @@ async function verifyConceptModel(directory = conceptModelDirectory()) {
       if (size !== asset.bytes || hash.digest("hex") !== asset.sha256)
         throw new Error("Pinned hash mismatch");
     } catch (error) {
-      throw new SignalGrepError(`Local concept model is missing or invalid (${asset.path}); run baoer_signal_grep_model --install-model explicitly`, { cause: error });
+      throw new SiftlightError(`Local concept model is missing or invalid (${asset.path}); run siftlight_model --install-model explicitly`, { cause: error });
     }
   }
 }
@@ -474,7 +474,7 @@ async function search() {
   const request = await requestFromStdin();
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
-  const stagingRoot = process.env.SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
+  const stagingRoot = process.env.SIFTLIGHT_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
   await verifyConceptModel(directory);
   const requested = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
@@ -564,4 +564,4 @@ if (process.argv.includes("--install-model"))
 else if (process.argv.includes("--infer"))
   await search();
 else
-  throw new Error("Usage: baoer_signal_grep_model --install-model");
+  throw new Error("Usage: siftlight_model --install-model");

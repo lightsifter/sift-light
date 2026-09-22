@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## [1.7.0-2] - 2026-09-22
+
+- Rename the project, npm package, tool, native plugins and configuration surface to Siftlight (拾光), under the LightSifter identity.
+- Distinguish retained-match completeness from filesystem coverage so ignored files can no longer hide behind an exhaustive absence claim.
+- Add bounded audit receipts with explicit ignore policy, pattern findings, scope coverage, source stability and reproducible follow-up requests.
+- Document the one-time migration requirement: remove installations registered under the earlier package identity before enabling Siftlight.
+
 ## [1.7.0-1] - 2026-09-22
 
 - Process optional semantic judgments in bounded batches, split oversized requests automatically, and preserve successful classifications when another batch fails.
@@ -59,7 +66,7 @@
 
 - Simplify interactive host output to the essential result statistics: match or item count, file count, completion state, budget state and continuation availability. File lists, source excerpts and raw failure diagnostics stay available to the model through structured evidence and inspect requests.
 - Keep model-facing evidence navigable with bounded match metadata, source inspection, semantic excerpts and explicit continuation requests. Recoverable request-contract failures remain actionable for the model without leaking their raw diagnostic text into the human-facing display.
-- Refresh Claude Code, Codex and Kimi MCP manifests to resolve the published `baoer_signal_grep@latest` package and keep all generated plugin artifacts on one release version.
+- Refresh Claude Code, Codex and Kimi MCP manifests to resolve the published `siftlight@latest` package and keep all generated plugin artifacts on one release version.
 - Add one owned lifecycle for long-running Concept and hybrid requests: the initial wait returns an exact `mode="await"` continuation with an operation id and progress, continuation resumes the same computation, final results are stably retained, and explicit cancellation waits for owned cleanup. Pending operations are bounded per service session, idle leases expire abandoned work, and real failures remain diagnostic instead of degrading to literal-only evidence.
 - Re-enumerate and verify a complete Concept source generation before publishing either Concept or hybrid evidence. Empty, unavailable, added, deleted and replaced files remain visible in coverage; source changes refresh within the operation deadline and mixed generations cannot be reported complete.
 - Deduplicate repeated embedding inputs before inference and atomically cache each completed embedding batch, exposing progress for unique embeddings and mapped passages. Cache reads distinguish misses or rebuildable corruption from real I/O failures.
@@ -78,7 +85,7 @@
 
 ## [1.5.6-3] - 2026-09-10
 
-- Provide ready-to-copy `baoer_signal_grep` requests when the hard search policy blocks a static standalone `rg` or `ripgrep` command that can be translated without ambiguity, while preserving search options, the original working-directory scope, and conservative manual recovery for unsupported shell behavior.
+- Provide ready-to-copy `siftlight` requests when the hard search policy blocks a static standalone `rg` or `ripgrep` command that can be translated without ambiguity, while preserving search options, the original working-directory scope, and conservative manual recovery for unsupported shell behavior.
 
 ## [1.5.6-2] - 2026-09-10
 
@@ -95,14 +102,14 @@
 - Add an explicit iteration budget so a future tokenizer or boundary regression fails fast with a clear diagnostic instead of hanging.
 - Keep hybrid literal evidence when Concept inference fails: semantic candidates are marked `skipped`, reasons name the failure, and the request returns partial hybrid results instead of discarding an in-flight exact search.
 - Keep models on the strongest applicable search mode after a rejected request: every host now instructs one corrected retry without copying the old error/request or weakening the search. Pi, OMP and MCP share one single-line 1,024-character error boundary with a 4,096-character raw scan limit; unknown objects are never coerced, so causes, stacks, hostile conversion hooks and repeated request text cannot accumulate in model context or block error formatting. Only explicit capability unavailability permits a visibly partial alternative.
-- Allow hosts to bound the complete Concept request—including queue admission, source planning and inference—with `BAOER_SIGNAL_GREP_CONCEPT_TIMEOUT_MS` (1s–1h). Missing or empty keeps the 10-minute default; invalid values fail closed before planning with an explicit configuration error.
+- Allow hosts to bound the complete Concept request—including queue admission, source planning and inference—with `SIFTLIGHT_CONCEPT_TIMEOUT_MS` (1s–1h). Missing or empty keeps the 10-minute default; invalid values fail closed before planning with an explicit configuration error.
 - Surface Concept admission planning in `counts`/`coverage` (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`, `admissionPlan`) and warn when interactive Concept enumerates more than 500 files. Empty files remain a normal skip and do not mark Concept coverage partial.
 
 ## [1.4.0] - 2026-09-09
 
-- Identify the exact Bash or PowerShell subcommand that triggered strict native search enforcement, including its sequence and bounded source position, while preserving the existing allow/deny policy. Denials now explain that the host call is atomic and instruct agents to split non-search work before routing only the search through `baoer_signal_grep`.
+- Identify the exact Bash or PowerShell subcommand that triggered strict native search enforcement, including its sequence and bounded source position, while preserving the existing allow/deny policy. Denials now explain that the host call is atomic and instruct agents to split non-search work before routing only the search through `siftlight`.
 - Add explicit `"hard"`, `"prefer"`, and `"off"` search-enforcement modes while retaining `true` and `false` configuration compatibility. Hard enforcement remains the default; prefer mode keeps the dedicated tool and model guidance without denying conventional searches.
-- Let Claude Code, Codex and Kimi native hooks select enforcement through `BAOER_SIGNAL_GREP_ENFORCE_SEARCH=hard|prefer|off`. Missing configuration remains hard, and unsupported values fail closed with a visible configuration error.
+- Let Claude Code, Codex and Kimi native hooks select enforcement through `SIFTLIGHT_ENFORCE_SEARCH=hard|prefer|off`. Missing configuration remains hard, and unsupported values fail closed with a visible configuration error.
 - Document why output-only pipeline filters remain available while direct content searches and pipelines containing another search producer remain blocked.
 
 ## [1.3.2] - 2026-09-09
@@ -164,7 +171,7 @@
 
 ## [1.2.3] - 2026-09-06
 
-- Add native OMP (Oh My Pi) compatibility with the `baoer_signal_grep` tool, profile-aware configuration, direct-search enforcement, lifecycle cleanup and a self-contained published extension bundle.
+- Add native OMP (Oh My Pi) compatibility with the `siftlight` tool, profile-aware configuration, direct-search enforcement, lifecycle cleanup and a self-contained published extension bundle.
 - Keep the existing Pi, Claude Code, Codex CLI/App, Kimi Code and MCP integrations unchanged while sharing configuration and search-policy behavior across hosts.
 
 ## [1.2.2] - 2026-09-06
@@ -177,13 +184,13 @@
 
 ## [1.2.1] - 2026-09-06
 
-- Bundle platform-specific ripgrep through a pinned dependency so MCP and Pi searches work without `rg` in `PATH`, including installations with lifecycle scripts disabled. Use one executable resolver for content, filename and Git-source searches, with an explicit `BAOER_SIGNAL_GREP_RG_PATH` override and actionable dependency errors.
+- Bundle platform-specific ripgrep through a pinned dependency so MCP and Pi searches work without `rg` in `PATH`, including installations with lifecycle scripts disabled. Use one executable resolver for content, filename and Git-source searches, with an explicit `SIFTLIGHT_RG_PATH` override and actionable dependency errors.
 - Make every MCP installation command follow the latest published version when the server starts.
 
 ## [1.2.0] - 2026-09-05
 
 - Fix missing file maps and matching lines in MCP clients that select structured results.
-- Make `baoer_signal_grep` the default conventional search tool in Pi; add native enforcement plugins for Claude Code, Codex and Kimi Code. MCP-only connections remain non-enforcing.
+- Make `siftlight` the default conventional search tool in Pi; add native enforcement plugins for Claude Code, Codex and Kimi Code. MCP-only connections remain non-enforcing.
 - Add filename discovery, whole-word and strict-scope searches, JS/TS symbol and call navigation, module relationships, and code-pattern search.
 - Add optional offline natural-language code discovery after explicit model installation.
 - Improve large-result pagination, partial-result reporting and cancellation handling.
@@ -191,7 +198,7 @@
 ## [1.0.0] - 2026-09-04
 
 - Add local stdio MCP connections for Claude Code, Codex and compatible clients.
-- Rename the package, tool, executable and Pi configuration to the `baoer_signal_grep` family. MCP environment variables now use `BAOER_SIGNAL_GREP_MCP_*`; old names are not aliases.
+- Rename the package, tool, executable and Pi configuration to the `siftlight` family. MCP environment variables now use `SIFTLIGHT_MCP_*`; old names are not aliases.
 
 ## [0.7.0] - 2026-09-03
 

@@ -1,6 +1,6 @@
 node_modules/
 coverage/
-.baoer_signal_grep-node-smoke/
+.siftlight-node-smoke/
 *.tgz
 .DS_Store
 .env

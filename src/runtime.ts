@@ -1,23 +1,23 @@
-import type { SignalGrepLocale } from "./config.js";
-import type { SignalGrepInput, SignalGrepSearchOptions, SignalGrepService } from "./service.js";
+import type { SiftlightLocale } from "./config.js";
+import type { SiftlightInput, SiftlightSearchOptions, SiftlightService } from "./service.js";
 import { type SessionSummarySnapshot, SessionSummary } from "./session-summary.js";
-import type { ContextBudget, SignalGrepResult } from "./types.js";
+import type { ContextBudget, SiftlightResult } from "./types.js";
 
-export class SignalGrepRuntime {
-  readonly #service: SignalGrepService;
+export class SiftlightRuntime {
+  readonly #service: SiftlightService;
   readonly #summary = new SessionSummary();
 
-  constructor(service: SignalGrepService) {
+  constructor(service: SiftlightService) {
     this.#service = service;
   }
 
   async search(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
     contextBudget?: ContextBudget,
-  ): Promise<SignalGrepResult> {
-    const searchOptions: SignalGrepSearchOptions = {};
+  ): Promise<SiftlightResult> {
+    const searchOptions: SiftlightSearchOptions = {};
     if (contextBudget) searchOptions.contextBudget = contextBudget;
     const result = await this.#service.search(input, cwd, signal, searchOptions);
     this.#summary.record(input, result);
@@ -31,7 +31,7 @@ export class SignalGrepRuntime {
     return this.#summary.snapshot;
   }
 
-  formatSessionStatus(locale: SignalGrepLocale): string | undefined {
+  formatSessionStatus(locale: SiftlightLocale): string | undefined {
     return this.#summary.format(locale);
   }
 

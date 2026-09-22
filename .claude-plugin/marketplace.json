@@ -1,11 +1,11 @@
 {
-  "name": "baoer-signal-grep",
-  "owner": { "name": "宝儿" },
+  "name": "siftlight",
+  "owner": { "name": "LightSifter" },
   "plugins": [
     {
-      "name": "baoer-signal-grep",
-      "source": "./plugins/baoer-signal-grep",
-      "description": "Enforce conventional local searches through baoer_signal_grep."
+      "name": "siftlight",
+      "source": "./plugins/siftlight",
+      "description": "Enforce conventional local searches through siftlight."
     }
   ]
 }

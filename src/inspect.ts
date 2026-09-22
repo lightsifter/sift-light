@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { abortError, CursorError, SignalGrepError } from "./errors.js";
+import { abortError, CursorError, SiftlightError } from "./errors.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import type { CodeStructureProvider, StructureInspection } from "./structure.js";
 import {
@@ -16,8 +16,8 @@ import {
   MAX_LINE_CHARACTERS,
   MAX_RESULT_BYTES,
   type MatchRecord,
-  type SignalGrepDetails,
-  type SignalGrepResult,
+  type SiftlightDetails,
+  type SiftlightResult,
   type SourceExcerptDetails,
   type SourceRevision,
   type StructureDetails,
@@ -60,12 +60,12 @@ export function resolveInspectionTarget(
   let line = input.line;
   let retainedMatch: MatchRecord | undefined;
   if (input.matchIndex !== undefined) {
-    if (!input.cursor) throw new SignalGrepError("matchIndex requires a cursor when mode=inspect");
+    if (!input.cursor) throw new SiftlightError("matchIndex requires a cursor when mode=inspect");
     if (input.path !== undefined || input.line !== undefined) {
-      throw new SignalGrepError("matchIndex replaces path and line when mode=inspect");
+      throw new SiftlightError("matchIndex replaces path and line when mode=inspect");
     }
     if (!Number.isSafeInteger(input.matchIndex) || input.matchIndex < 1) {
-      throw new SignalGrepError("matchIndex must be a positive integer when mode=inspect");
+      throw new SiftlightError("matchIndex must be a positive integer when mode=inspect");
     }
     const { snapshot } = snapshots.resolve(input.cursor);
     retainedMatch = snapshot.matches[input.matchIndex - 1];
@@ -77,9 +77,9 @@ export function resolveInspectionTarget(
     path = retainedMatch.displayPath;
     line = retainedMatch.lineNumber;
   }
-  if (!path) throw new SignalGrepError("path is required when mode=inspect");
+  if (!path) throw new SiftlightError("path is required when mode=inspect");
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
-    throw new SignalGrepError("line must be a positive integer when mode=inspect");
+    throw new SiftlightError("line must be a positive integer when mode=inspect");
   }
   const absolutePath = retainedMatch?.absolutePath ?? resolve(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
@@ -242,11 +242,11 @@ export async function inspectSource(
   cwd: string,
   signal: AbortSignal | undefined,
   options: InspectOptions,
-): Promise<SignalGrepResult> {
+): Promise<SiftlightResult> {
   const target = resolveInspectionTarget(input, cwd, options.snapshots);
   const evidence = await inspectSourceEvidence(target, cwd, signal, options);
   const { source, structure } = evidence;
-  const details: SignalGrepDetails = {
+  const details: SiftlightDetails = {
     version: 1,
     mode: "inspect",
     status: source ? "complete" : "partial",
@@ -266,6 +266,6 @@ export async function inspectSource(
     ? `${target.path}:${String(target.line)}\n${inspectionDescription(evidence)}\n\n${source.text}${sourceTruncationText(source)}\n\n${status}`
     : `${target.path}:${String(target.line)}\n\n${status}`;
   if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-    throw new SignalGrepError("Inspection metadata exceeds the result byte budget");
+    throw new SiftlightError("Inspection metadata exceeds the result byte budget");
   return { text, details };
 }

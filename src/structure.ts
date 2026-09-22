@@ -1,7 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { consumeCappedLines } from "./capped-lines.js";
 import { runOwnedProcess } from "./owned-process.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { getSourceRevision, sameSourceRevision } from "./source.js";
 import {
   MAX_PROTOCOL_LINE_BYTES,
@@ -56,7 +56,7 @@ class CtagsCommandError extends Error {
   }
 }
 
-class CtagsProtocolError extends SignalGrepError {}
+class CtagsProtocolError extends SiftlightError {}
 
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;

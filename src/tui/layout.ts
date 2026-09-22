@@ -1,10 +1,10 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { SignalGrepLocale } from "../config.js";
-import type { SignalGrepInput } from "../service.js";
+import type { SiftlightLocale } from "../config.js";
+import type { SiftlightInput } from "../service.js";
 import type { Dashboard } from "./dashboard.js";
 
-import { candy, type SignalGrepTheme } from "./palette.js";
-export type { SignalGrepTheme } from "./palette.js";
+import { candy, type SiftlightTheme } from "./palette.js";
+export type { SiftlightTheme } from "./palette.js";
 const DIGITS = [
   ["█▀█", "█ █", "█▄█"],
   ["▄█ ", " █ ", "▄█▄"],
@@ -81,8 +81,8 @@ function indent(lines: string[], gutter: number): string[] {
 
 export function renderDashboard(
   view: Dashboard,
-  locale: SignalGrepLocale,
-  theme: SignalGrepTheme,
+  locale: SiftlightLocale,
+  theme: SiftlightTheme,
   width: number,
   expanded: boolean,
 ): string[] {
@@ -253,10 +253,10 @@ export function renderDashboard(
   return fit(indent(lines, gutter), width);
 }
 
-export function renderSignalGrepCallLines(
-  input: SignalGrepInput,
-  locale: SignalGrepLocale,
-  theme: SignalGrepTheme,
+export function renderSiftlightCallLines(
+  input: SiftlightInput,
+  locale: SiftlightLocale,
+  theme: SiftlightTheme,
   width: number,
 ): string[] {
   const zh = locale === "zh-CN";
@@ -281,7 +281,7 @@ export function renderSignalGrepCallLines(
   return fit(
     indent(
       [
-        `${theme.fg("accent", theme.bold("baoer_signal_grep"))}  ${action}`,
+        `${theme.fg("accent", theme.bold("siftlight"))}  ${action}`,
         ...(input.path ? [theme.fg("text", safeLabel(input.path))] : []),
       ],
       gutter,

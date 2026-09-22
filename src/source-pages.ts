@@ -1,4 +1,4 @@
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { SourceDocument, type ByteRange, type SourcePosition } from "./source-document.js";
 
 export interface SourceFragment extends ByteRange {
@@ -23,7 +23,7 @@ export function mergeByteRanges(ranges: readonly ByteRange[]): ByteRange[] {
       range.start < 0 ||
       range.end < range.start
     ) {
-      throw new SignalGrepError("Invalid source range");
+      throw new SiftlightError("Invalid source range");
     }
     const previous = merged.at(-1);
     if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
@@ -72,12 +72,12 @@ export function sourcePage(
   focus?: number,
 ): SourcePage {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 256) {
-    throw new SignalGrepError("Source page budget must allow at least 256 bytes");
+    throw new SiftlightError("Source page budget must allow at least 256 bytes");
   }
   const gaps = mergeByteRanges(ranges);
   const range =
     gaps.find((item) => focus !== undefined && item.start <= focus && focus < item.end) ?? gaps[0];
-  if (!range) throw new SignalGrepError("Source range is already complete");
+  if (!range) throw new SiftlightError("Source range is already complete");
   document.checkRange(range);
   document.toCharacterOffset(range.start);
   document.toCharacterOffset(range.end);
@@ -106,7 +106,7 @@ export function sourcePage(
         text,
       };
     }
-    if (available <= 4) throw new SignalGrepError("Source metadata exceeds the page budget");
+    if (available <= 4) throw new SiftlightError("Source metadata exceeds the page budget");
     available = Math.max(4, Math.floor(available * 0.75));
   }
 }

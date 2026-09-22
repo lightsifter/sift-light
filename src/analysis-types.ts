@@ -1,5 +1,5 @@
 import type { ByteRange, SourceReference } from "./source-document.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import type { SearchScopeDetails, ResultStatistics } from "./types.js";
 import type { ValidationDetails } from "./validation-types.js";
 import type { ConceptSourceSummary } from "./concept-source-generation.js";
@@ -98,7 +98,7 @@ export interface AnalysisDetails {
   modelOutput?: boolean;
   semanticJudge?: SemanticJudgeDetails;
   statistics?: ResultStatistics;
-  items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SignalGrepInput })[];
+  items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SiftlightInput })[];
   sources?: SourceReference[];
   inspectCursor?: string;
   reasons: string[];
@@ -108,8 +108,8 @@ export interface AnalysisDetails {
   termCounts?: { term: string; retainedOccurrences: number }[];
   termCountsOffset?: number;
   totalTerms?: number;
-  termCountsNextRequest?: SignalGrepInput;
-  matchesRequest?: SignalGrepInput;
+  termCountsNextRequest?: SiftlightInput;
+  matchesRequest?: SiftlightInput;
   changes?: { base: string; target: string; scope: string; side: string };
   scope?: SearchScopeDetails;
   chunks?: {

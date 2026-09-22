@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { CursorError, SignalGrepError } from "./errors.js";
+import { CursorError, SiftlightError } from "./errors.js";
 import { MAX_SEARCH_STORAGE_BYTES, MAX_STORED_OCCURRENCES } from "./types.js";
 import type { SearchScan, SearchSnapshot } from "./types.js";
 
@@ -46,7 +46,7 @@ export class SnapshotStore {
       this.#scanBytes(scan) > this.#maxTotalStoredBytes ||
       this.#scanOccurrences(scan) > this.#maxTotalStoredOccurrences
     )
-      throw new SignalGrepError("Search snapshot exceeds the session storage budget");
+      throw new SiftlightError("Search snapshot exceeds the session storage budget");
     const now = this.#now();
     const snapshot: SearchSnapshot = {
       ...scan,

@@ -1,14 +1,14 @@
 {
-  "name": "baoer-signal-grep",
+  "name": "siftlight",
   "interface": {
-    "displayName": "Baoer Signal Grep"
+    "displayName": "Siftlight"
   },
   "plugins": [
     {
-      "name": "baoer-signal-grep",
+      "name": "siftlight",
       "source": {
         "source": "local",
-        "path": "./plugins/baoer-signal-grep"
+        "path": "./plugins/siftlight"
       },
       "policy": {
         "installation": "AVAILABLE",

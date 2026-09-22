@@ -8,7 +8,7 @@ import { structuralSearch } from "./structural-search.js";
 import { dirname, extname, resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
 import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
-import { abortError, CursorError, SignalGrepError } from "./errors.js";
+import { abortError, CursorError, SiftlightError } from "./errors.js";
 import { findGitRepository } from "./git-repository.js";
 import { isPathInsideCwd, isPathInsideRoot } from "./path-policy.js";
 import { resolveInspectionTarget } from "./inspect.js";
@@ -30,7 +30,7 @@ import { normalizeRequest } from "./request.js";
 import { runOwnedParallel } from "./owned-parallel.js";
 import { discoverFiles } from "./file-discovery.js";
 import type { RipgrepRunner } from "./rg.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import type { SnapshotStore } from "./snapshot-store.js";
 import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js";
 import { SourceContinuations } from "./source-continuations.js";
@@ -69,10 +69,10 @@ import {
   MAX_INSPECT_TARGETS,
   type SearchRequest,
   type SearchScopeDetails,
-  type SignalGrepResult,
+  type SiftlightResult,
 } from "./types.js";
 
-export function isEvidenceRequest(input: SignalGrepInput): boolean {
+export function isEvidenceRequest(input: SiftlightInput): boolean {
   return (
     input.mode === "concept" ||
     input.mode === "hybrid" ||
@@ -107,18 +107,18 @@ function maxFilesToParse(value: number | undefined): number {
     candidate < 1 ||
     candidate > MAX_CONFIGURABLE_STRUCTURE_FILES
   ) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `maxFilesToParse must be an integer from 1 through ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}`,
     );
   }
   return candidate;
 }
 
-function validateTerms(input: SignalGrepInput): string[] | undefined {
+function validateTerms(input: SiftlightInput): string[] | undefined {
   const terms = input.allOf;
   if (terms === undefined) {
     if (input.within !== undefined) {
-      throw new SignalGrepError(
+      throw new SiftlightError(
         "within is only valid with allOf; omit within for ordinary single-pattern searches",
       );
     }
@@ -131,7 +131,7 @@ function validateTerms(input: SignalGrepInput): string[] | undefined {
     terms.some((term) => typeof term !== "string" || !term.trim() || /[\r\n\0]/.test(term)) ||
     new Set(terms).size !== terms.length
   )
-    throw new SignalGrepError("allOf requires 2–3 distinct, nonempty, single-line literal terms");
+    throw new SiftlightError("allOf requires 2–3 distinct, nonempty, single-line literal terms");
   if (
     input.pattern !== undefined ||
     input.roles !== undefined ||
@@ -139,11 +139,11 @@ function validateTerms(input: SignalGrepInput): string[] | undefined {
     input.ignoreCase !== undefined ||
     input.wholeWord !== undefined
   )
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "allOf is an explicit case-sensitive literal conjunction; omit pattern, roles, literal and ignoreCase",
     );
   if (input.within !== undefined && input.within !== "file" && input.within !== "function")
-    throw new SignalGrepError("within must be file or function");
+    throw new SiftlightError("within must be file or function");
   return terms;
 }
 function fileConjunction(
@@ -190,6 +190,7 @@ function searchScope(request: SearchRequest): SearchScopeDetails {
     glob: [...request.glob],
     exclude: [...request.exclude],
     hidden: request.hidden,
+    ignorePolicy: request.ignorePolicy ?? "respect",
     expandedToProjectRoot: request.expandedFromPath !== undefined,
     assertion: path === "." ? "project-wide" : "requested-scope",
     ...(request.modifiedAfterMs !== undefined ? { modifiedAfterMs: request.modifiedAfterMs } : {}),
@@ -208,7 +209,7 @@ async function navigationRoot(cwd: string, path: string, signal?: AbortSignal): 
 
 type NavigationFilters = Pick<SearchRequest, "glob" | "exclude" | "hidden">;
 
-function navigationFilters(input: SignalGrepInput): NavigationFilters {
+function navigationFilters(input: SiftlightInput): NavigationFilters {
   const request = normalizeRequest({
     pattern: "",
     ...(input.glob !== undefined ? { glob: input.glob } : {}),
@@ -235,6 +236,7 @@ async function navigationScope(
     glob: [...filters.glob],
     exclude: [...filters.exclude],
     hidden: filters.hidden,
+    ignorePolicy: "respect",
     expandedToProjectRoot: false,
     assertion: isProjectRoot ? "project-wide" : "requested-scope",
   };
@@ -293,12 +295,12 @@ export class EvidenceService {
   }
 
   async #validateSavedEvidence(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
-  ): Promise<SignalGrepResult> {
+  ): Promise<SiftlightResult> {
     const cursor = input.cursor;
-    if (!cursor) throw new SignalGrepError("A saved evidence cursor is required");
+    if (!cursor) throw new SiftlightError("A saved evidence cursor is required");
     const startedAt = Date.now();
     const validated = await validateSavedEvidence({
       cursor,
@@ -343,7 +345,7 @@ export class EvidenceService {
 
   async #candidates(
     request: SearchRequest,
-    input: SignalGrepInput,
+    input: SiftlightInput,
     access: SourceAccess,
   ): Promise<{ candidates: EvidenceCandidates; request: SearchRequest }> {
     const collect = (candidateRequest: SearchRequest) =>
@@ -372,14 +374,14 @@ export class EvidenceService {
   }
 
   async search(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
     options: EvidenceSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+  ): Promise<SiftlightResult> {
     if (signal?.aborted) throw abortError();
     if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
-      throw new SignalGrepError(
+      throw new SiftlightError(
         "modifiedAfter and modifiedBefore apply to worktree searches and cannot be combined with changes",
       );
     const analysisStarted = performance.now();
@@ -389,7 +391,7 @@ export class EvidenceService {
     if (input.sourceCursor !== undefined) {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
-      if (input.mode !== "inspect") throw new SignalGrepError("sourceCursor requires mode=inspect");
+      if (input.mode !== "inspect") throw new SiftlightError("sourceCursor requires mode=inspect");
       return continueSource(input.sourceCursor, access, this.#continuations);
     }
     if (input.mode === "inspect") {
@@ -444,7 +446,7 @@ export class EvidenceService {
         throw new Error("Hybrid search did not settle its owned literal operation");
       if (!conceptResult) {
         if (conceptFailure instanceof Error) throw conceptFailure;
-        throw new SignalGrepError("Concept search failed without a diagnostic");
+        throw new SiftlightError("Concept search failed without a diagnostic");
       }
       const firstLiteralResult = literalResult;
       const verifiedLiteralResult = await this.#runner(literalRequest, cwd, signal);
@@ -503,11 +505,11 @@ export class EvidenceService {
         input.ignoreCase !== undefined ||
         input.wholeWord !== undefined
       )
-        throw new SignalGrepError(
+        throw new SiftlightError(
           "anyOf is an explicit case-sensitive literal union; omit pattern, allOf, within, roles, literal and ignoreCase",
         );
       if (input.mode !== undefined && input.mode !== "auto" && input.mode !== "matches")
-        throw new SignalGrepError("anyOf mode must be omitted, auto, or matches");
+        throw new SiftlightError("anyOf mode must be omitted, auto, or matches");
       const chunks = Array.from(
         { length: Math.ceil(anyOf.length / MAX_ANY_OF_TERMS) },
         (_, index) => anyOf.slice(index * MAX_ANY_OF_TERMS, (index + 1) * MAX_ANY_OF_TERMS),
@@ -631,7 +633,7 @@ export class EvidenceService {
             ].includes(role),
         ))
     )
-      throw new SignalGrepError("roles must contain supported syntactic roles");
+      throw new SiftlightError("roles must contain supported syntactic roles");
     const request = normalizeRequest(
       terms
         ? {
@@ -727,7 +729,7 @@ export class EvidenceService {
     await processFile(0);
     result.reasons = [...new Set(result.reasons)];
     if ((input.roles || (terms && input.within === "function")) && syntaxCapableFiles === 0) {
-      throw new SignalGrepError(
+      throw new SiftlightError(
         `${input.roles ? "roles" : "within=function"} requires a supported source language; use ordinary search or file-level allOf for non-code content`,
       );
     }
@@ -746,25 +748,25 @@ export class EvidenceService {
     return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
   }
 
-  #inspectionTargets(input: SignalGrepInput, cwd: string): SourceInspectionTarget[] {
+  #inspectionTargets(input: SiftlightInput, cwd: string): SourceInspectionTarget[] {
     if (input.targets !== undefined && input.matchIndices !== undefined)
-      throw new SignalGrepError("Use targets or matchIndices, not both");
+      throw new SiftlightError("Use targets or matchIndices, not both");
     if (input.targets !== undefined || input.matchIndices !== undefined) {
       if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
-        throw new SignalGrepError(
+        throw new SiftlightError(
           "Batch inspection accepts targets or matchIndices instead of path, line or matchIndex",
         );
       const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
       if (size < 1 || size > MAX_INSPECT_TARGETS)
-        throw new SignalGrepError("Batch inspection requires 1-5 targets");
+        throw new SiftlightError("Batch inspection requires 1-5 targets");
       if (input.targets) {
         if (input.cursor !== undefined)
-          throw new SignalGrepError("targets cannot be combined with cursor");
+          throw new SiftlightError("targets cannot be combined with cursor");
         return input.targets.map((target) =>
           matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
         );
       }
-      if (!input.cursor) throw new SignalGrepError("matchIndices requires a cursor");
+      if (!input.cursor) throw new SiftlightError("matchIndices requires a cursor");
       const cursor = input.cursor;
       return (input.matchIndices ?? []).map((matchIndex) =>
         this.#singleTarget({ cursor, matchIndex }, cwd),
@@ -772,7 +774,7 @@ export class EvidenceService {
     }
     return [this.#singleTarget(input, cwd)];
   }
-  #singleTarget(input: SignalGrepInput, cwd: string): SourceInspectionTarget {
+  #singleTarget(input: SiftlightInput, cwd: string): SourceInspectionTarget {
     if (input.cursor?.includes(".analysis.")) {
       if (input.path !== undefined || input.line !== undefined || input.matchIndex === undefined)
         throw new CursorError("Analysis inspection requires only cursor and matchIndex");
@@ -794,10 +796,10 @@ export class EvidenceService {
   }
 
   async #navigate(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     access: SourceAccess,
     options: EvidenceSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+  ): Promise<SiftlightResult> {
     const navigationStarted = performance.now();
     let path = input.path;
     let reference: SourceReference | undefined;
@@ -805,7 +807,7 @@ export class EvidenceService {
     let loaded: SourceDocument | undefined;
     if (input.cursor) {
       if (input.path !== undefined || input.line !== undefined || input.matchIndex === undefined)
-        throw new SignalGrepError(
+        throw new SiftlightError(
           "Snapshot navigation requires cursor+matchIndex instead of path/line",
         );
       const selected = this.#singleTarget(input, access.cwd);
@@ -813,20 +815,20 @@ export class EvidenceService {
       line = selected.line;
       reference = selected.reference;
       if (selected.unverified)
-        throw new SignalGrepError("Snapshot source revision is unverified; refresh the search");
+        throw new SiftlightError("Snapshot source revision is unverified; refresh the search");
       if (selected.expectedRevision) {
         const doc = await access.load(path);
         if (
           doc.reference.origin.kind !== "worktree" ||
           !sameSourceRevision(selected.expectedRevision, doc.reference.origin.revision)
         )
-          throw new SignalGrepError("Source changed; refresh the search");
+          throw new SiftlightError("Source changed; refresh the search");
         reference = doc.reference;
         loaded = doc;
       }
     } else if (input.matchIndex !== undefined)
-      throw new SignalGrepError("matchIndex requires a cursor");
-    if (!path) throw new SignalGrepError(`${input.mode} requires path or cursor+matchIndex`);
+      throw new SiftlightError("matchIndex requires a cursor");
+    if (!path) throw new SiftlightError(`${input.mode} requires path or cursor+matchIndex`);
     const document = loaded ?? (await access.load(path, reference));
     const language = syntaxLanguage(document.path);
     const isPython = /\.py$/iu.test(document.path);
@@ -834,13 +836,13 @@ export class EvidenceService {
       const capabilityFailure = outlineCapabilityError(document.path, "outline", true);
       if (capabilityFailure) throw capabilityFailure;
       if (!language && !isPython)
-        throw new SignalGrepError(
+        throw new SiftlightError(
           `No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`,
         );
     }
     if ((!language && !isPython) || language === "go") {
       const extension = extname(document.path) || "extensionless source";
-      throw new SignalGrepError(
+      throw new SiftlightError(
         `${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`,
       );
     }
@@ -985,7 +987,7 @@ export class EvidenceService {
       load: async (file: string, expected?: SourceReference) => {
         const absolutePath = await canonicalNavigationPath(resolve(access.cwd, file));
         if (!allowed.has(absolutePath))
-          throw new SignalGrepError("Navigation source is excluded by current ignore rules");
+          throw new SiftlightError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined) return document;
         return expected ? access.refresh(file, expected) : access.load(file);
       },

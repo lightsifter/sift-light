@@ -1,6 +1,6 @@
 {
-  "name": "baoer_signal_grep",
-  "version": "1.7.0-1",
+  "name": "siftlight",
+  "version": "1.7.0-2",
   "description": "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   "keywords": [
     "ai-agent",
@@ -19,19 +19,19 @@
     "search",
     "source-inspection"
   ],
-  "homepage": "https://github.com/xcjy8bao/baoer_signal_grep#readme",
+  "homepage": "https://github.com/lightsifter/siftlight#readme",
   "bugs": {
-    "url": "https://github.com/xcjy8bao/baoer_signal_grep/issues"
+    "url": "https://github.com/lightsifter/siftlight/issues"
   },
   "license": "AGPL-3.0-only",
-  "author": "宝儿",
+  "author": "LightSifter",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xcjy8bao/baoer_signal_grep.git"
+    "url": "git+https://github.com/lightsifter/siftlight.git"
   },
   "bin": {
-    "baoer_signal_grep_mcp": "./src/mcp-server.mjs",
-    "baoer_signal_grep_model": "./src/concept-worker.mjs"
+    "siftlight_mcp": "./src/mcp-server.mjs",
+    "siftlight_model": "./src/concept-worker.mjs"
   },
   "files": [
     "src/**/*.ts",
@@ -45,7 +45,7 @@
     "CHANGELOG.md",
     "SECURITY.md",
     "src/concept-worker.mjs",
-    "plugins/baoer-signal-grep/**"
+    "plugins/siftlight/**"
   ],
   "type": "module",
   "publishConfig": {
@@ -131,7 +131,7 @@
   },
   "omp": {
     "extensions": [
-      "./plugins/baoer-signal-grep/omp-extension.mjs"
+      "./plugins/siftlight/omp-extension.mjs"
     ]
   },
   "pi": {

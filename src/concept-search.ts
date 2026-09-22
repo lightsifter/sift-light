@@ -17,12 +17,12 @@ import {
   MAX_CONCEPT_WORKER_OUTPUT_BYTES,
   conceptCacheDirectory,
 } from "./concept-model.js";
-import { abortError, ConceptUnavailableError, SignalGrepError } from "./errors.js";
+import { abortError, ConceptUnavailableError, SiftlightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { scriptRuntimeEnvironment } from "./script-runtime.js";
 import { isRecordValue } from "./record-value.js";
 import { normalizeRequest } from "./request.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import { SourceAccess } from "./source-access.js";
 import type { SourceDocument, ByteRange } from "./source-document.js";
 import {
@@ -57,7 +57,7 @@ function conciseWorkerError(stderr: string): string {
 }
 
 /** A worker that disappears without a protocol result can be restarted once by the owner. */
-export class ConceptWorkerExitError extends SignalGrepError {
+export class ConceptWorkerExitError extends SiftlightError {
   readonly exitCode: number | null;
 
   constructor(exitCode: number | null, diagnostic: string) {
@@ -167,7 +167,7 @@ async function similarities(
             ]
           : [worker, "--infer"],
         cwd: dirname(worker),
-        env: { ...env, SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
+        env: { ...env, SIFTLIGHT_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
         ...(parent ? { signal: parent } : {}),
         input: Buffer.from(
           JSON.stringify({
@@ -180,7 +180,7 @@ async function similarities(
         for await (const chunk of stdout) {
           bytes += chunk.byteLength;
           if (bytes > MAX_CONCEPT_WORKER_OUTPUT_BYTES)
-            throw new SignalGrepError("Concept worker exceeded its 4 MiB response budget");
+            throw new SiftlightError("Concept worker exceeded its 4 MiB response budget");
           lineBuffer += decoder.write(Buffer.from(chunk));
           let newline = lineBuffer.indexOf("\n");
           while (newline >= 0) {
@@ -190,10 +190,10 @@ async function similarities(
             if (!line) continue;
             const parsed: unknown = JSON.parse(line);
             if (!isRecordValue(parsed) || typeof parsed.type !== "string")
-              throw new SignalGrepError("Invalid concept worker progress response");
+              throw new SiftlightError("Invalid concept worker progress response");
             if (parsed.type === "progress") {
               if (sawFinal)
-                throw new SignalGrepError("Concept worker emitted progress after its result");
+                throw new SiftlightError("Concept worker emitted progress after its result");
               if (
                 typeof parsed.phase !== "string" ||
                 (parsed.completed !== undefined &&
@@ -205,7 +205,7 @@ async function similarities(
                     !Number.isSafeInteger(parsed.total) ||
                     parsed.total < 0))
               )
-                throw new SignalGrepError("Invalid concept worker progress response");
+                throw new SiftlightError("Invalid concept worker progress response");
               const progress: OperationProgress = { phase: parsed.phase };
               if (typeof parsed.completed === "number") progress.completed = parsed.completed;
               if (typeof parsed.total === "number") progress.total = parsed.total;
@@ -216,12 +216,11 @@ async function similarities(
                 progress.detail = `unique embeddings ${String(parsed.uniqueEmbeddings)}, passages ${String(parsed.passages)}`;
               onProgress?.(progress);
             } else if (parsed.type === "result") {
-              if (sawFinal)
-                throw new SignalGrepError("Concept worker emitted more than one result");
+              if (sawFinal) throw new SiftlightError("Concept worker emitted more than one result");
               sawFinal = true;
               finalValue = parsed;
             } else {
-              throw new SignalGrepError("Invalid concept worker response type");
+              throw new SiftlightError("Invalid concept worker response type");
             }
           }
         }
@@ -240,8 +239,8 @@ async function similarities(
     if (lineBuffer.trim()) {
       const parsed: unknown = JSON.parse(lineBuffer.trim());
       if (!isRecordValue(parsed) || parsed.type !== "result")
-        throw new SignalGrepError("Concept worker did not return a result record");
-      if (sawFinal) throw new SignalGrepError("Concept worker emitted more than one result");
+        throw new SiftlightError("Concept worker did not return a result record");
+      if (sawFinal) throw new SiftlightError("Concept worker emitted more than one result");
       finalValue = parsed;
       sawFinal = true;
     }
@@ -273,7 +272,7 @@ async function similarities(
       !Number.isFinite(value.peakRssBytes) ||
       value.peakRssBytes < 0
     )
-      throw new SignalGrepError("Invalid concept inference response");
+      throw new SiftlightError("Invalid concept inference response");
     return {
       scores: value.scores.filter((score): score is number => typeof score === "number"),
       cacheHits: value.cacheHits,
@@ -306,14 +305,14 @@ async function similarities(
 
 export function validateConceptQuery(query: string | undefined): string {
   if (!query?.trim() || query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Concept query requires nonempty, single-line well-formed text of at most 256 characters",
     );
   return query;
 }
 
 async function runConceptSearch(
-  input: SignalGrepInput,
+  input: SiftlightInput,
   access: SourceAccess,
   infer: ConceptInferenceRunner,
   onProgress?: (progress: OperationProgress) => void,
@@ -434,6 +433,7 @@ async function runConceptSearch(
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden,
+    ignorePolicy: request.ignorePolicy ?? "respect",
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide",
   };
@@ -443,7 +443,7 @@ async function runConceptSearch(
 }
 
 export function conceptSearch(
-  input: SignalGrepInput,
+  input: SiftlightInput,
   access: SourceAccess,
   onProgress?: (progress: OperationProgress) => void,
 ): Promise<ConceptSearchExecution> {
@@ -453,7 +453,7 @@ export function conceptSearch(
 export type ConceptSearchRunner = typeof conceptSearch;
 
 async function runConceptSearchQueued(
-  input: SignalGrepInput,
+  input: SiftlightInput,
   access: SourceAccess,
   infer: ConceptInferenceRunner,
   onProgress?: (progress: OperationProgress) => void,

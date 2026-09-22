@@ -16,12 +16,13 @@ import {
   MAX_FILE_FILTER_ITEMS,
   MAX_PATH_CHARACTERS,
   MAX_PATTERN_CHARACTERS,
+  MAX_AUDIT_LITERAL_CHARACTERS,
 } from "./types.js";
 import {
   MODE_CONTRACT_DESCRIPTION,
   MODEL_USAGE_GUIDANCE,
   REQUEST_USAGE_GUIDANCE,
-  SIGNAL_GREP_MODES,
+  SIFTLIGHT_MODES,
   fieldGuidance,
 } from "./request-contract.js";
 
@@ -36,11 +37,11 @@ function stringEnum<const Values extends readonly string[]>(
   });
 }
 
-export const SIGNAL_GREP_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+export const SIFTLIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 
-export const SIGNAL_GREP_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
+export const SIFTLIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 
-export const signalGrepSchema = Type.Object({
+export const siftlightSchema = Type.Object({
   query: Type.Optional(
     Type.String({
       maxLength: 256,
@@ -189,6 +190,33 @@ export const signalGrepSchema = Type.Object({
   hidden: Type.Optional(
     Type.Boolean({ description: "Search hidden files (default true; .git is always excluded)." }),
   ),
+  ignorePolicy: Type.Optional(
+    stringEnum(["respect", "include"] as const, {
+      description:
+        "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted. include searches ignored files while still excluding .git internals and protected paths.",
+    }),
+  ),
+  patterns: Type.Optional(
+    Type.Array(
+      Type.Object(
+        {
+          id: Type.String({ minLength: 1, maxLength: 64 }),
+          literal: Type.String({
+            minLength: 1,
+            maxLength: MAX_AUDIT_LITERAL_CHARACTERS,
+            description: `Single-line exact text, limited to ${String(MAX_AUDIT_LITERAL_CHARACTERS)} characters and UTF-8 bytes.`,
+          }),
+        },
+        { additionalProperties: false },
+      ),
+      {
+        minItems: 1,
+        maxItems: 32,
+        description:
+          "Named exact-literal checks for mode=audit. Each finding is present, absent_with_complete_coverage, or unknown.",
+      },
+    ),
+  ),
   redact: Type.Optional(
     Type.Boolean({
       description:
@@ -240,7 +268,7 @@ export const signalGrepSchema = Type.Object({
     }),
   ),
   mode: Type.Optional(
-    stringEnum(SIGNAL_GREP_MODES, {
+    stringEnum(SIFTLIGHT_MODES, {
       description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION}`,
     }),
   ),

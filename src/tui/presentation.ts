@@ -1,7 +1,7 @@
 import type {
   InspectBatchItemDetails,
   SearchMode,
-  SignalGrepDetails,
+  SiftlightDetails,
   StructureStatus,
 } from "../types.js";
 
@@ -11,7 +11,7 @@ export interface SummaryRow {
 }
 
 interface PresentationBase {
-  details: SignalGrepDetails;
+  details: SiftlightDetails;
   text: string;
 }
 
@@ -45,7 +45,7 @@ export interface InspectPresentation extends PresentationBase {
   status: StructureStatus;
 }
 
-export type SignalGrepPresentation =
+export type SiftlightPresentation =
   | EmptyPresentation
   | SummaryPresentation
   | MatchesPresentation
@@ -68,8 +68,8 @@ function isNonNegativeSafeInteger(value: number): boolean {
 }
 
 function hasRecognizableDetails(
-  details: SignalGrepDetails | undefined,
-): details is SignalGrepDetails {
+  details: SiftlightDetails | undefined,
+): details is SiftlightDetails {
   if (!details || details.version !== 1 || details.analysis !== undefined) return false;
   if (!SEARCH_MODES.has(details.mode)) return false;
   if (details.status !== "complete" && details.status !== "partial") return false;
@@ -142,7 +142,7 @@ function parseMatchRange(text: string): Pick<MatchesPresentation, "firstMatch" |
   return { firstMatch, lastMatch };
 }
 
-function parseInspect(text: string, details: SignalGrepDetails): InspectPresentation | undefined {
+function parseInspect(text: string, details: SiftlightDetails): InspectPresentation | undefined {
   const structure = details.structure;
   if (!structure || !STRUCTURE_STATUSES.has(structure.status)) return undefined;
 
@@ -182,10 +182,10 @@ function parseInspect(text: string, details: SignalGrepDetails): InspectPresenta
   };
 }
 
-export function recognizeSignalGrepResult(
+export function recognizeSiftlightResult(
   text: string,
-  details: SignalGrepDetails | undefined,
-): SignalGrepPresentation | undefined {
+  details: SiftlightDetails | undefined,
+): SiftlightPresentation | undefined {
   if (!hasRecognizableDetails(details)) return undefined;
 
   if (details.mode === "inspect") {

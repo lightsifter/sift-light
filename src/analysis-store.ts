@@ -14,8 +14,8 @@ import {
   type AnalysisItem,
   type AnalysisResultSet,
 } from "./analysis-types.js";
-import { CursorError, SignalGrepError } from "./errors.js";
-import type { SignalGrepResult } from "./types.js";
+import { CursorError, SiftlightError } from "./errors.js";
+import type { SiftlightResult } from "./types.js";
 import { MAX_RESULT_BYTES } from "./types.js";
 import { modificationTimeBoundsText } from "./source.js";
 import {
@@ -192,7 +192,7 @@ function publicAnalysisItem(
   index: number,
   storedId: string,
   modelOutput: boolean,
-): NonNullable<SignalGrepResult["details"]["analysis"]>["items"][number] {
+): NonNullable<SiftlightResult["details"]["analysis"]>["items"][number] {
   const inspect =
     item.source && item.range
       ? {
@@ -295,14 +295,14 @@ export class AnalysisStore {
     bounded.reasons = boundedReasons(bounded.reasons);
     bytes = Buffer.byteLength(JSON.stringify(bounded));
     if (bytes > MAX_ANALYSIS_STORAGE_BYTES - 1024)
-      throw new SignalGrepError("Analysis metadata exceeds the storage budget");
+      throw new SiftlightError("Analysis metadata exceeds the storage budget");
     while (
       this.#items.size >= MAX_ANALYSIS_SNAPSHOTS ||
       this.#totalBytes() + bytes > MAX_ANALYSIS_STORAGE_BYTES ||
       this.#totalItems() + bounded.items.length > MAX_ANALYSIS_RESULTS
     ) {
       const oldest = [...this.#items.values()].toSorted((a, b) => a.touched - b.touched)[0];
-      if (!oldest) throw new SignalGrepError("Analysis metadata exceeds the storage budget");
+      if (!oldest) throw new SiftlightError("Analysis metadata exceeds the storage budget");
       this.#items.delete(oldest.id);
       this.#rememberExpired(oldest.id);
     }
@@ -362,7 +362,7 @@ export class AnalysisStore {
     return structuredClone(item);
   }
 
-  page(cursor: string, modelOutput = false): SignalGrepResult {
+  page(cursor: string, modelOutput = false): SiftlightResult {
     const { stored, offset, kind } = this.resolve(cursor);
     const { result } = stored;
     if (kind === "analysis-terms") return analysisTermPage(result, stored.id, offset);
@@ -375,8 +375,8 @@ export class AnalysisStore {
       Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
     const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
-    const items: NonNullable<SignalGrepResult["details"]["analysis"]>["items"] = [];
-    const sources: NonNullable<SignalGrepResult["details"]["analysis"]>["sources"] = [];
+    const items: NonNullable<SiftlightResult["details"]["analysis"]>["items"] = [];
+    const sources: NonNullable<SiftlightResult["details"]["analysis"]>["sources"] = [];
     const sourceIds = new Map<string, number>();
     const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
     const statistics = statisticsForItems(
@@ -413,7 +413,7 @@ export class AnalysisStore {
       const rowBytes = Buffer.byteLength(row) + 2;
       if (bytes + rowBytes > MAX_RESULT_BYTES) {
         if (items.length === 0)
-          throw new SignalGrepError("Analysis item exceeds the response limit; narrow its source");
+          throw new SiftlightError("Analysis item exceeds the response limit; narrow its source");
         return false;
       }
       rows.push(row);
@@ -475,7 +475,7 @@ export class AnalysisStore {
       ...(nextRequest ? [`Next request: ${JSON.stringify(nextRequest)}`] : []),
     ].join("\n\n");
     if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-      throw new SignalGrepError("Analysis metadata exceeds the output limit");
+      throw new SiftlightError("Analysis metadata exceeds the output limit");
     return {
       text,
       details: {

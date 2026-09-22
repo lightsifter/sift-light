@@ -1,5 +1,5 @@
 import { MAX_GIT_DIFF_WORK, MAX_STRUCTURE_BYTES, MAX_STRUCTURE_FILES } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { filterHistoricalPaths } from "./historical-paths.js";
 import {
   changedLineRanges,
@@ -93,7 +93,7 @@ function wholeFile(content: Buffer): GitLineRange[] {
 
 function validateLimit(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1)
-    throw new SignalGrepError(`${label} must be a positive integer`);
+    throw new SiftlightError(`${label} must be a positive integer`);
   return value;
 }
 
@@ -245,9 +245,9 @@ export async function readGitChanges(
   options: GitSourceOptions = {},
 ): Promise<GitChangeResult> {
   if (!["files", "lines"].includes(request.scope) || !["new", "old"].includes(request.side))
-    throw new SignalGrepError("Invalid Git scope or side");
+    throw new SiftlightError("Invalid Git scope or side");
   if (request.target !== undefined && request.base === undefined)
-    throw new SignalGrepError("Git commit comparison requires an explicit base and target");
+    throw new SiftlightError("Git commit comparison requires an explicit base and target");
   const maxFiles = validateLimit(options.maxFiles ?? MAX_STRUCTURE_FILES, "Git file limit");
   const maxBytes = validateLimit(options.maxBytes ?? MAX_STRUCTURE_BYTES, "Git byte limit");
   const maxDiffWork = validateLimit(
@@ -283,9 +283,9 @@ export async function readGitChanges(
     visible = filtered.paths;
     filterBytes = filtered.bytesRead ?? 0;
     if (!Number.isSafeInteger(filterBytes) || filterBytes < 0 || filterBytes > maxBytes)
-      throw new SignalGrepError("Git path filtering exceeded its shared source read budget");
+      throw new SiftlightError("Git path filtering exceeded its shared source read budget");
     if (visible.some((path) => !allowed.has(path)))
-      throw new SignalGrepError("Git path filter expanded the authorized candidate set");
+      throw new SiftlightError("Git path filter expanded the authorized candidate set");
     visible = [...new Set(visible)];
   }
   const readBudget: GitReadBudget = { bytes: filterBytes, maxBytes };
@@ -358,7 +358,7 @@ export async function readGitSource(
 ): Promise<GitRawSource> {
   const path = gitPath(cwd, identity.path);
   if (!(await visibleGitPaths(cwd, [path], signal, options.includePath)).includes(path))
-    throw new SignalGrepError("Git source is excluded by current workspace privacy or path rules");
+    throw new SiftlightError("Git source is excluded by current workspace privacy or path rules");
   const selected = await filterHistoricalPaths(
     cwd,
     [path],
@@ -366,15 +366,15 @@ export async function readGitSource(
     signal,
   );
   if (selected.partial || !selected.paths.includes(path))
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Git source is excluded or unverified by current .ignore/.rgignore rules",
     );
   const commit = await resolveGitCommit(cwd, identity.commit, signal);
   const tree = await readGitTree(cwd, commit, signal, path);
   const entry: GitTreeEntry | undefined = tree.entries.get(path);
-  if (!entry) throw new SignalGrepError("Git source path does not exist in the requested commit");
+  if (!entry) throw new SiftlightError("Git source path does not exist in the requested commit");
   if (identity.blob !== undefined && identity.blob !== entry.blob)
-    throw new SignalGrepError("Git source blob does not match its commit and path");
+    throw new SiftlightError("Git source blob does not match its commit and path");
   return readGitBlob(
     cwd,
     commit,

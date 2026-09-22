@@ -1,0 +1,36 @@
+{
+  "name": "siftlight",
+  "version": "1.7.0-2",
+  "description": "Require siftlight for conventional local searches while keeping development tools available.",
+  "author": {
+    "name": "LightSifter"
+  },
+  "homepage": "https://github.com/lightsifter/siftlight#readme",
+  "license": "AGPL-3.0-only",
+  "mcpServers": {
+    "siftlight": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "siftlight-runtime@npm:siftlight@1.7.0-2",
+        "siftlight_mcp",
+        "--stdio"
+      ],
+      "env": {
+        "npm_config_ignore_scripts": "true",
+        "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",
+        "SIFTLIGHT_MCP_OUTPUT_MODE": "model"
+      }
+    }
+  },
+  "systemPrompt": "Use siftlight for local content and filename searches. The plugin blocks conventional alternative search entries. Ordinary reads, edits, tests and builds remain available.",
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "^(?:Bash|Grep|Glob|Shell|SearchFileContent|SearchFiles|GlobFile)$",
+      "command": "node \"./hooks/search-policy.mjs\"",
+      "timeout": 5
+    }
+  ]
+}

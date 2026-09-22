@@ -1,5 +1,5 @@
 import { relative, resolve, sep } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import { isPathInsideCwd, SearchPathPolicy } from "./path-policy.js";
 import { fileScopeArguments } from "./rg.js";
@@ -40,7 +40,7 @@ export function workspaceRelativePath(
   policy.assertPath(absolute);
   const local = relative(resolve(cwd), absolute);
   if (local.split(sep).some((part) => part.toLowerCase() === ".git"))
-    throw new SignalGrepError("Git internals are excluded from source candidates");
+    throw new SiftlightError("Git internals are excluded from source candidates");
   return isPathInsideCwd(absolute, cwd)
     ? local.split(sep).join("/")
     : absolute.replaceAll("\\", "/");
@@ -57,7 +57,7 @@ export async function listWorkspaceFiles(
   const searchPath = await policy.resolveSearchTarget(absolutePath);
   const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
-    throw new SignalGrepError("Candidate file limit must be a positive integer");
+    throw new SiftlightError("Candidate file limit must be a positive integer");
   const paths = new Set<string>();
   const reasons = new Set<string>();
   let coverageIssue: WorkspaceFileList["coverageIssue"];
@@ -114,18 +114,18 @@ export async function listWorkspaceFiles(
           }
         }
         if (pending.length > 0)
-          throw new SignalGrepError("Candidate enumeration ended without a NUL delimiter");
+          throw new SiftlightError("Candidate enumeration ended without a NUL delimiter");
       },
     );
     const diagnostics = classifyRipgrepDiagnostics(result.stderr);
     if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
-      throw new SignalGrepError(describeUnreadableDiagnostics(diagnostics.unreadable));
+      throw new SiftlightError(describeUnreadableDiagnostics(diagnostics.unreadable));
     if (diagnostics.unreadable.length > 0) {
       reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
       coverageIssue = "unreadable";
     }
     if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
-      throw new SignalGrepError(
+      throw new SiftlightError(
         result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`,
       );
   } catch (error) {

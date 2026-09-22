@@ -1,14 +1,14 @@
-import type { SignalGrepInput } from "./service.js";
-import type { OperationDetails, SignalGrepDetails, SignalGrepResult } from "./types.js";
+import type { SiftlightInput } from "./service.js";
+import type { OperationDetails, SiftlightDetails, SiftlightResult } from "./types.js";
 import type { OperationSnapshot, OperationWaitResult } from "./operation-lifecycle.js";
 
-export function operationRequest(operationId: string): SignalGrepInput {
+export function operationRequest(operationId: string): SiftlightInput {
   return { mode: "await", operationId };
 }
 
 export function operationDetails<T>(
   operation: OperationSnapshot<T>,
-  nextRequest?: SignalGrepInput,
+  nextRequest?: SiftlightInput,
 ): OperationDetails {
   return {
     id: operation.id,
@@ -24,12 +24,12 @@ export function operationDetails<T>(
 }
 
 export function waitingResult(
-  operation: OperationSnapshot<SignalGrepResult>,
+  operation: OperationSnapshot<SiftlightResult>,
   mode: "concept" | "hybrid",
-): SignalGrepResult {
+): SiftlightResult {
   const nextRequest = operationRequest(operation.id);
   const progress = operation.progress ? ` Progress: ${JSON.stringify(operation.progress)}.` : "";
-  const details: SignalGrepDetails = {
+  const details: SiftlightDetails = {
     version: 1,
     mode,
     status: "waiting",
@@ -49,12 +49,12 @@ export function waitingResult(
 }
 
 export function operationStateResult(
-  operation: OperationSnapshot<SignalGrepResult>,
+  operation: OperationSnapshot<SiftlightResult>,
   mode: "concept" | "hybrid",
-): SignalGrepResult {
+): SiftlightResult {
   if (operation.state === "complete" && operation.result !== undefined)
     return completeOperationResult(operation.result, operation);
-  const details: SignalGrepDetails = {
+  const details: SiftlightDetails = {
     version: 1,
     mode,
     status: operation.state,
@@ -74,9 +74,9 @@ export function operationStateResult(
 }
 
 export function completeOperationResult(
-  result: SignalGrepResult,
-  operation: OperationSnapshot<SignalGrepResult>,
-): SignalGrepResult {
+  result: SiftlightResult,
+  operation: OperationSnapshot<SiftlightResult>,
+): SiftlightResult {
   const stable = structuredClone(result);
   return {
     ...stable,
@@ -90,9 +90,9 @@ export function completeOperationResult(
 }
 
 export function operationOutcome(
-  outcome: OperationWaitResult<SignalGrepResult>,
+  outcome: OperationWaitResult<SiftlightResult>,
   mode: "concept" | "hybrid",
-): SignalGrepResult {
+): SiftlightResult {
   if (outcome.state === "running") return waitingResult(outcome.operation, mode);
   if (outcome.state === "complete")
     return completeOperationResult(outcome.result, outcome.operation);

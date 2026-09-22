@@ -1,4 +1,4 @@
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import {
   inspectionDescription,
   inspectSourceEvidence,
@@ -21,7 +21,7 @@ import {
   type InspectBatchItemDetails,
   type InspectRetry,
   type InspectTarget,
-  type SignalGrepResult,
+  type SiftlightResult,
   type SourceRevision,
 } from "./types.js";
 
@@ -39,25 +39,24 @@ interface InspectionBlock {
 
 function batchInputs(input: InspectBatchInput): InspectInput[] {
   if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined) {
-    throw new SignalGrepError("Batch inspection cannot be combined with path, line, or matchIndex");
+    throw new SiftlightError("Batch inspection cannot be combined with path, line, or matchIndex");
   }
   if (input.matchIndices !== undefined && input.targets !== undefined) {
-    throw new SignalGrepError("Use either matchIndices or targets for batch inspection");
+    throw new SiftlightError("Use either matchIndices or targets for batch inspection");
   }
   const count = input.matchIndices?.length ?? input.targets?.length ?? 0;
   if (count < 1 || count > MAX_INSPECT_TARGETS) {
-    throw new SignalGrepError(`Batch inspection requires 1-${String(MAX_INSPECT_TARGETS)} targets`);
+    throw new SiftlightError(`Batch inspection requires 1-${String(MAX_INSPECT_TARGETS)} targets`);
   }
   if (input.matchIndices) {
     const { cursor } = input;
-    if (!cursor) throw new SignalGrepError("matchIndices requires a cursor when mode=inspect");
+    if (!cursor) throw new SiftlightError("matchIndices requires a cursor when mode=inspect");
     return input.matchIndices.map((matchIndex) => ({ cursor, matchIndex }));
   }
   if (input.cursor !== undefined) {
-    throw new SignalGrepError("targets cannot be combined with a cursor; use matchIndices");
+    throw new SiftlightError("targets cannot be combined with a cursor; use matchIndices");
   }
-  if (!input.targets)
-    throw new SignalGrepError("Batch inspection requires targets or matchIndices");
+  if (!input.targets) throw new SiftlightError("Batch inspection requires targets or matchIndices");
   return input.targets;
 }
 
@@ -141,7 +140,7 @@ export async function inspectSourceBatch(
   cwd: string,
   signal: AbortSignal | undefined,
   options: InspectOptions,
-): Promise<SignalGrepResult> {
+): Promise<SiftlightResult> {
   if (signal?.aborted) throw abortError();
   const inputs = batchInputs(input);
   const targets = inputs.map((item) => resolveInspectionTarget(item, cwd, options.snapshots));
@@ -159,7 +158,7 @@ export async function inspectSourceBatch(
   let blocks: InspectionBlock[] = [];
   const initialBytes = Buffer.byteLength(batchText(items, blocks, descriptions));
   if (initialBytes + 512 > MAX_RESULT_BYTES) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Batch target metadata exceeds the result byte budget; inspect fewer targets",
     );
   }
@@ -244,7 +243,7 @@ export async function inspectSourceBatch(
   if (signal?.aborted) throw abortError();
   const text = batchText(items, blocks, descriptions);
   if (Buffer.byteLength(text) > MAX_RESULT_BYTES) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Batch result metadata exceeds the byte budget; inspect fewer targets",
     );
   }

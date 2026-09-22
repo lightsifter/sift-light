@@ -5,7 +5,7 @@ import {
   MAX_STRUCTURE_FILES,
 } from "./analysis-limits.js";
 import { consumeCappedLines } from "./capped-lines.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { readGitChanges, type GitChangeRequest } from "./git-source.js";
 import { filterHistoricalPaths } from "./historical-paths.js";
 import { runOwnedProcess } from "./owned-process.js";
@@ -52,7 +52,7 @@ interface MatchBudget {
   retained: number;
   protocolBytes: number;
 }
-class CandidateLimit extends SignalGrepError {}
+class CandidateLimit extends SiftlightError {}
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -65,7 +65,7 @@ function integer(value: unknown): value is number {
 function eventBytes(value: unknown): Buffer {
   if (record(value) && typeof value.text === "string") return Buffer.from(value.text);
   if (record(value) && typeof value.bytes === "string") return Buffer.from(value.bytes, "base64");
-  throw new SignalGrepError("Raw ripgrep event omitted source bytes");
+  throw new SiftlightError("Raw ripgrep event omitted source bytes");
 }
 
 /** Half-open source ranges never attribute the start of an unchanged next line to a changed line. */
@@ -124,7 +124,7 @@ async function searchRawSource(
             try {
               event = JSON.parse(line);
             } catch (error) {
-              throw new SignalGrepError("Invalid raw ripgrep JSON", { cause: error });
+              throw new SiftlightError("Invalid raw ripgrep JSON", { cause: error });
             }
             if (!record(event) || event.type !== "match") return;
             const data = event.data;
@@ -135,7 +135,7 @@ async function searchRawSource(
               data.line_number < 1 ||
               !Array.isArray(data.submatches)
             )
-              throw new SignalGrepError("Invalid raw ripgrep match event");
+              throw new SiftlightError("Invalid raw ripgrep match event");
             const start = data.absolute_offset;
             const bytes = eventBytes(data.lines);
             if (
@@ -143,7 +143,7 @@ async function searchRawSource(
               start + bytes.length > document.bytes.length ||
               !document.bytes.subarray(start, start + bytes.length).equals(bytes)
             )
-              throw new SignalGrepError(
+              throw new SiftlightError(
                 "Raw ripgrep evidence does not match its source version and line offset",
               );
             for (const submatch of data.submatches) {
@@ -155,7 +155,7 @@ async function searchRawSource(
                 submatch.end > bytes.length ||
                 !bytes.subarray(submatch.start, submatch.end).equals(eventBytes(submatch.match))
               )
-                throw new SignalGrepError("Invalid raw ripgrep occurrence bounds or bytes");
+                throw new SiftlightError("Invalid raw ripgrep occurrence bounds or bytes");
               const range = { start: start + submatch.start, end: start + submatch.end };
               if (allowed && !occurrenceInsideRanges(range, allowed, document)) continue;
               if (budget.retained >= MAX_ANALYSIS_RESULTS)
@@ -170,9 +170,7 @@ async function searchRawSource(
         ),
     );
     if (result.code !== 0 && result.code !== 1)
-      throw new SignalGrepError(
-        result.stderr.trim() || `Raw ripgrep exited ${String(result.code)}`,
-      );
+      throw new SiftlightError(result.stderr.trim() || `Raw ripgrep exited ${String(result.code)}`);
   } catch (error) {
     if (!(error instanceof CandidateLimit)) throw error;
     return { occurrences, reason: error.message };
@@ -244,7 +242,7 @@ async function ordinaryCandidates(options: EvidenceCandidateOptions): Promise<Ev
     for (const match of matches) {
       const lineStart = document.lineStarts[match.lineNumber - 1];
       if (lineStart === undefined)
-        throw new SignalGrepError("Retained match line is outside its verified source");
+        throw new SiftlightError("Retained match line is outside its verified source");
       const base = lineStart + (utf8Bom && match.lineNumber === 1 ? 3 : 0);
       const lineEnd = document.lineStarts[match.lineNumber] ?? document.bytes.length;
       if (match.occurrences.length === 0)
@@ -253,7 +251,7 @@ async function ordinaryCandidates(options: EvidenceCandidateOptions): Promise<Ev
         const range = { start: base + occurrence.byteStart, end: base + occurrence.byteEnd };
         document.checkRange(range);
         if (range.end > lineEnd)
-          throw new SignalGrepError("Retained occurrence extends beyond its verified source line");
+          throw new SiftlightError("Retained occurrence extends beyond its verified source line");
         if (retained >= MAX_ANALYSIS_RESULTS) {
           reasons.add(
             `Candidate matching reached the ${String(MAX_ANALYSIS_RESULTS)} occurrence limit`,
@@ -280,7 +278,7 @@ export async function collectEvidenceCandidates(
     options.request.path &&
     !isPathInsideCwd(resolve(options.cwd, options.request.path), options.cwd)
   ) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent",
     );
   }

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import type { InspectionTarget } from "./inspect.js";
 import type { SourceAccess } from "./source-access.js";
 import { SourceContinuations } from "./source-continuations.js";
@@ -13,11 +13,11 @@ import { mergeByteRanges, sourcePage, type SourceFragment } from "./source-pages
 import { getSourceRevision, sameSourceRevision, sourceRangeFromBytes } from "./source.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { syntaxLanguage } from "./syntax.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import {
   MAX_RESULT_BYTES,
   type InspectBatchItemDetails,
-  type SignalGrepResult,
+  type SiftlightResult,
   type SourceBoundary,
   type SourceExcerptDetails,
   type SourceRevision,
@@ -35,7 +35,7 @@ export interface SourceInspectionTarget {
   focus?: number;
   expectedRevision?: SourceRevision;
   unverified?: boolean;
-  retry?: SignalGrepInput;
+  retry?: SiftlightInput;
 }
 interface PreparedTarget {
   target: SourceInspectionTarget;
@@ -236,7 +236,7 @@ function blockDetails(block: SourceBlock): SourceExcerptDetails {
   const ends = block.fragments.map((fragment) => fragment.end);
   const start = starts.length > 0 ? Math.min(...starts) : (block.ranges[0]?.start ?? 0);
   const end = ends.length > 0 ? Math.max(...ends) : start;
-  const nextRequest: SignalGrepInput | undefined = block.continuation
+  const nextRequest: SiftlightInput | undefined = block.continuation
     ? { mode: "inspect", sourceCursor: block.continuation }
     : undefined;
   return {
@@ -354,7 +354,7 @@ export async function inspectDocumentsMetadata(
   targets: SourceInspectionTarget[],
   access: SourceAccess,
   structure?: CodeStructureProvider,
-): Promise<SignalGrepResult> {
+): Promise<SiftlightResult> {
   const items: InspectBatchItemDetails[] = [];
   const paths = new Set<string>();
   const preparedTargets: Array<{ itemIndex: number; document: SourceDocument }> = [];
@@ -449,7 +449,7 @@ export async function inspectDocuments(
   access: SourceAccess,
   continuations: SourceContinuations,
   structure?: CodeStructureProvider,
-): Promise<SignalGrepResult> {
+): Promise<SiftlightResult> {
   const items: InspectBatchItemDetails[] = [];
   const blocks: SourceBlock[] = [];
   let metadataOnly = false;
@@ -510,7 +510,7 @@ export async function inspectDocuments(
   const baseBytes = Buffer.byteLength(render(items, blocks, targets.length === 1));
   let remainingResponseBytes = MAX_RESULT_BYTES - baseBytes - blocks.length * 400;
   if (blocks.length && remainingResponseBytes < blocks.length * 256)
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Inspection selectors exceed the shared response limit; use fewer targets",
     );
   for (const [index, block] of blocks.entries()) {
@@ -632,7 +632,7 @@ export async function inspectDocuments(
   }
   const text = render(items, blocks, targets.length === 1);
   if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-    throw new SignalGrepError("Inspection metadata exceeds the response byte limit");
+    throw new SiftlightError("Inspection metadata exceeds the response byte limit");
   const complete =
     items.every((item) => item.status === "returned") &&
     blocks.every((block) => block.remaining.length === 0);
@@ -667,7 +667,7 @@ export async function inspectDocuments(
 export function continueSourceMetadata(
   cursor: string,
   continuations: SourceContinuations,
-): SignalGrepResult {
+): SiftlightResult {
   const state = continuations.resolve(cursor);
   const remainingBytes = state.remaining.reduce(
     (total, range) => total + range.end - range.start,
@@ -692,7 +692,7 @@ export async function continueSource(
   cursor: string,
   access: SourceAccess,
   continuations: SourceContinuations,
-): Promise<SignalGrepResult> {
+): Promise<SiftlightResult> {
   const state = continuations.resolve(cursor);
   const document = await access.load(state.source.path, state.source);
   const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
@@ -711,7 +711,7 @@ export async function continueSource(
   const source = blockDetails(block);
   const text = render([], [block], true);
   if (Buffer.byteLength(text) > MAX_RESULT_BYTES)
-    throw new SignalGrepError("Source continuation metadata exceeds the output limit");
+    throw new SiftlightError("Source continuation metadata exceeds the output limit");
   return {
     text,
     details: {

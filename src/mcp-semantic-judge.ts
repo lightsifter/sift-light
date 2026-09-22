@@ -1,7 +1,7 @@
 import {
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
-  readSignalGrepConfigFile,
-  SIGNAL_GREP_CONFIG_ENV,
+  readSiftlightConfigFile,
+  SIFTLIGHT_CONFIG_ENV,
 } from "./config-reader.js";
 import {
   createDisabledSemanticJudgeIntegration,
@@ -10,7 +10,7 @@ import {
 } from "./semantic-judge.js";
 
 function configuredPath(environment: NodeJS.ProcessEnv): string | undefined {
-  const value = environment[SIGNAL_GREP_CONFIG_ENV]?.trim();
+  const value = environment[SIFTLIGHT_CONFIG_ENV]?.trim();
   return value || undefined;
 }
 
@@ -25,7 +25,7 @@ export async function createMcpSemanticJudgeIntegration(
   const path = configuredPath(environment);
   if (!path) return createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
 
-  const config = await readSignalGrepConfigFile(path, { missing: "error" });
+  const config = await readSiftlightConfigFile(path, { missing: "error" });
   return createSemanticJudgeIntegration(
     config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
     environment,

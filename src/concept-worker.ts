@@ -108,7 +108,7 @@ async function search(): Promise<void> {
   const request = await requestFromStdin();
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
-  const stagingRoot = process.env.SIGNAL_GREP_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
+  const stagingRoot = process.env.SIFTLIGHT_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
   await verifyConceptModel(directory);
   const requested: PendingConceptEmbedding[] = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
@@ -207,4 +207,4 @@ async function search(): Promise<void> {
 
 if (process.argv.includes("--install-model")) await installConceptModel();
 else if (process.argv.includes("--infer")) await search();
-else throw new Error("Usage: baoer_signal_grep_model --install-model");
+else throw new Error("Usage: siftlight_model --install-model");

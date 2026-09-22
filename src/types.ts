@@ -2,7 +2,7 @@ import type { AnalysisDetails } from "./analysis-types.js";
 import type { ValidationDetails } from "./validation-types.js";
 import type { SourceFragment } from "./source-pages.js";
 import type { ByteRange, SourceReference } from "./source-document.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import type { OperationProgress } from "./operation-lifecycle.js";
 import type { RequestContractDetails } from "./request-contract.js";
 import type { LanguageCapabilityInventory } from "./language-capabilities.js";
@@ -34,11 +34,13 @@ export const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
 export const MAX_SOURCE_FILE_BYTES = 5 * 1024 * 1024;
 export const MAX_PATH_CHARACTERS = 4_096;
 export const MAX_PATTERN_CHARACTERS = 64 * 1024;
+export const MAX_AUDIT_LITERAL_CHARACTERS = 256;
 export const MAX_FILE_FILTER_ITEMS = 64;
 export const MAX_SOURCE_REVISION_CONCURRENCY = 16;
 export const MAX_SOURCE_REVISION_FILES = 50_000;
 
 export type SearchMode =
+  | "audit"
   | "concept"
   | "hybrid"
   | "structure"
@@ -67,7 +69,7 @@ export interface OperationDetails {
   deadlineAt: number;
   leaseExpiresAt: number;
   progress?: OperationProgressDetails;
-  nextRequest?: SignalGrepInput;
+  nextRequest?: SiftlightInput;
   error?: string;
 }
 
@@ -152,7 +154,7 @@ export interface SourceExcerptDetails {
   remainingRanges?: ByteRange[];
   complete?: boolean;
   boundary?: SourceBoundary;
-  nextRequest?: SignalGrepInput;
+  nextRequest?: SiftlightInput;
 }
 
 export interface InspectRetry {
@@ -187,6 +189,8 @@ export interface SearchRequest {
   literal: boolean;
   ignoreCase?: boolean;
   hidden: boolean;
+  ignorePolicy?: "respect" | "include";
+  binaryAsText?: boolean;
   context: number;
   pageSize: number;
   redact?: boolean;
@@ -200,6 +204,7 @@ export interface SearchScopeDetails {
   glob: string[];
   exclude: string[];
   hidden: boolean;
+  ignorePolicy?: "respect" | "include";
   expandedToProjectRoot: boolean;
   assertion: "requested-scope" | "project-wide";
   modifiedAfterMs?: number;
@@ -222,6 +227,11 @@ export interface SearchScan {
   fileCounts: Map<string, number>;
   sourceRevisions: Map<string, SourceRevision>;
   snapshotComplete: boolean;
+  filesystemCoverage?: "complete" | "policy-filtered" | "partial";
+  filesystemCoverageReasons?: string[];
+  ignoredFileCount?: number;
+  ignoredFileSamples?: string[];
+  searchedFileCount?: number;
   truncatedLines: number;
   retention?: SearchRetentionDetails;
 }
@@ -262,8 +272,8 @@ export interface ResultStatistics {
   topFilesOmitted: number;
 }
 
-export interface SignalGrepDetails {
-  inspectRequest?: SignalGrepInput;
+export interface SiftlightDetails {
+  inspectRequest?: SiftlightInput;
   version: 1;
   mode: SearchMode;
   status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";
@@ -275,7 +285,7 @@ export interface SignalGrepDetails {
   snapshotComplete: boolean;
   retention?: SearchRetentionDetails;
   cursor?: string;
-  nextRequest?: SignalGrepInput;
+  nextRequest?: SiftlightInput;
   analysis?: AnalysisDetails;
   statistics?: ResultStatistics;
   validation?: ValidationDetails;
@@ -305,9 +315,54 @@ export interface SignalGrepDetails {
   redactionApplied?: boolean;
   operation?: OperationDetails;
   capabilities?: LanguageCapabilityInventory;
+  audit?: AuditReceiptDetails;
+  searchCoverage?: {
+    retainedMatches: "complete" | "partial";
+    filesystem: "complete" | "policy-filtered" | "partial";
+    ignoredFiles: number;
+    ignoredFileSamples: string[];
+    searchedFiles: number;
+    reasons: string[];
+  };
 }
 
-export interface SignalGrepResult {
+export interface AuditPatternInput {
+  id: string;
+  literal: string;
+}
+
+export interface AuditFindingDetails {
+  id: string;
+  status: "present" | "absent_with_complete_coverage" | "unknown";
+  matches: number;
+  files: number;
+  evidence: { path: string; line: number }[];
+  reproduction: SiftlightInput;
+}
+
+export interface AuditReceiptDetails {
+  declaredScope: SearchScopeDetails;
+  coverage: {
+    filesDiscovered: number;
+    filesAdmitted: number;
+    filesSearched: number;
+    ignoredFiles: number;
+    ignoredFileSamples: string[];
+    ignoredFilesOmitted: number;
+    filesSkippedOther: number;
+    complete: boolean;
+    reasons: string[];
+    reasonsOmitted: number;
+  };
+  stability: {
+    status: "stable" | "changed_during_search" | "unknown";
+    changedFiles: string[];
+    changedFilesOmitted: number;
+  };
+  findings: AuditFindingDetails[];
+}
+
+export interface SiftlightResult {
   text: string;
-  details: SignalGrepDetails;
+  details: SiftlightDetails;
 }

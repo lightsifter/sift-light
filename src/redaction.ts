@@ -1,4 +1,4 @@
-import type { SignalGrepResult } from "./types.js";
+import type { SiftlightResult } from "./types.js";
 
 const PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
 const SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
@@ -80,7 +80,7 @@ function redactInPlace(value: unknown, seen: WeakSet<object>): number {
 }
 
 /** Display-only policy: search and source-version facts stay exact, every returned string is masked. */
-export function redactSignalGrepResult(result: SignalGrepResult): SignalGrepResult {
+export function redactSiftlightResult(result: SiftlightResult): SiftlightResult {
   const text = redactString(result.text);
   const details = structuredClone(result.details);
   const redactedCount = text.count + redactInPlace(details, new WeakSet());

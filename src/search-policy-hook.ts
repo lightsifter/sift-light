@@ -23,7 +23,7 @@ function deny(reason: string): void {
 }
 
 const inputTimer = setTimeout(() => {
-  process.stderr.write("baoer_signal_grep search policy: hook input timed out\n");
+  process.stderr.write("siftlight search policy: hook input timed out\n");
   process.exit(2);
 }, 3000);
 try {
@@ -54,8 +54,8 @@ try {
   deny(
     error instanceof Error &&
       (error.message.startsWith("Search policy") ||
-        error.message.startsWith("Invalid baoer_signal_grep environment variable"))
+        error.message.startsWith("Invalid siftlight environment variable"))
       ? error.message
-      : "baoer_signal_grep search policy failed; repair or disable this plugin before retrying",
+      : "siftlight search policy failed; repair or disable this plugin before retrying",
   );
 }

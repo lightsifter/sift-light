@@ -2,7 +2,7 @@ import { isUtf8 } from "node:buffer";
 import { createHash } from "node:crypto";
 import { open, realpath } from "node:fs/promises";
 import { relative, resolve } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { isPathInsideCwd, SearchPathPolicy } from "./path-policy.js";
 import { getSourceRevision, sameSourceRevision, sourceRevisionFromStats } from "./source.js";
 import { MAX_SOURCE_FILE_BYTES, type SourceRevision } from "./types.js";
@@ -27,7 +27,7 @@ export interface SourcePosition {
   column: number;
 }
 
-export class SourceDocumentError extends SignalGrepError {
+export class SourceDocumentError extends SiftlightError {
   readonly reason: "source-changed" | "source-unavailable" | "file-too-large" | "encoding";
 
   constructor(
@@ -88,11 +88,11 @@ export class SourceDocument {
   toByteOffset(character: number): number {
     this.#requireUtf8();
     if (!Number.isSafeInteger(character) || character < 0 || character > this.text.length) {
-      throw new SignalGrepError("Source character offset is outside the document");
+      throw new SiftlightError("Source character offset is outside the document");
     }
     const code = this.text.charCodeAt(character);
     if (code >= 0xdc00 && code <= 0xdfff) {
-      throw new SignalGrepError("Source character offset splits a Unicode character");
+      throw new SiftlightError("Source character offset splits a Unicode character");
     }
     const value = this.#offsets()[character];
     if (value === undefined) throw new Error("Missing source offset");
@@ -113,7 +113,7 @@ export class SourceDocument {
       else high = middle;
     }
     if (offsets[low] !== byte) {
-      throw new SignalGrepError("Source byte offset splits a Unicode character");
+      throw new SiftlightError("Source byte offset splits a Unicode character");
     }
     return low;
   }
@@ -150,7 +150,7 @@ export class SourceDocument {
       endLine < startLine ||
       startLine > this.lineStarts.length
     ) {
-      throw new SignalGrepError("Source line range is outside the document");
+      throw new SiftlightError("Source line range is outside the document");
     }
     const start = this.lineStarts[startLine - 1];
     if (start === undefined) throw new Error("Missing source line");
@@ -173,7 +173,7 @@ export class SourceDocument {
       range.end < range.start ||
       range.end > this.bytes.length
     ) {
-      throw new SignalGrepError("Source byte range is outside the document");
+      throw new SiftlightError("Source byte range is outside the document");
     }
   }
 
@@ -209,7 +209,7 @@ export async function readWorkspaceDocument(
 ): Promise<SourceDocument> {
   if (signal?.aborted) throw abortError();
   if (expected?.kind === "git") {
-    throw new SignalGrepError("A Git source reference cannot be read from the worktree");
+    throw new SiftlightError("A Git source reference cannot be read from the worktree");
   }
   const absolute = resolve(cwd, path);
   const [canonical, canonicalCwd] = await Promise.all([

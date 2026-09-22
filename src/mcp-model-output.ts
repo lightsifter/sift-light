@@ -1,5 +1,5 @@
 import type { AnalysisDetails } from "./analysis-types.js";
-import type { SignalGrepDetails, SignalGrepResult } from "./types.js";
+import type { SiftlightDetails, SiftlightResult } from "./types.js";
 
 import { formatStatistics } from "./result-statistics.js";
 
@@ -7,7 +7,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function compactMetadata(details: SignalGrepDetails, analysis: AnalysisDetails): string[] {
+function compactMetadata(details: SiftlightDetails, analysis: AnalysisDetails): string[] {
   return [
     ...(analysis.statistics ? formatStatistics(analysis.statistics) : []),
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,
@@ -68,7 +68,7 @@ function compactInspectInstruction(analysis: AnalysisDetails): string | undefine
   return `Inspect item #N: mode="inspect", cursor=${JSON.stringify(inspect.cursor)}, matchIndex=N${inspect.redact ? ", redact=true" : ""}.`;
 }
 
-function compactHeader(details: SignalGrepDetails, analysis: AnalysisDetails): string {
+function compactHeader(details: SiftlightDetails, analysis: AnalysisDetails): string {
   if (
     analysis.termCounts &&
     analysis.termCountsOffset !== undefined &&
@@ -88,7 +88,7 @@ function compactHeader(details: SignalGrepDetails, analysis: AnalysisDetails): s
 }
 
 function distinctNextRequest(
-  details: SignalGrepDetails,
+  details: SiftlightDetails,
   analysis: AnalysisDetails,
 ): string | undefined {
   if (!details.nextRequest) return undefined;
@@ -99,7 +99,7 @@ function distinctNextRequest(
     : serialized;
 }
 
-export function compactMcpModelText(result: SignalGrepResult): string {
+export function compactMcpModelText(result: SiftlightResult): string {
   const analysis = result.details.analysis;
   // Validation is a source-state report, not a pageable syntax/result inventory.
   // Its authoritative text retains freshness, comparison target and check interval.

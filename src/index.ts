@@ -1,37 +1,37 @@
-import { SIGNAL_GREP_DESCRIPTION, signalGrepSchema } from "./tool-schema.js";
+import { SIFTLIGHT_DESCRIPTION, siftlightSchema } from "./tool-schema.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   normalizeSearchEnforcement,
-  readSignalGrepConfig,
+  readSiftlightConfig,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
-  type SignalGrepConfig,
+  type SiftlightConfig,
 } from "./config.js";
 import { resolveContextBudget } from "./context-budget.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
-import { SignalGrepRuntime } from "./runtime.js";
+import { SiftlightRuntime } from "./runtime.js";
 import { SESSION_STATUS_KEY } from "./session-summary.js";
-import { SignalGrepService } from "./service.js";
-import { signalGrepPromptGuidelines } from "./prompt-guidelines.js";
-import type { SignalGrepDetails } from "./types.js";
-import { renderSignalGrepCall, renderSignalGrepResult } from "./tui/renderers.js";
+import { SiftlightService } from "./service.js";
+import { siftlightPromptGuidelines } from "./prompt-guidelines.js";
+import type { SiftlightDetails } from "./types.js";
+import { renderSiftlightCall, renderSiftlightResult } from "./tui/renderers.js";
 import { registerPiSearchPolicy } from "./pi-search-policy.js";
 import { modelErrorText } from "./model-error.js";
 import { createSemanticJudgeIntegration } from "./semantic-judge.js";
 
-const SIGNAL_GREP_LABEL = "baoer_signal_grep";
+const SIFTLIGHT_LABEL = "siftlight";
 
-export { signalGrepPromptGuidelines };
+export { siftlightPromptGuidelines };
 
-export async function registerSignalGrepExtension(
+export async function registerSiftlightExtension(
   pi: ExtensionAPI,
-  config: SignalGrepConfig,
+  config: SiftlightConfig,
 ): Promise<void> {
   const semanticJudge = createSemanticJudgeIntegration(
     config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
   );
-  const runtime = new SignalGrepRuntime(
-    new SignalGrepService({
+  const runtime = new SiftlightRuntime(
+    new SiftlightService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
       semanticJudge,
@@ -39,20 +39,20 @@ export async function registerSignalGrepExtension(
   );
   const { locale } = config;
 
-  pi.registerTool<typeof signalGrepSchema, SignalGrepDetails>({
-    name: "baoer_signal_grep",
-    label: SIGNAL_GREP_LABEL,
-    description: SIGNAL_GREP_DESCRIPTION,
+  pi.registerTool<typeof siftlightSchema, SiftlightDetails>({
+    name: "siftlight",
+    label: SIFTLIGHT_LABEL,
+    description: SIFTLIGHT_DESCRIPTION,
     promptSnippet: "Search file contents without flooding context",
-    promptGuidelines: signalGrepPromptGuidelines(),
-    parameters: signalGrepSchema,
+    promptGuidelines: siftlightPromptGuidelines(),
+    parameters: siftlightSchema,
 
     renderCall(params, theme) {
-      return renderSignalGrepCall(params, locale, theme);
+      return renderSiftlightCall(params, locale, theme);
     },
 
     renderResult(result, { expanded, isPartial }, theme, context) {
-      return renderSignalGrepResult(
+      return renderSiftlightResult(
         result,
         { expanded, isPartial, isError: context.isError },
         locale,
@@ -92,6 +92,6 @@ export async function registerSignalGrepExtension(
   });
 }
 
-export default async function signalGrepExtension(pi: ExtensionAPI) {
-  await registerSignalGrepExtension(pi, await readSignalGrepConfig());
+export default async function siftlightExtension(pi: ExtensionAPI) {
+  await registerSiftlightExtension(pi, await readSiftlightConfig());
 }

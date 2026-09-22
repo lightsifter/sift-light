@@ -1,26 +1,23 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export const SIGNAL_GREP_CONFIG_FILE = "baoer_signal_grep.json";
-export const SIGNAL_GREP_CONFIG_ENV = "BAOER_SIGNAL_GREP_CONFIG";
+export const SIFTLIGHT_CONFIG_FILE = "siftlight.json";
+export const SIFTLIGHT_CONFIG_ENV = "SIFTLIGHT_CONFIG";
 
-export type SignalGrepLocale = "en" | "zh-CN";
+export type SiftlightLocale = "en" | "zh-CN";
 export type SearchEnforcementMode = "hard" | "prefer" | "off";
 
-export const SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
+export const SIFTLIGHT_ENFORCEMENT_ENV = "SIFTLIGHT_ENFORCE_SEARCH";
 
-export interface SignalGrepConfig {
-  locale: SignalGrepLocale;
+export interface SiftlightConfig {
+  locale: SiftlightLocale;
   enforceSearch?: SearchEnforcementMode;
   semanticJudge?: SemanticJudgeConfig;
 }
 
 export type SemanticJudgeProvider = "jev";
 
-export const SEMANTIC_JUDGE_API_KEY_ENVS = [
-  "TYPESAFE_API_KEY",
-  "BAOER_SIGNAL_GREP_JEV_API_KEY",
-] as const;
+export const SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFTLIGHT_JEV_API_KEY"] as const;
 
 export interface SemanticJudgeConfig {
   enabled: boolean;
@@ -44,28 +41,28 @@ export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
   maxRetries: 2,
 };
 
-export const DEFAULT_SIGNAL_GREP_CONFIG: Readonly<SignalGrepConfig> = {
+export const DEFAULT_SIFTLIGHT_CONFIG: Readonly<SiftlightConfig> = {
   locale: "en",
   enforceSearch: "hard",
   semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG,
 };
 
-interface RawSignalGrepConfig {
+interface RawSiftlightConfig {
   locale?: unknown;
   enforceSearch?: unknown;
   semanticJudge?: unknown;
 }
 
-export interface ReadSignalGrepConfigOptions {
+export interface ReadSiftlightConfigOptions {
   missing?: "defaults" | "error";
 }
 
-export function resolveSignalGrepConfigPath(
+export function resolveSiftlightConfigPath(
   agentDirectory: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
-  const configured = environment[SIGNAL_GREP_CONFIG_ENV]?.trim();
-  return configured || join(agentDirectory, SIGNAL_GREP_CONFIG_FILE);
+  const configured = environment[SIFTLIGHT_CONFIG_ENV]?.trim();
+  return configured || join(agentDirectory, SIFTLIGHT_CONFIG_FILE);
 }
 
 interface RawSemanticJudgeConfig {
@@ -87,7 +84,7 @@ function isMissingFile(error: unknown): boolean {
   return hasErrorCode(error, ["ENOENT"]);
 }
 
-function isRawSignalGrepConfig(value: unknown): value is RawSignalGrepConfig {
+function isRawSiftlightConfig(value: unknown): value is RawSiftlightConfig {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -110,7 +107,7 @@ function boundedInteger(
     candidate > maximum
   ) {
     throw new Error(
-      `Invalid baoer_signal_grep ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`,
+      `Invalid siftlight ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`,
     );
   }
   return candidate;
@@ -119,7 +116,7 @@ function boundedInteger(
 function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
   if (value === undefined) return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
   if (!isRawSemanticJudgeConfig(value)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: semanticJudge must be an object`);
+    throw new Error(`Invalid siftlight config at ${path}: semanticJudge must be an object`);
   }
   const unknown = Object.keys(value).filter(
     (key) =>
@@ -136,35 +133,30 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`,
+      `Invalid siftlight config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`,
     );
   }
   const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
   if (typeof enabled !== "boolean") {
-    throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.enabled must be a boolean`,
-    );
+    throw new Error(`Invalid siftlight config at ${path}: semanticJudge.enabled must be a boolean`);
   }
   const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
   if (provider !== "jev") {
-    throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.provider must be "jev"`,
-    );
+    throw new Error(`Invalid siftlight config at ${path}: semanticJudge.provider must be "jev"`);
   }
   const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
   if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2_048) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a nonempty URL`,
+      `Invalid siftlight config at ${path}: semanticJudge.endpoint must be a nonempty URL`,
     );
   }
   let parsedEndpoint: URL;
   try {
     parsedEndpoint = new URL(endpoint);
   } catch (error) {
-    throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must be a URL`,
-      { cause: error },
-    );
+    throw new Error(`Invalid siftlight config at ${path}: semanticJudge.endpoint must be a URL`, {
+      cause: error,
+    });
   }
   const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
   const secureEndpoint =
@@ -172,13 +164,13 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
     (parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname));
   if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`,
+      `Invalid siftlight config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`,
     );
   }
   const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
   if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`,
+      `Invalid siftlight config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`,
     );
   }
   const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
@@ -189,7 +181,7 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
     /[\r\n\0]/u.test(model)
   ) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: semanticJudge.model must be bounded single-line text`,
+      `Invalid siftlight config at ${path}: semanticJudge.model must be bounded single-line text`,
     );
   }
   return {
@@ -222,25 +214,25 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
   };
 }
 
-function parseConfig(value: unknown, path: string): SignalGrepConfig {
-  if (!isRawSignalGrepConfig(value)) {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: expected a JSON object`);
+function parseConfig(value: unknown, path: string): SiftlightConfig {
+  if (!isRawSiftlightConfig(value)) {
+    throw new Error(`Invalid siftlight config at ${path}: expected a JSON object`);
   }
   const unknown = Object.keys(value).filter(
     (key) => !["locale", "enforceSearch", "semanticJudge"].includes(key),
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid baoer_signal_grep config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`,
+      `Invalid siftlight config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`,
     );
   }
   const { locale, enforceSearch } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
-    throw new Error(`Invalid baoer_signal_grep config at ${path}: locale must be "en" or "zh-CN"`);
+    throw new Error(`Invalid siftlight config at ${path}: locale must be "en" or "zh-CN"`);
   }
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
   return {
-    locale: locale ?? DEFAULT_SIGNAL_GREP_CONFIG.locale,
+    locale: locale ?? DEFAULT_SIFTLIGHT_CONFIG.locale,
     enforceSearch: enforcement,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path),
   };
@@ -250,24 +242,22 @@ export function normalizeSearchEnforcement(value: unknown, source: string): Sear
   if (value === undefined || value === "hard") return "hard";
   if (value === "prefer") return "prefer";
   if (value === "off") return "off";
-  throw new Error(
-    `Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`,
-  );
+  throw new Error(`Invalid siftlight ${source}: enforceSearch must be "hard", "prefer", or "off"`);
 }
 
 /** Native hooks inherit this setting from their host process; absent means fail-safe hard mode. */
 export function readNativeSearchEnforcement(
   environment: NodeJS.ProcessEnv = process.env,
 ): SearchEnforcementMode {
-  const value = environment[SIGNAL_GREP_ENFORCEMENT_ENV];
-  return normalizeSearchEnforcement(value, `environment variable ${SIGNAL_GREP_ENFORCEMENT_ENV}`);
+  const value = environment[SIFTLIGHT_ENFORCEMENT_ENV];
+  return normalizeSearchEnforcement(value, `environment variable ${SIFTLIGHT_ENFORCEMENT_ENV}`);
 }
 
 /** Read and validate one host-selected config path. */
-export async function readSignalGrepConfigFile(
+export async function readSiftlightConfigFile(
   path: string,
-  options: ReadSignalGrepConfigOptions = {},
-): Promise<SignalGrepConfig> {
+  options: ReadSiftlightConfigOptions = {},
+): Promise<SiftlightConfig> {
   try {
     const content = await readFile(path, "utf8");
     return parseConfig(JSON.parse(content), path);
@@ -275,14 +265,14 @@ export async function readSignalGrepConfigFile(
     if (isMissingFile(error)) {
       if (options.missing === "error") {
         throw new Error(
-          `baoer_signal_grep config was not found at ${path}; create it or unset ${SIGNAL_GREP_CONFIG_ENV}`,
+          `siftlight config was not found at ${path}; create it or unset ${SIFTLIGHT_CONFIG_ENV}`,
           { cause: error },
         );
       }
-      return { ...DEFAULT_SIGNAL_GREP_CONFIG };
+      return { ...DEFAULT_SIFTLIGHT_CONFIG };
     }
     if (error instanceof SyntaxError) {
-      throw new Error(`Invalid baoer_signal_grep config at ${path}: ${error.message}`, {
+      throw new Error(`Invalid siftlight config at ${path}: ${error.message}`, {
         cause: error,
       });
     }
