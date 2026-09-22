@@ -2,13 +2,15 @@
 
 ## Unreleased
 
-## [1.7.0-2] - 2026-09-22
+## [1.0.0] - 2026-09-22
 
 - Rename the project, npm package, tool, native plugins and configuration surface to Siftlight (拾光), under the LightSifter identity.
 - Distinguish retained-match completeness from filesystem coverage so ignored files can no longer hide behind an exhaustive absence claim.
 - Add bounded audit receipts with explicit ignore policy, pattern findings, scope coverage, source stability and reproducible follow-up requests.
 - Automatically process Concept and hybrid scopes of up to 2,000 files in sequential 200-file batches, merging them into one globally ranked, verifiable result while keeping `maxFilesToParse` as an optional hard ceiling.
 - Document the one-time migration requirement: remove installations registered under the earlier package identity before enabling Siftlight.
+
+This is the first public release under the Siftlight package identity. Earlier entries below record development completed before the Siftlight 1.0 version line.
 
 ## [1.7.0-1] - 2026-09-22
 
@@ -196,10 +198,10 @@
 - Add optional offline natural-language code discovery after explicit model installation.
 - Improve large-result pagination, partial-result reporting and cancellation handling.
 
-## [1.0.0] - 2026-09-04
+## Pre-release development milestone 1.0.0 - 2026-09-04
 
 - Add local stdio MCP connections for Claude Code, Codex and compatible clients.
-- Rename the package, tool, executable and Pi configuration to the `siftlight` family. MCP environment variables now use `SIFTLIGHT_MCP_*`; old names are not aliases.
+- Begin the internal migration of the package, tool, executable and Pi configuration to the `siftlight` family. This milestone was not published under the Siftlight npm package identity. MCP environment variables use `SIFTLIGHT_MCP_*`; retired names are not aliases.
 
 ## [0.7.0] - 2026-09-03
 

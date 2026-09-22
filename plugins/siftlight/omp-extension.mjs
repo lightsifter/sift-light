@@ -1814,7 +1814,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "siftlight",
-  version: "1.7.0-2",
+  version: "1.0.0",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",

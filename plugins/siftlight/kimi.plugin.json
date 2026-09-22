@@ -1,6 +1,6 @@
 {
   "name": "siftlight",
-  "version": "1.7.0-2",
+  "version": "1.0.0",
   "description": "Require siftlight for conventional local searches while keeping development tools available.",
   "author": {
     "name": "LightSifter"
@@ -13,7 +13,7 @@
       "args": [
         "--yes",
         "--package",
-        "siftlight-runtime@npm:siftlight@1.7.0-2",
+        "siftlight-runtime@npm:siftlight@1.0.0",
         "siftlight-mcp",
         "--stdio"
       ],
