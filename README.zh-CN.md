@@ -146,11 +146,11 @@ Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保�
 ### Claude Code 或 Codex：连接 MCP
 
 ```bash
-claude mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+claude mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 ```bash
-codex mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+codex mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 `@latest` 会在 MCP 启动时跟随最新发布版本，更新后重启宿主即可加载。服务器默认搜索当前项目，可用 `SIFTLIGHT_MCP_CWD` 指定其他根目录。仅连接 MCP 会添加工具，不会禁用其他搜索工具。

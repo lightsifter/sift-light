@@ -100,7 +100,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
       "--yes",
       "--package",
       `siftlight-runtime@npm:${packageJson.name}@${packageJson.version}`,
-      "siftlight_mcp",
+      "siftlight-mcp",
       "--stdio",
     ],
     env: mcpEnvironment,

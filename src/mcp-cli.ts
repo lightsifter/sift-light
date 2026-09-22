@@ -1,6 +1,6 @@
 export type SiftlightMcpTransport = "http" | "stdio";
 
-export const SIFTLIGHT_MCP_USAGE = `Usage: siftlight_mcp [--http | --stdio]
+export const SIFTLIGHT_MCP_USAGE = `Usage: siftlight-mcp [--http | --stdio]
 
 Transports:
   --http   Start the Streamable HTTP server (default)

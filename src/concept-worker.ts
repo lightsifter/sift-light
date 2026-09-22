@@ -207,4 +207,4 @@ async function search(): Promise<void> {
 
 if (process.argv.includes("--install-model")) await installConceptModel();
 else if (process.argv.includes("--infer")) await search();
-else throw new Error("Usage: siftlight_model --install-model");
+else throw new Error("Usage: siftlight-model --install-model");

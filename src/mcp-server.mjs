@@ -37,8 +37,8 @@ var package_default = {
     url: "git+https://github.com/lightsifter/siftlight.git"
   },
   bin: {
-    siftlight_mcp: "./src/mcp-server.mjs",
-    siftlight_model: "./src/concept-worker.mjs"
+    "siftlight-mcp": "src/mcp-server.mjs",
+    "siftlight-model": "src/concept-worker.mjs"
   },
   files: [
     "src/**/*.ts",
@@ -73,7 +73,7 @@ var package_default = {
     "test:node": "bun run doc/testing/scripts/node-smoke.ts",
     benchmark: "bun run doc/testing/scripts/benchmark.ts",
     check: "bun run format:check && bun run lint && bun run typecheck && bun run build",
-    "pack:check": "bun pm pack --dry-run",
+    "pack:check": "bun pm pack --dry-run && bun run scripts/check-npm-publish.ts",
     "setup:concept": "bun run src/concept-worker.mjs --install-model",
     "build:concept-worker": "bun run scripts/build-concept-worker.ts",
     "check:concept-worker": "bun run doc/testing/scripts/check-concept-worker.ts",
@@ -13725,7 +13725,7 @@ function mcpSemanticJudgeConfigSource(environment = process.env) {
 }
 
 // src/mcp-cli.ts
-var SIFTLIGHT_MCP_USAGE = `Usage: siftlight_mcp [--http | --stdio]
+var SIFTLIGHT_MCP_USAGE = `Usage: siftlight-mcp [--http | --stdio]
 
 Transports:
   --http   Start the Streamable HTTP server (default)

@@ -144,11 +144,11 @@ When enabled, the configured endpoint receives only the query and bounded candid
 ### Claude Code or Codex: MCP connection
 
 ```bash
-claude mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+claude mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 ```bash
-codex mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+codex mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 `@latest` follows the newest published version when MCP starts. Restart the host to load updates. The server searches the active project; `SIFTLIGHT_MCP_CWD` can select a different root. An MCP-only connection adds the tool without disabling other search tools.
