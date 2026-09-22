@@ -1,11 +1,11 @@
-import { DEFAULT_MCP_OUTPUT_MODE, type SignalGrepMcpOutputMode } from "./mcp-output.js";
+import { DEFAULT_MCP_OUTPUT_MODE, type SiftlightMcpOutputMode } from "./mcp-output.js";
 
 const SOURCE_OUTPUT_GUIDANCE =
   "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 
-export function signalGrepPromptGuidelines(structuredOutput = true): string[] {
+export function siftlightPromptGuidelines(structuredOutput = true): string[] {
   return [
-    `Use baoer_signal_grep for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
+    `Use siftlight for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
@@ -26,7 +26,7 @@ export function signalGrepPromptGuidelines(structuredOutput = true): string[] {
   ];
 }
 
-function signalGrepModelGuidelines(): string[] {
+function siftlightModelGuidelines(): string[] {
   return [
     `Search with pattern and optional path. ${SOURCE_OUTPUT_GUIDANCE} Omit mode/limit for automatic detail/summary selection. Compact model analysis pages may defer source excerpts to inspect.`,
     `Use ranked paths and condition counts to choose evidence. Cursor continuation pages the retained snapshot; summary file selection returns ordinary match metadata. Use mode="inspect" when an edit requires exact source.`,
@@ -35,8 +35,8 @@ function signalGrepModelGuidelines(): string[] {
   ];
 }
 
-export function signalGrepMcpInstructions(
-  outputMode: SignalGrepMcpOutputMode = DEFAULT_MCP_OUTPUT_MODE,
+export function siftlightMcpInstructions(
+  outputMode: SiftlightMcpOutputMode = DEFAULT_MCP_OUTPUT_MODE,
 ): string {
   const outputInstruction =
     outputMode === "structured"
@@ -45,10 +45,10 @@ export function signalGrepMcpInstructions(
         ? "Returns one compact model-facing evidence page: paths, locations, classifications and any retained excerpts; copy continuation requests exactly."
         : "Successful MCP results provide one complete evidence page with statistics, coverage, continuation selectors and any bounded excerpts the requested mode retains.";
   return [
-    "Use baoer_signal_grep for read-only local search with bounded source evidence from the configured project cwd.",
+    "Use siftlight for read-only local search with bounded source evidence from the configured project cwd.",
     outputInstruction,
     ...(outputMode === "model"
-      ? signalGrepModelGuidelines()
-      : signalGrepPromptGuidelines(outputMode === "structured")),
+      ? siftlightModelGuidelines()
+      : siftlightPromptGuidelines(outputMode === "structured")),
   ].join("\n");
 }

@@ -1,6 +1,6 @@
 import { posix } from "node:path";
 import { MAX_ANALYSIS_RESULTS, MAX_ANALYSIS_STORAGE_BYTES } from "./analysis-limits.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import {
   NavigationContext,
   moduleRange,
@@ -82,11 +82,11 @@ function targetSymbol(facts: ModuleFacts, input: NavigationInput): TestTargetSym
     })
     .toSorted((a, b) => a.end - a.start - (b.end - b.start));
   if (symbols.length === 0)
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Test navigation target does not identify an implemented function/method",
     );
   if (input.line === undefined && symbols.length > 1)
-    throw new SignalGrepError("Test navigation symbol is ambiguous; include its source line");
+    throw new SiftlightError("Test navigation symbol is ambiguous; include its source line");
   const symbol = symbols[0];
   if (!symbol) throw new Error("Missing selected test target symbol");
   let carrier = symbol.node;
@@ -292,9 +292,9 @@ export async function findRelatedTests(
 ): Promise<NavigationResult> {
   const started = performance.now();
   if (input.line !== undefined && (!Number.isSafeInteger(input.line) || input.line < 1))
-    throw new SignalGrepError("Test target line must be a positive integer");
+    throw new SiftlightError("Test target line must be a positive integer");
   if (input.symbol !== undefined && input.symbol.trim().length === 0)
-    throw new SignalGrepError("Test target symbol must be nonempty");
+    throw new SiftlightError("Test target symbol must be nonempty");
   const context = new NavigationContext(host);
   let target;
   try {

@@ -1,4 +1,4 @@
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import type {
   SemanticJudgeCandidate,
   SemanticJudgeResult,
@@ -8,7 +8,7 @@ import type {
 const MAX_SEMANTIC_JUDGE_BATCH_CANDIDATES = 8;
 export const MAX_SEMANTIC_JUDGE_REQUEST_BYTES = 64 * 1024;
 
-export class SemanticJudgePayloadTooLargeError extends SignalGrepError {
+export class SemanticJudgePayloadTooLargeError extends SiftlightError {
   constructor(message: string) {
     super(message);
     this.name = "SemanticJudgePayloadTooLargeError";

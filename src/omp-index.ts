@@ -3,37 +3,37 @@ import { join } from "node:path";
 import {
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
   normalizeSearchEnforcement,
-  readSignalGrepConfigFile,
-  resolveSignalGrepConfigPath,
-  SIGNAL_GREP_CONFIG_ENV,
-  type SignalGrepConfig,
+  readSiftlightConfigFile,
+  resolveSiftlightConfigPath,
+  SIFTLIGHT_CONFIG_ENV,
+  type SiftlightConfig,
 } from "./config-reader.js";
 import { resolveContextBudget } from "./context-budget.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
-import { SignalGrepRuntime } from "./runtime.js";
+import { SiftlightRuntime } from "./runtime.js";
 import { SESSION_STATUS_KEY } from "./session-summary.js";
-import { SignalGrepService, type SignalGrepInput } from "./service.js";
-import { signalGrepPromptGuidelines } from "./prompt-guidelines.js";
+import { SiftlightService, type SiftlightInput } from "./service.js";
+import { siftlightPromptGuidelines } from "./prompt-guidelines.js";
 import {
-  renderSignalGrepCall,
-  renderSignalGrepResult,
-  type SignalGrepToolResult,
+  renderSiftlightCall,
+  renderSiftlightResult,
+  type SiftlightToolResult,
 } from "./tui/renderers.js";
 import {
   PREFERRED_SEARCH_GUIDANCE,
   SEARCH_POLICY_GUIDANCE,
   SearchPolicy,
 } from "./search-policy.js";
-import { signalGrepSchema } from "./tool-schema.js";
+import { siftlightSchema } from "./tool-schema.js";
 import { modelErrorText } from "./model-error.js";
 import { createSemanticJudgeIntegration } from "./semantic-judge.js";
 
-const SIGNAL_GREP_LABEL = "baoer_signal_grep";
+const SIFTLIGHT_LABEL = "siftlight";
 const OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
-type OmpToolInput = SignalGrepInput & { i?: unknown };
+type OmpToolInput = SiftlightInput & { i?: unknown };
 
-function normalizeOmpToolInput(params: OmpToolInput): SignalGrepInput {
+function normalizeOmpToolInput(params: OmpToolInput): SiftlightInput {
   if (!Object.hasOwn(params, "i")) return params;
   const input = { ...params };
   delete input.i;
@@ -87,18 +87,18 @@ interface OmpToolDefinition {
     signal: AbortSignal | undefined,
     onUpdate: unknown,
     ctx: OmpExtensionContext,
-  ): Promise<SignalGrepToolResult>;
+  ): Promise<SiftlightToolResult>;
   renderCall?(
-    params: SignalGrepInput,
+    params: SiftlightInput,
     options: unknown,
     theme: OmpTheme,
-  ): ReturnType<typeof renderSignalGrepCall>;
+  ): ReturnType<typeof renderSiftlightCall>;
   renderResult?(
-    result: SignalGrepToolResult,
+    result: SiftlightToolResult,
     options: OmpRenderOptions,
     theme: OmpTheme,
-    args?: SignalGrepInput,
-  ): ReturnType<typeof renderSignalGrepResult>;
+    args?: SiftlightInput,
+  ): ReturnType<typeof renderSiftlightResult>;
 }
 
 interface OmpExtensionAPI {
@@ -162,7 +162,7 @@ function selectSearchTools(pi: OmpExtensionAPI, replaceAlternatives: boolean): s
   const next = replaceAlternatives
     ? current.filter((tool) => !OMP_REPLACED_SEARCH_TOOLS.has(tool))
     : [...current];
-  if (!next.includes(SIGNAL_GREP_LABEL)) next.push(SIGNAL_GREP_LABEL);
+  if (!next.includes(SIFTLIGHT_LABEL)) next.push(SIFTLIGHT_LABEL);
   return next;
 }
 
@@ -172,27 +172,27 @@ function toolSelectionChanged(current: string[], next: string[]): boolean {
 
 function resultOptions(
   options: OmpRenderOptions,
-  result: SignalGrepToolResult,
+  result: SiftlightToolResult,
 ): OmpRenderOptions & { isError: boolean } {
   return { ...options, isError: result.isError === true };
 }
 
-export async function registerOmpSignalGrepExtension(
+export async function registerOmpSiftlightExtension(
   pi: OmpExtensionAPI,
-  searchPolicyAssets = new URL("../plugins/baoer-signal-grep/hooks/", import.meta.url),
-  config?: SignalGrepConfig,
+  searchPolicyAssets = new URL("../plugins/siftlight/hooks/", import.meta.url),
+  config?: SiftlightConfig,
 ): Promise<void> {
   const policy = new SearchPolicy(searchPolicyAssets);
   const resolvedConfig =
     config ??
-    (await readSignalGrepConfigFile(resolveSignalGrepConfigPath(ompAgentDir()), {
-      missing: process.env[SIGNAL_GREP_CONFIG_ENV]?.trim() ? "error" : "defaults",
+    (await readSiftlightConfigFile(resolveSiftlightConfigPath(ompAgentDir()), {
+      missing: process.env[SIFTLIGHT_CONFIG_ENV]?.trim() ? "error" : "defaults",
     }));
   const semanticJudge = createSemanticJudgeIntegration(
     resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
   );
-  const runtime = new SignalGrepRuntime(
-    new SignalGrepService({
+  const runtime = new SiftlightRuntime(
+    new SiftlightService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
       semanticJudge,
@@ -215,21 +215,21 @@ export async function registerOmpSignalGrepExtension(
   };
 
   pi.registerTool({
-    name: SIGNAL_GREP_LABEL,
-    label: SIGNAL_GREP_LABEL,
+    name: SIFTLIGHT_LABEL,
+    label: SIFTLIGHT_LABEL,
     description:
       "Search and navigate code with bounded, verifiable evidence. Use pattern for content or mode=files with query for filenames.",
     approval: "read",
     promptSnippet: "Search file contents without flooding context",
-    promptGuidelines: signalGrepPromptGuidelines(),
-    parameters: signalGrepSchema,
+    promptGuidelines: siftlightPromptGuidelines(),
+    parameters: siftlightSchema,
 
     renderCall(params, _options, theme) {
-      return renderSignalGrepCall(params, locale, theme);
+      return renderSiftlightCall(params, locale, theme);
     },
 
     renderResult(result, options, theme) {
-      return renderSignalGrepResult(result, resultOptions(options, result), locale, theme);
+      return renderSiftlightResult(result, resultOptions(options, result), locale, theme);
     },
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -272,6 +272,6 @@ export async function registerOmpSignalGrepExtension(
   });
 }
 
-export default async function signalGrepOmpExtension(pi: OmpExtensionAPI): Promise<void> {
-  await registerOmpSignalGrepExtension(pi);
+export default async function siftlightOmpExtension(pi: OmpExtensionAPI): Promise<void> {
+  await registerOmpSiftlightExtension(pi);
 }

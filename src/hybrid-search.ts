@@ -6,7 +6,7 @@ import {
   ConceptSourceChangedError,
   verifyConceptSourceGeneration,
 } from "./concept-source-generation.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import { SourceDocumentError, type ByteRange, type SourceDocument } from "./source-document.js";
 import { sameSourceRevision } from "./source.js";
@@ -69,7 +69,7 @@ function rangesOverlap(left: ByteRange, right: ByteRange): boolean {
 export function hybridConceptLimit(value: number | undefined): number {
   const candidate = value ?? DEFAULT_HYBRID_CONCEPT_LIMIT;
   if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > MAX_HYBRID_CONCEPT_LIMIT) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `conceptLimit must be an integer from 1 through ${String(MAX_HYBRID_CONCEPT_LIMIT)}`,
     );
   }

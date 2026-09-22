@@ -4,18 +4,18 @@ import {
   DEFAULT_MCP_MAX_SESSIONS,
   DEFAULT_MCP_PORT,
   DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
-  BAOER_SIGNAL_GREP_MCP_PATH,
-  createDefaultSignalGrepMcpService,
-  startSignalGrepMcpServer,
+  SIFTLIGHT_MCP_PATH,
+  createDefaultSiftlightMcpService,
+  startSiftlightMcpServer,
 } from "./mcp.js";
 import {
   createMcpSemanticJudgeIntegration,
   mcpSemanticJudgeConfigSource,
 } from "./mcp-semantic-judge.js";
 import type { SemanticJudgeIntegration } from "./semantic-judge.js";
-import { parseSignalGrepMcpTransport, BAOER_SIGNAL_GREP_MCP_USAGE } from "./mcp-cli.js";
-import { parseSignalGrepMcpOutputMode, type SignalGrepMcpOutputMode } from "./mcp-output.js";
-import { startSignalGrepMcpStdioServer } from "./mcp-stdio.js";
+import { parseSiftlightMcpTransport, SIFTLIGHT_MCP_USAGE } from "./mcp-cli.js";
+import { parseSiftlightMcpOutputMode, type SiftlightMcpOutputMode } from "./mcp-output.js";
+import { startSiftlightMcpStdioServer } from "./mcp-stdio.js";
 
 function environmentInteger(
   name: string,
@@ -35,7 +35,7 @@ function environmentInteger(
 }
 
 function allowedOrigins(): string[] {
-  return (process.env.BAOER_SIGNAL_GREP_MCP_ALLOWED_ORIGINS ?? "")
+  return (process.env.SIFTLIGHT_MCP_ALLOWED_ORIGINS ?? "")
     .split(",")
     .map((origin) => origin.trim())
     .filter((origin) => origin.length > 0);
@@ -48,27 +48,27 @@ async function configuredSemanticJudge(): Promise<SemanticJudgeIntegration> {
 function logSemanticJudgeStatus(integration: SemanticJudgeIntegration): void {
   const status = integration.config.enabled ? "enabled" : "disabled";
   process.stderr.write(
-    `baoer_signal_grep MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}\n`,
+    `siftlight MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}\n`,
   );
 }
 
 async function runHttpServer(
-  outputMode: SignalGrepMcpOutputMode,
+  outputMode: SiftlightMcpOutputMode,
   semanticJudge: SemanticJudgeIntegration | undefined,
 ): Promise<void> {
-  const running = await startSignalGrepMcpServer({
-    cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.cwd(),
-    host: process.env.BAOER_SIGNAL_GREP_MCP_HOST ?? DEFAULT_MCP_HOST,
-    port: environmentInteger("BAOER_SIGNAL_GREP_MCP_PORT", DEFAULT_MCP_PORT, 0, 65_535),
-    createService: () => createDefaultSignalGrepMcpService(semanticJudge),
+  const running = await startSiftlightMcpServer({
+    cwd: process.env.SIFTLIGHT_MCP_CWD ?? process.cwd(),
+    host: process.env.SIFTLIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
+    port: environmentInteger("SIFTLIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65_535),
+    createService: () => createDefaultSiftlightMcpService(semanticJudge),
     maxSessions: environmentInteger(
-      "BAOER_SIGNAL_GREP_MCP_MAX_SESSIONS",
+      "SIFTLIGHT_MCP_MAX_SESSIONS",
       DEFAULT_MCP_MAX_SESSIONS,
       1,
       Number.MAX_SAFE_INTEGER,
     ),
     sessionIdleTimeoutMs: environmentInteger(
-      "BAOER_SIGNAL_GREP_MCP_SESSION_IDLE_MS",
+      "SIFTLIGHT_MCP_SESSION_IDLE_MS",
       DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
       1,
       Number.MAX_SAFE_INTEGER,
@@ -83,16 +83,16 @@ async function runHttpServer(
   }
   const displayHost = address.family === "IPv6" ? `[${address.address}]` : address.address;
   process.stderr.write(
-    `baoer_signal_grep MCP listening on http://${displayHost}:${String(address.port)}${BAOER_SIGNAL_GREP_MCP_PATH}\n`,
+    `siftlight MCP listening on http://${displayHost}:${String(address.port)}${SIFTLIGHT_MCP_PATH}\n`,
   );
-  process.stderr.write(`baoer_signal_grep MCP working directory: ${running.cwd}\n`);
+  process.stderr.write(`siftlight MCP working directory: ${running.cwd}\n`);
 
   let shuttingDown = false;
   const closeAfterSignal = async (): Promise<void> => {
     try {
       await running.close();
     } catch (error) {
-      process.stderr.write(`baoer_signal_grep MCP shutdown failed: ${String(error)}\n`);
+      process.stderr.write(`siftlight MCP shutdown failed: ${String(error)}\n`);
       process.exitCode = 1;
     }
   };
@@ -106,16 +106,16 @@ async function runHttpServer(
 }
 
 async function runStdioServer(
-  outputMode: SignalGrepMcpOutputMode,
+  outputMode: SiftlightMcpOutputMode,
   semanticJudge: SemanticJudgeIntegration | undefined,
 ): Promise<void> {
-  const running = await startSignalGrepMcpStdioServer({
-    cwd: process.env.BAOER_SIGNAL_GREP_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
+  const running = await startSiftlightMcpStdioServer({
+    cwd: process.env.SIFTLIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSignalGrepMcpService(semanticJudge),
+    createService: () => createDefaultSiftlightMcpService(semanticJudge),
   });
-  process.stderr.write("baoer_signal_grep MCP serving one local client over stdio\n");
-  process.stderr.write(`baoer_signal_grep MCP working directory: ${running.cwd}\n`);
+  process.stderr.write("siftlight MCP serving one local client over stdio\n");
+  process.stderr.write(`siftlight MCP working directory: ${running.cwd}\n`);
 
   let shuttingDown = false;
   const shutdown = (): void => {
@@ -134,12 +134,12 @@ async function runStdioServer(
 }
 
 async function main(): Promise<void> {
-  const transport = parseSignalGrepMcpTransport(process.argv.slice(2));
+  const transport = parseSiftlightMcpTransport(process.argv.slice(2));
   if (transport === "help") {
-    process.stdout.write(BAOER_SIGNAL_GREP_MCP_USAGE);
+    process.stdout.write(SIFTLIGHT_MCP_USAGE);
     return;
   }
-  const outputMode = parseSignalGrepMcpOutputMode(process.env.BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE);
+  const outputMode = parseSiftlightMcpOutputMode(process.env.SIFTLIGHT_MCP_OUTPUT_MODE);
   const semanticJudge = await configuredSemanticJudge();
   logSemanticJudgeStatus(semanticJudge);
   if (transport === "stdio") {
@@ -152,6 +152,6 @@ async function main(): Promise<void> {
 try {
   await main();
 } catch (error) {
-  process.stderr.write(`baoer_signal_grep MCP failed: ${String(error)}\n`);
+  process.stderr.write(`siftlight MCP failed: ${String(error)}\n`);
   process.exitCode = 1;
 }

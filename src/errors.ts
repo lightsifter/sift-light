@@ -1,36 +1,36 @@
-export class SignalGrepError extends Error {
+export class SiftlightError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
-    this.name = "SignalGrepError";
+    this.name = "SiftlightError";
   }
 }
 
-export type SignalGrepRecoveryAction = "retry" | "choose-capability" | "manual";
+export type SiftlightRecoveryAction = "retry" | "choose-capability" | "manual";
 
-export interface SignalGrepDiagnosticIssue {
+export interface SiftlightDiagnosticIssue {
   field: string;
   reason: string;
 }
 
-export interface SignalGrepDiagnosticRecovery {
-  action: SignalGrepRecoveryAction;
+export interface SiftlightDiagnosticRecovery {
+  action: SiftlightRecoveryAction;
   reason: string;
   nextRequest?: Record<string, unknown>;
 }
 
-export interface SignalGrepDiagnosticDetails {
+export interface SiftlightDiagnosticDetails {
   code: string;
   mode?: string;
-  issues: readonly SignalGrepDiagnosticIssue[];
-  recovery: SignalGrepDiagnosticRecovery;
+  issues: readonly SiftlightDiagnosticIssue[];
+  recovery: SiftlightDiagnosticRecovery;
 }
 
-export interface SignalGrepDiagnosticError extends Error {
-  readonly details: SignalGrepDiagnosticDetails;
+export interface SiftlightDiagnosticError extends Error {
+  readonly details: SiftlightDiagnosticDetails;
 }
 
 /** A bounded Concept provider failure that hybrid retrieval may expose as skipped coverage. */
-export class ConceptUnavailableError extends SignalGrepError {
+export class ConceptUnavailableError extends SiftlightError {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ConceptUnavailableError";
@@ -40,10 +40,10 @@ export class ConceptUnavailableError extends SignalGrepError {
 export type RipgrepInputErrorCode = "E_REGEX_INVALID" | "E_SEARCH_PATH_NOT_FOUND";
 
 /** A bounded, non-retrying diagnostic for an invalid search input at ripgrep's boundary. */
-export class RipgrepInputError extends SignalGrepError {
+export class RipgrepInputError extends SiftlightError {
   readonly code: RipgrepInputErrorCode;
   readonly guidance: string;
-  readonly details: SignalGrepDiagnosticDetails;
+  readonly details: SiftlightDiagnosticDetails;
 
   constructor(code: RipgrepInputErrorCode, message: string, guidance: string) {
     super(`${message} ${guidance}`);
@@ -63,7 +63,7 @@ export class RipgrepInputError extends SignalGrepError {
   }
 }
 
-export class CursorError extends SignalGrepError {
+export class CursorError extends SiftlightError {
   readonly code:
     | "E_CURSOR_MALFORMED"
     | "E_CURSOR_NOT_FOUND"

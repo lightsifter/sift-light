@@ -1,25 +1,25 @@
 import type { Readable, Writable } from "node:stream";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  createDefaultSignalGrepMcpService,
-  createSignalGrepMcpServer,
-  type SignalGrepMcpService,
+  createDefaultSiftlightMcpService,
+  createSiftlightMcpServer,
+  type SiftlightMcpService,
 } from "./mcp.js";
 import {
   DEFAULT_MCP_OUTPUT_MODE,
-  parseSignalGrepMcpOutputMode,
-  type SignalGrepMcpOutputMode,
+  parseSiftlightMcpOutputMode,
+  type SiftlightMcpOutputMode,
 } from "./mcp-output.js";
 
-export interface SignalGrepMcpStdioOptions {
+export interface SiftlightMcpStdioOptions {
   cwd?: string;
   input?: Readable;
   output?: Writable;
-  outputMode?: SignalGrepMcpOutputMode;
-  createService?: () => SignalGrepMcpService;
+  outputMode?: SiftlightMcpOutputMode;
+  createService?: () => SiftlightMcpService;
 }
 
-export interface RunningSignalGrepMcpStdioServer {
+export interface RunningSiftlightMcpStdioServer {
   readonly cwd: string;
   readonly closed: Promise<void>;
   close(): Promise<void>;
@@ -29,15 +29,15 @@ function rejectedReasons(results: readonly PromiseSettledResult<unknown>[]): unk
   return results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 }
 
-export async function startSignalGrepMcpStdioServer(
-  options: SignalGrepMcpStdioOptions = {},
-): Promise<RunningSignalGrepMcpStdioServer> {
+export async function startSiftlightMcpStdioServer(
+  options: SiftlightMcpStdioOptions = {},
+): Promise<RunningSiftlightMcpStdioServer> {
   const cwd = options.cwd ?? process.cwd();
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
-  const outputMode = parseSignalGrepMcpOutputMode(options.outputMode ?? DEFAULT_MCP_OUTPUT_MODE);
-  const service = (options.createService ?? createDefaultSignalGrepMcpService)();
-  const protocol = createSignalGrepMcpServer(service, cwd, outputMode);
+  const outputMode = parseSiftlightMcpOutputMode(options.outputMode ?? DEFAULT_MCP_OUTPUT_MODE);
+  const service = (options.createService ?? createDefaultSiftlightMcpService)();
+  const protocol = createSiftlightMcpServer(service, cwd, outputMode);
 
   const lifecycle = Promise.withResolvers<void>();
   let closePromise: Promise<void> | undefined;

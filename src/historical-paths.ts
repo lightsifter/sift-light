@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, parse, relative, resolve } from "node:path";
 import { MAX_STRUCTURE_BYTES, MAX_STRUCTURE_FILES } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import {
   assertExistingPathInsideCwd,
   isPathInsideCwd,
@@ -56,7 +56,7 @@ export async function filterHistoricalPaths(
   signal?: AbortSignal,
 ): Promise<HistoricalPathSelection> {
   if (!isPathInsideCwd(resolve(cwd, request.path ?? "."), cwd)) {
-    throw new SignalGrepError("Historical path filtering requires a path inside cwd");
+    throw new SiftlightError("Historical path filtering requires a path inside cwd");
   }
   const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
   const candidates = paths.filter(
@@ -71,7 +71,7 @@ export async function filterHistoricalPaths(
   const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
   if (bounded.length === 0)
     return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
-  const root = await mkdtemp(join(tmpdir(), "baoer_signal_grep-paths-"));
+  const root = await mkdtemp(join(tmpdir(), "siftlight-paths-"));
   const absoluteCwd = resolve(cwd);
   const volumeRoot = parse(absoluteCwd).root;
   const ignoreFiles: { local: string; bytes: Buffer }[] = [];
@@ -88,14 +88,14 @@ export async function filterHistoricalPaths(
           const before = await lstat(path);
           discovered = true;
           if (!before.isFile())
-            throw new SignalGrepError(
+            throw new SiftlightError(
               "Current ignore rules are not regular files; historical path filtering is unavailable",
             );
           if (
             before.size > MAX_SOURCE_FILE_BYTES ||
             ignoreBytesRead + before.size > MAX_STRUCTURE_BYTES
           )
-            throw new SignalGrepError("Current ignore rules exceed the source read budget");
+            throw new SiftlightError("Current ignore rules exceed the source read budget");
           const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
           let bytes: Buffer;
           try {
@@ -105,7 +105,7 @@ export async function filterHistoricalPaths(
                 sourceRevisionFromStats(await handle.stat()),
               )
             )
-              throw new SignalGrepError("Current ignore rules changed before reading");
+              throw new SiftlightError("Current ignore rules changed before reading");
             const buffer = Buffer.alloc(before.size + 1);
             let used = 0;
             while (used < buffer.length) {
@@ -132,7 +132,7 @@ export async function filterHistoricalPaths(
                 sourceRevisionFromStats(await handle.stat()),
               )
             )
-              throw new SignalGrepError(
+              throw new SiftlightError(
                 "Current ignore rules changed during historical path filtering",
               );
           } finally {
@@ -143,7 +143,7 @@ export async function filterHistoricalPaths(
         } catch (error) {
           if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
           if (discovered)
-            throw new SignalGrepError(
+            throw new SiftlightError(
               "Current ignore rules disappeared during historical path filtering",
             );
         }

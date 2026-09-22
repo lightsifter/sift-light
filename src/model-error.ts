@@ -1,15 +1,15 @@
 import { types } from "node:util";
 import {
   boundedRequestContractDetails,
-  isSignalGrepDiagnosticError,
+  isSiftlightDiagnosticError,
   MAX_REQUEST_RECOVERY_BYTES,
 } from "./request-contract.js";
-import type { SignalGrepDiagnosticError } from "./errors.js";
+import type { SiftlightDiagnosticError } from "./errors.js";
 import type { RequestContractDetails } from "./request-contract.js";
 
 const MAX_RAW_ERROR_SCAN_CHARACTERS = 4_096;
 const MAX_MODEL_ERROR_CHARACTERS = 1_024;
-const MODEL_ERROR_PREFIX = "baoer_signal_grep failed:";
+const MODEL_ERROR_PREFIX = "siftlight failed:";
 
 function errorMessage(error: unknown): string {
   try {
@@ -45,15 +45,14 @@ function errorMessage(error: unknown): string {
 
 /** One bounded model-facing diagnostic; never serialize causes, stacks, or repeated request text. */
 export function modelErrorText(error: unknown): string {
-  if (isSignalGrepDiagnosticError(error)) return requestContractErrorText(error);
+  if (isSiftlightDiagnosticError(error)) return requestContractErrorText(error);
   const raw = errorMessage(error);
   const normalized = raw
     .slice(0, MAX_RAW_ERROR_SCAN_CHARACTERS)
     .toWellFormed()
     .replace(/\s+/gu, " ")
     .trim();
-  const message =
-    normalized.replace(/^(?:baoer_signal_grep failed:\s*)+/u, "") || "unknown failure";
+  const message = normalized.replace(/^(?:siftlight failed:\s*)+/u, "") || "unknown failure";
   const text = `${MODEL_ERROR_PREFIX} ${message}`;
   if (text.length <= MAX_MODEL_ERROR_CHARACTERS) return text;
   return `${text.slice(0, MAX_MODEL_ERROR_CHARACTERS - 1).toWellFormed()}…`;
@@ -65,7 +64,7 @@ export function modelErrorText(error: unknown): string {
  * builder omits oversized next requests instead of allowing a false exact
  * retry to be emitted.
  */
-export function requestContractErrorText(error: SignalGrepDiagnosticError): string {
+export function requestContractErrorText(error: SiftlightDiagnosticError): string {
   return requestContractProjection(error).text;
 }
 
@@ -79,7 +78,7 @@ function projectRequestContract(
   serialized: string,
   message: string,
 ): string {
-  const prefix = `baoer_signal_grep failed: request rejected [${projected.code}]: ${message}`;
+  const prefix = `siftlight failed: request rejected [${projected.code}]: ${message}`;
   const recovery = projected.recovery;
   const next = recovery.nextRequest
     ? "\nCopy the nested recovery.nextRequest object unchanged; do not repeat the original query."
@@ -91,7 +90,7 @@ function projectRequestContract(
 
 /** Build the one bounded contract projection consumed by structured and text hosts. */
 export function requestContractProjection(
-  error: SignalGrepDiagnosticError,
+  error: SiftlightDiagnosticError,
 ): RequestContractProjection {
   const details = boundedRequestContractDetails(error.details);
   const serializedDetails = JSON.stringify(details);

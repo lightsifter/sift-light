@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
 import {
   boundedRipgrepDiagnostic,
@@ -48,9 +48,16 @@ export async function captureCandidateRevisions(
   maxFiles: number,
   signal?: AbortSignal,
   redact = false,
-): Promise<{ revisions: Map<string, SourceRevision>; unreadable: RipgrepUnreadableDiagnostic[] }> {
+): Promise<{
+  revisions: Map<string, SourceRevision>;
+  unreadable: RipgrepUnreadableDiagnostic[];
+  enumerationTruncated: boolean;
+  invalidPathCount: number;
+}> {
   const revisions = new Map<string, SourceRevision>();
   let candidateCount = 0;
+  let enumerationTruncated = false;
+  let invalidPathCount = 0;
   const metadataFailures: RipgrepUnreadableDiagnostic[] = [];
   const recordMetadataFailure = (path: string, error: unknown): void => {
     const reason = error instanceof Error ? error.message : String(error);
@@ -71,30 +78,34 @@ export async function captureCandidateRevisions(
         while (delimiter >= 0) {
           const rawPath = pending.subarray(0, delimiter);
           if (rawPath.length > MAX_PROTOCOL_LINE_BYTES) {
-            throw new SignalGrepError("ripgrep file path exceeds the protocol byte limit");
+            throw new SiftlightError("ripgrep file path exceeds the protocol byte limit");
           }
-          if (candidateCount < maxFiles) {
-            const path = rawPath.toString("utf8");
-            // Lossy file names cannot provide trustworthy path-based revision evidence.
-            if (Buffer.from(path, "utf8").equals(rawPath)) {
+          const path = rawPath.toString("utf8");
+          // Lossy file names cannot provide trustworthy path-based revision evidence.
+          if (Buffer.from(path, "utf8").equals(rawPath)) {
+            if (candidateCount < maxFiles) {
               candidateCount += 1;
               batch.push(resolve(cwd, path));
+            } else {
+              enumerationTruncated = true;
             }
             if (batch.length === MAX_SOURCE_REVISION_CONCURRENCY) {
               // oxlint-disable-next-line no-await-in-loop -- backpressure bounds concurrent metadata reads.
               await captureBatch(batch, revisions, signal, recordMetadataFailure);
               batch = [];
             }
+          } else {
+            invalidPathCount += 1;
           }
           pending = pending.subarray(delimiter + 1);
           delimiter = pending.indexOf(0);
         }
         if (pending.length > MAX_PROTOCOL_LINE_BYTES) {
-          throw new SignalGrepError("ripgrep file path exceeds the protocol byte limit");
+          throw new SiftlightError("ripgrep file path exceeds the protocol byte limit");
         }
       }
       if (pending.length > 0) {
-        throw new SignalGrepError("ripgrep file enumeration ended without a NUL delimiter");
+        throw new SiftlightError("ripgrep file enumeration ended without a NUL delimiter");
       }
       await captureBatch(batch, revisions, signal, recordMetadataFailure);
     },
@@ -104,13 +115,13 @@ export async function captureCandidateRevisions(
   const unreadable = [...diagnostics.unreadable, ...metadataFailures];
   if (inputError) throw inputError;
   if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
-    return { revisions, unreadable };
+    return { revisions, unreadable, enumerationTruncated, invalidPathCount };
   if (result.code !== 0 && result.code !== 1) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       result.stderr.trim() || `ripgrep file enumeration exited with status ${String(result.code)}`,
     );
   }
-  return { revisions, unreadable };
+  return { revisions, unreadable, enumerationTruncated, invalidPathCount };
 }
 
 export async function retainStableSourceRevisions(

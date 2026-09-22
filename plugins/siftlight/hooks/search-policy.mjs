@@ -4,10 +4,10 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 // src/errors.ts
-class SignalGrepError extends Error {
+class SiftlightError extends Error {
   constructor(message, options) {
     super(message, options);
-    this.name = "SignalGrepError";
+    this.name = "SiftlightError";
   }
 }
 
@@ -28,9 +28,9 @@ function list(value) {
 }
 function validateText(value, field, maxCharacters, singleLine = false) {
   if (!value.isWellFormed() || /\0/.test(value) || singleLine && /[\r\n]/.test(value))
-    throw new SignalGrepError(`${field} must be well-formed text without NUL or line breaks`);
+    throw new SiftlightError(`${field} must be well-formed text without NUL or line breaks`);
   if (value.length > maxCharacters)
-    throw new SignalGrepError(`${field} is too long (maximum ${String(maxCharacters)} characters); use a shorter value or a narrower working directory`);
+    throw new SiftlightError(`${field} is too long (maximum ${String(maxCharacters)} characters); use a shorter value or a narrower working directory`);
 }
 function validateSearchPath(value, field = "path") {
   validateText(value.replace(/^@/, ""), field, MAX_PATH_CHARACTERS, true);
@@ -47,7 +47,7 @@ function validateRawSearchInput(input) {
   ]) {
     const values = list(value);
     if (values.length > MAX_FILE_FILTER_ITEMS)
-      throw new SignalGrepError(`${field} accepts at most ${String(MAX_FILE_FILTER_ITEMS)} entries`);
+      throw new SiftlightError(`${field} accepts at most ${String(MAX_FILE_FILTER_ITEMS)} entries`);
     values.forEach((item) => validateText(item, field, MAX_PATH_CHARACTERS, true));
   }
   for (const [field, value] of [
@@ -55,10 +55,10 @@ function validateRawSearchInput(input) {
     ["modifiedBefore", input.modifiedBefore]
   ]) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 0))
-      throw new SignalGrepError(`${field} must be a non-negative Unix timestamp in milliseconds`);
+      throw new SiftlightError(`${field} must be a non-negative Unix timestamp in milliseconds`);
   }
   if (input.modifiedAfter !== undefined && input.modifiedBefore !== undefined && input.modifiedAfter > input.modifiedBefore)
-    throw new SignalGrepError("modifiedAfter must be earlier than or equal to modifiedBefore");
+    throw new SiftlightError("modifiedAfter must be earlier than or equal to modifiedBefore");
 }
 
 // src/search-policy-recovery.ts
@@ -353,7 +353,7 @@ function recoverFileEnumeration(argv, language, workingDirectory) {
   try {
     validateRawSearchInput(filters);
   } catch (error) {
-    if (error instanceof SignalGrepError)
+    if (error instanceof SiftlightError)
       return manual("files");
     throw error;
   }
@@ -408,7 +408,7 @@ function recoverShellSearch(command, match, workingDirectory) {
   try {
     validateRawSearchInput(request);
   } catch (error) {
-    if (error instanceof SignalGrepError)
+    if (error instanceof SiftlightError)
       return manual(match.kind);
     throw error;
   }
@@ -4006,16 +4006,16 @@ function recovery(kind) {
 function blockedMatch(command, match, workingDirectory) {
   const location = match.nestedDepth > 0 ? `nested ${match.language} command #${match.commandIndex}` : `${match.language} subcommand #${match.commandIndex}`;
   const recovered = recoverShellSearch(command, match, workingDirectory);
-  const repair = recovered.kind === "concrete" ? `retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovered.request}` : `an equivalent request was not generated because ${recovered.reason}; manually translate the search, then retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovery(match.kind)}`;
+  const repair = recovered.kind === "concrete" ? `retry exactly once through siftlight (possibly MCP-prefixed) with ${recovered.request}` : `an equivalent request was not generated because ${recovered.reason}; manually translate the search, then retry exactly once through siftlight (possibly MCP-prefixed) with ${recovery(match.kind)}`;
   return {
     block: true,
-    reason: `baoer_signal_grep search policy blocked direct ${match.kind} search at ${location} (${match.command} …, bytes ${match.startByte}-${match.endByte}); the atomic shell call did not run. Split out non-search operations, then ${repair}. Do not include this denial in the retry, repeat it through another shell/script, or weaken the search. If baoer_signal_grep is unavailable, report that connection error once without attempting another search.`
+    reason: `siftlight search policy blocked direct ${match.kind} search at ${location} (${match.command} …, bytes ${match.startByte}-${match.endByte}); the atomic shell call did not run. Split out non-search operations, then ${repair}. Do not include this denial in the retry, repeat it through another shell/script, or weaken the search. If siftlight is unavailable, report that connection error once without attempting another search.`
   };
 }
 function blockedTool(kind, toolName) {
   return {
     block: true,
-    reason: `baoer_signal_grep search policy blocked direct ${kind} tool ${toolName}; it did not run. Retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovery(kind)}. Do not include this denial in the retry, use another search entry, or weaken the search. If baoer_signal_grep is unavailable, report that connection error once without attempting another search.`
+    reason: `siftlight search policy blocked direct ${kind} tool ${toolName}; it did not run. Retry exactly once through siftlight (possibly MCP-prefixed) with ${recovery(kind)}. Do not include this denial in the retry, use another search entry, or weaken the search. If siftlight is unavailable, report that connection error once without attempting another search.`
   };
 }
 
@@ -4049,11 +4049,8 @@ class SearchPolicy {
 }
 
 // src/config-reader.ts
-var SIGNAL_GREP_ENFORCEMENT_ENV = "BAOER_SIGNAL_GREP_ENFORCE_SEARCH";
-var SEMANTIC_JUDGE_API_KEY_ENVS = [
-  "TYPESAFE_API_KEY",
-  "BAOER_SIGNAL_GREP_JEV_API_KEY"
-];
+var SIFTLIGHT_ENFORCEMENT_ENV = "SIFTLIGHT_ENFORCE_SEARCH";
+var SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFTLIGHT_JEV_API_KEY"];
 var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
   enabled: false,
   provider: "jev",
@@ -4071,11 +4068,11 @@ function normalizeSearchEnforcement(value, source) {
     return "prefer";
   if (value === "off")
     return "off";
-  throw new Error(`Invalid baoer_signal_grep ${source}: enforceSearch must be "hard", "prefer", or "off"`);
+  throw new Error(`Invalid siftlight ${source}: enforceSearch must be "hard", "prefer", or "off"`);
 }
 function readNativeSearchEnforcement(environment = process.env) {
-  const value = environment[SIGNAL_GREP_ENFORCEMENT_ENV];
-  return normalizeSearchEnforcement(value, `environment variable ${SIGNAL_GREP_ENFORCEMENT_ENV}`);
+  const value = environment[SIFTLIGHT_ENFORCEMENT_ENV];
+  return normalizeSearchEnforcement(value, `environment variable ${SIFTLIGHT_ENFORCEMENT_ENV}`);
 }
 
 // src/search-policy-hook.ts
@@ -4097,7 +4094,7 @@ function deny(reason) {
 `);
 }
 var inputTimer = setTimeout(() => {
-  process.stderr.write(`baoer_signal_grep search policy: hook input timed out
+  process.stderr.write(`siftlight search policy: hook input timed out
 `);
   process.exit(2);
 }, 3000);
@@ -4112,5 +4109,5 @@ try {
     deny(decision.reason);
 } catch (error) {
   clearTimeout(inputTimer);
-  deny(error instanceof Error && (error.message.startsWith("Search policy") || error.message.startsWith("Invalid baoer_signal_grep environment variable")) ? error.message : "baoer_signal_grep search policy failed; repair or disable this plugin before retrying");
+  deny(error instanceof Error && (error.message.startsWith("Search policy") || error.message.startsWith("Invalid siftlight environment variable")) ? error.message : "siftlight search policy failed; repair or disable this plugin before retrying");
 }

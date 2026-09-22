@@ -1,22 +1,22 @@
 import { type Component } from "@earendil-works/pi-tui";
-import type { SignalGrepLocale } from "../config.js";
-import type { SignalGrepInput } from "../service.js";
-import type { SignalGrepDetails } from "../types.js";
+import type { SiftlightLocale } from "../config.js";
+import type { SiftlightInput } from "../service.js";
+import type { SiftlightDetails } from "../types.js";
 import { dashboard } from "./dashboard.js";
-import { fit, renderDashboard, renderSignalGrepCallLines, type SignalGrepTheme } from "./layout.js";
+import { fit, renderDashboard, renderSiftlightCallLines, type SiftlightTheme } from "./layout.js";
 
-export interface SignalGrepToolResult {
+export interface SiftlightToolResult {
   content: { type: string; text?: string }[];
-  details?: SignalGrepDetails;
+  details?: SiftlightDetails;
   isError?: boolean;
 }
-export interface SignalGrepRenderOptions {
+export interface SiftlightRenderOptions {
   expanded: boolean;
   isError: boolean;
   isPartial: boolean;
 }
 
-function component(render: (width: number) => string[], locale: SignalGrepLocale): Component {
+function component(render: (width: number) => string[], locale: SiftlightLocale): Component {
   return {
     render(width) {
       try {
@@ -32,7 +32,7 @@ function component(render: (width: number) => string[], locale: SignalGrepLocale
   };
 }
 
-function failure(text: string, locale: SignalGrepLocale): string {
+function failure(text: string, locale: SiftlightLocale): string {
   const zh = locale === "zh-CN";
   if (/expired|cursor.*invalid/i.test(text))
     return zh ? "结果已过期，请重新搜索" : "Results expired; run the search again";
@@ -46,19 +46,19 @@ function failure(text: string, locale: SignalGrepLocale): string {
   return zh ? "搜索未完成，请检查搜索条件后重试" : "Search failed; check the query and retry";
 }
 
-export function renderSignalGrepCall(
-  input: SignalGrepInput,
-  locale: SignalGrepLocale,
-  theme: SignalGrepTheme,
+export function renderSiftlightCall(
+  input: SiftlightInput,
+  locale: SiftlightLocale,
+  theme: SiftlightTheme,
 ): Component {
-  return component((width) => renderSignalGrepCallLines(input, locale, theme, width), locale);
+  return component((width) => renderSiftlightCallLines(input, locale, theme, width), locale);
 }
 
-export function renderSignalGrepResult(
-  result: SignalGrepToolResult,
-  options: SignalGrepRenderOptions,
-  locale: SignalGrepLocale,
-  theme: SignalGrepTheme,
+export function renderSiftlightResult(
+  result: SiftlightToolResult,
+  options: SiftlightRenderOptions,
+  locale: SiftlightLocale,
+  theme: SiftlightTheme,
 ): Component {
   return component((width) => {
     const zh = locale === "zh-CN";

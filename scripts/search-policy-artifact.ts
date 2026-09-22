@@ -1,12 +1,12 @@
 import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
-import { SEMANTIC_JUDGE_API_KEY_ENVS, SIGNAL_GREP_CONFIG_ENV } from "../src/config-reader.js";
+import { SEMANTIC_JUDGE_API_KEY_ENVS, SIFTLIGHT_CONFIG_ENV } from "../src/config-reader.js";
 import { buildConceptWorker } from "./concept-worker-artifact.js";
 import { buildSyntaxWorker } from "./syntax-worker-artifact.js";
 
 const repository = resolve(import.meta.dirname, "..");
-export const searchPluginRoot = join(repository, "plugins/baoer-signal-grep");
+export const searchPluginRoot = join(repository, "plugins/siftlight");
 export const SEARCH_PLUGIN_FILES = [
   "LICENSE",
   "package.json",
@@ -74,16 +74,16 @@ export async function buildSearchPlugin(root: string): Promise<void> {
   );
   await writeFile(join(hooks, "THIRD_PARTY_NOTICES.txt"), notices.join("\n\n"));
   const identity = {
-    name: "baoer-signal-grep",
+    name: "siftlight",
     version: packageJson.version,
     description:
-      "Require baoer_signal_grep for conventional local searches while keeping development tools available.",
+      "Require siftlight for conventional local searches while keeping development tools available.",
     author: { name: packageJson.author },
     homepage: packageJson.homepage,
     license: packageJson.license,
   };
   const ompPackage = {
-    name: "baoer-signal-grep",
+    name: "siftlight",
     version: packageJson.version,
     private: true,
     type: "module",
@@ -92,26 +92,26 @@ export async function buildSearchPlugin(root: string): Promise<void> {
   const mcpEnvironment = {
     npm_config_ignore_scripts: "true",
     ONNXRUNTIME_NODE_INSTALL_CUDA: "skip",
-    BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE: "model",
+    SIFTLIGHT_MCP_OUTPUT_MODE: "model",
   };
   const mcpConnection = {
     command: "npx",
     args: [
       "--yes",
       "--package",
-      `baoer-signal-grep-runtime@npm:${packageJson.name}@${packageJson.version}`,
-      "baoer_signal_grep_mcp",
+      `siftlight-runtime@npm:${packageJson.name}@${packageJson.version}`,
+      "siftlight_mcp",
       "--stdio",
     ],
     env: mcpEnvironment,
   };
   const mcp = {
-    baoer_signal_grep: mcpConnection,
+    siftlight: mcpConnection,
   };
   const sharedMcp = {
-    baoer_signal_grep: {
+    siftlight: {
       ...mcpConnection,
-      env_vars: [SIGNAL_GREP_CONFIG_ENV, ...SEMANTIC_JUDGE_API_KEY_ENVS],
+      env_vars: [SIFTLIGHT_CONFIG_ENV, ...SEMANTIC_JUDGE_API_KEY_ENVS],
     },
   };
   const localMcpServer = [
@@ -124,10 +124,10 @@ export async function buildSearchPlugin(root: string): Promise<void> {
       ...identity,
       mcpServers: "./.mcp.json",
       interface: {
-        displayName: "baoer_signal_grep",
+        displayName: "siftlight",
         shortDescription: "Enforced local code search",
         longDescription: identity.description,
-        defaultPrompt: "Search this project's code using baoer_signal_grep.",
+        defaultPrompt: "Search this project's code using siftlight.",
         developerName: packageJson.author,
         category: "Productivity",
         capabilities: [],
@@ -157,7 +157,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
       ...identity,
       mcpServers: mcp,
       systemPrompt:
-        "Use baoer_signal_grep for local content and filename searches. The plugin blocks conventional alternative search entries. Ordinary reads, edits, tests and builds remain available.",
+        "Use siftlight for local content and filename searches. The plugin blocks conventional alternative search entries. Ordinary reads, edits, tests and builds remain available.",
       hooks: [
         {
           event: "PreToolUse",

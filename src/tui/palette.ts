@@ -1,6 +1,6 @@
 import type { Theme as PiTheme } from "@earendil-works/pi-coding-agent";
 
-export type SignalGrepTheme = Pick<PiTheme, "bold" | "fg"> &
+export type SiftlightTheme = Pick<PiTheme, "bold" | "fg"> &
   Partial<Pick<PiTheme, "getBgAnsi" | "getFgAnsi" | "getColorMode">>;
 const DARK = [
   [255, 95, 175],
@@ -47,7 +47,7 @@ function brightness(ansi: string): number | undefined {
 }
 
 /** Read host styling on every render; no independent theme state or terminal queries. */
-export function candy(theme: SignalGrepTheme, index: number, text: string): string {
+export function candy(theme: SiftlightTheme, index: number, text: string): string {
   const background = theme.getBgAnsi ? brightness(theme.getBgAnsi("toolSuccessBg")) : undefined;
   const foreground = theme.getFgAnsi ? brightness(theme.getFgAnsi("text")) : undefined;
   const light =

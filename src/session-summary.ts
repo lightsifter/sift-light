@@ -1,9 +1,9 @@
-import type { SignalGrepLocale } from "./config.js";
-import { BAOER_SIGNAL_GREP_VERSION } from "./package-version.js";
-import type { SignalGrepInput } from "./service.js";
-import type { SignalGrepResult } from "./types.js";
+import type { SiftlightLocale } from "./config.js";
+import { SIFTLIGHT_VERSION } from "./package-version.js";
+import type { SiftlightInput } from "./service.js";
+import type { SiftlightResult } from "./types.js";
 
-export const SESSION_STATUS_KEY = "baoer_signal_grep_session";
+export const SESSION_STATUS_KEY = "siftlight_session";
 
 export interface SessionSummarySnapshot {
   queries: number;
@@ -13,7 +13,7 @@ export interface SessionSummarySnapshot {
   failedCalls: number;
 }
 
-function isNewQuery(input: SignalGrepInput): boolean {
+function isNewQuery(input: SiftlightInput): boolean {
   return (
     input.cursor === undefined &&
     input.sourceCursor === undefined &&
@@ -21,7 +21,7 @@ function isNewQuery(input: SignalGrepInput): boolean {
   );
 }
 
-function wasAutomaticallyOrganized(input: SignalGrepInput, result: SignalGrepResult): boolean {
+function wasAutomaticallyOrganized(input: SiftlightInput, result: SiftlightResult): boolean {
   const autoMode = input.mode === undefined || input.mode === "auto";
   return autoMode && input.limit === undefined && result.details.summaryFilesShown !== undefined;
 }
@@ -59,7 +59,7 @@ export class SessionSummary {
     failedCalls: 0,
   };
 
-  record(input: SignalGrepInput, result: SignalGrepResult): void {
+  record(input: SiftlightInput, result: SiftlightResult): void {
     if (!isNewQuery(input)) return;
     this.#snapshot.queries += 1;
     if (result.details.status === "complete") this.#snapshot.completeQueries += 1;
@@ -75,14 +75,14 @@ export class SessionSummary {
     return { ...this.#snapshot };
   }
 
-  format(locale: SignalGrepLocale): string | undefined {
+  format(locale: SiftlightLocale): string | undefined {
     const { failedCalls, organizedQueries, queries } = this.#snapshot;
     if (queries === 0 && failedCalls === 0) return undefined;
     if (locale === "zh-CN") {
       const organized =
         organizedQueries > 0 ? `；${String(organizedQueries)} 次结果已自动按文件整理` : "";
       const failures = failedCalls > 0 ? `；${String(failedCalls)} 次调用失败` : "";
-      return `baoer_signal_grep ${BAOER_SIGNAL_GREP_VERSION}：已处理 ${String(queries)} 次查询，${formatChineseCompleteness(this.#snapshot)}${organized}${failures}`;
+      return `siftlight ${SIFTLIGHT_VERSION}：已处理 ${String(queries)} 次查询，${formatChineseCompleteness(this.#snapshot)}${organized}${failures}`;
     }
     const queryWord = queries === 1 ? "query" : "queries";
     let organized = "";
@@ -95,6 +95,6 @@ export class SessionSummary {
       const callWord = failedCalls === 1 ? "call" : "calls";
       failures = `; ${failedCalls} failed ${callWord}`;
     }
-    return `baoer_signal_grep ${BAOER_SIGNAL_GREP_VERSION}: handled ${String(queries)} ${queryWord}; ${formatEnglishCompleteness(this.#snapshot)}${organized}${failures}`;
+    return `siftlight ${SIFTLIGHT_VERSION}: handled ${String(queries)} ${queryWord}; ${formatEnglishCompleteness(this.#snapshot)}${organized}${failures}`;
   }
 }

@@ -3,10 +3,10 @@ import { recoverShellSearch } from "./search-policy-recovery.js";
 import { ShellSearchPolicy, type ShellSearchMatch } from "./search-policy-shell.js";
 
 export const SEARCH_POLICY_GUIDANCE =
-  "Local content and filename searches must use baoer_signal_grep. Built-in search tools and direct search commands are blocked before execution; filtering output from an unrelated producer at a pipeline tail remains available. Use pattern for contents or mode=files with query for filenames. Keep read/edit/write, tests and builds available. After a denial, call baoer_signal_grep once with the stated repair; do not paste the denial into the request, repeat the blocked call, use another shell/custom script, or weaken the search mode.";
+  "Local content and filename searches must use siftlight. Built-in search tools and direct search commands are blocked before execution; filtering output from an unrelated producer at a pipeline tail remains available. Use pattern for contents or mode=files with query for filenames. Keep read/edit/write, tests and builds available. After a denial, call siftlight once with the stated repair; do not paste the denial into the request, repeat the blocked call, use another shell/custom script, or weaken the search mode.";
 export const PI_REPLACED_SEARCH_TOOLS = new Set(["grep", "find"]);
 export const PREFERRED_SEARCH_GUIDANCE =
-  "Prefer baoer_signal_grep for local content and filename searches because it provides bounded evidence, coverage and continuation details. Conventional search entries remain available in advisory mode.";
+  "Prefer siftlight for local content and filename searches because it provides bounded evidence, coverage and continuation details. Conventional search entries remain available in advisory mode.";
 const contentTools = new Set(["grep", "Grep", "SearchFileContent"]);
 const fileTools = new Set(["find", "glob", "Glob", "GlobFile", "SearchFiles"]);
 const shellTools = new Set([
@@ -47,18 +47,18 @@ function blockedMatch(
   const recovered = recoverShellSearch(command, match, workingDirectory);
   const repair =
     recovered.kind === "concrete"
-      ? `retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovered.request}`
-      : `an equivalent request was not generated because ${recovered.reason}; manually translate the search, then retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovery(match.kind)}`;
+      ? `retry exactly once through siftlight (possibly MCP-prefixed) with ${recovered.request}`
+      : `an equivalent request was not generated because ${recovered.reason}; manually translate the search, then retry exactly once through siftlight (possibly MCP-prefixed) with ${recovery(match.kind)}`;
   return {
     block: true,
-    reason: `baoer_signal_grep search policy blocked direct ${match.kind} search at ${location} (${match.command} …, bytes ${match.startByte}-${match.endByte}); the atomic shell call did not run. Split out non-search operations, then ${repair}. Do not include this denial in the retry, repeat it through another shell/script, or weaken the search. If baoer_signal_grep is unavailable, report that connection error once without attempting another search.`,
+    reason: `siftlight search policy blocked direct ${match.kind} search at ${location} (${match.command} …, bytes ${match.startByte}-${match.endByte}); the atomic shell call did not run. Split out non-search operations, then ${repair}. Do not include this denial in the retry, repeat it through another shell/script, or weaken the search. If siftlight is unavailable, report that connection error once without attempting another search.`,
   };
 }
 
 function blockedTool(kind: SearchKind, toolName: string): SearchPolicyDecision {
   return {
     block: true,
-    reason: `baoer_signal_grep search policy blocked direct ${kind} tool ${toolName}; it did not run. Retry exactly once through baoer_signal_grep (possibly MCP-prefixed) with ${recovery(kind)}. Do not include this denial in the retry, use another search entry, or weaken the search. If baoer_signal_grep is unavailable, report that connection error once without attempting another search.`,
+    reason: `siftlight search policy blocked direct ${kind} tool ${toolName}; it did not run. Retry exactly once through siftlight (possibly MCP-prefixed) with ${recovery(kind)}. Do not include this denial in the retry, use another search entry, or weaken the search. If siftlight is unavailable, report that connection error once without attempting another search.`,
   };
 }
 

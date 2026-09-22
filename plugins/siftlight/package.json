@@ -1,6 +1,6 @@
 {
-  "name": "baoer-signal-grep",
-  "version": "1.7.0-1",
+  "name": "siftlight",
+  "version": "1.7.0-2",
   "private": true,
   "type": "module",
   "omp": {

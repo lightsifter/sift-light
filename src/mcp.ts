@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { BAOER_SIGNAL_GREP_VERSION } from "./package-version.js";
+import { SIFTLIGHT_VERSION } from "./package-version.js";
 import { Value } from "typebox/value";
 import {
   CallToolRequestSchema,
@@ -12,46 +12,42 @@ import {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { SignalGrepResult } from "./types.js";
+import type { SiftlightResult } from "./types.js";
 import {
   DEFAULT_MCP_OUTPUT_MODE,
-  parseSignalGrepMcpOutputMode,
-  type SignalGrepMcpOutputMode,
+  parseSiftlightMcpOutputMode,
+  type SiftlightMcpOutputMode,
 } from "./mcp-output.js";
 import { compactMcpModelText } from "./mcp-model-output.js";
 import { modelErrorText, requestContractProjection } from "./model-error.js";
 import {
-  isSignalGrepDiagnosticError,
+  isSiftlightDiagnosticError,
   RequestContractError,
   schemaContractError,
 } from "./request-contract.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
-import {
-  SignalGrepService,
-  type SignalGrepInput,
-  type SignalGrepSearchOptions,
-} from "./service.js";
+import { SiftlightService, type SiftlightInput, type SiftlightSearchOptions } from "./service.js";
 import {
   createDisabledSemanticJudgeIntegration,
   type SemanticJudgeIntegration,
 } from "./semantic-judge.js";
 import { DEFAULT_SEMANTIC_JUDGE_CONFIG } from "./config-reader.js";
-import { signalGrepMcpInstructions } from "./prompt-guidelines.js";
+import { siftlightMcpInstructions } from "./prompt-guidelines.js";
 import {
-  SIGNAL_GREP_DESCRIPTION,
-  SIGNAL_GREP_MODEL_DESCRIPTION,
-  signalGrepSchema,
+  SIFTLIGHT_DESCRIPTION,
+  SIFTLIGHT_MODEL_DESCRIPTION,
+  siftlightSchema,
 } from "./tool-schema.js";
 
-export const BAOER_SIGNAL_GREP_MCP_PATH = "/mcp";
+export const SIFTLIGHT_MCP_PATH = "/mcp";
 export const DEFAULT_MCP_HOST = "127.0.0.1";
 export const DEFAULT_MCP_PORT = 3000;
 export const DEFAULT_MCP_MAX_SESSIONS = 100;
 export const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 export const MAX_MCP_BODY_BYTES = 16 * 1024 * 1024;
 
-const SIGNAL_GREP_OUTPUT_SCHEMA: Tool["outputSchema"] = {
+const SIFTLIGHT_OUTPUT_SCHEMA: Tool["outputSchema"] = {
   type: "object",
   properties: {
     text: {
@@ -64,43 +60,43 @@ const SIGNAL_GREP_OUTPUT_SCHEMA: Tool["outputSchema"] = {
   required: ["text", "details"],
 };
 
-function signalGrepTool(outputMode: SignalGrepMcpOutputMode): Tool {
+function siftlightTool(outputMode: SiftlightMcpOutputMode): Tool {
   const tool: Tool = {
-    name: "baoer_signal_grep",
-    title: "baoer_signal_grep",
-    description: outputMode === "model" ? SIGNAL_GREP_MODEL_DESCRIPTION : SIGNAL_GREP_DESCRIPTION,
+    name: "siftlight",
+    title: "siftlight",
+    description: outputMode === "model" ? SIFTLIGHT_MODEL_DESCRIPTION : SIFTLIGHT_DESCRIPTION,
     // TypeBox and MCP both consume JSON Schema, but their TypeScript declarations are intentionally unrelated.
-    // SAFETY: signalGrepSchema is runtime-validated TypeBox JSON Schema and matches MCP's input schema shape.
+    // SAFETY: siftlightSchema is runtime-validated TypeBox JSON Schema and matches MCP's input schema shape.
     // oxlint-disable-next-line no-unsafe-type-assertion -- this is the checked JSON Schema adapter boundary
-    inputSchema: signalGrepSchema as unknown as Tool["inputSchema"],
+    inputSchema: siftlightSchema as unknown as Tool["inputSchema"],
     annotations: {
-      title: "baoer_signal_grep",
+      title: "siftlight",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
   };
-  if (outputMode === "structured") tool.outputSchema = SIGNAL_GREP_OUTPUT_SCHEMA;
+  if (outputMode === "structured") tool.outputSchema = SIFTLIGHT_OUTPUT_SCHEMA;
   return tool;
 }
 
-export interface SignalGrepMcpService {
+export interface SiftlightMcpService {
   search(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
-    options?: SignalGrepSearchOptions,
-  ): Promise<SignalGrepResult>;
+    options?: SiftlightSearchOptions,
+  ): Promise<SiftlightResult>;
   shutdown(): Promise<void>;
 }
 
-export function createDefaultSignalGrepMcpService(
+export function createDefaultSiftlightMcpService(
   semanticJudge?: SemanticJudgeIntegration,
-): SignalGrepMcpService {
+): SiftlightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
-  return new SignalGrepService({
+  return new SiftlightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
     semanticJudge: resolvedSemanticJudge,
@@ -112,8 +108,8 @@ function errorMessage(error: unknown): string {
 }
 
 function validationError(value: unknown): RequestContractError | undefined {
-  if (Value.Check(signalGrepSchema, value)) return undefined;
-  const first = Value.Errors(signalGrepSchema, value)[0];
+  if (Value.Check(siftlightSchema, value)) return undefined;
+  const first = Value.Errors(siftlightSchema, value)[0];
   return schemaContractError(
     value,
     first?.instancePath,
@@ -121,16 +117,16 @@ function validationError(value: unknown): RequestContractError | undefined {
   );
 }
 
-function parseSignalGrepInput(value: unknown): SignalGrepInput {
+function parseSiftlightInput(value: unknown): SiftlightInput {
   const failure = validationError(value);
   if (failure) throw failure;
   // Value.Check has validated the complete public schema before this boundary.
   // oxlint-disable-next-line no-unsafe-type-assertion -- TypeBox's inferred shape feeds the existing service contract
-  return value as SignalGrepInput;
+  return value as SiftlightInput;
 }
 
-function toolError(error: unknown, outputMode: SignalGrepMcpOutputMode) {
-  const contractProjection = isSignalGrepDiagnosticError(error)
+function toolError(error: unknown, outputMode: SiftlightMcpOutputMode) {
+  const contractProjection = isSiftlightDiagnosticError(error)
     ? requestContractProjection(error)
     : undefined;
   const text = contractProjection?.text ?? modelErrorText(error);
@@ -159,18 +155,18 @@ function toolError(error: unknown, outputMode: SignalGrepMcpOutputMode) {
   };
 }
 
-export function createSignalGrepMcpServer(
-  service: SignalGrepMcpService,
+export function createSiftlightMcpServer(
+  service: SiftlightMcpService,
   cwd: string,
-  outputMode: SignalGrepMcpOutputMode = DEFAULT_MCP_OUTPUT_MODE,
+  outputMode: SiftlightMcpOutputMode = DEFAULT_MCP_OUTPUT_MODE,
 ): McpServer {
-  const resolvedOutputMode = parseSignalGrepMcpOutputMode(outputMode);
-  const tool = signalGrepTool(resolvedOutputMode);
+  const resolvedOutputMode = parseSiftlightMcpOutputMode(outputMode);
+  const tool = siftlightTool(resolvedOutputMode);
   const server = new McpServer(
-    { name: "baoer_signal_grep", version: BAOER_SIGNAL_GREP_VERSION },
+    { name: "siftlight", version: SIFTLIGHT_VERSION },
     {
       capabilities: { tools: {} },
-      instructions: signalGrepMcpInstructions(resolvedOutputMode),
+      instructions: siftlightMcpInstructions(resolvedOutputMode),
     },
   );
 
@@ -183,7 +179,7 @@ export function createSignalGrepMcpServer(
       return toolError(new Error(`Unknown tool: ${request.params.name}`), resolvedOutputMode);
     }
     try {
-      const input = parseSignalGrepInput(request.params.arguments ?? {});
+      const input = parseSiftlightInput(request.params.arguments ?? {});
       const result = await service.search(input, cwd, extra.signal, {
         modelOutput: resolvedOutputMode === "model",
         modelSource:
@@ -206,7 +202,7 @@ export function createSignalGrepMcpServer(
 
 interface McpSession {
   protocol: McpServer;
-  service: SignalGrepMcpService;
+  service: SiftlightMcpService;
   transport: StreamableHTTPServerTransport;
   lastAccessedAt: number;
   activeRequests: number;
@@ -237,7 +233,7 @@ interface McpSessionState {
   readonly maxSessions: number;
   readonly idleTimeoutMs: number;
   readonly allowedOrigins: ReadonlySet<string>;
-  readonly outputMode: SignalGrepMcpOutputMode;
+  readonly outputMode: SiftlightMcpOutputMode;
   readonly cleanupErrors: unknown[];
   pendingInitializations: number;
   closing: boolean;
@@ -275,18 +271,18 @@ async function useSession(session: McpSession, operation: () => Promise<void>): 
   }
 }
 
-export interface SignalGrepMcpHttpOptions {
+export interface SiftlightMcpHttpOptions {
   cwd?: string;
   host?: string;
   port?: number;
   allowedOrigins?: readonly string[];
   maxSessions?: number;
   sessionIdleTimeoutMs?: number;
-  outputMode?: SignalGrepMcpOutputMode;
-  createService?: () => SignalGrepMcpService;
+  outputMode?: SiftlightMcpOutputMode;
+  createService?: () => SiftlightMcpService;
 }
 
-export interface RunningSignalGrepMcpServer {
+export interface RunningSiftlightMcpServer {
   readonly httpServer: Server;
   readonly cwd: string;
   close(): Promise<void>;
@@ -365,21 +361,20 @@ function writeJsonError(response: ServerResponse, status: number, message: strin
 }
 
 function reportHttpFailure(response: ServerResponse, error: unknown): void {
-  process.stderr.write(`baoer_signal_grep MCP request failed: ${errorMessage(error)}\n`);
+  process.stderr.write(`siftlight MCP request failed: ${errorMessage(error)}\n`);
   if (!response.headersSent) writeJsonError(response, 500, "MCP request failed");
   else response.destroy();
 }
 
 function requestPath(request: IncomingMessage): string {
-  return new URL(request.url ?? BAOER_SIGNAL_GREP_MCP_PATH, "http://baoer_signal_grep.local")
-    .pathname;
+  return new URL(request.url ?? SIFTLIGHT_MCP_PATH, "http://siftlight.local").pathname;
 }
 
 async function handleMcpRequest(
   request: IncomingMessage,
   response: ServerResponse,
   state: McpSessionState,
-  createService: () => SignalGrepMcpService,
+  createService: () => SiftlightMcpService,
   cwd: string,
 ): Promise<void> {
   if (!admitOrigin(request, response, state.allowedOrigins)) return;
@@ -395,7 +390,7 @@ async function handleMcpRequest(
     writeJsonError(response, 400, "MCP request URL is invalid");
     return;
   }
-  if (path !== BAOER_SIGNAL_GREP_MCP_PATH) {
+  if (path !== SIFTLIGHT_MCP_PATH) {
     writeJsonError(response, 404, "MCP endpoint not found");
     return;
   }
@@ -461,7 +456,7 @@ async function handleMcpRequest(
             }
           },
         });
-        const protocol = createSignalGrepMcpServer(service, cwd, state.outputMode);
+        const protocol = createSiftlightMcpServer(service, cwd, state.outputMode);
         pendingSession = {
           protocol,
           service,
@@ -547,9 +542,9 @@ async function handleMcpRequest(
   writeJsonError(response, 405, "MCP method not allowed");
 }
 
-export async function startSignalGrepMcpServer(
-  options: SignalGrepMcpHttpOptions = {},
-): Promise<RunningSignalGrepMcpServer> {
+export async function startSiftlightMcpServer(
+  options: SiftlightMcpHttpOptions = {},
+): Promise<RunningSiftlightMcpServer> {
   const cwd = options.cwd ?? process.cwd();
   const maxSessions = options.maxSessions ?? DEFAULT_MCP_MAX_SESSIONS;
   const idleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS;
@@ -563,12 +558,12 @@ export async function startSignalGrepMcpServer(
     maxSessions,
     idleTimeoutMs,
     allowedOrigins: new Set(options.allowedOrigins ?? []),
-    outputMode: parseSignalGrepMcpOutputMode(options.outputMode),
+    outputMode: parseSiftlightMcpOutputMode(options.outputMode),
     cleanupErrors: [],
     pendingInitializations: 0,
     closing: false,
   };
-  const createService = options.createService ?? createDefaultSignalGrepMcpService;
+  const createService = options.createService ?? createDefaultSiftlightMcpService;
   const httpServer = createServer((request, response) => {
     void handleMcpRequest(request, response, state, createService, cwd).catch((error: unknown) => {
       reportHttpFailure(response, error);

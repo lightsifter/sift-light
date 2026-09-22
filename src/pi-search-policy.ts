@@ -11,14 +11,14 @@ export function registerPiSearchPolicy(
   pi: ExtensionAPI,
   mode: Exclude<SearchEnforcementMode, "off">,
 ): void {
-  const policy = new SearchPolicy(new URL("../plugins/baoer-signal-grep/hooks/", import.meta.url));
+  const policy = new SearchPolicy(new URL("../plugins/siftlight/hooks/", import.meta.url));
   const selectTools = () => {
     const current = pi.getActiveTools();
     const next =
       mode === "hard"
         ? current.filter((tool) => !PI_REPLACED_SEARCH_TOOLS.has(tool))
         : [...current];
-    if (!next.includes("baoer_signal_grep")) next.push("baoer_signal_grep");
+    if (!next.includes("siftlight")) next.push("siftlight");
     if (next.length !== current.length || next.some((tool, index) => tool !== current[index]))
       pi.setActiveTools(next);
   };

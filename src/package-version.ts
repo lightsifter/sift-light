@@ -1,3 +1,3 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
-export const BAOER_SIGNAL_GREP_VERSION = packageMetadata.version;
+export const SIFTLIGHT_VERSION = packageMetadata.version;

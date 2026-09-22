@@ -1,6 +1,6 @@
 import { posix } from "node:path";
 import { MAX_IMPORT_FILES, MAX_IMPORT_HOPS } from "./analysis-limits.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import type { SourceReference } from "./source-document.js";
 import {
   NavigationContext,
@@ -70,7 +70,7 @@ export async function resolveStaticModule(
   try {
     path = context.normalizePath(joined);
   } catch (error) {
-    if (error instanceof SignalGrepError) return { reason: "outside-workspace" };
+    if (error instanceof SiftlightError) return { reason: "outside-workspace" };
     throw error;
   }
   const candidates = new Set([path]);

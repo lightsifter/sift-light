@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 
 const POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"] as const;
 const PORTABLE_CREDENTIAL_DIRECTORY_NAMES = [
@@ -139,9 +139,8 @@ export class SearchPathPolicy {
 
   assertPath(path: string): void {
     const absolute = resolve(this.cwd, path);
-    if (isGitInternal(absolute))
-      throw new SignalGrepError("Git internals are excluded from search");
-    if (this.isProtected(absolute)) throw new SignalGrepError(blockedPathMessage(absolute));
+    if (isGitInternal(absolute)) throw new SiftlightError("Git internals are excluded from search");
+    if (this.isProtected(absolute)) throw new SiftlightError(blockedPathMessage(absolute));
   }
 
   async resolveExistingPath(path: string): Promise<string | undefined> {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { decodeGitPath, runGitRead, splitGitRecords } from "./git-process.js";
 import {
   assertExistingPathInsideCwd,
@@ -50,19 +50,19 @@ export async function verifyWorktreeRevision(
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
   }
-  throw new SignalGrepError("Working source changed during Git comparison; retry a new search");
+  throw new SiftlightError("Working source changed during Git comparison; retry a new search");
 }
 
 export function gitPath(cwd: string, path: string): string {
   if (path.length === 0 || path.includes("\0"))
-    throw new SignalGrepError("Git source path is invalid");
+    throw new SiftlightError("Git source path is invalid");
   const absolute = resolve(cwd, path);
   const local = relative(resolve(cwd), absolute).split(sep).join("/");
   if (
     !isPathInsideCwd(absolute, cwd) ||
     local.split("/").some((part) => part.toLowerCase() === ".git")
   ) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       "Git source path must stay within the working directory and outside .git",
     );
   }
@@ -75,7 +75,7 @@ export async function resolveGitCommit(
   signal?: AbortSignal,
 ): Promise<string> {
   if (ref.trim().length === 0 || ref.length > 1024 || ref.includes("\0")) {
-    throw new SignalGrepError("Git commit reference must be a nonempty bounded string");
+    throw new SiftlightError("Git commit reference must be a nonempty bounded string");
   }
   const { output } = await runGitRead(
     cwd,
@@ -88,7 +88,7 @@ export async function resolveGitCommit(
   );
   const commit = output.toString("ascii").trim();
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit))
-    throw new SignalGrepError("Git returned an invalid commit identity");
+    throw new SiftlightError("Git returned an invalid commit identity");
   return commit;
 }
 
@@ -100,7 +100,7 @@ export async function resolveGitRepository(cwd: string, signal?: AbortSignal): P
     signal ? { signal, maxBytes: 4096 } : { maxBytes: 4096 },
   );
   const root = decodeGitPath(output).replace(/\r?\n$/, "");
-  if (!isAbsolute(root)) throw new SignalGrepError("Git returned an invalid repository root");
+  if (!isAbsolute(root)) throw new SiftlightError("Git returned an invalid repository root");
   return resolve(root);
 }
 
@@ -111,7 +111,7 @@ export async function findGitRepository(
   try {
     return await resolveGitRepository(cwd, signal);
   } catch (error) {
-    if (error instanceof SignalGrepError && error.message.includes("not a git repository")) {
+    if (error instanceof SiftlightError && error.message.includes("not a git repository")) {
       return undefined;
     }
     throw error;
@@ -143,12 +143,12 @@ export async function readGitTree(
       !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(blob) ||
       !["blob", "commit"].includes(type ?? "")
     ) {
-      throw new SignalGrepError("Git tree returned an invalid raw object entry");
+      throw new SiftlightError("Git tree returned an invalid raw object entry");
     }
     const local = gitPath(cwd, decodeGitPath(record.subarray(tab + 1)));
     const byteSize = type === "commit" ? 0 : Number(size);
     if (!Number.isSafeInteger(byteSize) || byteSize < 0)
-      throw new SignalGrepError("Git tree returned an invalid blob size");
+      throw new SiftlightError("Git tree returned an invalid blob size");
     entries.set(local, { path: local, mode, blob, size: byteSize });
   }
   return { entries, limited: false };
@@ -239,13 +239,13 @@ export async function readGitBlob(
   });
   budget.bytes += output.length;
   if (output.length !== size)
-    throw new SignalGrepError("Git blob size does not match its immutable tree entry");
+    throw new SiftlightError("Git blob size does not match its immutable tree entry");
   const verifiedBlob = createHash(blob.length === 40 ? "sha1" : "sha256")
     .update(`blob ${String(output.length)}\0`)
     .update(output)
     .digest("hex");
   if (verifiedBlob !== blob)
-    throw new SignalGrepError("Git blob bytes do not match their immutable object identity");
+    throw new SiftlightError("Git blob bytes do not match their immutable object identity");
   return {
     path,
     mode,
@@ -305,7 +305,7 @@ export async function readWorktreeSource(
           sourceRevisionFromStats(await handle.stat()),
         )
       )
-        throw new SignalGrepError("Working source changed before reading");
+        throw new SiftlightError("Working source changed before reading");
       const buffer = Buffer.alloc(before.size + 1);
       let bytes = 0;
       while (bytes < buffer.length) {
@@ -330,7 +330,7 @@ export async function readWorktreeSource(
           sourceRevisionFromStats(await handle.stat()),
         )
       ) {
-        throw new SignalGrepError(
+        throw new SiftlightError(
           "Working source changed while reading; Git ranges and source cannot be mixed",
         );
       }
@@ -354,7 +354,7 @@ export async function readWorktreeSource(
     if (error instanceof Error && "code" in error) {
       if (error.code === "ENOENT") {
         if (discovered)
-          throw new SignalGrepError("Working source disappeared while reading; retry a new search");
+          throw new SiftlightError("Working source disappeared while reading; retry a new search");
         return { path, mode: "000000", sourceStatus: "absent" };
       }
       if (["EACCES", "EPERM", "ELOOP", "ENOTDIR"].includes(String(error.code)))

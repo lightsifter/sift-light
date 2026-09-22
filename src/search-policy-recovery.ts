@@ -1,6 +1,6 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { SearchKind } from "./search-policy-commands.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { validateRawSearchInput, type RawSearchInput } from "./request.js";
 import type { ShellSearchMatch } from "./search-policy-shell.js";
 
@@ -327,7 +327,7 @@ function recoverFileEnumeration(
   try {
     validateRawSearchInput(filters);
   } catch (error) {
-    if (error instanceof SignalGrepError) return manual("files");
+    if (error instanceof SiftlightError) return manual("files");
     throw error;
   }
   return { kind: "concrete", request: JSON.stringify({ mode: "files", ...filters }) };
@@ -381,7 +381,7 @@ export function recoverShellSearch(
   try {
     validateRawSearchInput(request);
   } catch (error) {
-    if (error instanceof SignalGrepError) return manual(match.kind);
+    if (error instanceof SiftlightError) return manual(match.kind);
     throw error;
   }
   return { kind: "concrete", request: JSON.stringify(request) };

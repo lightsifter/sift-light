@@ -1,7 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
-import { abortError, CursorError, SignalGrepError } from "./errors.js";
+import { abortError, CursorError, SiftlightError } from "./errors.js";
 import { evidenceRecheck } from "./evidence-validity.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { sameSourceRevision, sourceRevisionFromStats } from "./source.js";
@@ -71,7 +71,7 @@ function systemErrorCode(error: unknown): string | undefined {
 
 function policyFailure(error: unknown): boolean {
   return (
-    error instanceof SignalGrepError &&
+    error instanceof SiftlightError &&
     (error.message.startsWith("Path is inside a protected credential or system area:") ||
       error.message === "Git internals are excluded from search" ||
       error.message === "Path must stay within the working directory")

@@ -1,13 +1,13 @@
 import { setImmediate } from "node:timers/promises";
 import { MAX_GIT_DIFF_WORK } from "./analysis-limits.js";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 
 export interface GitLineRange {
   startLine: number;
   endLine: number;
 }
 
-export class GitDiffLimitError extends SignalGrepError {}
+export class GitDiffLimitError extends SiftlightError {}
 
 /** One work counter is shared by every file and rename comparison in a request. */
 export class GitDiffBudget {

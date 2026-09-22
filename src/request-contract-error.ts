@@ -1,9 +1,9 @@
 import {
-  SignalGrepError,
-  type SignalGrepDiagnosticDetails,
-  type SignalGrepDiagnosticIssue,
-  type SignalGrepDiagnosticRecovery,
-  type SignalGrepRecoveryAction,
+  SiftlightError,
+  type SiftlightDiagnosticDetails,
+  type SiftlightDiagnosticIssue,
+  type SiftlightDiagnosticRecovery,
+  type SiftlightRecoveryAction,
 } from "./errors.js";
 
 /** One bounded protocol budget shared by the typed error and its projections. */
@@ -15,13 +15,13 @@ export function boundedDisplay(value: string, maximum = MAX_REQUEST_DISPLAY_CHAR
   return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}…`;
 }
 
-export type RequestIssue = SignalGrepDiagnosticIssue;
-export type RequestRecoveryAction = SignalGrepRecoveryAction;
-export type RequestRecovery = SignalGrepDiagnosticRecovery;
-export type RequestContractDetails = SignalGrepDiagnosticDetails;
+export type RequestIssue = SiftlightDiagnosticIssue;
+export type RequestRecoveryAction = SiftlightRecoveryAction;
+export type RequestRecovery = SiftlightDiagnosticRecovery;
+export type RequestContractDetails = SiftlightDiagnosticDetails;
 
 /** A typed boundary error; callers can project it without parsing message text. */
-export class RequestContractError extends SignalGrepError {
+export class RequestContractError extends SiftlightError {
   readonly #details: RequestContractDetails;
 
   constructor(details: RequestContractDetails, message: string) {
@@ -54,9 +54,9 @@ export class RequestContractError extends SignalGrepError {
   }
 }
 
-export function isSignalGrepDiagnosticError(
+export function isSiftlightDiagnosticError(
   error: unknown,
-): error is import("./errors.js").SignalGrepDiagnosticError {
+): error is import("./errors.js").SiftlightDiagnosticError {
   if (!(error instanceof Error)) return false;
   const details = "details" in error ? error.details : undefined;
   return typeof details === "object" && details !== null;

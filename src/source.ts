@@ -1,6 +1,6 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import { excerptText } from "./excerpt.js";
 import { isPathInsideCwd, SearchPathPolicy } from "./path-policy.js";
 import {
@@ -89,29 +89,29 @@ export async function assertExistingSearchPath(path: string, cwd: string): Promi
 
 export async function assertExistingPathInsideCwd(path: string, cwd: string): Promise<void> {
   if (!isPathInsideCwd(path, cwd)) {
-    throw new SignalGrepError("Path must stay within the working directory");
+    throw new SiftlightError("Path must stay within the working directory");
   }
   const canonical = await new SearchPathPolicy(cwd).resolveExistingPath(path);
   if (canonical && !isPathInsideCwd(canonical, await realpath(cwd))) {
-    throw new SignalGrepError("Path must stay within the working directory");
+    throw new SiftlightError("Path must stay within the working directory");
   }
 }
 
-export class SourceTooLargeError extends SignalGrepError {
+export class SourceTooLargeError extends SiftlightError {
   constructor(message: string) {
     super(message);
     this.name = "SourceTooLargeError";
   }
 }
 
-export class SourceBudgetTooSmallError extends SignalGrepError {
+export class SourceBudgetTooSmallError extends SiftlightError {
   constructor() {
     super("Source target line exceeds the available byte budget");
     this.name = "SourceBudgetTooSmallError";
   }
 }
 
-export class SourceLineUnavailableError extends SignalGrepError {
+export class SourceLineUnavailableError extends SiftlightError {
   constructor(line: number) {
     super(`Source line ${String(line)} is beyond the end of the file`);
     this.name = "SourceLineUnavailableError";

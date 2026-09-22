@@ -1,23 +1,23 @@
 {
   "mcpServers": {
-    "baoer_signal_grep": {
+    "siftlight": {
       "command": "npx",
       "args": [
         "--yes",
         "--package",
-        "baoer-signal-grep-runtime@npm:baoer_signal_grep@1.7.0-1",
-        "baoer_signal_grep_mcp",
+        "siftlight-runtime@npm:siftlight@1.7.0-2",
+        "siftlight_mcp",
         "--stdio"
       ],
       "env": {
         "npm_config_ignore_scripts": "true",
         "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",
-        "BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE": "model"
+        "SIFTLIGHT_MCP_OUTPUT_MODE": "model"
       },
       "env_vars": [
-        "BAOER_SIGNAL_GREP_CONFIG",
+        "SIFTLIGHT_CONFIG",
         "TYPESAFE_API_KEY",
-        "BAOER_SIGNAL_GREP_JEV_API_KEY"
+        "SIFTLIGHT_JEV_API_KEY"
       ]
     }
   }

@@ -1,11 +1,12 @@
 import { MAX_PAGE_SIZE } from "./types.js";
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import {
   DEFAULT_LANGUAGE_CAPABILITIES,
   outlineExtension as languageOutlineExtension,
 } from "./language-capability-definitions.js";
 
-export const SIGNAL_GREP_MODES = [
+export const SIFTLIGHT_MODES = [
+  "audit",
   "auto",
   "summary",
   "matches",
@@ -23,8 +24,8 @@ export const SIGNAL_GREP_MODES = [
   "cancel",
 ] as const;
 
-export type SignalGrepMode = (typeof SIGNAL_GREP_MODES)[number];
-export type RequestField = keyof SignalGrepInput;
+export type SiftlightMode = (typeof SIFTLIGHT_MODES)[number];
+export type RequestField = keyof SiftlightInput;
 
 const commonFields = ["mode", "redact"] as const satisfies readonly RequestField[];
 const sourceFilters = [
@@ -37,6 +38,7 @@ const ordinaryFields = [
   ...commonFields,
   "pattern",
   ...sourceFilters,
+  "ignorePolicy",
   "literal",
   "ignoreCase",
   "context",
@@ -55,7 +57,8 @@ const ordinaryFields = [
   "matchIndex",
 ] as const satisfies readonly RequestField[];
 
-export const MODE_FIELDS_BY_MODE: Record<SignalGrepMode, readonly RequestField[]> = {
+export const MODE_FIELDS_BY_MODE: Record<SiftlightMode, readonly RequestField[]> = {
+  audit: [...commonFields, "patterns", ...sourceFilters, "ignorePolicy"],
   auto: ordinaryFields,
   summary: ordinaryFields,
   matches: ordinaryFields,
@@ -89,7 +92,7 @@ export const MODE_FIELDS_BY_MODE: Record<SignalGrepMode, readonly RequestField[]
   cancel: ["mode", "operationId"],
 };
 
-export const SAFE_DROP_FIELDS: Partial<Record<SignalGrepMode, readonly RequestField[]>> = {
+export const SAFE_DROP_FIELDS: Partial<Record<SiftlightMode, readonly RequestField[]>> = {
   files: ["scope"],
 };
 
@@ -101,7 +104,7 @@ export const SUPPORTED_OUTLINE_EXTENSIONS = new Set(
   ),
 );
 
-export function modeFields(mode: SignalGrepMode): readonly RequestField[] {
+export function modeFields(mode: SiftlightMode): readonly RequestField[] {
   return MODE_FIELDS_BY_MODE[mode];
 }
 
@@ -110,12 +113,13 @@ export function modeFields(mode: SignalGrepMode): readonly RequestField[] {
  * shape mimics the call syntax a host would accept and can be copied into the
  * arguments as a nonexistent nested field.
  */
-export function modeFieldSummary(mode: SignalGrepMode): string {
+export function modeFieldSummary(mode: SiftlightMode): string {
   return `${mode}: ${modeFields(mode).join(",")}`;
 }
 
 /** Compact schema-facing summary derived from the runtime field catalog. */
 const MODE_SUMMARY_MODES = [
+  "audit",
   "files",
   "concept",
   "hybrid",
@@ -124,7 +128,7 @@ const MODE_SUMMARY_MODES = [
   "capabilities",
   "await",
   "cancel",
-] as const satisfies readonly SignalGrepMode[];
+] as const satisfies readonly SiftlightMode[];
 
 export const MODE_FIELD_SUMMARY = MODE_SUMMARY_MODES.map((mode) => modeFieldSummary(mode)).join(
   "; ",
@@ -146,6 +150,9 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   limit: "limit is an output/page budget and is never silently dropped",
   scope:
     "scope applies to ordinary content search; mode=files rejects this field because its scope is fixed strict, and only redundant strict may be removed",
+  ignorePolicy:
+    "respect keeps repository ignore rules; include searches ignored files but always excludes .git internals and protected paths",
+  patterns: "audit accepts named exact-literal patterns and returns one closure receipt",
 };
 
 export function fieldGuidance(field: RequestField): string {

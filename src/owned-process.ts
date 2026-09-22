@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { abortError, SignalGrepError } from "./errors.js";
+import { abortError, SiftlightError } from "./errors.js";
 import type { Writable } from "node:stream";
 
 const MAX_STDERR_BYTES = 16 * 1024;
@@ -73,7 +73,7 @@ export async function runOwnedProcess(
       if (!closed) child.kill("SIGKILL");
     }, TERMINATE_GRACE_MS);
     deadlineTimer = setTimeout(() => {
-      rejectClose?.(new SignalGrepError("Owned search process did not close after termination"));
+      rejectClose?.(new SiftlightError("Owned search process did not close after termination"));
     }, TERMINATE_DEADLINE_MS);
   };
   signal?.addEventListener("abort", terminate, { once: true });

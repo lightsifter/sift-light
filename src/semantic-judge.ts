@@ -7,7 +7,7 @@ import {
   type SemanticJudgeDetails,
   type SemanticJudgeJudgment,
 } from "./analysis-types.js";
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import {
   createSemanticJudgeBatches,
   judgeSemanticCandidateBatches,
@@ -58,14 +58,14 @@ export interface SemanticJudgeIntegration {
   runner?: SemanticJudgeRunner;
 }
 
-export class SemanticJudgeConfigurationError extends SignalGrepError {
+export class SemanticJudgeConfigurationError extends SiftlightError {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "SemanticJudgeConfigurationError";
   }
 }
 
-class SemanticJudgeRequestError extends SignalGrepError {
+class SemanticJudgeRequestError extends SiftlightError {
   readonly retryable: boolean;
 
   constructor(message: string, retryable: boolean, options?: ErrorOptions) {

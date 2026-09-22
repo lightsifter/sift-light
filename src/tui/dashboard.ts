@@ -1,5 +1,5 @@
-import type { SignalGrepDetails } from "../types.js";
-import { recognizeSignalGrepResult, type SummaryRow } from "./presentation.js";
+import type { SiftlightDetails } from "../types.js";
+import { recognizeSiftlightResult, type SummaryRow } from "./presentation.js";
 
 export interface Dashboard {
   total: number;
@@ -27,7 +27,7 @@ function grouped(paths: string[]): SummaryRow[] {
 /** Derive human statistics without copying any source, labels or protocol instructions. */
 export function dashboard(
   text: string,
-  details: SignalGrepDetails | undefined,
+  details: SiftlightDetails | undefined,
 ): Dashboard | undefined {
   if (!details || details.version !== 1 || !["complete", "partial"].includes(details.status))
     return undefined;
@@ -46,7 +46,7 @@ export function dashboard(
   let rows: SummaryRow[] = [];
   let pageOnly = false;
   let unavailable = 0;
-  const presentation = recognizeSignalGrepResult(text, details);
+  const presentation = recognizeSiftlightResult(text, details);
   if (presentation?.kind === "summary") {
     rows = presentation.rows;
   } else if (statistics && !inspection) {

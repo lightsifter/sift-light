@@ -1,4 +1,4 @@
-import { SignalGrepError } from "./errors.js";
+import { SiftlightError } from "./errors.js";
 import { createHash } from "node:crypto";
 import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import {
@@ -51,7 +51,7 @@ export interface ConceptSourceGeneration {
   verifiedAt?: number;
 }
 
-export class ConceptSourceChangedError extends SignalGrepError {
+export class ConceptSourceChangedError extends SiftlightError {
   constructor(message = "Concept source changed while evidence was being computed") {
     super(message);
     this.name = "ConceptSourceChangedError";
@@ -205,7 +205,7 @@ export async function verifyConceptSourceGeneration(
     current.coverageIssue !== undefined &&
     current.coverageIssue !== generation.files.coverageIssue
   ) {
-    throw new SignalGrepError(current.reasons.join("; "));
+    throw new SiftlightError(current.reasons.join("; "));
   }
   if (
     current.partial !== generation.files.partial ||

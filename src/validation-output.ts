@@ -1,5 +1,5 @@
 import type { AnalysisItem, AnalysisDetails } from "./analysis-types.js";
-import type { SignalGrepDetails, SignalGrepResult } from "./types.js";
+import type { SiftlightDetails, SiftlightResult } from "./types.js";
 import type {
   ValidationDetails,
   EvidenceSourceStatus,
@@ -83,7 +83,7 @@ function base(
   total: number,
   files: number,
   returned = total,
-): SignalGrepDetails {
+): SiftlightDetails {
   return {
     version: 1,
     mode,
@@ -100,7 +100,7 @@ export function validationResult(
   state: SavedEvidenceValidationResult,
   cursor: string,
   checkInterval: { start: number; end: number; selected?: number },
-): SignalGrepResult {
+): SiftlightResult {
   const { recheck, comparisonTarget, coverage } = state;
   const status =
     state.storedPartial || coverage === "partial" || recheck.validity !== "current"
@@ -125,7 +125,7 @@ export function validationResult(
     reasons,
     validation,
   };
-  const details: SignalGrepDetails = {
+  const details: SiftlightDetails = {
     ...base(
       "validate",
       status,

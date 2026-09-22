@@ -4,7 +4,7 @@ import { ConceptSourceChangedError } from "./concept-source-generation.js";
 import type { GitChangeRequest } from "./git-source.js";
 import type { SyntaxRoleName } from "./syntax.js";
 import { resolve } from "node:path";
-import { CursorError, SignalGrepError } from "./errors.js";
+import { CursorError, SiftlightError } from "./errors.js";
 import { DISCOVERY_MODE_REQUIRED_ERROR } from "./discovery-errors.js";
 import { validateRequestContract } from "./request-contract.js";
 import {
@@ -21,7 +21,7 @@ import {
   validateRawSearchInput,
   validateSearchPath,
 } from "./request.js";
-import { redactSignalGrepResult } from "./redaction.js";
+import { redactSiftlightResult } from "./redaction.js";
 import type { RipgrepRunner } from "./rg.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { ConceptWorkerExitError, type ConceptSearchRunner } from "./concept-search.js";
@@ -40,6 +40,7 @@ import {
 } from "./operation-output.js";
 import { modificationTimeBoundsText } from "./source.js";
 import { resolveConceptTimeoutMs } from "./concept-model.js";
+import { runAuditSearch } from "./audit-search.js";
 import {
   LanguageCapabilityCatalog,
   type LanguageCapabilityInventory,
@@ -50,15 +51,16 @@ import {
   MAX_LINE_CHARACTERS,
   MAX_SELECTED_PATHS,
   type ContextBudget,
+  type AuditPatternInput,
   type InspectTarget,
   type SearchMode,
   type SearchSnapshot,
   type SearchScopeDetails,
-  type SignalGrepDetails,
-  type SignalGrepResult,
+  type SiftlightDetails,
+  type SiftlightResult,
 } from "./types.js";
 
-export interface SignalGrepInput extends RawSearchInput {
+export interface SiftlightInput extends RawSearchInput {
   query?: string;
   mode?: SearchMode;
   cursor?: string;
@@ -77,9 +79,10 @@ export interface SignalGrepInput extends RawSearchInput {
   maxFilesToParse?: number;
   conceptLimit?: number;
   operationId?: string;
+  patterns?: AuditPatternInput[];
 }
 
-export interface SignalGrepServiceOptions {
+export interface SiftlightServiceOptions {
   runRipgrep: RipgrepRunner;
   snapshots?: SnapshotStore;
   summaryFileLimit?: number;
@@ -88,7 +91,7 @@ export interface SignalGrepServiceOptions {
   semanticJudge?: SemanticJudgeIntegration;
 }
 
-export interface SignalGrepSearchOptions {
+export interface SiftlightSearchOptions {
   contextBudget?: ContextBudget;
   modelOutput?: boolean;
   modelSource?: boolean;
@@ -99,7 +102,7 @@ function filterList(value: string | string[] | undefined): string[] {
   return value === undefined ? [] : Array.isArray(value) ? [...value] : [value];
 }
 
-function capabilitiesResult(inventory: LanguageCapabilityInventory): SignalGrepResult {
+function capabilitiesResult(inventory: LanguageCapabilityInventory): SiftlightResult {
   const languageText = inventory.languages.length
     ? inventory.languages
         .map((entry) => {
@@ -142,17 +145,17 @@ interface PathSelection {
   key: string;
 }
 
-function cursorPathSelection(input: SignalGrepInput, cwd: string): PathSelection | undefined {
+function cursorPathSelection(input: SiftlightInput, cwd: string): PathSelection | undefined {
   if (input.path !== undefined && input.paths !== undefined) {
-    throw new SignalGrepError("Use either path or paths with a cursor, not both");
+    throw new SiftlightError("Use either path or paths with a cursor, not both");
   }
   const rawPaths = input.paths ?? (input.path === undefined ? [] : [input.path]);
   if (input.paths !== undefined && rawPaths.length === 0) {
-    throw new SignalGrepError("paths must contain at least one retained file");
+    throw new SiftlightError("paths must contain at least one retained file");
   }
   if (rawPaths.length === 0) return undefined;
   if (rawPaths.length > MAX_SELECTED_PATHS) {
-    throw new SignalGrepError(
+    throw new SiftlightError(
       `paths cannot contain more than ${String(MAX_SELECTED_PATHS)} entries`,
     );
   }
@@ -163,7 +166,7 @@ function cursorPathSelection(input: SignalGrepInput, cwd: string): PathSelection
   for (const rawPath of rawPaths) {
     const label = rawPath.replace(/^@/, "");
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
-    if (label.length === 0) throw new SignalGrepError("Cursor paths cannot be empty");
+    if (label.length === 0) throw new SiftlightError("Cursor paths cannot be empty");
     const absolutePath = resolve(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath)) continue;
@@ -177,7 +180,7 @@ function cursorPathSelection(input: SignalGrepInput, cwd: string): PathSelection
   return { labels, absolutePaths, key };
 }
 
-function baseDetails(snapshot: SearchSnapshot, mode: SearchMode): SignalGrepDetails {
+function baseDetails(snapshot: SearchSnapshot, mode: SearchMode): SiftlightDetails {
   const sourceUnverifiedFileCount = new Set(
     snapshot.matches
       .filter((match) => !snapshot.sourceRevisions.has(match.absolutePath))
@@ -186,12 +189,23 @@ function baseDetails(snapshot: SearchSnapshot, mode: SearchMode): SignalGrepDeta
   return {
     version: 1,
     mode,
-    status: snapshot.snapshotComplete ? "complete" : "partial",
+    status:
+      snapshot.snapshotComplete && (snapshot.filesystemCoverage ?? "complete") === "complete"
+        ? "complete"
+        : "partial",
     totalMatches: snapshot.totalMatches,
     storedMatches: snapshot.matches.length,
     totalFiles: snapshot.fileCounts.size,
     returnedMatches: 0,
     snapshotComplete: snapshot.snapshotComplete,
+    searchCoverage: {
+      retainedMatches: snapshot.snapshotComplete ? "complete" : "partial",
+      filesystem: snapshot.filesystemCoverage ?? "complete",
+      ignoredFiles: snapshot.ignoredFileCount ?? 0,
+      ignoredFileSamples: [...(snapshot.ignoredFileSamples ?? [])],
+      searchedFiles: snapshot.searchedFileCount ?? 0,
+      reasons: [...(snapshot.filesystemCoverageReasons ?? [])],
+    },
     ...(snapshot.retention ? { retention: snapshot.retention } : {}),
     scope: searchScope(snapshot.request),
     ...(snapshot.request.redact ? { redactionRequested: true } : {}),
@@ -209,6 +223,7 @@ function searchScope(request: SearchSnapshot["request"]): SearchScopeDetails {
     glob: [...request.glob],
     exclude: [...request.exclude],
     hidden: request.hidden,
+    ignorePolicy: request.ignorePolicy ?? "respect",
     expandedToProjectRoot: request.expandedFromPath !== undefined,
     assertion: path === "." ? "project-wide" : "requested-scope",
     ...(request.modifiedAfterMs !== undefined ? { modifiedAfterMs: request.modifiedAfterMs } : {}),
@@ -218,7 +233,17 @@ function searchScope(request: SearchSnapshot["request"]): SearchScopeDetails {
   };
 }
 
-function emptyResultText(scope: SearchScopeDetails): string {
+function emptyResultText(details: SiftlightDetails): string {
+  const scope = details.scope ?? {
+    path: ".",
+    requestedPath: ".",
+    glob: [],
+    exclude: [],
+    hidden: true,
+    ignorePolicy: "respect" as const,
+    expandedToProjectRoot: false,
+    assertion: "project-wide" as const,
+  };
   const filters =
     scope.glob.length ||
     scope.exclude.length ||
@@ -231,7 +256,18 @@ function emptyResultText(scope: SearchScopeDetails): string {
     ? ` after the requested path ${JSON.stringify(scope.requestedPath)} also returned no matches`
     : "";
   const range = scope.assertion === "project-wide" ? "project root" : "requested path";
-  return `No matches found anywhere in ${range} ${JSON.stringify(scope.path)}${expansion}.${filters}${modificationTimeBoundsText(scope.modifiedAfterMs, scope.modifiedBeforeMs)}`;
+  const coverage = details.searchCoverage;
+  const conclusion =
+    coverage?.filesystem === "complete"
+      ? `No matches found anywhere in ${range}`
+      : `No matches found among files admitted in ${range}; absence is unknown outside this coverage`;
+  const ignored = coverage?.ignoredFiles
+    ? ` ${String(coverage.ignoredFiles)} file(s) were excluded by ignore rules.`
+    : "";
+  const reasons = coverage?.reasons.length
+    ? ` Filesystem coverage reasons: ${coverage.reasons.map((reason) => JSON.stringify(reason)).join("; ")}.`
+    : "";
+  return `${conclusion} ${JSON.stringify(scope.path)}${expansion}.${filters}${ignored}${reasons}${modificationTimeBoundsText(scope.modifiedAfterMs, scope.modifiedBeforeMs)}`;
 }
 
 function scopeExpansionNote(scope: SearchScopeDetails | undefined, totalMatches: number): string {
@@ -244,8 +280,16 @@ function scopeExpansionNote(scope: SearchScopeDetails | undefined, totalMatches:
 }
 
 function completenessNote(snapshot: SearchSnapshot): string {
-  if (snapshot.snapshotComplete) return "complete snapshot";
-  const reasons = snapshot.retention?.reasons.join("; ");
+  if (snapshot.snapshotComplete && (snapshot.filesystemCoverage ?? "complete") === "complete")
+    return "complete retained-match and filesystem snapshot";
+  if (snapshot.snapshotComplete && snapshot.filesystemCoverage === "policy-filtered")
+    return `complete retained-match snapshot; filesystem coverage is policy-filtered because ${String(snapshot.ignoredFileCount ?? 0)} file(s) were excluded by ignore rules`;
+  const reasons = [
+    ...(snapshot.retention?.reasons ?? []),
+    ...(snapshot.filesystemCoverageReasons ?? []),
+  ].join("; ");
+  if (snapshot.snapshotComplete)
+    return `complete retained-match snapshot; PARTIAL filesystem coverage${reasons ? `: ${reasons}` : ""}`;
   return `PARTIAL snapshot: retained ${snapshot.matches.length} of ${snapshot.totalMatches} matches; ${reasons ? `${reasons}; ` : ""}narrow the search to retrieve all matches`;
 }
 
@@ -255,13 +299,13 @@ function lineExcerptNote(snapshot: SearchSnapshot): string {
     : "";
 }
 
-function sourceVerificationNote(details: SignalGrepDetails): string {
+function sourceVerificationNote(details: SiftlightDetails): string {
   return details.sourceUnverifiedFileCount
     ? `\n\n[Source revision unverified for ${String(details.sourceUnverifiedFileCount)} retained file(s); context and snapshot-scoped inspection require verified source.]`
     : "";
 }
 function selectContextBudget(
-  input: SignalGrepInput,
+  input: SiftlightInput,
   mode: SearchMode,
   candidate: ContextBudget | undefined,
 ): ContextBudget | undefined {
@@ -281,10 +325,10 @@ function pageMatchesOccurrences(snapshot: SearchSnapshot, first: number, last: n
 }
 
 function attachContextBudget(
-  result: SignalGrepResult,
+  result: SiftlightResult,
   budget: ContextBudget | undefined,
   totalMatches: number,
-): SignalGrepResult {
+): SiftlightResult {
   if (!budget || totalMatches === 0) return result;
   let text = result.text;
   if (budget.tier !== "full") {
@@ -319,18 +363,18 @@ async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promi
   });
 }
 
-export class SignalGrepService {
+export class SiftlightService {
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
   readonly #summaryFileLimit: number;
   readonly #capabilities = new LanguageCapabilityCatalog();
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
-  readonly #active = new Set<Promise<SignalGrepResult>>();
-  #operations: OperationLifecycle<SignalGrepResult>;
+  readonly #active = new Set<Promise<SiftlightResult>>();
+  #operations: OperationLifecycle<SiftlightResult>;
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
-  constructor(options: SignalGrepServiceOptions) {
+  constructor(options: SiftlightServiceOptions) {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
@@ -345,19 +389,19 @@ export class SignalGrepService {
   }
 
   async search(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
-    options: SignalGrepSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+    options: SiftlightSearchOptions = {},
+  ): Promise<SiftlightResult> {
     validateRawSearchInput(input);
     validateRequestContract(input);
-    let request: Promise<SignalGrepResult>;
+    let request: Promise<SiftlightResult>;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);
     } else {
       if (input.operationId !== undefined)
-        throw new SignalGrepError("operationId is only valid with mode=await or mode=cancel");
+        throw new SiftlightError("operationId is only valid with mode=await or mode=cancel");
       for (const path of input.paths ?? []) validateSearchPath(path, "paths");
       for (const target of input.targets ?? []) {
         if (target && typeof target.path === "string")
@@ -374,14 +418,14 @@ export class SignalGrepService {
     try {
       const result = await request;
       return input.redact || result.details.redactionRequested
-        ? redactSignalGrepResult(result)
+        ? redactSiftlightResult(result)
         : result;
     } finally {
       this.#active.delete(request);
     }
   }
 
-  #isLongRunningQuery(input: SignalGrepInput): input is SignalGrepInput & {
+  #isLongRunningQuery(input: SiftlightInput): input is SiftlightInput & {
     mode: "concept" | "hybrid";
   } {
     return (
@@ -392,11 +436,11 @@ export class SignalGrepService {
   }
 
   async #searchOperation(
-    input: SignalGrepInput & { mode: "concept" | "hybrid" },
+    input: SiftlightInput & { mode: "concept" | "hybrid" },
     cwd: string,
     signal: AbortSignal | undefined,
-    options: SignalGrepSearchOptions,
-  ): Promise<SignalGrepResult> {
+    options: SiftlightSearchOptions,
+  ): Promise<SiftlightResult> {
     const started = this.#operations.start(
       async (operationSignal, operationId) => {
         const combined = AbortSignal.any([operationSignal, this.#lifecycle.signal]);
@@ -431,7 +475,7 @@ export class SignalGrepService {
             if (combined.aborted) throw error;
             const remaining = deadlineAt - Date.now();
             if (remaining <= 0)
-              throw new SignalGrepError("Source did not stabilize before the operation deadline", {
+              throw new SiftlightError("Source did not stabilize before the operation deadline", {
                 cause: error,
               });
             this.#operations.updateProgress(operationId, {
@@ -450,19 +494,19 @@ export class SignalGrepService {
   }
 
   async #operationCommand(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal: AbortSignal | undefined,
-  ): Promise<SignalGrepResult> {
+  ): Promise<SiftlightResult> {
     if (!input.operationId || typeof input.operationId !== "string")
-      throw new SignalGrepError("mode=await and mode=cancel require operationId");
+      throw new SiftlightError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
     if (resolve(cwd) !== resolve(existing.metadata.cwd))
-      throw new SignalGrepError("Operation belongs to a different working directory");
+      throw new SiftlightError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
-      throw new SignalGrepError(
+      throw new SiftlightError(
         `${input.mode} accepts only operationId; remove ${forbidden.join(", ")} and copy the returned nextRequest exactly`,
       );
     if (input.mode === "cancel") {
@@ -480,11 +524,11 @@ export class SignalGrepService {
   }
 
   async #search(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
-    options: SignalGrepSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+    options: SiftlightSearchOptions = {},
+  ): Promise<SiftlightResult> {
     if (
       input.cursor !== undefined &&
       (typeof input.cursor !== "string" || input.cursor.trim().length === 0)
@@ -503,23 +547,24 @@ export class SignalGrepService {
       });
       return capabilitiesResult(inventory);
     }
+    if (mode === "audit") return runAuditSearch(input, cwd, this.#runRipgrep, signal);
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);
     if (isEvidenceRequest(input)) return this.#evidence.search(input, cwd, signal, options);
-    if (input.query !== undefined) throw new SignalGrepError(DISCOVERY_MODE_REQUIRED_ERROR);
+    if (input.query !== undefined) throw new SiftlightError(DISCOVERY_MODE_REQUIRED_ERROR);
     if (input.maxFilesToParse !== undefined) {
-      throw new SignalGrepError("maxFilesToParse is only valid for structural analysis requests");
+      throw new SiftlightError("maxFilesToParse is only valid for structural analysis requests");
     }
     if (input.cursor) return this.#continue(input, cwd, signal, options);
     if (input.paths !== undefined) {
-      throw new SignalGrepError("paths can only select retained files from a cursor");
+      throw new SiftlightError("paths can only select retained files from a cursor");
     }
     if (input.matchIndex !== undefined) {
-      throw new SignalGrepError("matchIndex requires mode=inspect with a cursor");
+      throw new SiftlightError("matchIndex requires mode=inspect with a cursor");
     }
     if (input.matchIndices !== undefined || input.targets !== undefined) {
-      throw new SignalGrepError("matchIndices and targets require mode=inspect");
+      throw new SiftlightError("matchIndices and targets require mode=inspect");
     }
-    if (input.line !== undefined) throw new SignalGrepError("line requires mode=inspect");
+    if (input.line !== undefined) throw new SiftlightError("line requires mode=inspect");
 
     const request = normalizeRequest(input);
     let scan = await this.#runRipgrep(request, cwd, signal);
@@ -533,12 +578,12 @@ export class SignalGrepService {
     }
     const snapshot = this.#snapshots.create(scan);
     try {
-      let result: SignalGrepResult;
+      let result: SiftlightResult;
 
       if (snapshot.totalMatches === 0) {
         const details = baseDetails(snapshot, mode);
         result = {
-          text: emptyResultText(details.scope ?? searchScope(snapshot.request)),
+          text: emptyResultText(details),
           details,
         };
       } else if (snapshot.matches.length === 0) {
@@ -615,18 +660,18 @@ export class SignalGrepService {
   }
 
   async #continue(
-    input: SignalGrepInput,
+    input: SiftlightInput,
     cwd: string,
     signal?: AbortSignal,
-    options: SignalGrepSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+    options: SiftlightSearchOptions = {},
+  ): Promise<SiftlightResult> {
     const cursor = input.cursor;
     if (!cursor) throw new CursorError("A cursor is required to continue a search");
     const { snapshot, offset, kind, selectionKey } = this.#snapshots.resolve(cursor);
     const mode = input.mode ?? "auto";
     if (mode === "summary") {
       if (input.path !== undefined || input.paths !== undefined) {
-        throw new SignalGrepError("path and paths are not valid while paging a file summary");
+        throw new SiftlightError("path and paths are not valid while paging a file summary");
       }
       if (kind !== "summary") {
         throw new CursorError(
@@ -655,9 +700,9 @@ export class SignalGrepService {
 
   #finalize(
     snapshot: SearchSnapshot,
-    result: SignalGrepResult,
+    result: SiftlightResult,
     retainSnapshot = false,
-  ): SignalGrepResult {
+  ): SiftlightResult {
     if (
       !result.details.cursor &&
       !result.details.inspectRequest &&
@@ -676,7 +721,7 @@ export class SignalGrepService {
     signal: AbortSignal | undefined,
     offset = 0,
     budget?: ContextBudget,
-  ): Promise<SignalGrepResult> {
+  ): Promise<SiftlightResult> {
     this.#reusableSummarySnapshots.add(snapshot);
     const summary = formatSummary(
       snapshot,
@@ -727,7 +772,9 @@ export class SignalGrepService {
     const followUp = cursor
       ? `\n\nSnapshot cursor="${cursor}". Snapshot cursor available: ${cursor}.${inspectRequest ? `\nInspect samples: ${JSON.stringify(inspectRequest)}` : ""}${matchesRequest ? `\nRetrieve matching lines: ${JSON.stringify(matchesRequest)}` : ""}${nextRequest ? `\nNext request: ${JSON.stringify(nextRequest)}` : ""}`
       : "";
-    const text = `Search summary (${snapshot.snapshotComplete ? "complete" : "PARTIAL"}). ${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
+    const complete =
+      snapshot.snapshotComplete && (snapshot.filesystemCoverage ?? "complete") === "complete";
+    const text = `Search summary (${complete ? "complete" : "PARTIAL"}). ${snapshot.totalMatches} matches across ${snapshot.fileCounts.size} files (${completenessNote(snapshot)}).\n${fileRange}\n\n${summary.body}${omitted}${samples}${sampleOmissions}${lineExcerptNote(snapshot)}${modificationTimeBoundsText(details.scope?.modifiedAfterMs, details.scope?.modifiedBeforeMs)}${followUp}${sourceVerificationNote(details)}`;
     return {
       text,
       details: {
@@ -755,8 +802,8 @@ export class SignalGrepService {
     mode: SearchMode,
     signal?: AbortSignal,
     selection?: PathSelection,
-    options: SignalGrepSearchOptions = {},
-  ): Promise<SignalGrepResult> {
+    options: SiftlightSearchOptions = {},
+  ): Promise<SiftlightResult> {
     if (offset === snapshot.matches.length) {
       throw new CursorError("Cursor is already at the end of the retained snapshot.");
     }
@@ -818,9 +865,9 @@ export class SignalGrepService {
     selectedPaths?: string[],
     selectionMissingPaths: string[] = [],
     selectionKey = "all",
-  ): SignalGrepResult {
+  ): SiftlightResult {
     if (page.returnedMatches === 0) {
-      throw new SignalGrepError("The output budget could not fit a single match");
+      throw new SiftlightError("The output budget could not fit a single match");
     }
     const cursor = page.hasNext
       ? this.#snapshots.cursor(snapshot, page.nextOffset, "matches", selectionKey)
@@ -850,7 +897,7 @@ export class SignalGrepService {
         `Context unavailable for ${String(page.contextOmittedFiles.length)} file(s); retained matching lines are still shown.`,
       );
     const contextNote = contextNotes.length > 0 ? `\n\n[${contextNotes.join(" ")}]` : "";
-    const inspectRequest: SignalGrepInput | undefined =
+    const inspectRequest: SiftlightInput | undefined =
       snapshot.truncatedLines > 0
         ? {
             mode: "inspect",

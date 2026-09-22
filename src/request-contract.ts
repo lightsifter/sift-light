@@ -1,4 +1,4 @@
-import type { SignalGrepInput } from "./service.js";
+import type { SiftlightInput } from "./service.js";
 import { MAX_HYBRID_CONCEPT_LIMIT, MAX_CONFIGURABLE_STRUCTURE_FILES } from "./analysis-limits.js";
 import { MAX_CONTEXT_LINES, MAX_PAGE_SIZE } from "./types.js";
 import { containsSensitiveText } from "./redaction.js";
@@ -11,10 +11,10 @@ import {
 import {
   MODE_FIELDS_BY_MODE,
   SAFE_DROP_FIELDS,
-  SIGNAL_GREP_MODES,
+  SIFTLIGHT_MODES,
   SUPPORTED_OUTLINE_EXTENSIONS,
   type RequestField,
-  type SignalGrepMode,
+  type SiftlightMode,
   modeFields,
   outlineExtension,
 } from "./request-contract-catalog.js";
@@ -24,15 +24,15 @@ export {
   MODE_FIELD_SUMMARY,
   MODEL_USAGE_GUIDANCE,
   REQUEST_USAGE_GUIDANCE,
-  SIGNAL_GREP_MODES,
+  SIFTLIGHT_MODES,
   fieldGuidance,
 } from "./request-contract-catalog.js";
-export type { RequestField, SignalGrepMode } from "./request-contract-catalog.js";
+export type { RequestField, SiftlightMode } from "./request-contract-catalog.js";
 export {
   MAX_REQUEST_RECOVERY_BYTES,
   RequestContractError,
   boundedRequestContractDetails,
-  isSignalGrepDiagnosticError,
+  isSiftlightDiagnosticError,
 } from "./request-contract-error.js";
 export type {
   RequestContractDetails,
@@ -54,11 +54,11 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function modeOf(input: Record<string, unknown>): SignalGrepMode | undefined {
+function modeOf(input: Record<string, unknown>): SiftlightMode | undefined {
   const mode = input.mode;
   if (mode === undefined) return "auto";
   if (typeof mode !== "string") return undefined;
-  return SIGNAL_GREP_MODES.find((candidate) => candidate === mode);
+  return SIFTLIGHT_MODES.find((candidate) => candidate === mode);
 }
 
 function inputModeLabel(input: Record<string, unknown>): string | undefined {
@@ -117,7 +117,7 @@ function schemaError(
 
 function safeNextRequest(
   input: Record<string, unknown>,
-  mode: SignalGrepMode,
+  mode: SiftlightMode,
   invalid: readonly string[],
 ): Record<string, unknown> | undefined {
   if (input.redact === true && containsSensitiveText(input)) return undefined;
@@ -137,7 +137,7 @@ function safeNextRequest(
 
 function fieldsError(
   input: Record<string, unknown>,
-  mode: SignalGrepMode,
+  mode: SiftlightMode,
   invalid: readonly string[],
   selectorIssues: readonly RequestIssue[] = [],
 ): RequestContractError {
@@ -188,7 +188,7 @@ function fieldsError(
   );
 }
 
-function selectorIssuesFor(input: Record<string, unknown>, mode: SignalGrepMode): RequestIssue[] {
+function selectorIssuesFor(input: Record<string, unknown>, mode: SiftlightMode): RequestIssue[] {
   if (
     (mode === "auto" || mode === "summary" || mode === "matches") &&
     typeof input.cursor === "string" &&
@@ -260,7 +260,7 @@ function selectorIssuesFor(input: Record<string, unknown>, mode: SignalGrepMode)
 
 function selectorError(
   input: Record<string, unknown>,
-  mode: SignalGrepMode,
+  mode: SiftlightMode,
   issues: readonly RequestIssue[],
 ): RequestContractError {
   const reason = issues.map((issue) => `${issue.field}: ${issue.reason}`).join("; ");
@@ -302,7 +302,15 @@ function validateValueRanges(input: Record<string, unknown>): void {
   }
 }
 
-function validateRequired(input: Record<string, unknown>, mode: SignalGrepMode): void {
+function validateRequired(input: Record<string, unknown>, mode: SiftlightMode): void {
+  if (mode === "audit" && (!Array.isArray(input.patterns) || input.patterns.length === 0))
+    throw capabilityError(
+      "E_AUDIT_PATTERNS_REQUIRED",
+      mode,
+      "patterns",
+      "mode=audit requires one or more named literal patterns",
+      "Provide patterns as objects with id and literal fields",
+    );
   if (
     (mode === "concept" || mode === "hybrid") &&
     (typeof input.query !== "string" || !input.query.trim())
@@ -326,7 +334,7 @@ function validateRequired(input: Record<string, unknown>, mode: SignalGrepMode):
   }
 }
 
-function validateOutlineCapability(input: Record<string, unknown>, mode: SignalGrepMode): void {
+function validateOutlineCapability(input: Record<string, unknown>, mode: SiftlightMode): void {
   if (mode !== "outline") return;
   const capability = outlineCapability(typeof input.path === "string" ? input.path : undefined);
   if (!capability.supported && typeof input.path === "string")
@@ -336,7 +344,7 @@ function validateOutlineCapability(input: Record<string, unknown>, mode: SignalG
 /** Shared outline capability check for a path resolved from a cursor/document. */
 export function outlineCapabilityError(
   path: string,
-  mode: SignalGrepMode = "outline",
+  mode: SiftlightMode = "outline",
   resolvedDocument = false,
 ): RequestContractError | undefined {
   const capability = outlineCapability(path, resolvedDocument);
@@ -352,7 +360,7 @@ export function outlineCapabilityError(
 }
 
 /** Validate the mode contract before dispatch. This is the sole field-policy entry point. */
-export function validateRequestContract(input: SignalGrepInput): void {
+export function validateRequestContract(input: SiftlightInput): void {
   const value: unknown = input;
   if (!record(value)) throw schemaError({}, "request", "request must be an object");
   const raw = value;
@@ -363,7 +371,7 @@ export function validateRequestContract(input: SignalGrepInput): void {
       "E_MODE_UNKNOWN",
       inputModeLabel(raw),
       "mode",
-      `mode must be one of ${SIGNAL_GREP_MODES.join(", ")}`,
+      `mode must be one of ${SIFTLIGHT_MODES.join(", ")}`,
       "Choose one of the advertised modes and retry",
     );
   if (raw.sourceCursor !== undefined && mode !== "inspect")
@@ -468,6 +476,6 @@ export function schemaContractError(
           "Correct the value according to the advertised schema; no value is clamped or guessed.",
       },
     },
-    `Invalid baoer_signal_grep arguments at /${normalized}: ${message}`,
+    `Invalid siftlight arguments at /${normalized}: ${message}`,
   );
 }
