@@ -251,7 +251,10 @@ export class AnalysisStore {
       ...result,
       reasons: boundedReasons(result.reasons),
       items: [],
-      coverage: { ...result.coverage, retention: "complete" },
+      coverage: {
+        ...result.coverage,
+        retention: result.coverage?.retention ?? "complete",
+      },
     };
     let bytes = Buffer.byteLength(JSON.stringify(bounded));
     const candidates = result.items.map((item, index) => ({ item, index }));

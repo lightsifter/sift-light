@@ -79,7 +79,7 @@ async function verifyConceptModel(directory = conceptModelDirectory()) {
       if (size !== asset.bytes || hash.digest("hex") !== asset.sha256)
         throw new Error("Pinned hash mismatch");
     } catch (error) {
-      throw new SiftlightError(`Local concept model is missing or invalid (${asset.path}); run siftlight_model --install-model explicitly`, { cause: error });
+      throw new SiftlightError(`Local concept model is missing or invalid (${asset.path}); run siftlight-model --install-model explicitly`, { cause: error });
     }
   }
 }
@@ -564,4 +564,4 @@ if (process.argv.includes("--install-model"))
 else if (process.argv.includes("--infer"))
   await search();
 else
-  throw new Error("Usage: siftlight_model --install-model");
+  throw new Error("Usage: siftlight-model --install-model");

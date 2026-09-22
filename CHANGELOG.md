@@ -7,6 +7,7 @@
 - Rename the project, npm package, tool, native plugins and configuration surface to Siftlight (拾光), under the LightSifter identity.
 - Distinguish retained-match completeness from filesystem coverage so ignored files can no longer hide behind an exhaustive absence claim.
 - Add bounded audit receipts with explicit ignore policy, pattern findings, scope coverage, source stability and reproducible follow-up requests.
+- Automatically process Concept and hybrid scopes of up to 2,000 files in sequential 200-file batches, merging them into one globally ranked, verifiable result while keeping `maxFilesToParse` as an optional hard ceiling.
 - Document the one-time migration requirement: remove installations registered under the earlier package identity before enabling Siftlight.
 
 ## [1.7.0-1] - 2026-09-22

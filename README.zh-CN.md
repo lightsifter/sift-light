@@ -35,9 +35,9 @@
 
 当一句话可能记错了措辞时，可以用一个自然语言 `query` 调用 `mode: "hybrid"`。Hybrid 会在同一个受控请求中始终执行精确字面搜索和已安装的本地 Concept 模型：精确证据固定排在前面，语义候选明确标注且只表示相似度，与精确命中范围重叠的候选会被去重。初始页面共享计数、覆盖状态、来源引用和一个检查游标，以紧凑预览代替拼接两份完整响应。`conceptLimit` 只调整不重叠的语义补充数量（默认 3，最大 20），不会挤占字面证据；返回的 matches 请求从同一个快照开始完整的精确优先分页，不会重新执行任一搜索。
 
-Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段落，不再固定抽取范围开头的一小部分。超过模型 token 窗口的段落会拆成带重叠、且保证不截断的窗口参与排名，后半段内容不会被静默丢弃。离线 embedding 按内容、模型版本和分段版本缓存在本地，缓存上限为 512 MiB；重复内容直接复用，内容变化自然失效，缓存写入或清理失败会在结果中明确显示。
+Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段落，不再固定抽取范围开头的一小部分。Concept 和 hybrid 默认会自动接纳最多 2,000 个文件，在内部按每批 200 个文件顺序处理，再合并成一次全局排名和一份覆盖结果。所有批次共享同一个请求的 32 MiB 读取预算，扩大文件上限不会把内容预算成倍放大。用户不需要自己计算或续接批次；只有确实想主动缩小范围时，才需要把 `maxFilesToParse` 作为可选的高级硬上限。超过模型 token 窗口的段落会拆成带重叠、且保证不截断的窗口参与排名，后半段内容不会被静默丢弃。离线 embedding 按内容、模型版本和分段版本缓存在本地，缓存上限为 512 MiB；重复内容直接复用，内容变化自然失效，缓存写入或清理失败会在结果中明确显示。
 
-Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: "waiting"` 或 `"running"`、`operationId`、进度和精确的 `nextRequest`，例如 `{ "mode": "await", "operationId": "..." }`。请原样复制这个请求：它会续接同一个计算，不会重启查询，也不会降级成只有字面的结果。最终结果可稳定复取十分钟；每个服务会话最多保留 32 个终态结果。`mode: "cancel"` 会停止自有任务并等待清理完成。每个服务会话最多同时接纳八个 pending operation；单个 operation 使用 `SIFTLIGHT_CONCEPT_TIMEOUT_MS` 指定一个总执行时限（整数毫秒，1000–3600000，默认 600000），另有 120 秒无人续接租期。真实模型、来源或资源故障会以明确失败返回。发布结果前会重新枚举并校验同一来源 generation；源文件变化会刷新 operation，混合版本不会被标成 complete。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`）会出现在结果里，便于在下一次请求前用 `path` 或 `glob` 收窄大库。空文件属于正常跳过，不会把结果标成 partial。
+Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: "waiting"` 或 `"running"`、`operationId`、进度和精确的 `nextRequest`，例如 `{ "mode": "await", "operationId": "..." }`。请原样复制这个请求：它会续接同一个计算，不会重启查询，也不会降级成只有字面的结果。最终结果可稳定复取十分钟；每个服务会话最多保留 32 个终态结果。`mode: "cancel"` 会停止自有任务并等待清理完成。每个服务会话最多同时接纳八个 pending operation；单个 operation 使用 `SIFTLIGHT_CONCEPT_TIMEOUT_MS` 指定一个总执行时限（整数毫秒，1000–3600000，默认 600000），另有 120 秒无人续接租期。真实模型、来源或资源故障会以明确失败返回。发布结果前会重新枚举并校验同一来源 generation；源文件变化会刷新 operation，混合版本不会被标成 complete。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`、`batchesPlanned`、`batchesCompleted`）会在结果里明确显示。空文件属于正常跳过，不会把结果标成 partial。
 
 ### 几个条件，可以一起交代
 
@@ -146,11 +146,11 @@ Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保�
 ### Claude Code 或 Codex：连接 MCP
 
 ```bash
-claude mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+claude mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 ```bash
-codex mcp add siftlight -- npx -y --package siftlight@latest siftlight_mcp --stdio
+codex mcp add siftlight -- npx -y --package siftlight@latest siftlight-mcp --stdio
 ```
 
 `@latest` 会在 MCP 启动时跟随最新发布版本，更新后重启宿主即可加载。服务器默认搜索当前项目，可用 `SIFTLIGHT_MCP_CWD` 指定其他根目录。仅连接 MCP 会添加工具，不会禁用其他搜索工具。

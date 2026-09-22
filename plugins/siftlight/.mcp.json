@@ -6,7 +6,7 @@
         "--yes",
         "--package",
         "siftlight-runtime@npm:siftlight@1.7.0-2",
-        "siftlight_mcp",
+        "siftlight-mcp",
         "--stdio"
       ],
       "env": {

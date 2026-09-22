@@ -243,7 +243,7 @@ export const siftlightSchema = Type.Object({
     Type.Integer({
       minimum: 1,
       maximum: MAX_CONFIGURABLE_STRUCTURE_FILES,
-      description: `Maximum source files parsed by one structural analysis request (default 200, max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Candidate discovery still searches the full requested scope.`,
+      description: `Advanced hard ceiling for source files admitted by one analysis request (max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Concept and hybrid automatically process the requested scope in bounded batches when omitted; other structural modes default to 200. Candidate discovery still searches the full requested scope.`,
     }),
   ),
   conceptLimit: Type.Optional(

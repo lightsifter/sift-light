@@ -100,8 +100,8 @@ export interface EvidenceSearchOptions {
   onProgress?: (progress: OperationProgress) => void;
 }
 
-function maxFilesToParse(value: number | undefined): number {
-  const candidate = value ?? MAX_STRUCTURE_FILES;
+function maxFilesToParse(value: number | undefined, defaultValue = MAX_STRUCTURE_FILES): number {
+  const candidate = value ?? defaultValue;
   if (
     !Number.isSafeInteger(candidate) ||
     candidate < 1 ||
@@ -385,7 +385,11 @@ export class EvidenceService {
         "modifiedAfter and modifiedBefore apply to worktree searches and cannot be combined with changes",
       );
     const analysisStarted = performance.now();
-    const fileLimit = maxFilesToParse(input.maxFilesToParse);
+    const automaticConceptLimit =
+      input.mode === "concept" || input.mode === "hybrid"
+        ? MAX_CONFIGURABLE_STRUCTURE_FILES
+        : MAX_STRUCTURE_FILES;
+    const fileLimit = maxFilesToParse(input.maxFilesToParse, automaticConceptLimit);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
     if (input.mode === "validate") return this.#validateSavedEvidence(input, cwd, signal);
     if (input.sourceCursor !== undefined) {
@@ -423,14 +427,20 @@ export class EvidenceService {
       let conceptFailure: unknown;
       options.onProgress?.({ phase: "literal-search" });
       await runOwnedParallel<void>((groupSignal) => {
-        conceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
+        const ownedConceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, {
+          maxFiles: fileLimit,
+        });
+        conceptAccess = ownedConceptAccess;
+        const literalOperation = this.#runner(literalRequest, cwd, groupSignal).then((result) => {
+          literalResult = result;
+          return new Set(result.matches.map((match) => resolve(match.absolutePath)));
+        });
         return [
-          this.#runner(literalRequest, cwd, groupSignal).then((result) => {
-            literalResult = result;
-            return undefined;
-          }),
-          // Semantic failure must not cancel an in-flight literal search owned by the same group.
-          this.#conceptSearch(input, conceptAccess, options.onProgress)
+          literalOperation.then(() => undefined),
+          this.#conceptSearch(input, ownedConceptAccess, options.onProgress, {
+            retainPaths: literalOperation,
+            verifySourceGeneration: false,
+          })
             .then((result) => {
               conceptResult = result;
               return undefined;
@@ -455,11 +465,10 @@ export class EvidenceService {
           "Literal source evidence changed while concept evidence was being computed",
         );
       }
-      const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
       const hybrid = await combineHybridSearch(
         verifiedLiteralResult,
         conceptResult,
-        literalAccess,
+        conceptAccess,
         limit,
         query,
         this.#semanticJudge,

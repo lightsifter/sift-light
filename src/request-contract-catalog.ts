@@ -84,8 +84,8 @@ export const MODE_FIELDS_BY_MODE: Record<SiftlightMode, readonly RequestField[]>
   ],
   files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
-  concept: [...commonFields, "query", ...sourceFilters],
-  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit"],
+  concept: [...commonFields, "query", ...sourceFilters, "maxFilesToParse"],
+  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit", "maxFilesToParse"],
   validate: [...commonFields, "cursor", "matchIndex"],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
@@ -153,6 +153,8 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   ignorePolicy:
     "respect keeps repository ignore rules; include searches ignored files but always excludes .git internals and protected paths",
   patterns: "audit accepts named exact-literal patterns and returns one closure receipt",
+  maxFilesToParse:
+    "concept/hybrid automatically batch the requested scope; this optional field sets an advanced hard file ceiling",
 };
 
 export function fieldGuidance(field: RequestField): string {

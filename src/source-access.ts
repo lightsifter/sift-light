@@ -28,6 +28,11 @@ interface SyntaxParseResult {
   cacheHit: boolean;
 }
 
+interface SourceBudgetLedger {
+  readBytes: number;
+  verificationBytes: number;
+}
+
 /** One parser owner across calls, with a bounded content-addressed syntax cache. */
 export class SyntaxQueue {
   #tail: Promise<void> = Promise.resolve();
@@ -112,8 +117,8 @@ export class SourceAccess {
   readonly #documents = new Map<string, Promise<SourceDocument>>();
   readonly #syntax = new Map<SourceDocument, Promise<SyntaxAnalysis>>();
   readonly #maxVerificationBytes: number;
+  readonly #budget: SourceBudgetLedger;
   #bytes = 0;
-  #verificationBytes = 0;
   #syntaxParses = 0;
   #syntaxCacheHits = 0;
   #readTail: Promise<void> = Promise.resolve();
@@ -122,13 +127,18 @@ export class SourceAccess {
     cwd: string,
     queue: SyntaxQueue,
     signal?: AbortSignal,
-    options: { maxFiles?: number; maxVerificationBytes?: number } = {},
+    options: {
+      maxFiles?: number;
+      maxVerificationBytes?: number;
+      budget?: SourceBudgetLedger;
+    } = {},
   ) {
     this.cwd = cwd;
     this.#queue = queue;
     this.signal = signal;
     this.#maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
     this.#maxVerificationBytes = options.maxVerificationBytes ?? MAX_STRUCTURE_BYTES;
+    this.#budget = options.budget ?? { readBytes: 0, verificationBytes: 0 };
   }
 
   get filesRead(): number {
@@ -152,6 +162,15 @@ export class SourceAccess {
     return new SourceAccess(this.cwd, this.#queue, signal, {
       maxFiles: this.#maxFiles,
       maxVerificationBytes: this.#maxVerificationBytes,
+    });
+  }
+
+  /** Create one request-owned batch with a fresh document cache and the shared byte ledger. */
+  batch(maxFiles: number): SourceAccess {
+    return new SourceAccess(this.cwd, this.#queue, this.signal, {
+      maxFiles,
+      maxVerificationBytes: this.#maxVerificationBytes,
+      budget: this.#budget,
     });
   }
 
@@ -197,7 +216,7 @@ export class SourceAccess {
     verification: boolean,
   ): Promise<SourceDocument> {
     let document: SourceDocument;
-    const consumed = verification ? this.#verificationBytes : this.#bytes - this.#verificationBytes;
+    const consumed = verification ? this.#budget.verificationBytes : this.#budget.readBytes;
     const budget = verification ? this.#maxVerificationBytes : MAX_STRUCTURE_BYTES;
     const remaining = budget - consumed;
     if (remaining <= 0)
@@ -234,8 +253,9 @@ export class SourceAccess {
       );
     }
     this.#bytes += document.bytes.length;
-    if (verification) this.#verificationBytes += document.bytes.length;
-    else if (this.#bytes - this.#verificationBytes > MAX_STRUCTURE_BYTES)
+    if (verification) this.#budget.verificationBytes += document.bytes.length;
+    else this.#budget.readBytes += document.bytes.length;
+    if (!verification && this.#budget.readBytes > MAX_STRUCTURE_BYTES)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     return document;
   }

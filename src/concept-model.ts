@@ -88,7 +88,7 @@ export async function verifyConceptModel(directory = conceptModelDirectory()): P
         throw new Error("Pinned hash mismatch");
     } catch (error) {
       throw new SiftlightError(
-        `Local concept model is missing or invalid (${asset.path}); run siftlight_model --install-model explicitly`,
+        `Local concept model is missing or invalid (${asset.path}); run siftlight-model --install-model explicitly`,
         { cause: error },
       );
     }
