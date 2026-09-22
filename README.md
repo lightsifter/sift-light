@@ -126,7 +126,7 @@ The feature is enabled only when `semanticJudge.enabled` is explicitly set to `t
 }
 ```
 
-When enabled, the configured endpoint receives only the query and bounded candidate excerpts. A missing key or provider failure is reported as an explicit partial result; local candidates remain available, and semantic classification is not runtime proof.
+When enabled, the configured endpoint receives only the query and bounded candidate excerpts. Up to eight candidates and 64 KiB are sent per request. Independent batches run under the existing 20-candidate ceiling; an HTTP 413 response splits only that batch. If one batch fails, its candidates keep their local order while successful batches still contribute classifications, and the result reports partial coverage with judged/unjudged candidate and batch counts. A missing key still fails configuration explicitly, local candidates are never removed by a provider failure, and semantic classification is not runtime proof.
 
 ### Claude Code or Codex: MCP connection
 
@@ -146,7 +146,7 @@ Pi and OMP load their host-scoped configuration by default. Set `BAOER_SIGNAL_GR
 BAOER_SIGNAL_GREP_CONFIG=/absolute/path/to/baoer_signal_grep.json
 ```
 
-Keep `TYPESAFE_API_KEY` in the MCP process environment or its secret manager; never put the credential value in the configuration file or a checked-in host manifest. The standalone MCP server keeps semantic judging disabled when this path is absent, and fails at startup when an explicit path is missing or an enabled configuration has no key. It never silently claims that Jev ran. Startup diagnostics are written to stderr, and hybrid results expose `semanticJudge.status`; `complete` with `judgedCandidates > 0` is the runtime evidence that the layer actually ran.
+Keep `TYPESAFE_API_KEY` in the MCP process environment or its secret manager; never put the credential value in the configuration file or a checked-in host manifest. The standalone MCP server keeps semantic judging disabled when this path is absent, and fails at startup when an explicit path is missing or an enabled configuration has no key. It never silently claims that Jev ran. Startup diagnostics are written to stderr, and hybrid results expose `semanticJudge.status`; `judgedCandidates > 0` proves that at least one remote batch completed, `complete` means every considered candidate was judged, and `partial` keeps the remaining candidates locally ordered and explicitly unjudged.
 
 MCP returns readable text plus structured evidence by default. If a host serializes both forms into the model context, set `BAOER_SIGNAL_GREP_MCP_OUTPUT_MODE=model` in that MCP server's environment and restart it. Model mode omits `structuredContent` and its advertised output schema, advertises concise workflow guidance, and selects the smaller of the standard page and a compact view of the same retained analysis snapshot. Repeated paths and inspect requests are shared, hybrid does not concatenate separate literal and Concept bodies, and outline excerpts are deferred to version-checked inspection. Counts, coverage, partial status, reasons and continuation requests remain visible. Use `text` to omit structured output while preserving the complete standard text and full usage guidance, or retain the default `structured` mode for programmatic consumers and clients that expose only structured results. Any other value fails at startup. The bundled Claude Code, Codex and Kimi native plugins select `model`; direct MCP connections retain the structured default unless configured explicitly.
 

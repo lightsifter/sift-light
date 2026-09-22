@@ -31,6 +31,14 @@ import { createSemanticJudgeIntegration } from "./semantic-judge.js";
 
 const SIGNAL_GREP_LABEL = "baoer_signal_grep";
 const OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
+type OmpToolInput = SignalGrepInput & { i?: unknown };
+
+function normalizeOmpToolInput(params: OmpToolInput): SignalGrepInput {
+  if (!Object.hasOwn(params, "i")) return params;
+  const input = { ...params };
+  delete input.i;
+  return input;
+}
 
 interface OmpTheme {
   bold(value: string): string;
@@ -75,7 +83,7 @@ interface OmpToolDefinition {
   parameters: unknown;
   execute(
     toolCallId: string,
-    params: SignalGrepInput,
+    params: OmpToolInput,
     signal: AbortSignal | undefined,
     onUpdate: unknown,
     ctx: OmpExtensionContext,
@@ -227,7 +235,7 @@ export async function registerOmpSignalGrepExtension(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runtime.search(
-          params,
+          normalizeOmpToolInput(params),
           ctx.cwd,
           signal,
           resolveContextBudget(ctx.getContextUsage()),

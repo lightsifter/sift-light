@@ -1,6 +1,6 @@
 {
   "name": "baoer-signal-grep",
-  "version": "1.6.8-2",
+  "version": "1.7.0-1",
   "description": "Require baoer_signal_grep for conventional local searches while keeping development tools available.",
   "author": {
     "name": "宝儿"
@@ -13,7 +13,7 @@
       "args": [
         "--yes",
         "--package",
-        "baoer-signal-grep-runtime@npm:baoer_signal_grep@1.6.8-2",
+        "baoer-signal-grep-runtime@npm:baoer_signal_grep@1.7.0-1",
         "baoer_signal_grep_mcp",
         "--stdio"
       ],

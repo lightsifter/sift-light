@@ -2,13 +2,18 @@ import type { SemanticJudgeConfig } from "./config-reader.js";
 import {
   SEMANTIC_JUDGE_CLASSIFICATIONS,
   SEMANTIC_JUDGE_NON_PROOF_CLAIM,
-  type AnalysisItem,
   type AnalysisResultSet,
   type SemanticJudgeClassification,
   type SemanticJudgeDetails,
   type SemanticJudgeJudgment,
 } from "./analysis-types.js";
 import { SignalGrepError } from "./errors.js";
+import {
+  createSemanticJudgeBatches,
+  judgeSemanticCandidateBatches,
+  MAX_SEMANTIC_JUDGE_REQUEST_BYTES,
+  SemanticJudgePayloadTooLargeError,
+} from "./semantic-judge-batches.js";
 
 const MAX_CANDIDATE_CHARS = 4_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -158,6 +163,7 @@ function requestBody(
     questions,
   };
 }
+
 async function responseText(response: Response): Promise<string> {
   if (!response.body) {
     const contentLength = response.headers.get("content-length");
@@ -239,6 +245,11 @@ function createJevRunner(
   return async (query, candidates, parentSignal) => {
     const startedAt = performance.now();
     const body = JSON.stringify(requestBody(query, candidates, config.model));
+    if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
+      throw new SemanticJudgePayloadTooLargeError(
+        "Semantic judge request exceeded the 64 KiB request limit",
+      );
+    }
     for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
       const controller = new AbortController();
       const onParentAbort = (): void => controller.abort(parentSignal?.reason);
@@ -259,6 +270,11 @@ function createJevRunner(
           signal: controller.signal,
         });
         if (!response.ok) {
+          if (response.status === 413) {
+            throw new SemanticJudgePayloadTooLargeError(
+              "Semantic judge rejected an oversized request with HTTP 413",
+            );
+          }
           const retryable =
             response.status === 408 ||
             response.status === 429 ||
@@ -315,7 +331,12 @@ function createJevRunner(
         };
       } catch (error) {
         if (parentSignal?.aborted) throw error;
-        const retryable = error instanceof SemanticJudgeRequestError ? error.retryable : true;
+        const retryable =
+          error instanceof SemanticJudgePayloadTooLargeError
+            ? false
+            : error instanceof SemanticJudgeRequestError
+              ? error.retryable
+              : true;
         if (!retryable || attempt >= config.maxRetries) throw error;
         // oxlint-disable-next-line no-await-in-loop -- provider retries share one bounded request budget.
         await waitForRetry(retryDelay(attempt), parentSignal);
@@ -361,8 +382,26 @@ function baseDetails(config: SemanticJudgeConfig): SemanticJudgeDetails {
     maxCandidates: config.maxCandidates,
     candidatesConsidered: 0,
     judgedCandidates: 0,
+    candidatesUnjudged: 0,
+    batchesAttempted: 0,
+    batchesCompleted: 0,
+    batchesFailed: 0,
+    batchesSplit: 0,
     classificationCounts: {},
   };
+}
+
+function optionalUsageTotal(
+  results: readonly SemanticJudgeResult[],
+  select: (result: SemanticJudgeResult) => number | undefined,
+): number | undefined {
+  let total = 0;
+  for (const result of results) {
+    const value = select(result);
+    if (value === undefined) return undefined;
+    total += value;
+  }
+  return total;
 }
 
 export async function applySemanticJudge(
@@ -384,68 +423,97 @@ export async function applySemanticJudge(
   if (candidates.length === 0) {
     return { ...result, semanticJudge: { ...initial, status: "complete", model: config.model } };
   }
-  let judged: SemanticJudgeResult;
-  try {
-    judged = await integration.runner(query, candidates, signal);
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    const reason = `Semantic judge unavailable; local semantic candidates retained without behavior classification: ${boundedError(error)}`;
-    return {
-      ...result,
-      partial: true,
-      reasons: [...result.reasons, reason],
-      semanticJudge: {
-        ...initial,
-        status: "failed",
-        reason,
-        model: config.model,
-      },
-    };
+  const startedAt = performance.now();
+  const execution = await judgeSemanticCandidateBatches(
+    integration.runner,
+    query,
+    createSemanticJudgeBatches(
+      candidates,
+      (batch) =>
+        new TextEncoder().encode(JSON.stringify(requestBody(query, batch, config.model)))
+          .byteLength,
+    ),
+    signal,
+  );
+  const judgments = new Map<number, SemanticJudgeJudgment>();
+  const judgmentModels = new Map<number, string>();
+  for (const success of execution.successes) {
+    for (const judgment of success.result.judgments) {
+      const candidateIndex = success.startIndex + judgment.candidateIndex;
+      judgments.set(candidateIndex, { ...judgment, candidateIndex });
+      judgmentModels.set(candidateIndex, success.result.model);
+    }
   }
-  const judgments = new Map(judged.judgments.map((item) => [item.candidateIndex, item]));
   const counts: Record<string, number> = {};
-  for (const judgment of judged.judgments)
+  for (const judgment of judgments.values())
     counts[judgment.classification] = (counts[judgment.classification] ?? 0) + 1;
-  const order = result.items.map((_item, index) => index);
-  order.sort((left, right) => {
-    const leftJudgment = judgments.get(left);
-    const rightJudgment = judgments.get(right);
-    if (!leftJudgment || !rightJudgment) return left - right;
-    const priority =
+  const rankedJudgedIndices = [...judgments.keys()].toSorted((left, right) => {
+    const leftJudgment = judgments.get(left)!;
+    const rightJudgment = judgments.get(right)!;
+    return (
       CLASSIFICATION_PRIORITY[leftJudgment.classification] -
-      CLASSIFICATION_PRIORITY[rightJudgment.classification];
-    return priority || rightJudgment.probability - leftJudgment.probability || left - right;
+        CLASSIFICATION_PRIORITY[rightJudgment.classification] ||
+      rightJudgment.probability - leftJudgment.probability ||
+      left - right
+    );
   });
-  const reordered = order
-    .map((index) => {
-      const item = result.items[index];
-      const judgment = judgments.get(index);
-      if (!item || !judgment) return item;
-      return Object.assign({}, item, {
-        details: Object.assign({}, item.details, {
-          semanticJudge: {
-            classification: judgment.classification,
-            probability: judgment.probability,
-            ...(judgment.confidence === undefined ? {} : { confidence: judgment.confidence }),
-            model: judged.model,
-            claim: SEMANTIC_JUDGE_NON_PROOF_CLAIM,
-          },
-        }),
-      });
-    })
-    .filter((item): item is AnalysisItem => item !== undefined);
+  let rankedOffset = 0;
+  const reordered = result.items.map((original, index) => {
+    if (!judgments.has(index)) return original;
+    const rankedIndex = rankedJudgedIndices[rankedOffset++];
+    const item = rankedIndex === undefined ? undefined : result.items[rankedIndex];
+    const judgment = rankedIndex === undefined ? undefined : judgments.get(rankedIndex);
+    const model = rankedIndex === undefined ? undefined : judgmentModels.get(rankedIndex);
+    if (!item || !judgment || !model) return original;
+    return Object.assign({}, item, {
+      details: Object.assign({}, item.details, {
+        semanticJudge: {
+          classification: judgment.classification,
+          probability: judgment.probability,
+          ...(judgment.confidence === undefined ? {} : { confidence: judgment.confidence }),
+          model,
+          claim: SEMANTIC_JUDGE_NON_PROOF_CLAIM,
+        },
+      }),
+    });
+  });
+  const candidatesUnjudged = candidates.length - judgments.size;
+  const failureDetails = [
+    ...new Set(execution.failures.map((failure) => boundedError(failure.error))),
+  ];
+  const status =
+    execution.failures.length === 0 ? "complete" : judgments.size > 0 ? "partial" : "failed";
+  const reason =
+    execution.failures.length === 0
+      ? undefined
+      : status === "failed"
+        ? `Semantic judge unavailable; local semantic candidates retained without behavior classification: ${boundedError(failureDetails.join("; "))}`
+        : `Semantic judge partially unavailable; ${String(candidatesUnjudged)} candidates retained in local order without behavior classification across ${String(execution.failures.length)} failed batch${execution.failures.length === 1 ? "" : "es"}: ${boundedError(failureDetails.join("; "))}`;
+  const successfulResults = execution.successes.map((success) => success.result);
+  const models = [...new Set(successfulResults.map((judged) => judged.model))];
+  const model = models.length === 1 ? (models[0] ?? config.model) : config.model;
+  const inputTokens = optionalUsageTotal(successfulResults, (judged) => judged.inputTokens);
+  const outputTokens = optionalUsageTotal(successfulResults, (judged) => judged.outputTokens);
   return {
     ...result,
+    partial: result.partial || execution.failures.length > 0,
+    reasons: reason ? [...result.reasons, reason] : result.reasons,
     items: reordered,
     semanticJudge: {
       ...initial,
-      status: "complete",
-      model: judged.model,
-      judgedCandidates: judged.judgments.length,
+      status,
+      model,
+      judgedCandidates: judgments.size,
+      candidatesUnjudged,
+      batchesAttempted: execution.attempts,
+      batchesCompleted: execution.successes.length,
+      batchesFailed: execution.failures.length,
+      batchesSplit: execution.splits,
       classificationCounts: counts,
-      ...(judged.inputTokens === undefined ? {} : { inputTokens: judged.inputTokens }),
-      ...(judged.outputTokens === undefined ? {} : { outputTokens: judged.outputTokens }),
-      elapsedMs: judged.elapsedMs,
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+      elapsedMs: Math.round(performance.now() - startedAt),
+      ...(reason ? { reason } : {}),
     },
   };
 }

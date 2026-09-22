@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "baoer_signal_grep",
-  version: "1.6.8-2",
+  version: "1.7.0-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -9322,6 +9322,85 @@ function parsePythonOutline(document) {
 // src/hybrid-search.ts
 import { resolve as resolve19 } from "node:path";
 
+// src/semantic-judge-batches.ts
+var MAX_SEMANTIC_JUDGE_BATCH_CANDIDATES = 8;
+var MAX_SEMANTIC_JUDGE_REQUEST_BYTES = 64 * 1024;
+
+class SemanticJudgePayloadTooLargeError extends SignalGrepError {
+  constructor(message) {
+    super(message);
+    this.name = "SemanticJudgePayloadTooLargeError";
+  }
+}
+function createSemanticJudgeBatches(candidates, serializedBytes) {
+  const batches = [];
+  let startIndex = 0;
+  let current = [];
+  for (const [index, candidate] of candidates.entries()) {
+    const proposed = [...current, candidate];
+    const exceedsCount = proposed.length > MAX_SEMANTIC_JUDGE_BATCH_CANDIDATES;
+    const exceedsBytes = serializedBytes(proposed) > MAX_SEMANTIC_JUDGE_REQUEST_BYTES;
+    if (current.length > 0 && (exceedsCount || exceedsBytes)) {
+      batches.push({ startIndex, candidates: current });
+      startIndex = index;
+      current = [candidate];
+    } else {
+      current = proposed;
+    }
+  }
+  if (current.length > 0)
+    batches.push({ startIndex, candidates: current });
+  return batches;
+}
+function combineBatchExecutions(executions) {
+  return {
+    successes: executions.flatMap((execution) => execution.successes),
+    failures: executions.flatMap((execution) => execution.failures),
+    attempts: executions.reduce((total, execution) => total + execution.attempts, 0),
+    splits: executions.reduce((total, execution) => total + execution.splits, 0)
+  };
+}
+async function settledBatchExecutions(operations) {
+  const settled = await Promise.allSettled(operations);
+  const executions = [];
+  let hasRejection = false;
+  let rejection;
+  for (const result of settled) {
+    if (result.status === "rejected") {
+      if (!hasRejection)
+        rejection = result.reason;
+      hasRejection = true;
+    } else
+      executions.push(result.value);
+  }
+  if (hasRejection)
+    throw rejection;
+  return executions;
+}
+async function judgeBatchWithSplit(runner, query, batch, signal) {
+  try {
+    const result = await runner(query, batch.candidates, signal);
+    return { successes: [{ ...batch, result }], failures: [], attempts: 1, splits: 0 };
+  } catch (error) {
+    if (signal?.aborted)
+      throw error;
+    if (error instanceof SemanticJudgePayloadTooLargeError && batch.candidates.length > 1) {
+      const midpoint = Math.ceil(batch.candidates.length / 2);
+      const left = await judgeBatchWithSplit(runner, query, { startIndex: batch.startIndex, candidates: batch.candidates.slice(0, midpoint) }, signal);
+      const right = await judgeBatchWithSplit(runner, query, {
+        startIndex: batch.startIndex + midpoint,
+        candidates: batch.candidates.slice(midpoint)
+      }, signal);
+      const combined = combineBatchExecutions([left, right]);
+      return { ...combined, attempts: combined.attempts + 1, splits: combined.splits + 1 };
+    }
+    return { successes: [], failures: [{ ...batch, error }], attempts: 1, splits: 0 };
+  }
+}
+async function judgeSemanticCandidateBatches(runner, query, batches, signal) {
+  return combineBatchExecutions(await settledBatchExecutions(batches.map((batch) => judgeBatchWithSplit(runner, query, batch, signal))));
+}
+
 // src/semantic-judge.ts
 var MAX_CANDIDATE_CHARS = 4000;
 var MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -9478,6 +9557,9 @@ function createJevRunner(config, key, fetcher) {
   return async (query, candidates, parentSignal) => {
     const startedAt = performance.now();
     const body = JSON.stringify(requestBody(query, candidates, config.model));
+    if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
+      throw new SemanticJudgePayloadTooLargeError("Semantic judge request exceeded the 64 KiB request limit");
+    }
     for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
       const controller = new AbortController;
       const onParentAbort = () => controller.abort(parentSignal?.reason);
@@ -9494,6 +9576,9 @@ function createJevRunner(config, key, fetcher) {
           signal: controller.signal
         });
         if (!response.ok) {
+          if (response.status === 413) {
+            throw new SemanticJudgePayloadTooLargeError("Semantic judge rejected an oversized request with HTTP 413");
+          }
           const retryable = response.status === 408 || response.status === 429 || response.status === 529 || response.status >= 500;
           throw new SemanticJudgeRequestError(`Semantic judge returned HTTP ${String(response.status)}`, retryable);
         }
@@ -9520,7 +9605,7 @@ function createJevRunner(config, key, fetcher) {
       } catch (error) {
         if (parentSignal?.aborted)
           throw error;
-        const retryable = error instanceof SemanticJudgeRequestError ? error.retryable : true;
+        const retryable = error instanceof SemanticJudgePayloadTooLargeError ? false : error instanceof SemanticJudgeRequestError ? error.retryable : true;
         if (!retryable || attempt >= config.maxRetries)
           throw error;
         await waitForRetry(retryDelay(attempt), parentSignal);
@@ -9555,8 +9640,23 @@ function baseDetails(config) {
     maxCandidates: config.maxCandidates,
     candidatesConsidered: 0,
     judgedCandidates: 0,
+    candidatesUnjudged: 0,
+    batchesAttempted: 0,
+    batchesCompleted: 0,
+    batchesFailed: 0,
+    batchesSplit: 0,
     classificationCounts: {}
   };
+}
+function optionalUsageTotal(results, select) {
+  let total = 0;
+  for (const result of results) {
+    const value = select(result);
+    if (value === undefined)
+      return;
+    total += value;
+  }
+  return total;
 }
 async function applySemanticJudge(result, query, integration, signal) {
   const config = integration?.config;
@@ -9572,67 +9672,78 @@ async function applySemanticJudge(result, query, integration, signal) {
   if (candidates.length === 0) {
     return { ...result, semanticJudge: { ...initial, status: "complete", model: config.model } };
   }
-  let judged;
-  try {
-    judged = await integration.runner(query, candidates, signal);
-  } catch (error) {
-    if (signal?.aborted)
-      throw error;
-    const reason = `Semantic judge unavailable; local semantic candidates retained without behavior classification: ${boundedError(error)}`;
-    return {
-      ...result,
-      partial: true,
-      reasons: [...result.reasons, reason],
-      semanticJudge: {
-        ...initial,
-        status: "failed",
-        reason,
-        model: config.model
-      }
-    };
+  const startedAt = performance.now();
+  const execution = await judgeSemanticCandidateBatches(integration.runner, query, createSemanticJudgeBatches(candidates, (batch) => new TextEncoder().encode(JSON.stringify(requestBody(query, batch, config.model))).byteLength), signal);
+  const judgments = new Map;
+  const judgmentModels = new Map;
+  for (const success of execution.successes) {
+    for (const judgment of success.result.judgments) {
+      const candidateIndex = success.startIndex + judgment.candidateIndex;
+      judgments.set(candidateIndex, { ...judgment, candidateIndex });
+      judgmentModels.set(candidateIndex, success.result.model);
+    }
   }
-  const judgments = new Map(judged.judgments.map((item) => [item.candidateIndex, item]));
   const counts = {};
-  for (const judgment of judged.judgments)
+  for (const judgment of judgments.values())
     counts[judgment.classification] = (counts[judgment.classification] ?? 0) + 1;
-  const order = result.items.map((_item, index) => index);
-  order.sort((left, right) => {
+  const rankedJudgedIndices = [...judgments.keys()].toSorted((left, right) => {
     const leftJudgment = judgments.get(left);
     const rightJudgment = judgments.get(right);
-    if (!leftJudgment || !rightJudgment)
-      return left - right;
-    const priority = CLASSIFICATION_PRIORITY[leftJudgment.classification] - CLASSIFICATION_PRIORITY[rightJudgment.classification];
-    return priority || rightJudgment.probability - leftJudgment.probability || left - right;
+    return CLASSIFICATION_PRIORITY[leftJudgment.classification] - CLASSIFICATION_PRIORITY[rightJudgment.classification] || rightJudgment.probability - leftJudgment.probability || left - right;
   });
-  const reordered = order.map((index) => {
-    const item = result.items[index];
-    const judgment = judgments.get(index);
-    if (!item || !judgment)
-      return item;
+  let rankedOffset = 0;
+  const reordered = result.items.map((original, index) => {
+    if (!judgments.has(index))
+      return original;
+    const rankedIndex = rankedJudgedIndices[rankedOffset++];
+    const item = rankedIndex === undefined ? undefined : result.items[rankedIndex];
+    const judgment = rankedIndex === undefined ? undefined : judgments.get(rankedIndex);
+    const model = rankedIndex === undefined ? undefined : judgmentModels.get(rankedIndex);
+    if (!item || !judgment || !model)
+      return original;
     return Object.assign({}, item, {
       details: Object.assign({}, item.details, {
         semanticJudge: {
           classification: judgment.classification,
           probability: judgment.probability,
           ...judgment.confidence === undefined ? {} : { confidence: judgment.confidence },
-          model: judged.model,
+          model,
           claim: SEMANTIC_JUDGE_NON_PROOF_CLAIM
         }
       })
     });
-  }).filter((item) => item !== undefined);
+  });
+  const candidatesUnjudged = candidates.length - judgments.size;
+  const failureDetails = [
+    ...new Set(execution.failures.map((failure) => boundedError(failure.error)))
+  ];
+  const status = execution.failures.length === 0 ? "complete" : judgments.size > 0 ? "partial" : "failed";
+  const reason = execution.failures.length === 0 ? undefined : status === "failed" ? `Semantic judge unavailable; local semantic candidates retained without behavior classification: ${boundedError(failureDetails.join("; "))}` : `Semantic judge partially unavailable; ${String(candidatesUnjudged)} candidates retained in local order without behavior classification across ${String(execution.failures.length)} failed batch${execution.failures.length === 1 ? "" : "es"}: ${boundedError(failureDetails.join("; "))}`;
+  const successfulResults = execution.successes.map((success) => success.result);
+  const models = [...new Set(successfulResults.map((judged) => judged.model))];
+  const model = models.length === 1 ? models[0] ?? config.model : config.model;
+  const inputTokens = optionalUsageTotal(successfulResults, (judged) => judged.inputTokens);
+  const outputTokens = optionalUsageTotal(successfulResults, (judged) => judged.outputTokens);
   return {
     ...result,
+    partial: result.partial || execution.failures.length > 0,
+    reasons: reason ? [...result.reasons, reason] : result.reasons,
     items: reordered,
     semanticJudge: {
       ...initial,
-      status: "complete",
-      model: judged.model,
-      judgedCandidates: judged.judgments.length,
+      status,
+      model,
+      judgedCandidates: judgments.size,
+      candidatesUnjudged,
+      batchesAttempted: execution.attempts,
+      batchesCompleted: execution.successes.length,
+      batchesFailed: execution.failures.length,
+      batchesSplit: execution.splits,
       classificationCounts: counts,
-      ...judged.inputTokens === undefined ? {} : { inputTokens: judged.inputTokens },
-      ...judged.outputTokens === undefined ? {} : { outputTokens: judged.outputTokens },
-      elapsedMs: judged.elapsedMs
+      ...inputTokens === undefined ? {} : { inputTokens },
+      ...outputTokens === undefined ? {} : { outputTokens },
+      elapsedMs: Math.round(performance.now() - startedAt),
+      ...reason ? { reason } : {}
     }
   };
 }
@@ -9817,7 +9928,7 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
   const conceptCoverage = concept.coverage?.conceptCandidates ?? (concept.partial ? "partial" : "complete");
   const conceptSourceCoverage = execution.sourceGeneration.partial ? "partial" : "complete";
   const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
-  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed";
+  const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed" || judgedConcept.semanticJudge?.status === "partial";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
   return {
     kind: "hybrid",
