@@ -1,13 +1,12 @@
 import { rangeEvidence } from "./analysis-evidence.js";
 import { OwnedTaskQueue } from "./owned-task-queue.js";
 const inferenceQueue = new OwnedTaskQueue();
-import { dirname } from "node:path";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { mkdir } from "node:fs/promises";
 import { rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AnalysisResultSet, ConceptScoreProfile } from "./analysis-types.js";
 import {
   CONCEPT_MODEL,
@@ -32,15 +31,14 @@ import {
   type ConceptSourceGeneration,
 } from "./concept-source-generation.js";
 import type { OperationProgress } from "./operation-lifecycle.js";
+import { MAX_ANALYSIS_RESULTS, MAX_STRUCTURE_FILES } from "./analysis-limits.js";
+import { listWorkspaceFiles } from "./workspace-files.js";
 
 export interface Passage {
   document: SourceDocument;
   range: ByteRange;
   text: string;
 }
-
-/** Soft planning signal: large enumerations should narrow path/glob before interactive inference. */
-const MAX_CONCEPT_FILES_WARN = 500;
 
 function conciseWorkerError(stderr: string): string {
   const errorLine = stderr
@@ -127,6 +125,11 @@ export interface ConceptInferenceResult {
 export interface ConceptSearchExecution {
   analysis: AnalysisResultSet;
   sourceGeneration: ConceptSourceGeneration;
+}
+
+export interface ConceptSearchOptions {
+  retainPaths?: ReadonlySet<string> | PromiseLike<ReadonlySet<string>>;
+  verifySourceGeneration?: boolean;
 }
 
 export type ConceptInferenceRunner = (
@@ -316,106 +319,203 @@ async function runConceptSearch(
   access: SourceAccess,
   infer: ConceptInferenceRunner,
   onProgress?: (progress: OperationProgress) => void,
+  options: ConceptSearchOptions = {},
 ): Promise<ConceptSearchExecution> {
   const query = validateConceptQuery(input.query);
+  const retainPaths =
+    options.retainPaths === undefined ? undefined : Promise.resolve(options.retainPaths);
   const started = performance.now();
   const request = normalizeRequest({ ...input, pattern: "" });
-  const sourceGeneration = await createConceptSourceGeneration(access, {
+  const filters = {
     ...(request.path ? { path: request.path } : {}),
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden,
+  };
+  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+    ...filters,
+    maxFiles: access.maxFiles,
   });
-  onProgress?.({
-    phase: "source-generation",
-    completed: sourceGeneration.files.paths.length,
-    total: sourceGeneration.files.paths.length,
-    detail: `generation ${sourceGeneration.inventoryHash}; admitted ${String(sourceGeneration.documents.length)}, unavailable ${String(sourceGeneration.filesUnavailable)}`,
-  });
-  const files = sourceGeneration.files;
+  const fileBatches = Array.from(
+    { length: Math.ceil(files.paths.length / MAX_STRUCTURE_FILES) },
+    (_, index) => files.paths.slice(index * MAX_STRUCTURE_FILES, (index + 1) * MAX_STRUCTURE_FILES),
+  );
   const result: AnalysisResultSet = {
     kind: "concept",
     unit: "evidence-items",
     items: [],
-    partial: sourceGeneration.partial,
-    reasons: [...sourceGeneration.reasons],
+    partial: files.partial,
+    reasons: [...files.reasons],
     redact: input.redact ?? false,
   };
-  const documents: { document: SourceDocument; next: number }[] = [];
-  for (const document of sourceGeneration.documents) documents.push({ document, next: 0 });
-  const passages: Passage[] = [];
-  while (documents.some((item) => item.next < item.document.text.length)) {
-    for (const item of documents) {
-      if (item.next >= item.document.text.length) continue;
-      const chunk = passage(item.document, item.next);
-      passages.push(chunk.value);
-      item.next = chunk.next;
+  const inventory: ConceptSourceGeneration["inventory"][number][] = [];
+  const retainedDocuments: SourceDocument[] = [];
+  const sourceReasons = [...files.reasons];
+  let sourcePartial = files.partial;
+  const allScores: number[] = [];
+  let filesAdmitted = 0;
+  let filesSkippedEmpty = 0;
+  let filesSkippedBinary = 0;
+  let filesUnavailable = 0;
+  let filesRead = 0;
+  let bytesRead = 0;
+  let passagesQueued = 0;
+  let conceptWindowsRanked = 0;
+  let conceptCacheHits = 0;
+  let conceptCacheMisses = 0;
+  let conceptCacheMaxBytes = 0;
+  let conceptCacheBytes: number | undefined;
+  let inferencePeakRssBytes = 0;
+  let retentionTruncated = false;
+  const generationStartedAt = Date.now();
+  for (const [batchIndex, paths] of fileBatches.entries()) {
+    const batchAccess = access.batch(paths.length);
+    // oxlint-disable-next-line no-await-in-loop -- sequential batches bound live source documents and model memory.
+    const generation = await createConceptSourceGeneration(batchAccess, filters, {
+      paths,
+      partial: false,
+      reasons: [],
+    });
+    inventory.push(...generation.inventory);
+    filesAdmitted += generation.filesAdmitted;
+    filesSkippedEmpty += generation.filesSkippedEmpty;
+    filesSkippedBinary += generation.filesSkippedBinary;
+    filesUnavailable += generation.filesUnavailable;
+    filesRead += batchAccess.filesRead;
+    bytesRead += batchAccess.bytesRead;
+    sourcePartial ||= generation.partial;
+    sourceReasons.push(...generation.reasons);
+    result.partial ||= generation.partial;
+    result.reasons.push(...generation.reasons);
+    onProgress?.({
+      phase: "source-generation",
+      completed: Math.min((batchIndex + 1) * MAX_STRUCTURE_FILES, files.paths.length),
+      total: files.paths.length,
+      detail: `batch ${String(batchIndex + 1)} of ${String(fileBatches.length)}; admitted ${String(filesAdmitted)}, unavailable ${String(filesUnavailable)}`,
+    });
+
+    const documents = generation.documents.map((document) => ({ document, next: 0 }));
+    const passages: Passage[] = [];
+    while (documents.some((item) => item.next < item.document.text.length)) {
+      for (const item of documents) {
+        if (item.next >= item.document.text.length) continue;
+        const chunk = passage(item.document, item.next);
+        passages.push(chunk.value);
+        item.next = chunk.next;
+      }
     }
+    passagesQueued += passages.length;
+    onProgress?.({
+      phase: "passage-queue",
+      completed: passagesQueued,
+      detail: `batch ${String(batchIndex + 1)} of ${String(fileBatches.length)}`,
+    });
+    if (!passages.length) continue;
+    // oxlint-disable-next-line no-await-in-loop -- one owned inference batch runs at a time and feeds one global ranking.
+    const inferred = await infer(query, passages, access.signal, onProgress);
+    // Literal discovery and this first Concept batch start together. Resolve the literal file set
+    // only when this batch is ready to release its documents, then retain matching documents only.
+    // oxlint-disable-next-line no-await-in-loop -- every sequential batch reuses the same settled literal path promise.
+    const retainedPathSet = retainPaths === undefined ? undefined : await retainPaths;
+    for (const document of generation.documents) {
+      if (retainedPathSet?.has(resolve(access.cwd, document.path))) {
+        retainedDocuments.push(document);
+      }
+    }
+    result.reasons.push(...inferred.warnings);
+    allScores.push(...inferred.scores);
+    conceptWindowsRanked += inferred.windowsRanked;
+    conceptCacheHits += inferred.cacheHits;
+    conceptCacheMisses += inferred.cacheMisses;
+    conceptCacheMaxBytes = Math.max(conceptCacheMaxBytes, inferred.cacheMaxBytes);
+    conceptCacheBytes = inferred.cacheBytes ?? conceptCacheBytes;
+    inferencePeakRssBytes = Math.max(inferencePeakRssBytes, inferred.peakRssBytes);
+    const batchItems = passages.map((item, index) => {
+      const similarity = inferred.scores[index];
+      if (similarity === undefined) throw new Error("Missing concept similarity");
+      const evidence = rangeEvidence(item.document, item.range);
+      return {
+        path: item.document.path,
+        line: item.document.lineAt(item.range.start),
+        source: item.document.reference,
+        range: item.range,
+        label: `Concept candidate (cosine ${similarity.toFixed(4)})`,
+        excerpt: evidence.excerpt,
+        details: {
+          kind: "concept-candidate",
+          certainty: "candidate",
+          score: similarity,
+          rankingReason:
+            "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
+          model: CONCEPT_MODEL,
+          revision: CONCEPT_REVISION,
+          tokenTruncated: false,
+          excerptRange: evidence.excerptRange,
+          excerptTruncated: evidence.excerptTruncated,
+        },
+      } satisfies AnalysisResultSet["items"][number];
+    });
+    const ranked = [...result.items, ...batchItems].toSorted(
+      (a, b) =>
+        Number(b.details?.score) - Number(a.details?.score) ||
+        a.path.localeCompare(b.path) ||
+        a.line - b.line,
+    );
+    if (ranked.length > MAX_ANALYSIS_RESULTS) retentionTruncated = true;
+    result.items = ranked.slice(0, MAX_ANALYSIS_RESULTS);
   }
-  onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
-  const filesAdmitted = documents.length;
-  const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
-  const filesSkippedBinary = sourceGeneration.filesSkippedBinary;
-  const filesUnavailable = sourceGeneration.filesUnavailable;
-  if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
+  if (retentionTruncated) {
+    result.partial = true;
     result.reasons.push(
-      `Concept enumerated ${String(files.paths.length)} files; narrow path or glob for faster interactive retrieval`,
+      `Concept ranking retained the top ${String(MAX_ANALYSIS_RESULTS)} candidates from ${String(passagesQueued)} passages`,
     );
   }
+  const sourceGeneration: ConceptSourceGeneration = {
+    cwd: access.cwd,
+    filters,
+    files,
+    inventory,
+    documents: retainedDocuments,
+    partial: sourcePartial,
+    reasons: [...new Set(sourceReasons)],
+    filesSkippedEmpty,
+    filesSkippedBinary,
+    filesUnavailable,
+    filesAdmitted,
+    batches: fileBatches.length,
+    batchFileLimit: MAX_STRUCTURE_FILES,
+    fileLimit: access.maxFiles,
+    startedAt: generationStartedAt,
+    inventoryHash: createHash("sha256")
+      .update(JSON.stringify(inventory))
+      .digest("hex")
+      .slice(0, 32),
+  };
   result.counts = {
     filesEnumerated: files.paths.length,
     filesAdmitted,
     filesSkippedEmpty,
     filesSkippedBinary,
     filesUnavailable,
-    passagesQueued: passages.length,
+    passagesQueued,
+    batchesPlanned: fileBatches.length,
+    batchesCompleted: fileBatches.length,
+    batchFileLimit: MAX_STRUCTURE_FILES,
   };
-  if (passages.length) {
-    const inferred = await infer(query, passages, access.signal, onProgress);
-    result.reasons.push(...inferred.warnings);
-    result.items = passages
-      .map((item, index) => {
-        const similarity = inferred.scores[index];
-        if (similarity === undefined) throw new Error("Missing concept similarity");
-        const evidence = rangeEvidence(item.document, item.range);
-        return {
-          path: item.document.path,
-          line: item.document.lineAt(item.range.start),
-          source: item.document.reference,
-          range: item.range,
-          label: `Concept candidate (cosine ${similarity.toFixed(4)})`,
-          excerpt: evidence.excerpt,
-          details: {
-            kind: "concept-candidate",
-            certainty: "candidate",
-            score: similarity,
-            rankingReason:
-              "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
-            model: CONCEPT_MODEL,
-            revision: CONCEPT_REVISION,
-            tokenTruncated: false,
-            excerptRange: evidence.excerptRange,
-            excerptTruncated: evidence.excerptTruncated,
-          },
-        };
-      })
-      .toSorted(
-        (a, b) =>
-          b.details.score - a.details.score || a.path.localeCompare(b.path) || a.line - b.line,
-      );
+  if (allScores.length) {
     result.stats = {
-      inferencePeakRssBytes: inferred.peakRssBytes,
-      passagesRanked: passages.length,
-      conceptWindowsRanked: inferred.windowsRanked,
-      conceptCacheHits: inferred.cacheHits,
-      conceptCacheMisses: inferred.cacheMisses,
-      conceptCacheMaxBytes: inferred.cacheMaxBytes,
-      ...(inferred.cacheBytes === undefined ? {} : { conceptCacheBytes: inferred.cacheBytes }),
-      scoreProfile: scoreProfile(inferred.scores),
+      inferencePeakRssBytes,
+      passagesRanked: passagesQueued,
+      conceptWindowsRanked,
+      conceptCacheHits,
+      conceptCacheMisses,
+      conceptCacheMaxBytes,
+      ...(conceptCacheBytes === undefined ? {} : { conceptCacheBytes }),
+      scoreProfile: scoreProfile(allScores),
     };
   }
-  result.filesRead = access.filesRead;
-  result.bytesRead = access.bytesRead;
+  result.filesRead = filesRead;
+  result.bytesRead = bytesRead;
   result.stats = {
     ...result.stats,
     elapsedMs: Math.round(performance.now() - started),
@@ -424,7 +524,8 @@ async function runConceptSearch(
   };
   result.coverage = {
     conceptCandidates: result.partial ? "partial" : "complete",
-    admissionPlan: result.partial ? "partial" : "complete",
+    admissionPlan: sourcePartial ? "partial" : "complete",
+    retention: retentionTruncated ? "partial" : "complete",
     compilerBindings: "not-applicable",
   };
   result.scope = {
@@ -437,7 +538,9 @@ async function runConceptSearch(
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide",
   };
-  await verifyConceptSourceGeneration(sourceGeneration, access);
+  if (options.verifySourceGeneration !== false) {
+    await verifyConceptSourceGeneration(sourceGeneration, access);
+  }
   result.sourceGeneration = conceptSourceSummary(sourceGeneration);
   return { analysis: result, sourceGeneration };
 }
@@ -446,8 +549,9 @@ export function conceptSearch(
   input: SiftlightInput,
   access: SourceAccess,
   onProgress?: (progress: OperationProgress) => void,
+  options?: ConceptSearchOptions,
 ): Promise<ConceptSearchExecution> {
-  return runConceptSearchQueued(input, access, similarities, onProgress);
+  return runConceptSearchQueued(input, access, similarities, onProgress, options);
 }
 
 export type ConceptSearchRunner = typeof conceptSearch;
@@ -457,9 +561,10 @@ async function runConceptSearchQueued(
   access: SourceAccess,
   infer: ConceptInferenceRunner,
   onProgress?: (progress: OperationProgress) => void,
+  options?: ConceptSearchOptions,
 ): Promise<ConceptSearchExecution> {
   return inferenceQueue
-    .run(() => runConceptSearch(input, access, infer, onProgress), access.signal)
+    .run(() => runConceptSearch(input, access, infer, onProgress, options), access.signal)
     .catch((error: unknown) => {
       if (access.signal?.aborted) throw abortError();
       throw error;
@@ -467,5 +572,6 @@ async function runConceptSearchQueued(
 }
 
 export function createConceptSearchRunner(infer: ConceptInferenceRunner): ConceptSearchRunner {
-  return (input, access, onProgress) => runConceptSearchQueued(input, access, infer, onProgress);
+  return (input, access, onProgress, options) =>
+    runConceptSearchQueued(input, access, infer, onProgress, options);
 }

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { AnalysisItem, AnalysisResultSet, CoverageStatus } from "./analysis-types.js";
 import type { ConceptSearchExecution } from "./concept-search.js";
 import {
+  conceptSourceSummary,
   ConceptSourceChangedError,
   verifyConceptSourceGeneration,
 } from "./concept-source-generation.js";
@@ -97,12 +98,16 @@ async function literalEvidence(
   rangesByPath: Map<string, ByteRange[]>;
   sourceCoverage: CoverageStatus;
   reasons: string[];
+  reusedDocuments: number;
+  loadedDocuments: number;
 }> {
   const documents = new Map<string, SourceDocument>();
   const unavailable = new Map<string, string>();
   const generatedDocuments = new Map(
     generation.documents.map((document) => [resolve(access.cwd, document.path), document]),
   );
+  let reusedDocuments = 0;
+  let loadedDocuments = 0;
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath)) continue;
     try {
@@ -111,6 +116,8 @@ async function literalEvidence(
       // files need a bounded inspection read.
       // oxlint-disable-next-line no-await-in-loop -- source reads share one bounded access budget.
       const document = generated ?? (await access.load(match.absolutePath));
+      if (generated) reusedDocuments += 1;
+      else loadedDocuments += 1;
       const expected = scan.sourceRevisions.get(match.absolutePath);
       if (!expected) {
         unavailable.set(match.absolutePath, "source revision metadata was unavailable");
@@ -173,6 +180,8 @@ async function literalEvidence(
     rangesByPath,
     sourceCoverage: unavailable.size ? "partial" : "complete",
     reasons,
+    reusedDocuments,
+    loadedDocuments,
   };
 }
 
@@ -292,6 +301,8 @@ export async function combineHybridSearch(
       conceptCandidatesOmitted,
       literalItemsRetained: literal.items.length,
       conceptItemsRetained: selectedConcept.length,
+      literalDocumentsReused: literal.reusedDocuments,
+      literalDocumentsLoaded: literal.loadedDocuments,
       ...(judgedConcept.semanticJudge
         ? {
             semanticJudgeCandidatesConsidered: judgedConcept.semanticJudge.candidatesConsidered,
@@ -306,11 +317,11 @@ export async function combineHybridSearch(
       crossSourceDeduplication: deduplicationCoverage,
       sourceInspection: literal.sourceCoverage,
       conceptSourceInspection: conceptSourceCoverage,
-      retention: "complete",
+      retention: concept.coverage?.retention ?? "complete",
     },
     ...(concept.stats ? { stats: concept.stats } : {}),
     ...(concept.redact !== undefined ? { redact: concept.redact } : {}),
-    ...(concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {}),
+    sourceGeneration: conceptSourceSummary(execution.sourceGeneration),
     ...(judgedConcept.semanticJudge ? { semanticJudge: judgedConcept.semanticJudge } : {}),
   };
 }

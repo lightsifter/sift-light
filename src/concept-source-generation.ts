@@ -1,5 +1,6 @@
 import { SiftlightError } from "./errors.js";
 import { createHash } from "node:crypto";
+import { MAX_STRUCTURE_FILES } from "./analysis-limits.js";
 import { SourceAccess, SourceBudgetError } from "./source-access.js";
 import {
   SourceDocumentError,
@@ -33,6 +34,9 @@ export interface ConceptSourceSummary {
   filesSkippedEmpty: number;
   filesSkippedBinary: number;
   filesUnavailable: number;
+  batches: number;
+  batchFileLimit: number;
+  fileLimit: number;
 }
 
 export interface ConceptSourceGeneration {
@@ -46,6 +50,10 @@ export interface ConceptSourceGeneration {
   readonly filesSkippedEmpty: number;
   readonly filesSkippedBinary: number;
   readonly filesUnavailable: number;
+  readonly filesAdmitted: number;
+  readonly batches: number;
+  readonly batchFileLimit: number;
+  readonly fileLimit: number;
   readonly startedAt: number;
   readonly inventoryHash: string;
   verifiedAt?: number;
@@ -79,8 +87,10 @@ function options(filters: ConceptSourceFilters): {
 export async function createConceptSourceGeneration(
   access: SourceAccess,
   filters: ConceptSourceFilters,
+  providedFiles?: WorkspaceFileList,
 ): Promise<ConceptSourceGeneration> {
-  const files = await listWorkspaceFiles(access.cwd, access.signal, options(filters));
+  const files =
+    providedFiles ?? (await listWorkspaceFiles(access.cwd, access.signal, options(filters)));
   const startedAt = Date.now();
   const inventory: ConceptSourceInventoryEntry[] = [];
   const documents: SourceDocument[] = [];
@@ -171,6 +181,10 @@ export async function createConceptSourceGeneration(
     filesSkippedEmpty,
     filesSkippedBinary,
     filesUnavailable,
+    filesAdmitted: documents.length,
+    batches: 1,
+    batchFileLimit: access.maxFiles,
+    fileLimit: access.maxFiles,
     startedAt,
     inventoryHash,
   };
@@ -183,10 +197,13 @@ export function conceptSourceSummary(generation: ConceptSourceGeneration): Conce
     startedAt: generation.startedAt,
     ...(generation.verifiedAt === undefined ? {} : { verifiedAt: generation.verifiedAt }),
     filesEnumerated: generation.files.paths.length,
-    filesAdmitted: generation.documents.length,
+    filesAdmitted: generation.filesAdmitted,
     filesSkippedEmpty: generation.filesSkippedEmpty,
     filesSkippedBinary: generation.filesSkippedBinary,
     filesUnavailable: generation.filesUnavailable,
+    batches: generation.batches,
+    batchFileLimit: generation.batchFileLimit,
+    fileLimit: generation.fileLimit,
   };
 }
 
@@ -200,7 +217,10 @@ export async function verifyConceptSourceGeneration(
   generation: ConceptSourceGeneration,
   access: SourceAccess,
 ): Promise<void> {
-  const current = await listWorkspaceFiles(access.cwd, access.signal, options(generation.filters));
+  const current = await listWorkspaceFiles(access.cwd, access.signal, {
+    ...options(generation.filters),
+    maxFiles: generation.fileLimit,
+  });
   if (
     current.coverageIssue !== undefined &&
     current.coverageIssue !== generation.files.coverageIssue
@@ -215,11 +235,18 @@ export async function verifyConceptSourceGeneration(
       "Concept source inventory changed while evidence was being computed",
     );
   }
+  let verificationAccess = access.batch(Math.min(generation.batchFileLimit, MAX_STRUCTURE_FILES));
+  let verifiedInBatch = 0;
   for (const entry of generation.inventory) {
     if (!entry.reference) continue;
+    if (verifiedInBatch >= verificationAccess.maxFiles) {
+      verificationAccess = access.batch(Math.min(generation.batchFileLimit, MAX_STRUCTURE_FILES));
+      verifiedInBatch = 0;
+    }
     try {
       // oxlint-disable-next-line no-await-in-loop -- every admitted file must be version-checked.
-      const document = await access.refresh(entry.path, entry.reference);
+      const document = await verificationAccess.refresh(entry.path, entry.reference);
+      verifiedInBatch += 1;
       const hash =
         document.reference.origin.kind === "worktree"
           ? document.reference.origin.contentHash

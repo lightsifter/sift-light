@@ -2088,7 +2088,7 @@ class SiftlightRuntime {
 }
 
 // src/service.ts
-import { createHash as createHash4 } from "crypto";
+import { createHash as createHash5 } from "crypto";
 
 // src/analysis-evidence.ts
 function sourceEvidence(document2, range) {
@@ -2171,13 +2171,12 @@ class OwnedTaskQueue {
 }
 
 // src/concept-search.ts
-import { dirname as dirname3 } from "path";
-import { join as join5 } from "path";
+import { dirname as dirname3, join as join5, resolve as resolve12 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { StringDecoder } from "string_decoder";
 import { mkdir as mkdir2 } from "fs/promises";
 import { rm as rm2 } from "fs/promises";
-import { randomUUID } from "crypto";
+import { createHash as createHash4, randomUUID } from "crypto";
 
 // src/concept-model.ts
 import { homedir as homedir2 } from "os";
@@ -2302,9 +2301,6 @@ function normalizeRequest(input) {
 // src/concept-source-generation.ts
 import { createHash as createHash3 } from "crypto";
 
-// src/source-access.ts
-import { extname as extname2, resolve as resolve11 } from "path";
-
 // src/analysis-limits.ts
 var MAX_STRUCTURE_FILES = 200;
 var MAX_CONFIGURABLE_STRUCTURE_FILES = 2000;
@@ -2331,6 +2327,9 @@ var MAX_IMPORT_HOPS = 8;
 var MAX_IMPORT_FILES = 20;
 var DEFAULT_HYBRID_CONCEPT_LIMIT = 3;
 var MAX_HYBRID_CONCEPT_LIMIT = 20;
+
+// src/source-access.ts
+import { extname as extname2, resolve as resolve11 } from "path";
 
 // src/historical-paths.ts
 import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "fs/promises";
@@ -4351,8 +4350,8 @@ class SourceAccess {
   #documents = new Map;
   #syntax = new Map;
   #maxVerificationBytes;
+  #budget;
   #bytes = 0;
-  #verificationBytes = 0;
   #syntaxParses = 0;
   #syntaxCacheHits = 0;
   #readTail = Promise.resolve();
@@ -4362,6 +4361,7 @@ class SourceAccess {
     this.signal = signal;
     this.#maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
     this.#maxVerificationBytes = options.maxVerificationBytes ?? MAX_STRUCTURE_BYTES;
+    this.#budget = options.budget ?? { readBytes: 0, verificationBytes: 0 };
   }
   get filesRead() {
     return this.#documents.size;
@@ -4382,6 +4382,13 @@ class SourceAccess {
     return new SourceAccess(this.cwd, this.#queue, signal, {
       maxFiles: this.#maxFiles,
       maxVerificationBytes: this.#maxVerificationBytes
+    });
+  }
+  batch(maxFiles) {
+    return new SourceAccess(this.cwd, this.#queue, this.signal, {
+      maxFiles,
+      maxVerificationBytes: this.#maxVerificationBytes,
+      budget: this.#budget
     });
   }
   async load(path, expected) {
@@ -4416,7 +4423,7 @@ class SourceAccess {
   }
   async#readOnce(path, expected, verification) {
     let document2;
-    const consumed = verification ? this.#verificationBytes : this.#bytes - this.#verificationBytes;
+    const consumed = verification ? this.#budget.verificationBytes : this.#budget.readBytes;
     const budget = verification ? this.#maxVerificationBytes : MAX_STRUCTURE_BYTES;
     const remaining = budget - consumed;
     if (remaining <= 0)
@@ -4438,8 +4445,10 @@ class SourceAccess {
     }
     this.#bytes += document2.bytes.length;
     if (verification)
-      this.#verificationBytes += document2.bytes.length;
-    else if (this.#bytes - this.#verificationBytes > MAX_STRUCTURE_BYTES)
+      this.#budget.verificationBytes += document2.bytes.length;
+    else
+      this.#budget.readBytes += document2.bytes.length;
+    if (!verification && this.#budget.readBytes > MAX_STRUCTURE_BYTES)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     return document2;
   }
@@ -4486,8 +4495,8 @@ function options(filters) {
     hidden: filters.hidden
   };
 }
-async function createConceptSourceGeneration(access, filters) {
-  const files = await listWorkspaceFiles(access.cwd, access.signal, options(filters));
+async function createConceptSourceGeneration(access, filters, providedFiles) {
+  const files = providedFiles ?? await listWorkspaceFiles(access.cwd, access.signal, options(filters));
   const startedAt = Date.now();
   const inventory = [];
   const documents = [];
@@ -4570,6 +4579,10 @@ async function createConceptSourceGeneration(access, filters) {
     filesSkippedEmpty,
     filesSkippedBinary,
     filesUnavailable,
+    filesAdmitted: documents.length,
+    batches: 1,
+    batchFileLimit: access.maxFiles,
+    fileLimit: access.maxFiles,
     startedAt,
     inventoryHash
   };
@@ -4581,10 +4594,13 @@ function conceptSourceSummary(generation) {
     startedAt: generation.startedAt,
     ...generation.verifiedAt === undefined ? {} : { verifiedAt: generation.verifiedAt },
     filesEnumerated: generation.files.paths.length,
-    filesAdmitted: generation.documents.length,
+    filesAdmitted: generation.filesAdmitted,
     filesSkippedEmpty: generation.filesSkippedEmpty,
     filesSkippedBinary: generation.filesSkippedBinary,
-    filesUnavailable: generation.filesUnavailable
+    filesUnavailable: generation.filesUnavailable,
+    batches: generation.batches,
+    batchFileLimit: generation.batchFileLimit,
+    fileLimit: generation.fileLimit
   };
 }
 function samePathSet(left, right) {
@@ -4593,18 +4609,28 @@ function samePathSet(left, right) {
   return left.every((path, index) => path === right[index]);
 }
 async function verifyConceptSourceGeneration(generation, access) {
-  const current = await listWorkspaceFiles(access.cwd, access.signal, options(generation.filters));
+  const current = await listWorkspaceFiles(access.cwd, access.signal, {
+    ...options(generation.filters),
+    maxFiles: generation.fileLimit
+  });
   if (current.coverageIssue !== undefined && current.coverageIssue !== generation.files.coverageIssue) {
     throw new SiftlightError(current.reasons.join("; "));
   }
   if (current.partial !== generation.files.partial || !samePathSet(current.paths, generation.files.paths)) {
     throw new ConceptSourceChangedError("Concept source inventory changed while evidence was being computed");
   }
+  let verificationAccess = access.batch(Math.min(generation.batchFileLimit, MAX_STRUCTURE_FILES));
+  let verifiedInBatch = 0;
   for (const entry of generation.inventory) {
     if (!entry.reference)
       continue;
+    if (verifiedInBatch >= verificationAccess.maxFiles) {
+      verificationAccess = access.batch(Math.min(generation.batchFileLimit, MAX_STRUCTURE_FILES));
+      verifiedInBatch = 0;
+    }
     try {
-      const document2 = await access.refresh(entry.path, entry.reference);
+      const document2 = await verificationAccess.refresh(entry.path, entry.reference);
+      verifiedInBatch += 1;
       const hash = document2.reference.origin.kind === "worktree" ? document2.reference.origin.contentHash : undefined;
       if (entry.contentHash !== hash)
         throw new ConceptSourceChangedError(`${entry.path}: source content changed`);
@@ -4623,7 +4649,6 @@ async function verifyConceptSourceGeneration(generation, access) {
 
 // src/concept-search.ts
 var inferenceQueue = new OwnedTaskQueue;
-var MAX_CONCEPT_FILES_WARN = 500;
 function conciseWorkerError(stderr) {
   const errorLine = stderr.split(/\r?\n/).map((line) => line.trim()).find((line) => /^(?:[A-Za-z_$][\w$]*Error|Error|error):\s*\S/i.test(line));
   if (errorLine)
@@ -4814,64 +4839,109 @@ function validateConceptQuery(query) {
     throw new SiftlightError("Concept query requires nonempty, single-line well-formed text of at most 256 characters");
   return query;
 }
-async function runConceptSearch(input, access, infer, onProgress) {
+async function runConceptSearch(input, access, infer, onProgress, options = {}) {
   const query = validateConceptQuery(input.query);
+  const retainPaths = options.retainPaths === undefined ? undefined : Promise.resolve(options.retainPaths);
   const started = performance.now();
   const request = normalizeRequest({ ...input, pattern: "" });
-  const sourceGeneration = await createConceptSourceGeneration(access, {
+  const filters = {
     ...request.path ? { path: request.path } : {},
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden
+  };
+  const files = await listWorkspaceFiles(access.cwd, access.signal, {
+    ...filters,
+    maxFiles: access.maxFiles
   });
-  onProgress?.({
-    phase: "source-generation",
-    completed: sourceGeneration.files.paths.length,
-    total: sourceGeneration.files.paths.length,
-    detail: `generation ${sourceGeneration.inventoryHash}; admitted ${String(sourceGeneration.documents.length)}, unavailable ${String(sourceGeneration.filesUnavailable)}`
-  });
-  const files = sourceGeneration.files;
+  const fileBatches = Array.from({ length: Math.ceil(files.paths.length / MAX_STRUCTURE_FILES) }, (_, index) => files.paths.slice(index * MAX_STRUCTURE_FILES, (index + 1) * MAX_STRUCTURE_FILES));
   const result = {
     kind: "concept",
     unit: "evidence-items",
     items: [],
-    partial: sourceGeneration.partial,
-    reasons: [...sourceGeneration.reasons],
+    partial: files.partial,
+    reasons: [...files.reasons],
     redact: input.redact ?? false
   };
-  const documents = [];
-  for (const document2 of sourceGeneration.documents)
-    documents.push({ document: document2, next: 0 });
-  const passages = [];
-  while (documents.some((item) => item.next < item.document.text.length)) {
-    for (const item of documents) {
-      if (item.next >= item.document.text.length)
-        continue;
-      const chunk = passage(item.document, item.next);
-      passages.push(chunk.value);
-      item.next = chunk.next;
+  const inventory = [];
+  const retainedDocuments = [];
+  const sourceReasons = [...files.reasons];
+  let sourcePartial = files.partial;
+  const allScores = [];
+  let filesAdmitted = 0;
+  let filesSkippedEmpty = 0;
+  let filesSkippedBinary = 0;
+  let filesUnavailable = 0;
+  let filesRead = 0;
+  let bytesRead = 0;
+  let passagesQueued = 0;
+  let conceptWindowsRanked = 0;
+  let conceptCacheHits = 0;
+  let conceptCacheMisses = 0;
+  let conceptCacheMaxBytes = 0;
+  let conceptCacheBytes;
+  let inferencePeakRssBytes = 0;
+  let retentionTruncated = false;
+  const generationStartedAt = Date.now();
+  for (const [batchIndex, paths] of fileBatches.entries()) {
+    const batchAccess = access.batch(paths.length);
+    const generation = await createConceptSourceGeneration(batchAccess, filters, {
+      paths,
+      partial: false,
+      reasons: []
+    });
+    inventory.push(...generation.inventory);
+    filesAdmitted += generation.filesAdmitted;
+    filesSkippedEmpty += generation.filesSkippedEmpty;
+    filesSkippedBinary += generation.filesSkippedBinary;
+    filesUnavailable += generation.filesUnavailable;
+    filesRead += batchAccess.filesRead;
+    bytesRead += batchAccess.bytesRead;
+    sourcePartial ||= generation.partial;
+    sourceReasons.push(...generation.reasons);
+    result.partial ||= generation.partial;
+    result.reasons.push(...generation.reasons);
+    onProgress?.({
+      phase: "source-generation",
+      completed: Math.min((batchIndex + 1) * MAX_STRUCTURE_FILES, files.paths.length),
+      total: files.paths.length,
+      detail: `batch ${String(batchIndex + 1)} of ${String(fileBatches.length)}; admitted ${String(filesAdmitted)}, unavailable ${String(filesUnavailable)}`
+    });
+    const documents = generation.documents.map((document2) => ({ document: document2, next: 0 }));
+    const passages = [];
+    while (documents.some((item) => item.next < item.document.text.length)) {
+      for (const item of documents) {
+        if (item.next >= item.document.text.length)
+          continue;
+        const chunk = passage(item.document, item.next);
+        passages.push(chunk.value);
+        item.next = chunk.next;
+      }
     }
-  }
-  onProgress?.({ phase: "passage-queue", completed: passages.length, total: passages.length });
-  const filesAdmitted = documents.length;
-  const filesSkippedEmpty = sourceGeneration.filesSkippedEmpty;
-  const filesSkippedBinary = sourceGeneration.filesSkippedBinary;
-  const filesUnavailable = sourceGeneration.filesUnavailable;
-  if (files.paths.length > MAX_CONCEPT_FILES_WARN) {
-    result.reasons.push(`Concept enumerated ${String(files.paths.length)} files; narrow path or glob for faster interactive retrieval`);
-  }
-  result.counts = {
-    filesEnumerated: files.paths.length,
-    filesAdmitted,
-    filesSkippedEmpty,
-    filesSkippedBinary,
-    filesUnavailable,
-    passagesQueued: passages.length
-  };
-  if (passages.length) {
+    passagesQueued += passages.length;
+    onProgress?.({
+      phase: "passage-queue",
+      completed: passagesQueued,
+      detail: `batch ${String(batchIndex + 1)} of ${String(fileBatches.length)}`
+    });
+    if (!passages.length)
+      continue;
     const inferred = await infer(query, passages, access.signal, onProgress);
+    const retainedPathSet = retainPaths === undefined ? undefined : await retainPaths;
+    for (const document2 of generation.documents) {
+      if (retainedPathSet?.has(resolve12(access.cwd, document2.path))) {
+        retainedDocuments.push(document2);
+      }
+    }
     result.reasons.push(...inferred.warnings);
-    result.items = passages.map((item, index) => {
+    allScores.push(...inferred.scores);
+    conceptWindowsRanked += inferred.windowsRanked;
+    conceptCacheHits += inferred.cacheHits;
+    conceptCacheMisses += inferred.cacheMisses;
+    conceptCacheMaxBytes = Math.max(conceptCacheMaxBytes, inferred.cacheMaxBytes);
+    conceptCacheBytes = inferred.cacheBytes ?? conceptCacheBytes;
+    inferencePeakRssBytes = Math.max(inferencePeakRssBytes, inferred.peakRssBytes);
+    const batchItems = passages.map((item, index) => {
       const similarity = inferred.scores[index];
       if (similarity === undefined)
         throw new Error("Missing concept similarity");
@@ -4895,20 +4965,59 @@ async function runConceptSearch(input, access, infer, onProgress) {
           excerptTruncated: evidence.excerptTruncated
         }
       };
-    }).toSorted((a, b) => b.details.score - a.details.score || a.path.localeCompare(b.path) || a.line - b.line);
+    });
+    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.score) - Number(a.details?.score) || a.path.localeCompare(b.path) || a.line - b.line);
+    if (ranked.length > MAX_ANALYSIS_RESULTS)
+      retentionTruncated = true;
+    result.items = ranked.slice(0, MAX_ANALYSIS_RESULTS);
+  }
+  if (retentionTruncated) {
+    result.partial = true;
+    result.reasons.push(`Concept ranking retained the top ${String(MAX_ANALYSIS_RESULTS)} candidates from ${String(passagesQueued)} passages`);
+  }
+  const sourceGeneration = {
+    cwd: access.cwd,
+    filters,
+    files,
+    inventory,
+    documents: retainedDocuments,
+    partial: sourcePartial,
+    reasons: [...new Set(sourceReasons)],
+    filesSkippedEmpty,
+    filesSkippedBinary,
+    filesUnavailable,
+    filesAdmitted,
+    batches: fileBatches.length,
+    batchFileLimit: MAX_STRUCTURE_FILES,
+    fileLimit: access.maxFiles,
+    startedAt: generationStartedAt,
+    inventoryHash: createHash4("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32)
+  };
+  result.counts = {
+    filesEnumerated: files.paths.length,
+    filesAdmitted,
+    filesSkippedEmpty,
+    filesSkippedBinary,
+    filesUnavailable,
+    passagesQueued,
+    batchesPlanned: fileBatches.length,
+    batchesCompleted: fileBatches.length,
+    batchFileLimit: MAX_STRUCTURE_FILES
+  };
+  if (allScores.length) {
     result.stats = {
-      inferencePeakRssBytes: inferred.peakRssBytes,
-      passagesRanked: passages.length,
-      conceptWindowsRanked: inferred.windowsRanked,
-      conceptCacheHits: inferred.cacheHits,
-      conceptCacheMisses: inferred.cacheMisses,
-      conceptCacheMaxBytes: inferred.cacheMaxBytes,
-      ...inferred.cacheBytes === undefined ? {} : { conceptCacheBytes: inferred.cacheBytes },
-      scoreProfile: scoreProfile(inferred.scores)
+      inferencePeakRssBytes,
+      passagesRanked: passagesQueued,
+      conceptWindowsRanked,
+      conceptCacheHits,
+      conceptCacheMisses,
+      conceptCacheMaxBytes,
+      ...conceptCacheBytes === undefined ? {} : { conceptCacheBytes },
+      scoreProfile: scoreProfile(allScores)
     };
   }
-  result.filesRead = access.filesRead;
-  result.bytesRead = access.bytesRead;
+  result.filesRead = filesRead;
+  result.bytesRead = bytesRead;
   result.stats = {
     ...result.stats,
     elapsedMs: Math.round(performance.now() - started),
@@ -4917,7 +5026,8 @@ async function runConceptSearch(input, access, infer, onProgress) {
   };
   result.coverage = {
     conceptCandidates: result.partial ? "partial" : "complete",
-    admissionPlan: result.partial ? "partial" : "complete",
+    admissionPlan: sourcePartial ? "partial" : "complete",
+    retention: retentionTruncated ? "partial" : "complete",
     compilerBindings: "not-applicable"
   };
   result.scope = {
@@ -4930,15 +5040,17 @@ async function runConceptSearch(input, access, infer, onProgress) {
     expandedToProjectRoot: false,
     assertion: request.path && request.path !== "." ? "requested-scope" : "project-wide"
   };
-  await verifyConceptSourceGeneration(sourceGeneration, access);
+  if (options.verifySourceGeneration !== false) {
+    await verifyConceptSourceGeneration(sourceGeneration, access);
+  }
   result.sourceGeneration = conceptSourceSummary(sourceGeneration);
   return { analysis: result, sourceGeneration };
 }
-function conceptSearch(input, access, onProgress) {
-  return runConceptSearchQueued(input, access, similarities, onProgress);
+function conceptSearch(input, access, onProgress, options) {
+  return runConceptSearchQueued(input, access, similarities, onProgress, options);
 }
-async function runConceptSearchQueued(input, access, infer, onProgress) {
-  return inferenceQueue.run(() => runConceptSearch(input, access, infer, onProgress), access.signal).catch((error) => {
+async function runConceptSearchQueued(input, access, infer, onProgress, options) {
+  return inferenceQueue.run(() => runConceptSearch(input, access, infer, onProgress, options), access.signal).catch((error) => {
     if (access.signal?.aborted)
       throw abortError();
     throw error;
@@ -5045,7 +5157,7 @@ async function structuralSearch(input, access) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname4, extname as extname3, resolve as resolve20 } from "path";
+import { dirname as dirname4, extname as extname3, resolve as resolve21 } from "path";
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "crypto";
@@ -5405,7 +5517,10 @@ class AnalysisStore {
       ...result,
       reasons: boundedReasons(result.reasons),
       items: [],
-      coverage: { ...result.coverage, retention: "complete" }
+      coverage: {
+        ...result.coverage,
+        retention: result.coverage?.retention ?? "complete"
+      }
     };
     let bytes = Buffer.byteLength(JSON.stringify(bounded));
     const candidates = result.items.map((item, index) => ({ item, index }));
@@ -5661,7 +5776,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
 }
 
 // src/inspect.ts
-import { resolve as resolve12 } from "path";
+import { resolve as resolve13 } from "path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -5688,7 +5803,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SiftlightError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve12(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve13(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -5710,7 +5825,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve13 } from "path";
+import { resolve as resolve14 } from "path";
 class CandidateLimit extends SiftlightError {
 }
 function record(value) {
@@ -5875,7 +5990,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve13(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve14(options.cwd, options.request.path), options.cwd)) {
     throw new SiftlightError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -5933,7 +6048,7 @@ async function collectEvidenceCandidates(options) {
 // src/import-model.ts
 import { posix } from "path";
 import { realpath as realpath4 } from "fs/promises";
-import { relative as relative7, resolve as resolve14 } from "path";
+import { relative as relative7, resolve as resolve15 } from "path";
 class NavigationFailure extends Error {
   reason;
   constructor(reason) {
@@ -6313,7 +6428,7 @@ class NavigationContext {
     const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map((path) => this.host.normalizePath?.(path) ?? navigationPath(path));
     const canonicalPaths = await Promise.all(normalizedPaths.map(async (normalized) => {
       try {
-        const target = await realpath4(resolve14(this.host.cwd, normalized));
+        const target = await realpath4(resolve15(this.host.cwd, normalized));
         const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative7(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
         return [normalized, canonical];
       } catch {
@@ -7381,10 +7496,10 @@ async function runOwnedParallel(start2, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve16, sep as sep4 } from "path";
+import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve17, sep as sep4 } from "path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve15 } from "path";
+import { resolve as resolve16 } from "path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -7395,7 +7510,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve15(cwd, path));
+      const revision = await getSourceRevision(resolve16(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -7457,8 +7572,8 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve16(cwd, root);
-  const absolutePath = resolve16(cwd, path);
+  const absoluteRoot = resolve17(cwd, root);
+  const absolutePath = resolve17(cwd, path);
   const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
@@ -7719,7 +7834,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve17 } from "path";
+import { resolve as resolve18 } from "path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -7794,7 +7909,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document2.utf8 && structure && document2.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document2.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve17(access.cwd, target.path),
+      absolutePath: resolve18(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document2.reference.origin.revision
@@ -7895,7 +8010,7 @@ function metadataStructure(details) {
 async function sourceDocumentIsCurrent(document2, access) {
   if (document2.reference.origin.kind !== "worktree")
     return true;
-  const current = await getSourceRevision(resolve17(access.cwd, document2.path));
+  const current = await getSourceRevision(resolve18(access.cwd, document2.path));
   return current !== undefined && sameSourceRevision(current, document2.reference.origin.revision);
 }
 async function inspectDocumentsMetadata(targets, access, structure) {
@@ -8114,7 +8229,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve17(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve18(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -8209,7 +8324,7 @@ async function continueSource(cursor, access, continuations) {
 
 // src/evidence-validation.ts
 import { realpath as realpath5, stat as stat3 } from "fs/promises";
-import { resolve as resolve18 } from "path";
+import { resolve as resolve19 } from "path";
 
 // src/evidence-validity.ts
 function aggregateEvidenceValidity(sources) {
@@ -8242,7 +8357,7 @@ function policyFailure(error) {
   return error instanceof SiftlightError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
 }
 async function confirmWorktreeState(path, cwd, signal) {
-  const absolute = resolve18(cwd, path);
+  const absolute = resolve19(cwd, path);
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
@@ -8384,7 +8499,7 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
   if (!target.revision)
     throw new Error("Snapshot validation target omitted its revision");
   try {
-    const absolute = resolve18(cwd, target.path);
+    const absolute = resolve19(cwd, target.path);
     const canonical = await policy.resolveExistingPath(absolute);
     if (!canonical) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
@@ -8476,14 +8591,14 @@ function evidenceScope(cwd, scope, request) {
   const exclude = scope?.exclude ?? request?.exclude;
   const hidden = scope?.hidden ?? request?.hidden;
   return {
-    root: resolve18(cwd, path),
+    root: resolve19(cwd, path),
     ...include && include.length > 0 ? { include: [...include] } : {},
     ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
     ...hidden === undefined ? {} : { hidden }
   };
 }
 async function validateSavedEvidence(options) {
-  let scope = { root: resolve18(options.cwd) };
+  let scope = { root: resolve19(options.cwd) };
   const reasons = [];
   let storedPartial = false;
   let targets;
@@ -9048,7 +9163,7 @@ function parsePythonOutline(document2) {
 }
 
 // src/hybrid-search.ts
-import { resolve as resolve19 } from "path";
+import { resolve as resolve20 } from "path";
 
 // src/semantic-judge-batches.ts
 var MAX_SEMANTIC_JUDGE_BATCH_CANDIDATES = 8;
@@ -9536,13 +9651,19 @@ function absoluteOccurrenceRanges(document2, line, match) {
 async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
-  const generatedDocuments = new Map(generation.documents.map((document2) => [resolve19(access.cwd, document2.path), document2]));
+  const generatedDocuments = new Map(generation.documents.map((document2) => [resolve20(access.cwd, document2.path), document2]));
+  let reusedDocuments = 0;
+  let loadedDocuments = 0;
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const generated = generatedDocuments.get(resolve19(access.cwd, match.absolutePath));
+      const generated = generatedDocuments.get(resolve20(access.cwd, match.absolutePath));
       const document2 = generated ?? await access.load(match.absolutePath);
+      if (generated)
+        reusedDocuments += 1;
+      else
+        loadedDocuments += 1;
       const expected = scan.sourceRevisions.get(match.absolutePath);
       if (!expected) {
         unavailable.set(match.absolutePath, "source revision metadata was unavailable");
@@ -9599,7 +9720,9 @@ async function literalEvidence(scan, access, generation) {
     items,
     rangesByPath,
     sourceCoverage: unavailable.size ? "partial" : "complete",
-    reasons
+    reasons,
+    reusedDocuments,
+    loadedDocuments
   };
 }
 function isLiteralOverlap(item, rangesByPath) {
@@ -9685,6 +9808,8 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
       conceptCandidatesOmitted,
       literalItemsRetained: literal.items.length,
       conceptItemsRetained: selectedConcept.length,
+      literalDocumentsReused: literal.reusedDocuments,
+      literalDocumentsLoaded: literal.loadedDocuments,
       ...judgedConcept.semanticJudge ? {
         semanticJudgeCandidatesConsidered: judgedConcept.semanticJudge.candidatesConsidered,
         semanticJudgeCandidatesJudged: judgedConcept.semanticJudge.judgedCandidates
@@ -9697,11 +9822,11 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
       crossSourceDeduplication: deduplicationCoverage,
       sourceInspection: literal.sourceCoverage,
       conceptSourceInspection: conceptSourceCoverage,
-      retention: "complete"
+      retention: concept.coverage?.retention ?? "complete"
     },
     ...concept.stats ? { stats: concept.stats } : {},
     ...concept.redact !== undefined ? { redact: concept.redact } : {},
-    ...concept.sourceGeneration ? { sourceGeneration: concept.sourceGeneration } : {},
+    sourceGeneration: conceptSourceSummary(execution.sourceGeneration),
     ...judgedConcept.semanticJudge ? { semanticJudge: judgedConcept.semanticJudge } : {}
   };
 }
@@ -9955,8 +10080,8 @@ var MODE_FIELDS_BY_MODE = {
   ],
   files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
-  concept: [...commonFields, "query", ...sourceFilters],
-  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit"],
+  concept: [...commonFields, "query", ...sourceFilters, "maxFilesToParse"],
+  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit", "maxFilesToParse"],
   validate: [...commonFields, "cursor", "matchIndex"],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
@@ -9995,7 +10120,8 @@ var REQUEST_FIELD_GUIDANCE = {
   limit: "limit is an output/page budget and is never silently dropped",
   scope: "scope applies to ordinary content search; mode=files rejects this field because its scope is fixed strict, and only redundant strict may be removed",
   ignorePolicy: "respect keeps repository ignore rules; include searches ignored files but always excludes .git internals and protected paths",
-  patterns: "audit accepts named exact-literal patterns and returns one closure receipt"
+  patterns: "audit accepts named exact-literal patterns and returns one closure receipt",
+  maxFilesToParse: "concept/hybrid automatically batch the requested scope; this optional field sets an advanced hard file ceiling"
 };
 function fieldGuidance(field) {
   return REQUEST_FIELD_GUIDANCE[field] ?? `${field} is accepted only by its cataloged modes`;
@@ -10313,8 +10439,8 @@ import { realpath as realpath6 } from "fs/promises";
 function isEvidenceRequest(input) {
   return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
-function maxFilesToParse(value) {
-  const candidate = value ?? MAX_STRUCTURE_FILES;
+function maxFilesToParse(value, defaultValue = MAX_STRUCTURE_FILES) {
+  const candidate = value ?? defaultValue;
   if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > MAX_CONFIGURABLE_STRUCTURE_FILES) {
     throw new SiftlightError(`maxFilesToParse must be an integer from 1 through ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}`);
   }
@@ -10385,11 +10511,11 @@ function searchScope(request) {
   };
 }
 async function navigationRoot(cwd, path, signal) {
-  const absolute = resolve20(cwd, path);
+  const absolute = resolve21(cwd, path);
   const repository = await findGitRepository(dirname4(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve20(cwd) : dirname4(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve21(cwd) : dirname4(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -10402,8 +10528,8 @@ function navigationFilters(input) {
 }
 async function navigationScope(cwd, root, requestedPath, filters) {
   const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath6(resolve20(cwd)).catch(() => resolve20(cwd)),
-    realpath6(root).catch(() => resolve20(root))
+    realpath6(resolve21(cwd)).catch(() => resolve21(cwd)),
+    realpath6(root).catch(() => resolve21(root))
   ]);
   const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
@@ -10418,13 +10544,13 @@ async function navigationScope(cwd, root, requestedPath, filters) {
   };
 }
 async function canonicalNavigationPath(path) {
-  return realpath6(path).catch(() => resolve20(path));
+  return realpath6(path).catch(() => resolve21(path));
 }
 async function canonicalNavigationFiles(cwd, root, files, primaryPath) {
   const canonicalRoot = await canonicalNavigationPath(root);
   const [enumerated, canonicalPrimary] = await Promise.all([
-    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve20(cwd, file)))),
-    canonicalNavigationPath(resolve20(cwd, primaryPath))
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve21(cwd, file)))),
+    canonicalNavigationPath(resolve21(cwd, primaryPath))
   ]);
   const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
   if (isPathInsideRoot(canonicalPrimary, canonicalRoot))
@@ -10517,7 +10643,8 @@ class EvidenceService {
     if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
       throw new SiftlightError("modifiedAfter and modifiedBefore apply to worktree searches and cannot be combined with changes");
     const analysisStarted = performance.now();
-    const fileLimit = maxFilesToParse(input.maxFilesToParse);
+    const automaticConceptLimit = input.mode === "concept" || input.mode === "hybrid" ? MAX_CONFIGURABLE_STRUCTURE_FILES : MAX_STRUCTURE_FILES;
+    const fileLimit = maxFilesToParse(input.maxFilesToParse, automaticConceptLimit);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
     if (input.mode === "validate")
       return this.#validateSavedEvidence(input, cwd, signal);
@@ -10555,13 +10682,22 @@ class EvidenceService {
       let conceptFailure;
       options.onProgress?.({ phase: "literal-search" });
       await runOwnedParallel((groupSignal) => {
-        conceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
+        const ownedConceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, {
+          maxFiles: fileLimit
+        });
+        conceptAccess = ownedConceptAccess;
+        const literalOperation = this.#runner(literalRequest, cwd, groupSignal).then((result) => {
+          literalResult = result;
+          return new Set(result.matches.map((match) => resolve21(match.absolutePath)));
+        });
         return [
-          this.#runner(literalRequest, cwd, groupSignal).then((result) => {
-            literalResult = result;
+          literalOperation.then(() => {
             return;
           }),
-          this.#conceptSearch(input, conceptAccess, options.onProgress).then((result) => {
+          this.#conceptSearch(input, ownedConceptAccess, options.onProgress, {
+            retainPaths: literalOperation,
+            verifySourceGeneration: false
+          }).then((result) => {
             conceptResult = result;
             return;
           }).catch((error) => {
@@ -10584,8 +10720,7 @@ class EvidenceService {
       if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
         throw new HybridSourceChangedError("Literal source evidence changed while concept evidence was being computed");
       }
-      const literalAccess = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
-      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, literalAccess, limit, query, this.#semanticJudge, signal);
+      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, conceptAccess, limit, query, this.#semanticJudge, signal);
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
@@ -10995,7 +11130,7 @@ class EvidenceService {
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = await canonicalNavigationPath(resolve20(access.cwd, file));
+        const absolutePath = await canonicalNavigationPath(resolve21(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SiftlightError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -11037,7 +11172,7 @@ class EvidenceService {
 }
 
 // src/service.ts
-import { resolve as resolve23 } from "path";
+import { resolve as resolve24 } from "path";
 
 // src/discovery-errors.ts
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
@@ -12045,7 +12180,7 @@ function operationOutcome(outcome, mode) {
 }
 
 // src/audit-search.ts
-import { resolve as resolve21 } from "path";
+import { resolve as resolve22 } from "path";
 var MAX_AUDIT_PATTERNS = 32;
 var MAX_AUDIT_CHANGED_FILES = 20;
 var MAX_AUDIT_EVIDENCE = 3;
@@ -12078,7 +12213,7 @@ async function revisionsFor(cwd, paths, signal) {
       throw signal.reason;
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve21(cwd, path), () => unavailable.push(path));
+      const revision = await getSourceRevision(resolve22(cwd, path), () => unavailable.push(path));
       if (revision)
         revisions.set(path, revision);
     }));
@@ -12319,7 +12454,7 @@ async function runAuditSearch(input, cwd, runRipgrep, signal) {
 }
 
 // src/language-capabilities.ts
-import { resolve as resolve22 } from "path";
+import { resolve as resolve23 } from "path";
 function normalizeLists(values) {
   return values === undefined ? [] : [...values];
 }
@@ -12372,7 +12507,7 @@ class LanguageCapabilityCatalog {
       ...new Map(entries.flatMap((entry) => this.descriptor(entry.language)?.capabilities ?? []).map((capability) => [capability.id, capability])).values()
     ];
     return {
-      root: resolve22(request.cwd),
+      root: resolve23(request.cwd),
       ...path ? { path } : {},
       partial: files.partial,
       reasons: files.reasons,
@@ -12451,14 +12586,14 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SiftlightError("Cursor paths cannot be empty");
-    const absolutePath = resolve23(cwd, label);
+    const absolutePath = resolve24(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash4("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash5("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails2(snapshot, mode) {
@@ -12704,7 +12839,7 @@ class SiftlightService {
       throw new SiftlightError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
-    if (resolve23(cwd) !== resolve23(existing.metadata.cwd))
+    if (resolve24(cwd) !== resolve24(existing.metadata.cwd))
       throw new SiftlightError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
@@ -16090,7 +16225,7 @@ function renderSiftlightResult(result, options, locale, theme) {
 }
 
 // src/search-policy-recovery.ts
-import { isAbsolute as isAbsolute6, relative as relative9, resolve as resolve24, sep as sep5 } from "path";
+import { isAbsolute as isAbsolute6, relative as relative9, resolve as resolve25, sep as sep5 } from "path";
 var CONTENT_MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
 var FILE_MANUAL_REASON = "the command is not a plain `find <root> -type f` enumeration, so depth limits, multiple or case-insensitive name predicates, extra tests and other actions cannot be expressed as one files request with the same scope";
 function manual(kind) {
@@ -16368,8 +16503,8 @@ function recoverFileEnumeration(argv, language, workingDirectory) {
     return manual("files");
   if (hasNormalizationSensitivePath(parsed.root))
     return manual("files");
-  const base = resolve24(workingDirectory);
-  const path = resolve24(base, parsed.root);
+  const base = resolve25(workingDirectory);
+  const path = resolve25(base, parsed.root);
   const localPath = relative9(base, path);
   if (isAbsolute6(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
     return manual("files");
@@ -16414,8 +16549,8 @@ function recoverShellSearch(command, match, workingDirectory) {
     return manual(match.kind);
   if (hasNormalizationSensitivePath(parsed.path))
     return manual(match.kind);
-  const base = resolve24(workingDirectory);
-  const path = resolve24(base, parsed.path);
+  const base = resolve25(workingDirectory);
+  const path = resolve25(base, parsed.path);
   const localPath = relative9(base, path);
   if (isAbsolute6(localPath) || localPath === ".." || localPath.startsWith(`..${sep5}`))
     return manual(match.kind);
@@ -20516,7 +20651,7 @@ var siftlightSchema = _Object_({
   maxFilesToParse: Optional(Integer({
     minimum: 1,
     maximum: MAX_CONFIGURABLE_STRUCTURE_FILES,
-    description: `Maximum source files parsed by one structural analysis request (default 200, max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Candidate discovery still searches the full requested scope.`
+    description: `Advanced hard ceiling for source files admitted by one analysis request (max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Concept and hybrid automatically process the requested scope in bounded batches when omitted; other structural modes default to 200. Candidate discovery still searches the full requested scope.`
   })),
   conceptLimit: Optional(Integer({
     minimum: 1,
