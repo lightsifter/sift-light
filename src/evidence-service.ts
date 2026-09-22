@@ -1,0 +1,1047 @@
+import {
+  conceptSearch,
+  type ConceptSearchExecution,
+  type ConceptSearchRunner,
+  validateConceptQuery,
+} from "./concept-search.js";
+import { structuralSearch } from "./structural-search.js";
+import { dirname, extname, resolve } from "node:path";
+import { AnalysisStore } from "./analysis-store.js";
+import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
+import { abortError, CursorError, SiftLightError } from "./errors.js";
+import { findGitRepository } from "./git-repository.js";
+import { isPathInsideCwd, isPathInsideRoot } from "./path-policy.js";
+import { resolveInspectionTarget } from "./inspect.js";
+import {
+  collectEvidenceCandidates,
+  type EvidenceCandidateFile,
+  type EvidenceCandidates,
+} from "./evidence-candidates.js";
+import { listWorkspaceFiles, workspaceRelativePath } from "./workspace-files.js";
+import { navigateImports } from "./import-navigation.js";
+import { findRelatedTests, isLikelyTestPath, TEST_DISCOVERY_PATTERN } from "./test-navigation.js";
+import { escapeRegexLiteral, literalOccurrences } from "./literal-search.js";
+import {
+  expandMultiTermCandidates,
+  retainedTermCounts,
+  validateAnyOf,
+} from "./multi-term-search.js";
+import { normalizeRequest } from "./request.js";
+import { runOwnedParallel } from "./owned-parallel.js";
+import { discoverFiles } from "./file-discovery.js";
+import type { RipgrepRunner } from "./rg.js";
+import type { SiftLightInput } from "./service.js";
+import type { SnapshotStore } from "./snapshot-store.js";
+import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js";
+import { SourceContinuations } from "./source-continuations.js";
+import { type ByteRange, type SourceDocument, type SourceReference } from "./source-document.js";
+import {
+  continueSource,
+  inspectDocuments,
+  matchInspectionTarget,
+  inspectDocumentsMetadata,
+  type SourceInspectionTarget,
+} from "./source-inspection.js";
+import { validateSavedEvidence } from "./evidence-validation.js";
+import { sameSourceRevision } from "./source.js";
+import type { CodeStructureProvider } from "./structure.js";
+import { filterRoleOccurrences, findFunctionConjunctions } from "./syntax-search.js";
+import { syntaxLanguage } from "./syntax.js";
+import { parsePythonOutline } from "./python-outline.js";
+import {
+  combineHybridSearch,
+  hybridConceptLimit,
+  retainedHybridCounts,
+  sameHybridLiteralScan,
+  HybridSourceChangedError,
+} from "./hybrid-search.js";
+import { validationResult } from "./validation-output.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
+import { outlineCapabilityError } from "./request-contract.js";
+import { realpath } from "node:fs/promises";
+import type { SemanticJudgeIntegration } from "./semantic-judge.js";
+import {
+  MAX_ANY_OF_TERMS,
+  MAX_CONFIGURABLE_STRUCTURE_FILES,
+  MAX_STRUCTURE_FILES,
+} from "./analysis-limits.js";
+import {
+  MAX_INSPECT_TARGETS,
+  type SearchRequest,
+  type SearchScopeDetails,
+  type SiftLightResult,
+} from "./types.js";
+
+export function isEvidenceRequest(input: SiftLightInput): boolean {
+  return (
+    input.mode === "concept" ||
+    input.mode === "hybrid" ||
+    input.mode === "structure" ||
+    input.mode === "files" ||
+    input.mode === "inspect" ||
+    input.mode === "outline" ||
+    input.mode === "imports" ||
+    input.mode === "tests" ||
+    input.mode === "validate" ||
+    input.sourceCursor !== undefined ||
+    input.anyOf !== undefined ||
+    input.allOf !== undefined ||
+    input.within !== undefined ||
+    input.roles !== undefined ||
+    input.changes !== undefined ||
+    input.symbol !== undefined ||
+    input.conceptLimit !== undefined ||
+    (input.cursor?.includes(".analysis") ?? false)
+  );
+}
+
+export interface EvidenceSearchOptions {
+  modelOutput?: boolean;
+  onProgress?: (progress: OperationProgress) => void;
+}
+
+function maxFilesToParse(value: number | undefined, defaultValue = MAX_STRUCTURE_FILES): number {
+  const candidate = value ?? defaultValue;
+  if (
+    !Number.isSafeInteger(candidate) ||
+    candidate < 1 ||
+    candidate > MAX_CONFIGURABLE_STRUCTURE_FILES
+  ) {
+    throw new SiftLightError(
+      `maxFilesToParse must be an integer from 1 through ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}`,
+    );
+  }
+  return candidate;
+}
+
+function validateTerms(input: SiftLightInput): string[] | undefined {
+  const terms = input.allOf;
+  if (terms === undefined) {
+    if (input.within !== undefined) {
+      throw new SiftLightError(
+        "within is only valid with allOf; omit within for ordinary single-pattern searches",
+      );
+    }
+    return undefined;
+  }
+  if (
+    !Array.isArray(terms) ||
+    terms.length < 2 ||
+    terms.length > 3 ||
+    terms.some((term) => typeof term !== "string" || !term.trim() || /[\r\n\0]/.test(term)) ||
+    new Set(terms).size !== terms.length
+  )
+    throw new SiftLightError("allOf requires 2–3 distinct, nonempty, single-line literal terms");
+  if (
+    input.pattern !== undefined ||
+    input.roles !== undefined ||
+    input.literal !== undefined ||
+    input.ignoreCase !== undefined ||
+    input.wholeWord !== undefined
+  )
+    throw new SiftLightError(
+      "allOf is an explicit case-sensitive literal conjunction; omit pattern, roles, literal and ignoreCase",
+    );
+  if (input.within !== undefined && input.within !== "file" && input.within !== "function")
+    throw new SiftLightError("within must be file or function");
+  return terms;
+}
+function fileConjunction(
+  document: SourceDocument,
+  terms: string[],
+  allowed?: ByteRange[],
+): AnalysisItem | undefined {
+  const evidence = terms.map((term) => ({
+    term,
+    ranges: literalOccurrences(document, term, allowed),
+  }));
+  if (evidence.some((item) => !item.ranges.length)) return undefined;
+  const first = evidence[0]?.ranges[0];
+  if (!first) throw new Error("Conjunction evidence unavailable");
+  return {
+    path: document.path,
+    line: document.lineAt(first.start),
+    label: "All terms occur in this file; no cross-file or execution-path claim",
+    source: document.reference,
+    range: first,
+    details: {
+      terms: evidence.map((item) => ({
+        term: item.term,
+        occurrences: item.ranges.length,
+        evidence: item.ranges.slice(0, 3).map((range) => ({
+          start: range.start,
+          end: range.end,
+          line: document.lineAt(range.start),
+          text: document.slice(document.lineRange(document.lineAt(range.start))).slice(0, 500),
+        })),
+      })),
+      scope: allowed ? "changed-lines" : "file",
+      unit: "files",
+    },
+  };
+}
+
+function searchScope(request: SearchRequest): SearchScopeDetails {
+  const path = request.path ?? ".";
+  const requestedPath = request.expandedFromPath ?? path;
+  return {
+    path,
+    requestedPath,
+    glob: [...request.glob],
+    exclude: [...request.exclude],
+    hidden: request.hidden,
+    ignorePolicy: request.ignorePolicy ?? "respect",
+    expandedToProjectRoot: request.expandedFromPath !== undefined,
+    assertion: path === "." ? "project-wide" : "requested-scope",
+    ...(request.modifiedAfterMs !== undefined ? { modifiedAfterMs: request.modifiedAfterMs } : {}),
+    ...(request.modifiedBeforeMs !== undefined
+      ? { modifiedBeforeMs: request.modifiedBeforeMs }
+      : {}),
+  };
+}
+
+async function navigationRoot(cwd: string, path: string, signal?: AbortSignal): Promise<string> {
+  const absolute = resolve(cwd, path);
+  const repository = await findGitRepository(dirname(absolute), signal);
+  if (repository) return repository;
+  return isPathInsideCwd(absolute, cwd) ? resolve(cwd) : dirname(absolute);
+}
+
+type NavigationFilters = Pick<SearchRequest, "glob" | "exclude" | "hidden">;
+
+function navigationFilters(input: SiftLightInput): NavigationFilters {
+  const request = normalizeRequest({
+    pattern: "",
+    ...(input.glob !== undefined ? { glob: input.glob } : {}),
+    ...(input.exclude !== undefined ? { exclude: input.exclude } : {}),
+    ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+  });
+  return { glob: request.glob, exclude: request.exclude, hidden: request.hidden };
+}
+
+async function navigationScope(
+  cwd: string,
+  root: string,
+  requestedPath: string,
+  filters: NavigationFilters,
+): Promise<SearchScopeDetails> {
+  const [canonicalCwd, canonicalRoot] = await Promise.all([
+    realpath(resolve(cwd)).catch(() => resolve(cwd)),
+    realpath(root).catch(() => resolve(root)),
+  ]);
+  const isProjectRoot = canonicalRoot === canonicalCwd;
+  return {
+    path: isProjectRoot ? "." : canonicalRoot,
+    requestedPath,
+    glob: [...filters.glob],
+    exclude: [...filters.exclude],
+    hidden: filters.hidden,
+    ignorePolicy: "respect",
+    expandedToProjectRoot: false,
+    assertion: isProjectRoot ? "project-wide" : "requested-scope",
+  };
+}
+
+async function canonicalNavigationPath(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
+
+async function canonicalNavigationFiles(
+  cwd: string,
+  root: string,
+  files: { paths: readonly string[] },
+  primaryPath: string,
+): Promise<{ allowed: ReadonlySet<string>; primaryPath: string }> {
+  const canonicalRoot = await canonicalNavigationPath(root);
+  const [enumerated, canonicalPrimary] = await Promise.all([
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve(cwd, file)))),
+    canonicalNavigationPath(resolve(cwd, primaryPath)),
+  ]);
+  const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
+  if (isPathInsideRoot(canonicalPrimary, canonicalRoot)) allowed.add(canonicalPrimary);
+  return { allowed, primaryPath: canonicalPrimary };
+}
+
+export class EvidenceService {
+  readonly #runner: RipgrepRunner;
+  readonly #snapshots: SnapshotStore;
+  readonly #structure: CodeStructureProvider | undefined;
+  readonly #conceptSearch: ConceptSearchRunner;
+  readonly #semanticJudge: SemanticJudgeIntegration | undefined;
+  readonly #queue = new SyntaxQueue();
+  readonly #analyses = new AnalysisStore();
+  readonly #continuations = new SourceContinuations();
+  constructor(
+    runner: RipgrepRunner,
+    snapshots: SnapshotStore,
+    structure?: CodeStructureProvider,
+    runConceptSearch: ConceptSearchRunner = conceptSearch,
+    semanticJudge?: SemanticJudgeIntegration,
+  ) {
+    this.#runner = runner;
+    this.#snapshots = snapshots;
+    this.#structure = structure;
+    this.#conceptSearch = runConceptSearch;
+    this.#semanticJudge = semanticJudge;
+  }
+  clear(): void {
+    this.#analyses.clear();
+    this.#continuations.clear();
+    this.#queue.clear();
+  }
+  async shutdown(): Promise<void> {
+    this.clear();
+    await this.#queue.shutdown();
+  }
+
+  async #validateSavedEvidence(
+    input: SiftLightInput,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<SiftLightResult> {
+    const cursor = input.cursor;
+    if (!cursor) throw new SiftLightError("A saved evidence cursor is required");
+    const startedAt = Date.now();
+    const validated = await validateSavedEvidence({
+      cursor,
+      cwd,
+      ...(signal ? { signal } : {}),
+      ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
+      analyses: this.#analyses,
+      snapshots: this.#snapshots,
+      queue: this.#queue,
+      maxFiles: MAX_STRUCTURE_FILES,
+    });
+    const finishedAt = Date.now();
+    return validationResult(validated, cursor, {
+      start: startedAt,
+      end: finishedAt,
+      ...(input.matchIndex !== undefined ? { selected: input.matchIndex } : {}),
+    });
+  }
+
+  async #testEntryPaths(
+    root: string,
+    files: readonly string[],
+    cwd: string,
+    filters: NavigationFilters,
+    signal?: AbortSignal,
+  ): Promise<string[]> {
+    const sourceGlobs = ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"];
+    const request = normalizeRequest({
+      pattern: TEST_DISCOVERY_PATTERN,
+      path: root,
+      glob: filters.glob.length ? filters.glob : sourceGlobs,
+      exclude: filters.exclude,
+      hidden: filters.hidden,
+      ignoreCase: false,
+    });
+    const scan = await this.#runner(request, cwd, signal);
+    const contentCandidates = new Set(scan.fileCounts.keys());
+    return files.filter(
+      (path) => isLikelyTestPath(path) || contentCandidates.has(workspaceRelativePath(cwd, path)),
+    );
+  }
+
+  async #candidates(
+    request: SearchRequest,
+    input: SiftLightInput,
+    access: SourceAccess,
+  ): Promise<{ candidates: EvidenceCandidates; request: SearchRequest }> {
+    const collect = (candidateRequest: SearchRequest) =>
+      collectEvidenceCandidates({
+        request: candidateRequest,
+        ...(input.changes ? { changes: input.changes } : {}),
+        cwd: access.cwd,
+        ...(access.signal ? { signal: access.signal } : {}),
+        access,
+        runRipgrep: this.#runner,
+        maxFiles: access.maxFiles,
+      });
+    const candidates = await collect(request);
+    if (
+      input.changes ||
+      request.scope === "strict" ||
+      request.path === undefined ||
+      candidates.files.length > 0 ||
+      candidates.partial
+    ) {
+      return { candidates, request };
+    }
+    const { path: requestedPath, ...projectRequest } = request;
+    const expandedRequest = { ...projectRequest, expandedFromPath: requestedPath };
+    return { candidates: await collect(expandedRequest), request: expandedRequest };
+  }
+
+  async search(
+    input: SiftLightInput,
+    cwd: string,
+    signal?: AbortSignal,
+    options: EvidenceSearchOptions = {},
+  ): Promise<SiftLightResult> {
+    if (signal?.aborted) throw abortError();
+    if (input.changes && (input.modifiedAfter !== undefined || input.modifiedBefore !== undefined))
+      throw new SiftLightError(
+        "modifiedAfter and modifiedBefore apply to worktree searches and cannot be combined with changes",
+      );
+    const analysisStarted = performance.now();
+    const automaticConceptLimit =
+      input.mode === "concept" || input.mode === "hybrid"
+        ? MAX_CONFIGURABLE_STRUCTURE_FILES
+        : MAX_STRUCTURE_FILES;
+    const fileLimit = maxFilesToParse(input.maxFilesToParse, automaticConceptLimit);
+    const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
+    if (input.mode === "validate") return this.#validateSavedEvidence(input, cwd, signal);
+    if (input.sourceCursor !== undefined) {
+      if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
+        throw new CursorError("A nonempty sourceCursor is required");
+      if (input.mode !== "inspect") throw new SiftLightError("sourceCursor requires mode=inspect");
+      return continueSource(input.sourceCursor, access, this.#continuations);
+    }
+    if (input.mode === "inspect") {
+      const targets = this.#inspectionTargets(input, cwd);
+      return targets.some((target) => target.range !== undefined)
+        ? inspectDocumentsMetadata(targets, access, this.#structure)
+        : inspectDocuments(targets, access, this.#continuations, this.#structure);
+    }
+    if (input.mode === "concept") {
+      const execution = await this.#conceptSearch(input, access, options.onProgress);
+      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+    }
+    if (input.mode === "hybrid") {
+      const query = validateConceptQuery(input.query);
+      const limit = hybridConceptLimit(input.conceptLimit);
+      const literalRequest = normalizeRequest({
+        pattern: query,
+        ...(input.path !== undefined ? { path: input.path } : {}),
+        ...(input.glob !== undefined ? { glob: input.glob } : {}),
+        ...(input.exclude !== undefined ? { exclude: input.exclude } : {}),
+        ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+        literal: true,
+        scope: "strict",
+        redact: input.redact ?? false,
+      });
+      let literalResult: Awaited<ReturnType<RipgrepRunner>> | undefined;
+      let conceptResult: ConceptSearchExecution | undefined;
+      let conceptAccess: SourceAccess | undefined;
+      let conceptFailure: unknown;
+      options.onProgress?.({ phase: "literal-search" });
+      await runOwnedParallel<void>((groupSignal) => {
+        const ownedConceptAccess = new SourceAccess(cwd, this.#queue, groupSignal, {
+          maxFiles: fileLimit,
+        });
+        conceptAccess = ownedConceptAccess;
+        const literalOperation = this.#runner(literalRequest, cwd, groupSignal).then((result) => {
+          literalResult = result;
+          return new Set(result.matches.map((match) => resolve(match.absolutePath)));
+        });
+        return [
+          literalOperation.then(() => undefined),
+          this.#conceptSearch(input, ownedConceptAccess, options.onProgress, {
+            retainPaths: literalOperation,
+            verifySourceGeneration: false,
+          })
+            .then((result) => {
+              conceptResult = result;
+              return undefined;
+            })
+            .catch((error: unknown) => {
+              if (signal?.aborted || groupSignal.aborted) throw error;
+              conceptFailure = error;
+              return undefined;
+            }),
+        ];
+      }, signal);
+      if (!literalResult || !conceptAccess)
+        throw new Error("Hybrid search did not settle its owned literal operation");
+      if (!conceptResult) {
+        if (conceptFailure instanceof Error) throw conceptFailure;
+        throw new SiftLightError("Concept search failed without a diagnostic");
+      }
+      const firstLiteralResult = literalResult;
+      const verifiedLiteralResult = await this.#runner(literalRequest, cwd, signal);
+      if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
+        throw new HybridSourceChangedError(
+          "Literal source evidence changed while concept evidence was being computed",
+        );
+      }
+      const hybrid = await combineHybridSearch(
+        verifiedLiteralResult,
+        conceptResult,
+        conceptAccess,
+        limit,
+        query,
+        this.#semanticJudge,
+        signal,
+      );
+      const originalCounts = hybrid.counts ?? {};
+      const cursor = this.#analyses.create(hybrid, (items) => ({
+        counts: retainedHybridCounts(originalCounts, items),
+      }));
+      return this.#analyses.page(cursor, options.modelOutput);
+    }
+    if (input.mode === "structure") {
+      return this.#analyses.page(
+        this.#analyses.create(await structuralSearch(input, access)),
+        options.modelOutput,
+      );
+    }
+    if (input.mode === "files") {
+      return this.#analyses.page(
+        this.#analyses.create(await discoverFiles(input, cwd, signal)),
+        options.modelOutput,
+      );
+    }
+    if (input.cursor?.includes(".analysis") && !input.mode?.match(/^(outline|imports|tests)$/)) {
+      this.#analyses.resolve(input.cursor);
+      if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
+        throw new CursorError(
+          "Analysis cursor cannot continue in the requested mode",
+          "E_CURSOR_WRONG_KIND",
+        );
+      return this.#analyses.page(input.cursor, options.modelOutput);
+    }
+    if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
+      return this.#navigate(input, access, options);
+    const anyOf = validateAnyOf(input.anyOf);
+    if (anyOf) {
+      if (
+        input.pattern !== undefined ||
+        input.allOf !== undefined ||
+        input.within !== undefined ||
+        input.roles !== undefined ||
+        input.literal !== undefined ||
+        input.ignoreCase !== undefined ||
+        input.wholeWord !== undefined
+      )
+        throw new SiftLightError(
+          "anyOf is an explicit case-sensitive literal union; omit pattern, allOf, within, roles, literal and ignoreCase",
+        );
+      if (input.mode !== undefined && input.mode !== "auto" && input.mode !== "matches")
+        throw new SiftLightError("anyOf mode must be omitted, auto, or matches");
+      const chunks = Array.from(
+        { length: Math.ceil(anyOf.length / MAX_ANY_OF_TERMS) },
+        (_, index) => anyOf.slice(index * MAX_ANY_OF_TERMS, (index + 1) * MAX_ANY_OF_TERMS),
+      );
+      const { path: _inputPath, ...unscopedInput } = input;
+      let chunkAccess = access;
+      const runChunks = async (expandedFromPath?: string) =>
+        runOwnedParallel((groupSignal) => {
+          chunkAccess = new SourceAccess(cwd, this.#queue, groupSignal, { maxFiles: fileLimit });
+          return chunks.map(async (chunk) => {
+            const request = normalizeRequest({
+              ...(expandedFromPath === undefined ? input : unscopedInput),
+              pattern: chunk.map(escapeRegexLiteral).join("|"),
+              literal: false,
+              ignoreCase: false,
+            });
+            const effectiveRequest =
+              expandedFromPath === undefined ? request : { ...request, expandedFromPath };
+            const candidates = await collectEvidenceCandidates({
+              request: effectiveRequest,
+              ...(input.changes ? { changes: input.changes } : {}),
+              cwd,
+              signal: groupSignal,
+              access: chunkAccess,
+              runRipgrep: this.#runner,
+              maxFiles: fileLimit,
+            });
+            return { chunk, request: effectiveRequest, candidates };
+          });
+        }, signal);
+      let chunkResults = await runChunks();
+      if (
+        !input.changes &&
+        input.path !== undefined &&
+        input.scope !== "strict" &&
+        chunkResults.every(({ candidates }) => !candidates.partial && candidates.files.length === 0)
+      ) {
+        chunkResults = await runChunks(input.path.replace(/^@/, ""));
+      }
+      const reasons = new Set<string>();
+      let partial = false;
+      let changes: AnalysisResultSet["changes"];
+      const candidateFiles = new Map<string, EvidenceCandidateFile>();
+      const invalidatedPaths = new Set<string>();
+      for (const { candidates } of chunkResults) {
+        partial ||= candidates.partial;
+        changes ??= candidates.changes;
+        for (const reason of candidates.reasons) reasons.add(reason);
+        for (const file of candidates.files) {
+          if (invalidatedPaths.has(file.document.path)) continue;
+          const existing = candidateFiles.get(file.document.path);
+          if (
+            existing &&
+            JSON.stringify(existing.document.reference) !== JSON.stringify(file.document.reference)
+          ) {
+            candidateFiles.delete(file.document.path);
+            invalidatedPaths.add(file.document.path);
+            partial = true;
+            reasons.add(`Source changed across anyOf chunks: ${file.document.path}`);
+          } else candidateFiles.set(file.document.path, file);
+        }
+      }
+      const expanded = expandMultiTermCandidates(
+        [...candidateFiles.values()],
+        anyOf,
+        input.changes?.scope === "lines",
+      );
+      partial ||= expanded.partial;
+      for (const reason of expanded.reasons) reasons.add(reason);
+      const scope = searchScope(
+        chunkResults[0]?.request ??
+          normalizeRequest({
+            ...input,
+            pattern: chunks[0]?.map(escapeRegexLiteral).join("|") ?? "",
+            literal: false,
+            ignoreCase: false,
+          }),
+      );
+      const result: AnalysisResultSet = {
+        kind: "any-of",
+        unit: "occurrences",
+        items: expanded.items,
+        partial,
+        reasons: [...reasons],
+        filesRead: chunkAccess.filesRead,
+        bytesRead: chunkAccess.bytesRead,
+        ...(changes ? { changes } : {}),
+        scope,
+        chunks: {
+          chunked: chunks.length > 1,
+          count: chunks.length,
+          maxTermsPerChunk: MAX_ANY_OF_TERMS,
+          execution: chunks.length > 1 ? ("bounded-parallel" as const) : ("single" as const),
+        },
+        coverage: { exactOccurrences: partial ? "partial" : "complete" },
+        redact: input.redact ?? false,
+      };
+      return this.#analyses.page(
+        this.#analyses.create(result, (retainedItems) => ({
+          termCounts: retainedTermCounts(anyOf, retainedItems),
+        })),
+        options.modelOutput,
+      );
+    }
+    const terms = validateTerms(input);
+    if (
+      input.roles !== undefined &&
+      (!input.roles.length ||
+        input.roles.some(
+          (role) =>
+            ![
+              "declaration",
+              "call",
+              "import",
+              "export",
+              "comment",
+              "string",
+              "jsx-text",
+              "code",
+              "unknown",
+            ].includes(role),
+        ))
+    )
+      throw new SiftLightError("roles must contain supported syntactic roles");
+    const request = normalizeRequest(
+      terms
+        ? {
+            ...input,
+            pattern: terms.map(escapeRegexLiteral).join("|"),
+            literal: false,
+            ignoreCase: false,
+          }
+        : input,
+    );
+    const selected = await this.#candidates(request, input, access);
+    const candidates = selected.candidates;
+    const kind = terms
+      ? input.within === "function"
+        ? "function-and"
+        : "file-and"
+      : input.roles
+        ? "roles"
+        : "changes";
+    const result: AnalysisResultSet = {
+      kind,
+      unit: kind === "function-and" ? "functions" : kind === "file-and" ? "files" : "occurrences",
+      items: [],
+      partial: candidates.partial,
+      reasons: [...candidates.reasons],
+      filesRead: candidates.filesRead,
+      bytesRead: candidates.bytesRead,
+      ...(candidates.changes ? { changes: candidates.changes } : {}),
+      scope: searchScope(selected.request),
+      coverage: {
+        candidateSearch: candidates.partial ? "partial" : "complete",
+        ...(terms || input.roles ? { syntaxClassification: "complete" as const } : {}),
+      },
+      redact: input.redact ?? false,
+    };
+    let syntaxCapableFiles = 0;
+    const processFile = async (index: number): Promise<void> => {
+      const file = candidates.files[index];
+      if (!file) return;
+      try {
+        if (!file.document.utf8) {
+          result.partial = true;
+          result.reasons.push(
+            `${file.document.path}: non-UTF-8 evidence cannot be reliably classified`,
+          );
+        } else if (terms && input.within !== "function") {
+          const item = fileConjunction(
+            file.document,
+            terms,
+            input.changes?.scope === "lines" ? file.changedRanges : undefined,
+          );
+          if (item) result.items.push(item);
+        } else if (terms || input.roles) {
+          if (syntaxLanguage(file.document.path)) syntaxCapableFiles += 1;
+          const syntax = await access.syntax(file.document);
+          const classified = terms
+            ? findFunctionConjunctions(
+                file.document,
+                syntax,
+                terms,
+                input.changes?.scope === "lines" ? file.changedRanges : undefined,
+              )
+            : filterRoleOccurrences(file.document, syntax, file.occurrences, input.roles ?? []);
+          result.items.push(...classified.items);
+          result.partial ||= classified.partial;
+          if (classified.partial && result.coverage)
+            result.coverage.syntaxClassification = "partial";
+          result.reasons.push(...classified.reasons);
+        } else {
+          for (const range of file.occurrences) {
+            const line = file.document.lineAt(range.start);
+            result.items.push({
+              path: file.document.path,
+              line,
+              label: `${file.change ?? "changed"} source occurrence`,
+              excerpt: file.document.slice(file.document.lineRange(line)).slice(0, 500),
+              source: file.document.reference,
+              range,
+              details: { change: file.change, byteRange: range },
+            });
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof SourceBudgetError)) throw error;
+        result.partial = true;
+        result.reasons.push(error.message);
+        return;
+      } finally {
+        access.releaseSyntax(file.document);
+      }
+      await processFile(index + 1);
+    };
+    await processFile(0);
+    result.reasons = [...new Set(result.reasons)];
+    if ((input.roles || (terms && input.within === "function")) && syntaxCapableFiles === 0) {
+      throw new SiftLightError(
+        `${input.roles ? "roles" : "within=function"} requires a supported source language; use ordinary search or file-level allOf for non-code content`,
+      );
+    }
+    if (terms || input.roles) {
+      result.stats = {
+        filesEnumerated: candidates.files.length,
+        filesParsed: access.syntaxParses,
+        filesSkipped: Math.max(0, candidates.files.length - syntaxCapableFiles),
+        cacheHits: access.syntaxCacheHits,
+        parseMs: Math.round(performance.now() - analysisStarted),
+        budgetExhausted: result.reasons.some(
+          (reason) => reason.includes("limit") || reason.includes("budget-exhausted"),
+        ),
+      };
+    }
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
+  }
+
+  #inspectionTargets(input: SiftLightInput, cwd: string): SourceInspectionTarget[] {
+    if (input.targets !== undefined && input.matchIndices !== undefined)
+      throw new SiftLightError("Use targets or matchIndices, not both");
+    if (input.targets !== undefined || input.matchIndices !== undefined) {
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
+        throw new SiftLightError(
+          "Batch inspection accepts targets or matchIndices instead of path, line or matchIndex",
+        );
+      const size = input.targets?.length ?? input.matchIndices?.length ?? 0;
+      if (size < 1 || size > MAX_INSPECT_TARGETS)
+        throw new SiftLightError("Batch inspection requires 1-5 targets");
+      if (input.targets) {
+        if (input.cursor !== undefined)
+          throw new SiftLightError("targets cannot be combined with cursor");
+        return input.targets.map((target) =>
+          matchInspectionTarget(resolveInspectionTarget(target, cwd, this.#snapshots)),
+        );
+      }
+      if (!input.cursor) throw new SiftLightError("matchIndices requires a cursor");
+      const cursor = input.cursor;
+      return (input.matchIndices ?? []).map((matchIndex) =>
+        this.#singleTarget({ cursor, matchIndex }, cwd),
+      );
+    }
+    return [this.#singleTarget(input, cwd)];
+  }
+  #singleTarget(input: SiftLightInput, cwd: string): SourceInspectionTarget {
+    if (input.cursor?.includes(".analysis.")) {
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex === undefined)
+        throw new CursorError("Analysis inspection requires only cursor and matchIndex");
+      const item = this.#analyses.item(input.cursor, input.matchIndex);
+      if (!item.source || !item.range)
+        throw new CursorError("This analysis item has no verified source range");
+      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
+      return {
+        path: item.path,
+        line: item.line,
+        reference: item.source,
+        ...(metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }),
+      };
+    }
+    return {
+      ...matchInspectionTarget(resolveInspectionTarget(input, cwd, this.#snapshots)),
+      ...(input.matchIndex !== undefined ? { matchIndex: input.matchIndex } : {}),
+    };
+  }
+
+  async #navigate(
+    input: SiftLightInput,
+    access: SourceAccess,
+    options: EvidenceSearchOptions = {},
+  ): Promise<SiftLightResult> {
+    const navigationStarted = performance.now();
+    let path = input.path;
+    let reference: SourceReference | undefined;
+    let line = input.line;
+    let loaded: SourceDocument | undefined;
+    if (input.cursor) {
+      if (input.path !== undefined || input.line !== undefined || input.matchIndex === undefined)
+        throw new SiftLightError(
+          "Snapshot navigation requires cursor+matchIndex instead of path/line",
+        );
+      const selected = this.#singleTarget(input, access.cwd);
+      path = selected.path;
+      line = selected.line;
+      reference = selected.reference;
+      if (selected.unverified)
+        throw new SiftLightError("Snapshot source revision is unverified; refresh the search");
+      if (selected.expectedRevision) {
+        const doc = await access.load(path);
+        if (
+          doc.reference.origin.kind !== "worktree" ||
+          !sameSourceRevision(selected.expectedRevision, doc.reference.origin.revision)
+        )
+          throw new SiftLightError("Source changed; refresh the search");
+        reference = doc.reference;
+        loaded = doc;
+      }
+    } else if (input.matchIndex !== undefined)
+      throw new SiftLightError("matchIndex requires a cursor");
+    if (!path) throw new SiftLightError(`${input.mode} requires path or cursor+matchIndex`);
+    const document = loaded ?? (await access.load(path, reference));
+    const language = syntaxLanguage(document.path);
+    const isPython = /\.py$/iu.test(document.path);
+    if (input.mode === "outline") {
+      const capabilityFailure = outlineCapabilityError(document.path, "outline", true);
+      if (capabilityFailure) throw capabilityFailure;
+      if (!language && !isPython)
+        throw new SiftLightError(
+          `No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`,
+        );
+    }
+    if ((!language && !isPython) || language === "go") {
+      const extension = extname(document.path) || "extensionless source";
+      throw new SiftLightError(
+        `${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`,
+      );
+    }
+    if (input.mode === "outline") {
+      const syntax = isPython ? undefined : await access.syntax(document);
+      const supported = isPython || (syntax?.status === "ok" && syntax.language !== "go");
+      const items: AnalysisItem[] = supported
+        ? isPython
+          ? parsePythonOutline(document).map((symbol) => ({
+              path: document.path,
+              line: symbol.startLine,
+              label: `${symbol.kind} ${symbol.name}${symbol.hasBody ? "" : " (no implementation body)"}`,
+              excerpt: symbol.signature,
+              source: document.reference,
+              range: symbol.range,
+              details: {
+                kind: "symbol",
+                language: "python",
+                name: symbol.name,
+                scope: symbol.scope,
+                hasBody: symbol.hasBody,
+                exported: false,
+                syntax: "indentation-based outline; not compiler binding",
+              },
+            }))
+          : (syntax?.symbols ?? []).map((symbol) => {
+              const range = {
+                start: document.toByteOffset(symbol.start),
+                end: document.toByteOffset(symbol.end),
+              };
+              const firstLine = document.lineAt(range.start);
+              const signatureEnd = symbol.bodyStart ?? symbol.end;
+              const signature = document.text.slice(
+                symbol.start,
+                Math.min(signatureEnd, symbol.start + 600),
+              );
+              return {
+                path: document.path,
+                line: firstLine,
+                label: `${symbol.kind} ${symbol.name}${symbol.hasBody ? "" : " (no implementation body)"}`,
+                excerpt: signature,
+                source: document.reference,
+                range,
+                details: {
+                  kind: "symbol",
+                  name: symbol.name,
+                  scope: symbol.scope,
+                  hasBody: symbol.hasBody,
+                  exported: symbol.exported,
+                  signatureTruncated: signatureEnd - symbol.start > 600,
+                },
+              };
+            })
+        : [];
+      return this.#analyses.page(
+        this.#analyses.create({
+          kind: "outline",
+          unit: "symbols",
+          items,
+          partial: !supported,
+          reasons: supported
+            ? isPython
+              ? [
+                  "Python outline uses indentation boundaries; it does not prove compiler bindings or runtime call relationships",
+                ]
+              : []
+            : [
+                `Outline requires reliable JS/TS/TSX or Python syntax (${syntax?.language ?? "unsupported"}: ${syntax?.status ?? "unsupported"})`,
+              ],
+          filesRead: access.filesRead,
+          bytesRead: access.bytesRead,
+          stats: {
+            filesEnumerated: 1,
+            filesParsed: isPython ? 0 : access.syntaxParses,
+            filesSkipped: 0,
+            cacheHits: isPython ? 0 : access.syntaxCacheHits,
+            parseMs: Math.round(performance.now() - navigationStarted),
+            budgetExhausted: false,
+          },
+          redact: input.redact ?? false,
+        }),
+        options.modelOutput,
+      );
+    }
+    if (document.reference.origin.kind !== "worktree")
+      return this.#analyses.page(
+        this.#analyses.create({
+          kind: input.mode === "imports" ? "imports" : "tests",
+          unit: "evidence-items",
+          items: [],
+          partial: true,
+          reasons: [
+            "Import and related-test navigation currently support worktree sources only; historical sources are not switched to the worktree",
+          ],
+        }),
+        options.modelOutput,
+      );
+    const root = await navigationRoot(access.cwd, document.path, access.signal);
+    const filters = navigationFilters(input);
+    if (input.mode === "tests" && isPython)
+      return this.#analyses.page(
+        this.#analyses.create({
+          kind: "tests",
+          unit: "evidence-items",
+          items: [],
+          partial: true,
+          reasons: [
+            'Python related-test navigation is not supported; use mode="outline" for Python source structure',
+          ],
+          filesRead: access.filesRead,
+          bytesRead: access.bytesRead,
+          stats: {
+            filesEnumerated: 0,
+            filesParsed: 0,
+            filesSkipped: 0,
+            cacheHits: 0,
+            parseMs: Math.round(performance.now() - navigationStarted),
+            budgetExhausted: false,
+          },
+          coverage: { navigation: "not-applicable" },
+          scope: await navigationScope(access.cwd, root, document.path, filters),
+          redact: input.redact ?? false,
+        }),
+        options.modelOutput,
+      );
+    const files = await listWorkspaceFiles(access.cwd, access.signal, {
+      path: root,
+      glob: filters.glob,
+      exclude: filters.exclude,
+      hidden: filters.hidden,
+    });
+    const { allowed, primaryPath } = await canonicalNavigationFiles(
+      access.cwd,
+      root,
+      files,
+      document.path,
+    );
+    const host = {
+      cwd: access.cwd,
+      ...(access.signal ? { signal: access.signal } : {}),
+      normalizePath: (file: string) => workspaceRelativePath(access.cwd, file),
+      load: async (file: string, expected?: SourceReference) => {
+        const absolutePath = await canonicalNavigationPath(resolve(access.cwd, file));
+        if (!allowed.has(absolutePath))
+          throw new SiftLightError("Navigation source is excluded by current ignore rules");
+        if (absolutePath === primaryPath && expected === undefined) return document;
+        return expected ? access.refresh(file, expected) : access.load(file);
+      },
+      syntax: (doc: SourceDocument) => access.syntax(doc),
+      releaseSyntax: (doc: SourceDocument) => access.releaseSyntax(doc),
+      listFiles: async () => files,
+      maxFilesToParse: access.maxFiles,
+    };
+    const request = {
+      path: document.path,
+      ...(line !== undefined ? { line } : {}),
+      ...(input.symbol !== undefined ? { symbol: input.symbol } : {}),
+    };
+    const result =
+      input.mode === "imports"
+        ? await navigateImports(host, request)
+        : await findRelatedTests(host, request, {
+            entryPaths: await this.#testEntryPaths(
+              root,
+              files.paths,
+              access.cwd,
+              filters,
+              access.signal,
+            ),
+          });
+    return this.#analyses.page(
+      this.#analyses.create({
+        ...result,
+        partial: result.partial || files.partial,
+        reasons: [...result.reasons, ...files.reasons],
+        kind: input.mode === "imports" ? "imports" : "tests",
+        unit: "evidence-items",
+        coverage: {
+          navigation: result.partial || files.partial ? "partial" : "complete",
+        },
+        stats: {
+          filesEnumerated: files.paths.length,
+          ...result.stats,
+          filesParsed: access.syntaxParses,
+          cacheHits: access.syntaxCacheHits,
+        },
+        scope: await navigationScope(access.cwd, root, document.path, filters),
+        redact: input.redact ?? false,
+      }),
+      options.modelOutput,
+    );
+  }
+}

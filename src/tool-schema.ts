@@ -1,0 +1,321 @@
+import { Type } from "typebox";
+import {
+  MAX_ANY_OF_TOTAL_TERMS,
+  MAX_ANY_OF_TERMS,
+  MAX_CONFIGURABLE_STRUCTURE_FILES,
+  DEFAULT_HYBRID_CONCEPT_LIMIT,
+  MAX_HYBRID_CONCEPT_LIMIT,
+  MAX_LITERAL_TERM_BYTES,
+  MIN_ANY_OF_TERMS,
+} from "./analysis-limits.js";
+import {
+  MAX_CONTEXT_LINES,
+  MAX_INSPECT_TARGETS,
+  MAX_PAGE_SIZE,
+  MAX_SELECTED_PATHS,
+  MAX_FILE_FILTER_ITEMS,
+  MAX_PATH_CHARACTERS,
+  MAX_PATTERN_CHARACTERS,
+  MAX_AUDIT_LITERAL_CHARACTERS,
+} from "./types.js";
+import {
+  MODE_CONTRACT_DESCRIPTION,
+  MODEL_USAGE_GUIDANCE,
+  REQUEST_USAGE_GUIDANCE,
+  SIFT_LIGHT_MODES,
+  fieldGuidance,
+} from "./request-contract.js";
+
+function stringEnum<const Values extends readonly string[]>(
+  values: Values,
+  options?: { description?: string },
+) {
+  return Type.Unsafe<Values[number]>({
+    type: "string",
+    enum: values,
+    ...(options?.description ? { description: options.description } : {}),
+  });
+}
+
+export const SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+
+export const SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
+
+export const siftLightSchema = Type.Object({
+  query: Type.Optional(
+    Type.String({
+      maxLength: 256,
+      description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`,
+    }),
+  ),
+  scope: Type.Optional(
+    stringEnum(["strict", "expand"] as const, {
+      description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`,
+    }),
+  ),
+  wholeWord: Type.Optional(
+    Type.Boolean({
+      description:
+        "Single-pattern search only: require ripgrep Unicode word boundaries around the match. Works with regex or literal=true.",
+    }),
+  ),
+  anyOf: Type.Optional(
+    Type.Array(Type.String({ maxLength: MAX_LITERAL_TERM_BYTES }), {
+      minItems: MIN_ANY_OF_TERMS,
+      maxItems: MAX_ANY_OF_TOTAL_TERMS,
+      description: `${fieldGuidance("anyOf")}. ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term.`,
+    }),
+  ),
+  allOf: Type.Optional(
+    Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
+      minItems: 2,
+      maxItems: 3,
+      description: `${fieldGuidance("allOf")}. 2-3 distinct terms must occur in one file (default) or one function.`,
+    }),
+  ),
+  within: Type.Optional(
+    stringEnum(["file", "function"] as const, {
+      description:
+        "Only valid with allOf; omit for ordinary single-pattern searches. function requires JS/TS/TSX and counts only that implementation's own code, excluding nested callbacks, strings/comments/types. Not proof of a shared execution path.",
+    }),
+  ),
+  roles: Type.Optional(
+    Type.Array(
+      stringEnum([
+        "declaration",
+        "call",
+        "import",
+        "export",
+        "comment",
+        "string",
+        "jsx-text",
+        "code",
+        "unknown",
+      ] as const),
+      {
+        minItems: 1,
+        description:
+          "Filter each single-pattern occurrence by syntax role (JS/TS/TSX/Go). Roles may be candidates, especially Go call/conversion ambiguity. Cannot combine with allOf.",
+      },
+    ),
+  ),
+  changes: Type.Optional(
+    Type.Object({
+      base: Type.Optional(
+        Type.String({
+          description: "Git base commit/ref; default HEAD, pinned to a commit at query time.",
+        }),
+      ),
+      target: Type.Optional(
+        Type.String({
+          description:
+            "Optional target commit/ref. Omit for final working-tree contents including unignored untracked files, not just the staged index.",
+        }),
+      ),
+      scope: stringEnum(["files", "lines"] as const, {
+        description:
+          "Search changed files or only changed lines. With allOf every term must lie on the chosen side's changed lines.",
+      }),
+      side: stringEnum(["new", "old"] as const, {
+        description:
+          "Choose final/new content or deleted/old content. Historical inspect and continuation remain bound to that commit/blob.",
+      }),
+    }),
+  ),
+  sourceCursor: Type.Optional(
+    Type.String({
+      description:
+        "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly.",
+    }),
+  ),
+  symbol: Type.Optional(
+    Type.String({
+      description:
+        "Syntax name for outline/imports/tests; use a concrete source file and line to narrow repeated names.",
+    }),
+  ),
+  pattern: Type.Optional(
+    Type.String({
+      maxLength: MAX_PATTERN_CHARACTERS,
+      description: `${fieldGuidance("pattern")}. mode=structure requires a nonempty ast-grep code pattern for JS/TS/TSX/Go (no lang field), at most 4 KiB, including $NAME and $$$ARGS metavariables; no regex/literal options. Omit for discovery, syntax navigation, inspection and cursors.`,
+    }),
+  ),
+  path: Type.Optional(
+    Type.String({
+      maxLength: MAX_PATH_CHARACTERS,
+      description: `${fieldGuidance("path")}. A zero-result content search expands from cwd unless scope=strict. outline and compiler navigation require a concrete file, not a directory. Compiler navigation stays within admitted workspace sources. Absolute paths and .. traversal may resolve outside cwd, except protected external system areas and .git internals; Git changes mode remains cwd-scoped.`,
+    }),
+  ),
+  paths: Type.Optional(
+    Type.Array(Type.String(), {
+      minItems: 1,
+      maxItems: MAX_SELECTED_PATHS,
+      description:
+        "Exact retained files to select together from a cursor. A new search accepts one path; split multiple roots into separate requests.",
+    }),
+  ),
+  glob: Type.Optional(
+    Type.Union(
+      [
+        Type.String({ maxLength: MAX_PATH_CHARACTERS }),
+        Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
+          maxItems: MAX_FILE_FILTER_ITEMS,
+        }),
+      ],
+      {
+        description: "Include glob or globs, for example '*.ts' or 'src/**'.",
+      },
+    ),
+  ),
+  exclude: Type.Optional(
+    Type.Union(
+      [
+        Type.String({ maxLength: MAX_PATH_CHARACTERS }),
+        Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
+          maxItems: MAX_FILE_FILTER_ITEMS,
+        }),
+      ],
+      {
+        description:
+          "Exclude file/path globs (not content negation); applied after include globs. A leading ! is optional.",
+      },
+    ),
+  ),
+  literal: Type.Optional(Type.Boolean({ description: fieldGuidance("literal") })),
+  ignoreCase: Type.Optional(
+    Type.Boolean({
+      description: "true for insensitive, false for sensitive; omitted uses smart-case.",
+    }),
+  ),
+  hidden: Type.Optional(
+    Type.Boolean({ description: "Search hidden files (default true; .git is always excluded)." }),
+  ),
+  ignorePolicy: Type.Optional(
+    stringEnum(["respect", "include"] as const, {
+      description:
+        "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted. include searches ignored files while still excluding .git internals and protected paths.",
+    }),
+  ),
+  patterns: Type.Optional(
+    Type.Array(
+      Type.Object(
+        {
+          id: Type.String({ minLength: 1, maxLength: 64 }),
+          literal: Type.String({
+            minLength: 1,
+            maxLength: MAX_AUDIT_LITERAL_CHARACTERS,
+            description: `Single-line exact text, limited to ${String(MAX_AUDIT_LITERAL_CHARACTERS)} characters and UTF-8 bytes.`,
+          }),
+        },
+        { additionalProperties: false },
+      ),
+      {
+        minItems: 1,
+        maxItems: 32,
+        description:
+          "Named exact-literal checks for mode=audit. Each finding is present, absent_with_complete_coverage, or unknown.",
+      },
+    ),
+  ),
+  redact: Type.Optional(
+    Type.Boolean({
+      description:
+        "Optional display-only masking for credential-like values and private-key bodies. Default false. It never changes searched files, admitted matches, counts, or cursor completeness.",
+    }),
+  ),
+  modifiedAfter: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Worktree modification-time lower bound, inclusive, as a Unix timestamp in milliseconds. Not valid with Git changes.",
+    }),
+  ),
+  modifiedBefore: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Worktree modification-time upper bound, exclusive, as a Unix timestamp in milliseconds. Not valid with Git changes.",
+    }),
+  ),
+  maxFilesToParse: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: MAX_CONFIGURABLE_STRUCTURE_FILES,
+      description: `Advanced hard ceiling for source files admitted by one analysis request (max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Concept and hybrid automatically process the requested scope in bounded batches when omitted; other structural modes default to 200. Candidate discovery still searches the full requested scope.`,
+    }),
+  ),
+  conceptLimit: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: MAX_HYBRID_CONCEPT_LIMIT,
+      description: `mode=hybrid only: retain the top semantic candidates after overlap deduplication (default ${String(DEFAULT_HYBRID_CONCEPT_LIMIT)}, max ${String(MAX_HYBRID_CONCEPT_LIMIT)}). Literal evidence has an independent retention budget and is never displaced by this limit.`,
+    }),
+  ),
+  context: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: MAX_CONTEXT_LINES,
+      description: `${fieldGuidance("context")}. New search only: nearby lines (0-20). MUST be omitted for inspect, which selects its own bounded source window.`,
+    }),
+  ),
+  limit: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: MAX_PAGE_SIZE,
+      description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`,
+    }),
+  ),
+  mode: Type.Optional(
+    stringEnum(SIFT_LIGHT_MODES, {
+      description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION}`,
+    }),
+  ),
+
+  line: Type.Optional(
+    Type.Number({
+      description:
+        "1-indexed source line for path inspection/navigation. Omit with matchIndex, matchIndices or targets.",
+    }),
+  ),
+  matchIndex: Type.Optional(
+    Type.Number({
+      description:
+        "1-based retained match index for cursor-scoped inspect; replaces path and line.",
+    }),
+  ),
+  matchIndices: Type.Optional(
+    Type.Array(Type.Integer({ minimum: 1 }), {
+      minItems: 1,
+      maxItems: MAX_INSPECT_TARGETS,
+      description:
+        "Inspect up to five visible match numbers together using the same cursor; mutually exclusive with matchIndex, path, line and targets.",
+    }),
+  ),
+  targets: Type.Optional(
+    Type.Array(
+      Type.Object({
+        path: Type.String({ maxLength: MAX_PATH_CHARACTERS }),
+        line: Type.Integer({ minimum: 1 }),
+      }),
+      {
+        minItems: 1,
+        maxItems: MAX_INSPECT_TARGETS,
+        description:
+          "Inspect known path/line locations together without a cursor. The complete batch shares one 16 KiB response budget.",
+      },
+    ),
+  ),
+  cursor: Type.Optional(
+    Type.String({ description: "Opaque cursor from a previous stable search snapshot." }),
+  ),
+  operationId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 128,
+      description:
+        "Operation handle returned by a waiting concept/hybrid result. Required with mode=await or mode=cancel; copy it exactly and do not start a new query.",
+    }),
+  ),
+});

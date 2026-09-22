@@ -1,0 +1,11 @@
+{
+  "name": "sift-light",
+  "owner": { "name": "baoer" },
+  "plugins": [
+    {
+      "name": "sift-light",
+      "source": "./plugins/sift-light",
+      "description": "Enforce conventional local searches through sift-light."
+    }
+  ]
+}

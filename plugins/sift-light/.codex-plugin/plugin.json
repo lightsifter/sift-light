@@ -1,0 +1,20 @@
+{
+  "name": "sift-light",
+  "version": "1.0.0",
+  "description": "Require sift-light for conventional local searches while keeping development tools available.",
+  "author": {
+    "name": "baoer"
+  },
+  "homepage": "https://github.com/lightsifter/sift-light#readme",
+  "license": "AGPL-3.0-only",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "sift-light",
+    "shortDescription": "Enforced local code search",
+    "longDescription": "Require sift-light for conventional local searches while keeping development tools available.",
+    "defaultPrompt": "Search this project's code using sift-light.",
+    "developerName": "baoer",
+    "category": "Productivity",
+    "capabilities": []
+  }
+}

@@ -1,0 +1,368 @@
+import type { AnalysisDetails } from "./analysis-types.js";
+import type { ValidationDetails } from "./validation-types.js";
+import type { SourceFragment } from "./source-pages.js";
+import type { ByteRange, SourceReference } from "./source-document.js";
+import type { SiftLightInput } from "./service.js";
+import type { OperationProgress } from "./operation-lifecycle.js";
+import type { RequestContractDetails } from "./request-contract.js";
+import type { LanguageCapabilityInventory } from "./language-capabilities.js";
+
+export const DEFAULT_PAGE_SIZE = 100;
+export const MAX_PAGE_SIZE = 100;
+export const DEFAULT_RESULT_TOKEN_BUDGET = 2_000;
+export const CONTEXT_BUDGET_POLICY = {
+  fullAboveRemainderPercent: 40,
+  criticalBelowRemainderPercent: 12,
+  resultTokenBudgets: {
+    full: DEFAULT_RESULT_TOKEN_BUDGET,
+    tight: 1_000,
+    critical: 500,
+  },
+} as const;
+export const ESTIMATED_CHARACTERS_PER_TOKEN = 4;
+export const DEFAULT_SUMMARY_FILE_LIMIT = 30;
+export const MAX_SELECTED_PATHS = 20;
+export const MAX_INSPECT_TARGETS = 5;
+export const MAX_DISPLAYED_OCCURRENCES = 20;
+export const MAX_STORED_MATCHES = 50_000;
+export const MAX_STORED_OCCURRENCES = 200_000;
+export const MAX_SEARCH_STORAGE_BYTES = 32 * 1024 * 1024;
+export const MAX_LINE_CHARACTERS = 500;
+export const MAX_RESULT_BYTES = 16 * 1024;
+export const MAX_CONTEXT_LINES = 20;
+export const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
+export const MAX_SOURCE_FILE_BYTES = 5 * 1024 * 1024;
+export const MAX_PATH_CHARACTERS = 4_096;
+export const MAX_PATTERN_CHARACTERS = 64 * 1024;
+export const MAX_AUDIT_LITERAL_CHARACTERS = 256;
+export const MAX_FILE_FILTER_ITEMS = 64;
+export const MAX_SOURCE_REVISION_CONCURRENCY = 16;
+export const MAX_SOURCE_REVISION_FILES = 50_000;
+
+export type SearchMode =
+  | "audit"
+  | "concept"
+  | "hybrid"
+  | "structure"
+  | "files"
+  | "auto"
+  | "summary"
+  | "matches"
+  | "inspect"
+  | "outline"
+  | "imports"
+  | "tests"
+  | "validate"
+  | "capabilities"
+  | "await"
+  | "cancel";
+
+export type OperationResultState = "running" | "complete" | "failed" | "cancelled" | "expired";
+
+export type OperationProgressDetails = OperationProgress;
+
+export interface OperationDetails {
+  id: string;
+  mode: "concept" | "hybrid";
+  state: OperationResultState;
+  startedAt: number;
+  deadlineAt: number;
+  leaseExpiresAt: number;
+  progress?: OperationProgressDetails;
+  nextRequest?: SiftLightInput;
+  error?: string;
+}
+
+export type ContextBudgetTier = keyof typeof CONTEXT_BUDGET_POLICY.resultTokenBudgets;
+
+export interface ContextBudget {
+  tier: ContextBudgetTier;
+  contextRemainderPercent: number;
+  resultTokenBudget: number;
+}
+
+export interface TextPosition {
+  line: number;
+  character: number;
+}
+
+export interface TextRange {
+  start: TextPosition;
+  end: TextPosition;
+  encoding: "utf-8" | "utf-16";
+}
+
+export interface MatchOccurrence {
+  byteStart: number;
+  byteEnd: number;
+  range: TextRange;
+}
+
+export interface SourceRevision {
+  size: number;
+  mtimeMs: number;
+  ctimeMs?: number;
+  inode?: number;
+  device?: number;
+}
+
+export type StructureStatus =
+  | "available"
+  | "no-symbol"
+  | "provider-unavailable"
+  | "source-unavailable"
+  | "parse-error"
+  | "file-too-large"
+  | "source-changed";
+
+export type SourceBoundary = "syntax" | "requested-range" | "line-window" | "mixed";
+
+export interface SymbolRange {
+  startLine: number;
+  endLine: number;
+}
+
+export interface StructureSymbol {
+  name: string;
+  kind: string;
+  scope: string[];
+  range: SymbolRange;
+}
+
+export interface StructureDetails {
+  status: StructureStatus;
+  provider?: string;
+  reason?: string;
+  language?: string;
+  symbol?: StructureSymbol;
+  range?: SymbolRange;
+}
+
+export interface InspectTarget {
+  path: string;
+  line: number;
+}
+
+export interface SourceExcerptDetails {
+  range: SymbolRange;
+  omittedBefore: number;
+  omittedAfter: number;
+  truncatedLines: number[];
+  reference?: SourceReference;
+  targetRanges?: ByteRange[];
+  fragments?: SourceFragment[];
+  remainingRanges?: ByteRange[];
+  complete?: boolean;
+  boundary?: SourceBoundary;
+  nextRequest?: SiftLightInput;
+}
+
+export interface InspectRetry {
+  mode: "inspect";
+  cursor?: string;
+  matchIndex?: number;
+  path?: string;
+  line?: number;
+}
+
+export interface InspectBatchItemDetails {
+  inputIndex: number;
+  path?: string;
+  line?: number;
+  matchIndex?: number;
+  status: "returned" | "deferred" | "error";
+  block?: number;
+  structure?: StructureDetails;
+  source?: SourceExcerptDetails;
+  error?: string;
+  retry?: InspectRetry;
+}
+
+export interface SearchRequest {
+  scope?: "strict" | "expand";
+  wholeWord?: boolean;
+  pattern: string;
+  path?: string;
+  expandedFromPath?: string;
+  glob: string[];
+  exclude: string[];
+  literal: boolean;
+  ignoreCase?: boolean;
+  hidden: boolean;
+  ignorePolicy?: "respect" | "include";
+  binaryAsText?: boolean;
+  context: number;
+  pageSize: number;
+  redact?: boolean;
+  modifiedAfterMs?: number;
+  modifiedBeforeMs?: number;
+}
+
+export interface SearchScopeDetails {
+  path: string;
+  requestedPath: string;
+  glob: string[];
+  exclude: string[];
+  hidden: boolean;
+  ignorePolicy?: "respect" | "include";
+  expandedToProjectRoot: boolean;
+  assertion: "requested-scope" | "project-wide";
+  modifiedAfterMs?: number;
+  modifiedBeforeMs?: number;
+}
+
+export interface MatchRecord {
+  absolutePath: string;
+  displayPath: string;
+  lineNumber: number;
+  lineContent: string;
+  lineTruncated: boolean;
+  occurrences: MatchOccurrence[];
+}
+
+export interface SearchScan {
+  request: SearchRequest;
+  matches: MatchRecord[];
+  totalMatches: number;
+  fileCounts: Map<string, number>;
+  sourceRevisions: Map<string, SourceRevision>;
+  snapshotComplete: boolean;
+  filesystemCoverage?: "complete" | "policy-filtered" | "partial";
+  filesystemCoverageReasons?: string[];
+  ignoredFileCount?: number;
+  ignoredFileSamples?: string[];
+  searchedFileCount?: number;
+  truncatedLines: number;
+  retention?: SearchRetentionDetails;
+}
+
+export interface SearchRetentionDetails {
+  accountedBytes: number;
+  retainedOccurrences: number;
+  maxBytes: number;
+  maxOccurrences: number;
+  reasons: string[];
+}
+
+export interface SearchSnapshot extends SearchScan {
+  id: string;
+  createdAt: number;
+  lastAccessedAt: number;
+}
+
+export interface StatisticsEntry {
+  label: string;
+  count: number;
+}
+
+export interface StatisticsGroup {
+  dimension: string;
+  entries: StatisticsEntry[];
+  omitted: number;
+  total: number;
+}
+
+export interface ResultStatistics {
+  unit: string;
+  total: number;
+  files: number;
+  directories: number;
+  groups: StatisticsGroup[];
+  topFiles: StatisticsEntry[];
+  topFilesOmitted: number;
+}
+
+export interface SiftLightDetails {
+  inspectRequest?: SiftLightInput;
+  version: 1;
+  mode: SearchMode;
+  status: "complete" | "partial" | "waiting" | "running" | "cancelled" | "failed" | "expired";
+  error?: RequestContractDetails;
+  totalMatches: number;
+  storedMatches: number;
+  totalFiles: number;
+  returnedMatches: number;
+  snapshotComplete: boolean;
+  retention?: SearchRetentionDetails;
+  cursor?: string;
+  nextRequest?: SiftLightInput;
+  analysis?: AnalysisDetails;
+  statistics?: ResultStatistics;
+  validation?: ValidationDetails;
+  sourceBlocks?: { path: string; source: SourceExcerptDetails }[];
+  summaryFilesShown?: number;
+  summaryOffset?: number;
+  selectedPaths?: string[];
+  selectionMissingPaths?: string[];
+  summaryFilesOmitted?: number;
+  lineContentTruncated?: number;
+  occurrenceRangesOmitted?: number;
+  occurrenceMatchesTruncated?: number;
+  sourceUnverifiedFileCount?: number;
+  summaryPreviewsShown?: number;
+  summaryPreviewsOmitted?: number;
+  budgetTier?: ContextBudgetTier;
+  contextRemainderPercent?: number;
+  resultTokenBudget?: number;
+  contextOmittedFiles?: string[];
+  contextChangedFiles?: string[];
+  structure?: StructureDetails;
+  source?: SourceExcerptDetails;
+  inspections?: InspectBatchItemDetails[];
+  scope?: SearchScopeDetails;
+  redactedCount?: number;
+  redactionRequested?: boolean;
+  redactionApplied?: boolean;
+  operation?: OperationDetails;
+  capabilities?: LanguageCapabilityInventory;
+  audit?: AuditReceiptDetails;
+  searchCoverage?: {
+    retainedMatches: "complete" | "partial";
+    filesystem: "complete" | "policy-filtered" | "partial";
+    ignoredFiles: number;
+    ignoredFileSamples: string[];
+    searchedFiles: number;
+    reasons: string[];
+  };
+}
+
+export interface AuditPatternInput {
+  id: string;
+  literal: string;
+}
+
+export interface AuditFindingDetails {
+  id: string;
+  status: "present" | "absent_with_complete_coverage" | "unknown";
+  matches: number;
+  files: number;
+  evidence: { path: string; line: number }[];
+  reproduction: SiftLightInput;
+}
+
+export interface AuditReceiptDetails {
+  declaredScope: SearchScopeDetails;
+  coverage: {
+    filesDiscovered: number;
+    filesAdmitted: number;
+    filesSearched: number;
+    ignoredFiles: number;
+    ignoredFileSamples: string[];
+    ignoredFilesOmitted: number;
+    filesSkippedOther: number;
+    complete: boolean;
+    reasons: string[];
+    reasonsOmitted: number;
+  };
+  stability: {
+    status: "stable" | "changed_during_search" | "unknown";
+    changedFiles: string[];
+    changedFilesOmitted: number;
+  };
+  findings: AuditFindingDetails[];
+}
+
+export interface SiftLightResult {
+  text: string;
+  details: SiftLightDetails;
+}

@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "sift-light": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "sift-light-runtime@npm:sift-light@1.0.0",
+        "sift-light-mcp",
+        "--stdio"
+      ],
+      "env": {
+        "npm_config_ignore_scripts": "true",
+        "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",
+        "SIFT_LIGHT_MCP_OUTPUT_MODE": "model"
+      },
+      "env_vars": [
+        "SIFT_LIGHT_CONFIG",
+        "TYPESAFE_API_KEY",
+        "SIFT_LIGHT_JEV_API_KEY"
+      ]
+    }
+  }
+}

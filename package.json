@@ -1,0 +1,142 @@
+{
+  "name": "sift-light",
+  "version": "1.0.0",
+  "description": "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
+  "keywords": [
+    "ai-agent",
+    "claude-code",
+    "code-navigation",
+    "codex",
+    "context-engineering",
+    "grep",
+    "mcp",
+    "oh-my-pi",
+    "omp",
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "ripgrep",
+    "search",
+    "source-inspection"
+  ],
+  "homepage": "https://github.com/lightsifter/sift-light#readme",
+  "bugs": {
+    "url": "https://github.com/lightsifter/sift-light/issues"
+  },
+  "license": "AGPL-3.0-only",
+  "author": "baoer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lightsifter/sift-light.git"
+  },
+  "bin": {
+    "sift-light-mcp": "src/mcp-server.mjs",
+    "sift-light-model": "src/concept-worker.mjs"
+  },
+  "files": [
+    "src/**/*.ts",
+    "src/syntax-worker.mjs",
+    "src/mcp-server.mjs",
+    "src/syntax-worker.toml",
+    "README.md",
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "src/concept-worker.mjs",
+    "plugins/sift-light/**"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "build:worker": "bun run scripts/build-syntax-worker.ts",
+    "check:worker": "bun run doc/testing/scripts/check-syntax-worker.ts",
+    "build:mcp": "bun run scripts/build-mcp-server.ts",
+    "check:mcp": "bun run doc/testing/scripts/check-mcp-server.ts",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./doc/testing/test",
+    "test:node": "bun run doc/testing/scripts/node-smoke.ts",
+    "benchmark": "bun run doc/testing/scripts/benchmark.ts",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run build",
+    "pack:check": "bun pm pack --dry-run && bun run scripts/check-npm-publish.ts",
+    "setup:concept": "bun run src/concept-worker.mjs --install-model",
+    "build:concept-worker": "bun run scripts/build-concept-worker.ts",
+    "check:concept-worker": "bun run doc/testing/scripts/check-concept-worker.ts",
+    "test:concept": "bun run doc/testing/scripts/test-concept.ts",
+    "evaluate:investigations": "bun run doc/testing/scripts/investigation-eval.ts",
+    "build:search-plugin": "bun run scripts/build-search-plugin.ts",
+    "check:search-plugin": "bun run doc/testing/scripts/check-search-plugin.ts",
+    "test:mcp-hosts": "bun run doc/testing/scripts/mcp-host-verification.ts",
+    "build": "bun run build:worker && bun run build:concept-worker && bun run build:search-plugin && bun run build:mcp",
+    "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
+    "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
+    "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
+    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test && bun run test:node && bun run benchmark"
+  },
+  "dependencies": {
+    "@ast-grep/lang-go": "0.0.6",
+    "@ast-grep/napi": "0.45.2",
+    "@huggingface/transformers": "3.8.1",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@vscode/ripgrep": "1.18.0",
+    "typebox": "1.3.19",
+    "web-tree-sitter": "0.25.10",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.3",
+    "@types/bun": "^1.4.0",
+    "oxfmt": "^0.65.0",
+    "oxlint": "^1.80.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "tree-sitter-bash": "0.25.1",
+    "tree-sitter-powershell": "0.26.4",
+    "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "bun": ">=1.4.0",
+    "node": ">=22.19.0"
+  },
+  "packageManager": "bun@1.4.2",
+  "knip": {
+    "entry": [
+      "src/mcp-server.ts"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./plugins/sift-light/omp-extension.mjs"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

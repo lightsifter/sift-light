@@ -1,0 +1,36 @@
+{
+  "name": "sift-light",
+  "version": "1.0.0",
+  "description": "Require sift-light for conventional local searches while keeping development tools available.",
+  "author": {
+    "name": "baoer"
+  },
+  "homepage": "https://github.com/lightsifter/sift-light#readme",
+  "license": "AGPL-3.0-only",
+  "mcpServers": {
+    "sift-light": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "sift-light-runtime@npm:sift-light@1.0.0",
+        "sift-light-mcp",
+        "--stdio"
+      ],
+      "env": {
+        "npm_config_ignore_scripts": "true",
+        "ONNXRUNTIME_NODE_INSTALL_CUDA": "skip",
+        "SIFT_LIGHT_MCP_OUTPUT_MODE": "model"
+      }
+    }
+  },
+  "systemPrompt": "Use sift-light for local content and filename searches. The plugin blocks conventional alternative search entries. Ordinary reads, edits, tests and builds remain available.",
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "^(?:Bash|Grep|Glob|Shell|SearchFileContent|SearchFiles|GlobFile)$",
+      "command": "node \"./hooks/search-policy.mjs\"",
+      "timeout": 5
+    }
+  ]
+}
