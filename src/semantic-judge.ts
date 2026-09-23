@@ -1,4 +1,8 @@
-import type { SemanticJudgeConfig } from "./config-reader.js";
+import {
+  DEFAULT_SEMANTIC_JUDGE_CONFIG,
+  type SemanticJudgeConfig,
+  type SiftLightConfig,
+} from "./config-reader.js";
 import {
   SEMANTIC_JUDGE_CLASSIFICATIONS,
   SEMANTIC_JUDGE_NON_PROOF_CLAIM,
@@ -373,6 +377,17 @@ export function createSemanticJudgeIntegration(
   }
   return { config, runner: createJevRunner(config, key, fetcher) };
 }
+
+export function createConfiguredSemanticJudgeIntegration(
+  config: SiftLightConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): SemanticJudgeIntegration {
+  const judge = config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG;
+  return config.vectorSearchEnabled === true
+    ? createSemanticJudgeIntegration(judge, environment)
+    : createDisabledSemanticJudgeIntegration(judge);
+}
+
 function baseDetails(config: SemanticJudgeConfig): SemanticJudgeDetails {
   return {
     enabled: config.enabled,

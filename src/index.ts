@@ -1,11 +1,6 @@
 import { SIFT_LIGHT_DESCRIPTION, siftLightSchema } from "./tool-schema.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-  normalizeSearchEnforcement,
-  readSiftLightConfig,
-  DEFAULT_SEMANTIC_JUDGE_CONFIG,
-  type SiftLightConfig,
-} from "./config.js";
+import { normalizeSearchEnforcement, readSiftLightConfig, type SiftLightConfig } from "./config.js";
 import { resolveContextBudget } from "./context-budget.js";
 import { createRipgrepRunner } from "./rg.js";
 import { createCtagsStructureProvider } from "./structure.js";
@@ -17,7 +12,7 @@ import type { SiftLightDetails } from "./types.js";
 import { renderSiftLightCall, renderSiftLightResult } from "./tui/renderers.js";
 import { registerPiSearchPolicy } from "./pi-search-policy.js";
 import { modelErrorText } from "./model-error.js";
-import { createSemanticJudgeIntegration } from "./semantic-judge.js";
+import { createConfiguredSemanticJudgeIntegration } from "./semantic-judge.js";
 
 const SIFT_LIGHT_LABEL = "sift-light";
 
@@ -27,13 +22,12 @@ export async function registerSiftLightExtension(
   pi: ExtensionAPI,
   config: SiftLightConfig,
 ): Promise<void> {
-  const semanticJudge = createSemanticJudgeIntegration(
-    config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
-  );
+  const semanticJudge = createConfiguredSemanticJudgeIntegration(config);
   const runtime = new SiftLightRuntime(
     new SiftLightService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
+      vectorSearchEnabled: config.vectorSearchEnabled === true,
       semanticJudge,
     }),
   );

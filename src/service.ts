@@ -87,6 +87,7 @@ export interface SiftLightServiceOptions {
   snapshots?: SnapshotStore;
   summaryFileLimit?: number;
   structure?: CodeStructureProvider;
+  vectorSearchEnabled?: boolean;
   conceptSearch?: ConceptSearchRunner;
   semanticJudge?: SemanticJudgeIntegration;
 }
@@ -367,6 +368,7 @@ export class SiftLightService {
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
   readonly #summaryFileLimit: number;
+  readonly #vectorSearchEnabled: boolean;
   readonly #capabilities = new LanguageCapabilityCatalog();
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
@@ -378,6 +380,7 @@ export class SiftLightService {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(
       this.#runRipgrep,
@@ -396,6 +399,11 @@ export class SiftLightService {
   ): Promise<SiftLightResult> {
     validateRawSearchInput(input);
     validateRequestContract(input);
+    if (!this.#vectorSearchEnabled && (input.mode === "concept" || input.mode === "hybrid")) {
+      throw new SiftLightError(
+        `${input.mode} search is disabled; set vectorSearchEnabled to true in sift-light.json and restart the host`,
+      );
+    }
     let request: Promise<SiftLightResult>;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);

@@ -1,11 +1,12 @@
 import {
+  DEFAULT_SIFT_LIGHT_CONFIG,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
   readSiftLightConfigFile,
   SIFT_LIGHT_CONFIG_ENV,
 } from "./config-reader.js";
 import {
   createDisabledSemanticJudgeIntegration,
-  createSemanticJudgeIntegration,
+  createConfiguredSemanticJudgeIntegration,
   type SemanticJudgeIntegration,
 } from "./semantic-judge.js";
 
@@ -19,17 +20,27 @@ function configuredPath(environment: NodeJS.ProcessEnv): string | undefined {
  * The MCP process must receive the same config path explicitly in its own host
  * environment; an absent path remains an observable, local-only disabled state.
  */
+export async function createMcpSearchFeatures(
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<{ semanticJudge: SemanticJudgeIntegration; vectorSearchEnabled: boolean }> {
+  const path = configuredPath(environment);
+  if (!path)
+    return {
+      semanticJudge: createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG),
+      vectorSearchEnabled: DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled === true,
+    };
+
+  const config = await readSiftLightConfigFile(path, { missing: "error" });
+  return {
+    semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
+    vectorSearchEnabled: config.vectorSearchEnabled === true,
+  };
+}
+
 export async function createMcpSemanticJudgeIntegration(
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<SemanticJudgeIntegration> {
-  const path = configuredPath(environment);
-  if (!path) return createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
-
-  const config = await readSiftLightConfigFile(path, { missing: "error" });
-  return createSemanticJudgeIntegration(
-    config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
-    environment,
-  );
+  return (await createMcpSearchFeatures(environment)).semanticJudge;
 }
 
 export function mcpSemanticJudgeConfigSource(

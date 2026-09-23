@@ -2,6 +2,10 @@
 
 ## 1.0.1 — 2026-09-23
 
+### Changed
+
+- Local vector search is now off by default. Existing `concept` and `hybrid` calls require `"vectorSearchEnabled": true` in the active `sift-light.json` and an installed model; otherwise they fail explicitly. Ordinary search remains available. Installing the model or enabling the optional Jev judge alone does not opt in.
+
 ### Fixed
 
 - Improve semantic ranking when very short passages compete with more detailed source evidence. Raw cosine similarity remains available alongside the ranking score; results are still relevance candidates, not verified behavior.

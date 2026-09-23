@@ -1,7 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  DEFAULT_SEMANTIC_JUDGE_CONFIG,
   normalizeSearchEnforcement,
   readSiftLightConfigFile,
   resolveSiftLightConfigPath,
@@ -27,7 +26,7 @@ import {
 } from "./search-policy.js";
 import { siftLightSchema } from "./tool-schema.js";
 import { modelErrorText } from "./model-error.js";
-import { createSemanticJudgeIntegration } from "./semantic-judge.js";
+import { createConfiguredSemanticJudgeIntegration } from "./semantic-judge.js";
 
 const SIFT_LIGHT_LABEL = "sift-light";
 const OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
@@ -188,13 +187,12 @@ export async function registerOmpSiftLightExtension(
     (await readSiftLightConfigFile(resolveSiftLightConfigPath(ompAgentDir()), {
       missing: process.env[SIFT_LIGHT_CONFIG_ENV]?.trim() ? "error" : "defaults",
     }));
-  const semanticJudge = createSemanticJudgeIntegration(
-    resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG,
-  );
+  const semanticJudge = createConfiguredSemanticJudgeIntegration(resolvedConfig);
   const runtime = new SiftLightRuntime(
     new SiftLightService({
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
+      vectorSearchEnabled: resolvedConfig.vectorSearchEnabled === true,
       semanticJudge,
     }),
   );
@@ -218,7 +216,7 @@ export async function registerOmpSiftLightExtension(
     name: SIFT_LIGHT_LABEL,
     label: SIFT_LIGHT_LABEL,
     description:
-      "Search and navigate code with bounded, verifiable evidence. Use pattern for content or mode=files with query for filenames.",
+      "Search code with bounded evidence. Routine searches use pattern for fast exact content or mode=files with query for filenames; concept/hybrid require vectorSearchEnabled:true in sift-light.json.",
     approval: "read",
     promptSnippet: "Search file contents without flooding context",
     promptGuidelines: siftLightPromptGuidelines(),
