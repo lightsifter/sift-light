@@ -7,7 +7,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function compactSemanticMetadata(details: SiftLightDetails, analysis: AnalysisDetails): string[] {
+  const counts = analysis.counts;
+  const stats = analysis.stats;
+  const judge = analysis.semanticJudge;
+  const coverage = analysis.coverage;
+  return [
+    ...(counts || stats
+      ? [
+          `Search: ${String(counts?.filesAdmitted ?? stats?.filesAdmitted ?? 0)} files, ${String(stats?.passagesRanked ?? counts?.passagesQueued ?? 0)} passages; ${String(stats?.elapsedMs ?? 0)} ms; peak inference RSS ${String(stats?.inferencePeakRssBytes ?? 0)} bytes; cache ${String(stats?.conceptCacheHits ?? 0)} hits/${String(stats?.conceptCacheMisses ?? 0)} misses.`,
+        ]
+      : []),
+    ...(coverage
+      ? [
+          `Coverage: ${Object.entries(coverage)
+            .map(([name, status]) => `${name}=${status}`)
+            .join(", ")}.`,
+        ]
+      : []),
+    ...(analysis.scope
+      ? [`Scope: ${analysis.scope.path}; ignore=${analysis.scope.ignorePolicy}.`]
+      : []),
+    ...(analysis.sourceGeneration
+      ? [
+          `Source: ${analysis.sourceGeneration.verification}; ${String(analysis.sourceGeneration.filesUnavailable)} unavailable.`,
+        ]
+      : []),
+    ...(judge
+      ? [
+          `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`,
+        ]
+      : []),
+    ...(details.operation
+      ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`]
+      : []),
+    ...analysis.reasons.map((reason) => `[${reason}]`),
+    ...(details.redactionApplied ? ["[Display redaction applied.]"] : []),
+  ];
+}
+
 function compactMetadata(details: SiftLightDetails, analysis: AnalysisDetails): string[] {
+  if (analysis.kind === "concept" || analysis.kind === "hybrid")
+    return compactSemanticMetadata(details, analysis);
   return [
     ...(analysis.statistics ? formatStatistics(analysis.statistics) : []),
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,

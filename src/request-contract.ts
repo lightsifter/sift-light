@@ -115,6 +115,23 @@ function schemaError(
   );
 }
 
+function plainFilePatternRecovery(
+  mode: SiftLightMode,
+  input: Record<string, unknown>,
+  invalid: readonly string[],
+): boolean {
+  return (
+    mode === "files" &&
+    invalid.includes("pattern") &&
+    input.query === undefined &&
+    typeof input.pattern === "string" &&
+    input.pattern.trim().length > 0 &&
+    input.pattern.length <= 256 &&
+    input.pattern.isWellFormed() &&
+    !/[\\^$.*+?()[\]{}|\r\n\0]/u.test(input.pattern)
+  );
+}
+
 function safeNextRequest(
   input: Record<string, unknown>,
   mode: SiftLightMode,
@@ -122,9 +139,12 @@ function safeNextRequest(
 ): Record<string, unknown> | undefined {
   if (input.redact === true && containsSensitiveText(input)) return undefined;
   const safe = new Set<string>(SAFE_DROP_FIELDS[mode] ?? []);
+  const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
+  if (plainFilePattern) safe.add("pattern");
   if (invalid.some((field) => !safe.has(field))) return undefined;
   const next: Record<string, unknown> = { ...input };
   for (const field of invalid) delete next[field];
+  if (plainFilePattern) next.query = input.pattern;
   if (selectorIssuesFor(next, mode).length > 0) return undefined;
   // A copied request must remain within the transport's bounded line budget.
   try {
@@ -165,7 +185,14 @@ function fieldsError(
   // the signature of arguments shaped as a per-mode object, which the flat
   // schema never advertises. Naming the accepted fields replaces an otherwise
   // puzzling rejection with the rule and the valid names.
-  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
+  const nestedModeObject = invalid.includes(mode);
+  const flatRule = nestedModeObject
+    ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`
+    : "";
+  const filesPatternRule =
+    mode === "files" && invalid.includes("pattern")
+      ? "For filename or path discovery, put the literal name text in query; pattern is a content-search regex, so check any regex syntax before copying it."
+      : "";
   return new RequestContractError(
     {
       code: "E_MODE_FIELDS",
@@ -174,17 +201,26 @@ function fieldsError(
       recovery: nextRequest
         ? {
             action: "retry",
-            reason: `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+            reason: plainFilePatternRecovery(mode, input, invalid)
+              ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved."
+              : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
             nextRequest,
           }
         : {
             action: "manual",
-            reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`,
+            reason: [
+              reason,
+              filesPatternRule ||
+                "Choose the mode explicitly or remove unsupported fields without changing the requested scope.",
+              flatRule,
+            ]
+              .filter(Boolean)
+              .join(" "),
           },
     },
     nextRequest
-      ? `${reason}; retry the exact nextRequest without repeating the original query.`
-      : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`,
+      ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}.`
+      : `${reason}; no semantics-preserving automatic request is available. ${filesPatternRule || flatRule || "Check the mode's accepted fields."}`,
   );
 }
 

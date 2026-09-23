@@ -134,8 +134,7 @@ function requestBody(
   for (const candidate of candidates) {
     questions[candidate.id] = {
       type: "choice",
-      instructions:
-        "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      instructions: `Classify only candidate ${candidate.id} in state.candidates for state.query. Judge that candidate's excerpt by its actual behavior, not by matching words or the other candidates.`,
       criteria: {
         "implementation-candidate":
           "The excerpt appears to implement the requested behavior or its core decision/side effect.",

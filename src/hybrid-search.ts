@@ -274,6 +274,14 @@ export async function combineHybridSearch(
   const selectionReason = conceptCandidatesOmitted
     ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates`
     : undefined;
+  const firstScore = Number(
+    eligibleConcept[0]?.details?.rankingScore ?? eligibleConcept[0]?.details?.score,
+  );
+  const secondScore = Number(
+    eligibleConcept[1]?.details?.rankingScore ?? eligibleConcept[1]?.details?.score,
+  );
+  const closeRanking =
+    Number.isFinite(firstScore) && Number.isFinite(secondScore) && firstScore - secondScore < 0.01;
   return {
     kind: "hybrid",
     unit: "evidence-items",
@@ -285,6 +293,11 @@ export async function combineHybridSearch(
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
       ...(selectionReason ? [selectionReason] : []),
+      ...(closeRanking
+        ? [
+            "Semantic ranks are close; verify the leading candidates with source inspection or literal terms.",
+          ]
+        : []),
       ...(judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []),
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,

@@ -21,7 +21,9 @@ export interface ConceptEmbeddingCallbacks {
   ) => void | Promise<void>;
 }
 
-const INFERENCE_BATCH_SIZE = 16;
+// Bound each ONNX call to four model windows. Larger native batches raised peak
+// RSS without a useful cold-start gain on the measured workload.
+const INFERENCE_BATCH_SIZE = 4;
 
 /** Snap a candidate UTF-16 index so it never splits a surrogate pair. */
 export function safeUtf16End(text: string, end: number): number {
@@ -62,6 +64,10 @@ export function maximumTokenSafeEnd(
   text: string,
   start: number,
 ): number {
+  // Most source passages already fit the model window. Avoid repeatedly
+  // tokenizing prefixes of the same passage in the binary-search path.
+  if (tokenCount(extractor, `${prefix}${text.slice(start)}`) <= CONCEPT_MODEL_TOKENS)
+    return text.length;
   let low = start + 1;
   let high = text.length;
   let accepted = start;
@@ -142,30 +148,56 @@ export async function embedConceptInputs(
 ): Promise<CachedConceptEmbedding[]> {
   const layouts = pending.map((item) => tokenSafeWindows(extractor, item));
   const inputs = layouts.flatMap((windows) => windows.map((window) => window.input));
-  const vectors: number[][] = [];
+  const vectors: (number[] | undefined)[] = Array(inputs.length);
   const layoutEnds: number[] = [];
+  const remainingWindows = layouts.map((windows) => windows.length);
   let layoutEnd = 0;
   for (const windows of layouts) {
     layoutEnd += windows.length;
     layoutEnds.push(layoutEnd);
   }
+  const orderedInputs = inputs
+    .map((input, index) => ({ input, index, tokens: tokenCount(extractor, input) }))
+    // Start with the largest shapes so the native arena can reuse allocations
+    // for smaller batches instead of retaining a growing sequence of arenas.
+    .toSorted((left, right) => right.tokens - left.tokens || left.index - right.index);
+  const vectorFor = (index: number): number[] => {
+    const vector = vectors[index];
+    if (!vector) throw new Error("Missing concept embedding vector");
+    return vector;
+  };
+  const ownerOf = (index: number): number => {
+    let low = 0;
+    let high = layoutEnds.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (index < layoutEnds[middle]!) high = middle;
+      else low = middle + 1;
+    }
+    return low;
+  };
   let completedEmbedding = 0;
-  for (let offset = 0; offset < inputs.length; offset += INFERENCE_BATCH_SIZE) {
-    const batch = inputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
+  let completedWindows = 0;
+  for (let offset = 0; offset < orderedInputs.length;) {
+    const orderedBatch = orderedInputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
+    const batch = orderedBatch.map((item) => item.input);
     // oxlint-disable-next-line no-await-in-loop -- bounded batches cap native tensor memory.
     const tensor = await extractor(batch, { pooling: "mean", normalize: true });
     if (tensor.data.length !== batch.length * CONCEPT_EMBEDDING_DIMENSIONS)
       throw new Error("Unexpected concept embedding dimensions");
     for (let index = 0; index < batch.length; index += 1) {
       const start = index * CONCEPT_EMBEDDING_DIMENSIONS;
-      vectors.push(
-        Array.from(tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS), Number),
+      const inputIndex = orderedBatch[index]!.index;
+      vectors[inputIndex] = Array.from(
+        tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS),
+        Number,
       );
+      remainingWindows[ownerOf(inputIndex)]!--;
     }
-    const completedWindows = Math.min(offset + batch.length, inputs.length);
+    completedWindows += batch.length;
     while (
-      layoutEnds[completedEmbedding] !== undefined &&
-      layoutEnds[completedEmbedding]! <= completedWindows
+      remainingWindows[completedEmbedding] !== undefined &&
+      remainingWindows[completedEmbedding] === 0
     ) {
       const start = completedEmbedding === 0 ? 0 : layoutEnds[completedEmbedding - 1]!;
       const item = pending[completedEmbedding];
@@ -177,7 +209,7 @@ export async function embedConceptInputs(
           windows: (layouts[completedEmbedding] ?? []).map((window, index) => ({
             start: window.start,
             end: window.end,
-            vector: vectors[start + index] ?? [],
+            vector: vectorFor(start + index),
           })),
         },
         completedEmbedding + 1,
@@ -186,6 +218,7 @@ export async function embedConceptInputs(
       completedEmbedding += 1;
     }
     callbacks.onBatch?.(completedWindows, inputs.length);
+    offset += batch.length;
   }
   let vectorIndex = 0;
   return pending.map((item, index) => ({
@@ -193,7 +226,7 @@ export async function embedConceptInputs(
     windows: (layouts[index] ?? []).map((window) => ({
       start: window.start,
       end: window.end,
-      vector: vectors[vectorIndex++] ?? [],
+      vector: vectorFor(vectorIndex++),
     })),
   }));
 }

@@ -140,7 +140,7 @@ async function search(): Promise<void> {
       local_files_only: true,
       dtype: "q8",
       device: "cpu",
-      session_options: { intraOpNumThreads: 2, interOpNumThreads: 1 },
+      session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 },
     });
     try {
       created = await embedConceptInputs(extractor, missing, {

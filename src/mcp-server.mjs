@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.0",
+  version: "1.0.1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -292,7 +292,33 @@ function analysisExtraGroups(counts, termCounts, items) {
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function compactSemanticMetadata(details, analysis) {
+  const counts = analysis.counts;
+  const stats = analysis.stats;
+  const judge = analysis.semanticJudge;
+  const coverage = analysis.coverage;
+  return [
+    ...counts || stats ? [
+      `Search: ${String(counts?.filesAdmitted ?? stats?.filesAdmitted ?? 0)} files, ${String(stats?.passagesRanked ?? counts?.passagesQueued ?? 0)} passages; ${String(stats?.elapsedMs ?? 0)} ms; peak inference RSS ${String(stats?.inferencePeakRssBytes ?? 0)} bytes; cache ${String(stats?.conceptCacheHits ?? 0)} hits/${String(stats?.conceptCacheMisses ?? 0)} misses.`
+    ] : [],
+    ...coverage ? [
+      `Coverage: ${Object.entries(coverage).map(([name, status]) => `${name}=${status}`).join(", ")}.`
+    ] : [],
+    ...analysis.scope ? [`Scope: ${analysis.scope.path}; ignore=${analysis.scope.ignorePolicy}.`] : [],
+    ...analysis.sourceGeneration ? [
+      `Source: ${analysis.sourceGeneration.verification}; ${String(analysis.sourceGeneration.filesUnavailable)} unavailable.`
+    ] : [],
+    ...judge ? [
+      `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`
+    ] : [],
+    ...details.operation ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`] : [],
+    ...analysis.reasons.map((reason) => `[${reason}]`),
+    ...details.redactionApplied ? ["[Display redaction applied.]"] : []
+  ];
+}
 function compactMetadata(details, analysis) {
+  if (analysis.kind === "concept" || analysis.kind === "hybrid")
+    return compactSemanticMetadata(details, analysis);
   return [
     ...analysis.statistics ? formatStatistics(analysis.statistics) : [],
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,
@@ -996,15 +1022,23 @@ function schemaError(input, field, reason) {
     recovery: { action: "manual", reason }
   }, `${field} is invalid: ${reason}`);
 }
+function plainFilePatternRecovery(mode, input, invalid) {
+  return mode === "files" && invalid.includes("pattern") && input.query === undefined && typeof input.pattern === "string" && input.pattern.trim().length > 0 && input.pattern.length <= 256 && input.pattern.isWellFormed() && !/[\\^$.*+?()[\]{}|\r\n\0]/u.test(input.pattern);
+}
 function safeNextRequest(input, mode, invalid) {
   if (input.redact === true && containsSensitiveText(input))
     return;
   const safe = new Set(SAFE_DROP_FIELDS[mode] ?? []);
+  const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
+  if (plainFilePattern)
+    safe.add("pattern");
   if (invalid.some((field) => !safe.has(field)))
     return;
   const next = { ...input };
   for (const field of invalid)
     delete next[field];
+  if (plainFilePattern)
+    next.query = input.pattern;
   if (selectorIssuesFor(next, mode).length > 0)
     return;
   try {
@@ -1033,20 +1067,26 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
     });
   const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
   const reason = omitted > 0 ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)` : `mode=${mode} does not accept ${visibleFields}`;
-  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
+  const nestedModeObject = invalid.includes(mode);
+  const flatRule = nestedModeObject ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.` : "";
+  const filesPatternRule = mode === "files" && invalid.includes("pattern") ? "For filename or path discovery, put the literal name text in query; pattern is a content-search regex, so check any regex syntax before copying it." : "";
   return new RequestContractError({
     code: "E_MODE_FIELDS",
     mode,
     issues,
     recovery: nextRequest ? {
       action: "retry",
-      reason: `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+      reason: plainFilePatternRecovery(mode, input, invalid) ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved." : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
       nextRequest
     } : {
       action: "manual",
-      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`
+      reason: [
+        reason,
+        filesPatternRule || "Choose the mode explicitly or remove unsupported fields without changing the requested scope.",
+        flatRule
+      ].filter(Boolean).join(" ")
     }
-  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
+  }, nextRequest ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}.` : `${reason}; no semantics-preserving automatic request is available. ${filesPatternRule || flatRule || "Check the mode's accepted fields."}`);
 }
 function selectorIssuesFor(input, mode) {
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof input.cursor === "string" && input.cursor.trim().length > 0 && !input.cursor.includes(".analysis")) {
@@ -1282,25 +1322,23 @@ function modelErrorText(error) {
 function requestContractErrorText(error) {
   return requestContractProjection(error).text;
 }
-function projectRequestContract(projected, serialized, message) {
-  const prefix = `sift-light failed: request rejected [${projected.code}]: ${message}`;
+function projectRequestContract(projected, serialized) {
   const recovery = projected.recovery;
   const next = recovery.nextRequest ? `
 Copy the nested recovery.nextRequest object unchanged; do not repeat the original query.` : `
-Recovery action: ${recovery.action}. ${recovery.reason}`;
+Recovery action: ${recovery.action}.`;
   return `
-Error details: ${serialized}
-${prefix}${next}`;
+sift-light failed: request rejected [${projected.code}].
+Error details: ${serialized}${next}`;
 }
 function requestContractProjection(error) {
   const details = boundedRequestContractDetails(error.details);
   const serializedDetails = JSON.stringify(details);
-  const boundedMessage = error.message.toWellFormed().slice(0, 1024);
-  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  const result = projectRequestContract(details, serializedDetails);
   if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES)
     return { details, text: result };
   const compact = {
-    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    code: details.code,
     ...details.mode ? { mode: details.mode } : {},
     issues: [
       {
@@ -1313,7 +1351,7 @@ function requestContractProjection(error) {
       reason: "Exact recovery was omitted; correct the request explicitly."
     }
   };
-  const compactText = projectRequestContract(compact, JSON.stringify(compact), "The request-contract error exceeded the bounded payload budget; correct the request explicitly.");
+  const compactText = projectRequestContract(compact, JSON.stringify(compact));
   return { details: compact, text: compactText };
 }
 
@@ -2819,7 +2857,7 @@ var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
 var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
-var CONCEPT_CACHE_VERSION = 1;
+var CONCEPT_CACHE_VERSION = 2;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MIN_CONCEPT_TIMEOUT_MS = 1000;
@@ -5142,6 +5180,11 @@ function scoreProfile(scores) {
     spread: top - min
   };
 }
+function conceptRankingScore(cosine, passageLength) {
+  const referenceLength = 500;
+  const maximumCorrection = 0.02;
+  return cosine - maximumCorrection * (1 - Math.sqrt(Math.min(passageLength / referenceLength, 1)));
+}
 function passage(document, start) {
   let end = Math.min(document.text.length, start + MAX_CONCEPT_CHARS);
   if (end < document.text.length) {
@@ -5400,6 +5443,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
       const similarity = inferred.scores[index];
       if (similarity === undefined)
         throw new Error("Missing concept similarity");
+      const rankingScore = conceptRankingScore(similarity, item.text.length);
       const evidence = rangeEvidence(item.document, item.range);
       return {
         path: item.document.path,
@@ -5412,7 +5456,8 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
           kind: "concept-candidate",
           certainty: "candidate",
           score: similarity,
-          rankingReason: "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
+          rankingScore,
+          rankingReason: "local multilingual E5 cosine similarity with bounded short-passage rank correction; relevance candidate, no binding or execution claim",
           model: CONCEPT_MODEL,
           revision: CONCEPT_REVISION,
           tokenTruncated: false,
@@ -5421,7 +5466,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
         }
       };
     });
-    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.score) - Number(a.details?.score) || a.path.localeCompare(b.path) || a.line - b.line);
+    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.rankingScore) - Number(a.details?.rankingScore) || a.path.localeCompare(b.path) || a.line - b.line);
     if (ranked.length > MAX_ANALYSIS_RESULTS)
       retentionTruncated = true;
     result.items = ranked.slice(0, MAX_ANALYSIS_RESULTS);
@@ -9664,7 +9709,7 @@ function requestBody(query, candidates, model) {
   for (const candidate of candidates) {
     questions[candidate.id] = {
       type: "choice",
-      instructions: "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      instructions: `Classify only candidate ${candidate.id} in state.candidates for state.query. Judge that candidate's excerpt by its actual behavior, not by matching words or the other candidates.`,
       criteria: {
         "implementation-candidate": "The excerpt appears to implement the requested behavior or its core decision/side effect.",
         "caller-candidate": "The excerpt invokes or wires an implementation but does not implement the behavior itself.",
@@ -10133,6 +10178,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
   const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
   const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed" || judgedConcept.semanticJudge?.status === "partial";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
+  const firstScore = Number(eligibleConcept[0]?.details?.rankingScore ?? eligibleConcept[0]?.details?.score);
+  const secondScore = Number(eligibleConcept[1]?.details?.rankingScore ?? eligibleConcept[1]?.details?.score);
+  const closeRanking = Number.isFinite(firstScore) && Number.isFinite(secondScore) && firstScore - secondScore < 0.01;
   return {
     kind: "hybrid",
     unit: "evidence-items",
@@ -10144,6 +10192,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
       ...selectionReason ? [selectionReason] : [],
+      ...closeRanking ? [
+        "Semantic ranks are close; verify the leading candidates with source inspection or literal terms."
+      ] : [],
       ...judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
