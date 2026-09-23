@@ -5,7 +5,7 @@
       "args": [
         "--yes",
         "--package",
-        "sift-light-runtime@npm:sift-light@1.0.0",
+        "sift-light-runtime@npm:sift-light@1.0.1",
         "sift-light-mcp",
         "--stdio"
       ],

@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.0",
+  version: "1.0.1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -292,7 +292,33 @@ function analysisExtraGroups(counts, termCounts, items) {
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function compactSemanticMetadata(details, analysis) {
+  const counts = analysis.counts;
+  const stats = analysis.stats;
+  const judge = analysis.semanticJudge;
+  const coverage = analysis.coverage;
+  return [
+    ...counts || stats ? [
+      `Search: ${String(counts?.filesAdmitted ?? stats?.filesAdmitted ?? 0)} files, ${String(stats?.passagesRanked ?? counts?.passagesQueued ?? 0)} passages; ${String(stats?.elapsedMs ?? 0)} ms; peak inference RSS ${String(stats?.inferencePeakRssBytes ?? 0)} bytes; cache ${String(stats?.conceptCacheHits ?? 0)} hits/${String(stats?.conceptCacheMisses ?? 0)} misses.`
+    ] : [],
+    ...coverage ? [
+      `Coverage: ${Object.entries(coverage).map(([name, status]) => `${name}=${status}`).join(", ")}.`
+    ] : [],
+    ...analysis.scope ? [`Scope: ${analysis.scope.path}; ignore=${analysis.scope.ignorePolicy}.`] : [],
+    ...analysis.sourceGeneration ? [
+      `Source: ${analysis.sourceGeneration.verification}; ${String(analysis.sourceGeneration.filesUnavailable)} unavailable.`
+    ] : [],
+    ...judge ? [
+      `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`
+    ] : [],
+    ...details.operation ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`] : [],
+    ...analysis.reasons.map((reason) => `[${reason}]`),
+    ...details.redactionApplied ? ["[Display redaction applied.]"] : []
+  ];
+}
 function compactMetadata(details, analysis) {
+  if (analysis.kind === "concept" || analysis.kind === "hybrid")
+    return compactSemanticMetadata(details, analysis);
   return [
     ...analysis.statistics ? formatStatistics(analysis.statistics) : [],
     analysis.counts ? `Counts: ${JSON.stringify(analysis.counts)}` : undefined,
@@ -996,15 +1022,23 @@ function schemaError(input, field, reason) {
     recovery: { action: "manual", reason }
   }, `${field} is invalid: ${reason}`);
 }
+function plainFilePatternRecovery(mode, input, invalid) {
+  return mode === "files" && invalid.includes("pattern") && input.query === undefined && typeof input.pattern === "string" && input.pattern.trim().length > 0 && input.pattern.length <= 256 && input.pattern.isWellFormed() && !/[\\^$.*+?()[\]{}|\r\n\0]/u.test(input.pattern);
+}
 function safeNextRequest(input, mode, invalid) {
   if (input.redact === true && containsSensitiveText(input))
     return;
   const safe = new Set(SAFE_DROP_FIELDS[mode] ?? []);
+  const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
+  if (plainFilePattern)
+    safe.add("pattern");
   if (invalid.some((field) => !safe.has(field)))
     return;
   const next = { ...input };
   for (const field of invalid)
     delete next[field];
+  if (plainFilePattern)
+    next.query = input.pattern;
   if (selectorIssuesFor(next, mode).length > 0)
     return;
   try {
@@ -1033,20 +1067,26 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
     });
   const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
   const reason = omitted > 0 ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)` : `mode=${mode} does not accept ${visibleFields}`;
-  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
+  const nestedModeObject = invalid.includes(mode);
+  const flatRule = nestedModeObject ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.` : "";
+  const filesPatternRule = mode === "files" && invalid.includes("pattern") ? "For filename or path discovery, put the literal name text in query; pattern is a content-search regex, so check any regex syntax before copying it." : "";
   return new RequestContractError({
     code: "E_MODE_FIELDS",
     mode,
     issues,
     recovery: nextRequest ? {
       action: "retry",
-      reason: `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+      reason: plainFilePatternRecovery(mode, input, invalid) ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved." : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
       nextRequest
     } : {
       action: "manual",
-      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`
+      reason: [
+        reason,
+        filesPatternRule || "Choose the mode explicitly or remove unsupported fields without changing the requested scope.",
+        flatRule
+      ].filter(Boolean).join(" ")
     }
-  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
+  }, nextRequest ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}.` : `${reason}; no semantics-preserving automatic request is available. ${filesPatternRule || flatRule || "Check the mode's accepted fields."}`);
 }
 function selectorIssuesFor(input, mode) {
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof input.cursor === "string" && input.cursor.trim().length > 0 && !input.cursor.includes(".analysis")) {
@@ -1282,25 +1322,23 @@ function modelErrorText(error) {
 function requestContractErrorText(error) {
   return requestContractProjection(error).text;
 }
-function projectRequestContract(projected, serialized, message) {
-  const prefix = `sift-light failed: request rejected [${projected.code}]: ${message}`;
+function projectRequestContract(projected, serialized) {
   const recovery = projected.recovery;
   const next = recovery.nextRequest ? `
 Copy the nested recovery.nextRequest object unchanged; do not repeat the original query.` : `
-Recovery action: ${recovery.action}. ${recovery.reason}`;
+Recovery action: ${recovery.action}.`;
   return `
-Error details: ${serialized}
-${prefix}${next}`;
+sift-light failed: request rejected [${projected.code}].
+Error details: ${serialized}${next}`;
 }
 function requestContractProjection(error) {
   const details = boundedRequestContractDetails(error.details);
   const serializedDetails = JSON.stringify(details);
-  const boundedMessage = error.message.toWellFormed().slice(0, 1024);
-  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  const result = projectRequestContract(details, serializedDetails);
   if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES)
     return { details, text: result };
   const compact = {
-    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    code: details.code,
     ...details.mode ? { mode: details.mode } : {},
     issues: [
       {
@@ -1313,7 +1351,7 @@ function requestContractProjection(error) {
       reason: "Exact recovery was omitted; correct the request explicitly."
     }
   };
-  const compactText = projectRequestContract(compact, JSON.stringify(compact), "The request-contract error exceeded the bounded payload budget; correct the request explicitly.");
+  const compactText = projectRequestContract(compact, JSON.stringify(compact));
   return { details: compact, text: compactText };
 }
 
@@ -2819,7 +2857,7 @@ var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
 var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
-var CONCEPT_CACHE_VERSION = 1;
+var CONCEPT_CACHE_VERSION = 2;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MIN_CONCEPT_TIMEOUT_MS = 1000;
@@ -5142,6 +5180,11 @@ function scoreProfile(scores) {
     spread: top - min
   };
 }
+function conceptRankingScore(cosine, passageLength) {
+  const referenceLength = 500;
+  const maximumCorrection = 0.02;
+  return cosine - maximumCorrection * (1 - Math.sqrt(Math.min(passageLength / referenceLength, 1)));
+}
 function passage(document, start) {
   let end = Math.min(document.text.length, start + MAX_CONCEPT_CHARS);
   if (end < document.text.length) {
@@ -5400,6 +5443,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
       const similarity = inferred.scores[index];
       if (similarity === undefined)
         throw new Error("Missing concept similarity");
+      const rankingScore = conceptRankingScore(similarity, item.text.length);
       const evidence = rangeEvidence(item.document, item.range);
       return {
         path: item.document.path,
@@ -5412,7 +5456,8 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
           kind: "concept-candidate",
           certainty: "candidate",
           score: similarity,
-          rankingReason: "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
+          rankingScore,
+          rankingReason: "local multilingual E5 cosine similarity with bounded short-passage rank correction; relevance candidate, no binding or execution claim",
           model: CONCEPT_MODEL,
           revision: CONCEPT_REVISION,
           tokenTruncated: false,
@@ -5421,7 +5466,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
         }
       };
     });
-    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.score) - Number(a.details?.score) || a.path.localeCompare(b.path) || a.line - b.line);
+    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.rankingScore) - Number(a.details?.rankingScore) || a.path.localeCompare(b.path) || a.line - b.line);
     if (ranked.length > MAX_ANALYSIS_RESULTS)
       retentionTruncated = true;
     result.items = ranked.slice(0, MAX_ANALYSIS_RESULTS);
@@ -9517,6 +9562,160 @@ function parsePythonOutline(document) {
 // src/hybrid-search.ts
 import { resolve as resolve20 } from "node:path";
 
+// src/config-reader.ts
+import { readFile as readFile2 } from "node:fs/promises";
+var SIFT_LIGHT_CONFIG_ENV = "SIFT_LIGHT_CONFIG";
+var SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFT_LIGHT_JEV_API_KEY"];
+var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
+  enabled: false,
+  provider: "jev",
+  endpoint: "https://api.typesafe.ai/v1/systemone",
+  apiKeyEnv: SEMANTIC_JUDGE_API_KEY_ENVS[0],
+  model: "jev-latest",
+  timeoutMs: 120000,
+  maxCandidates: 20,
+  maxRetries: 2
+};
+var DEFAULT_SIFT_LIGHT_CONFIG = {
+  locale: "en",
+  enforceSearch: "hard",
+  vectorSearchEnabled: false,
+  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
+};
+function hasErrorCode(error, codes) {
+  return error instanceof Error && "code" in error && codes.includes(String(error.code));
+}
+function isMissingFile(error) {
+  return hasErrorCode(error, ["ENOENT"]);
+}
+function isRawSiftLightConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isRawSemanticJudgeConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedInteger2(value, fallback, minimum, maximum, field) {
+  const candidate = value ?? fallback;
+  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
+    throw new Error(`Invalid sift-light ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`);
+  }
+  return candidate;
+}
+function parseSemanticJudge(value, path) {
+  if (value === undefined)
+    return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
+  if (!isRawSemanticJudgeConfig(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge must be an object`);
+  }
+  const unknown = Object.keys(value).filter((key) => ![
+    "enabled",
+    "provider",
+    "endpoint",
+    "apiKeyEnv",
+    "model",
+    "timeoutMs",
+    "maxCandidates",
+    "maxRetries"
+  ].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid sift-light config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`);
+  }
+  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.enabled must be a boolean`);
+  }
+  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
+  if (provider !== "jev") {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.provider must be "jev"`);
+  }
+  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
+  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
+  }
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch (error) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a URL`, {
+      cause: error
+    });
+  }
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const secureEndpoint = parsedEndpoint.protocol === "https:" || parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname);
+  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`);
+  }
+  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
+  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
+  }
+  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.model must be bounded single-line text`);
+  }
+  return {
+    enabled,
+    provider,
+    endpoint,
+    apiKeyEnv,
+    model,
+    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
+    maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
+    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
+  };
+}
+function parseConfig(value, path) {
+  if (!isRawSiftLightConfig(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
+  }
+  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge"].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled and semanticJudge are accepted`);
+  }
+  const { locale, enforceSearch, vectorSearchEnabled } = value;
+  if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
+    throw new Error(`Invalid sift-light config at ${path}: locale must be "en" or "zh-CN"`);
+  }
+  if (vectorSearchEnabled !== undefined && typeof vectorSearchEnabled !== "boolean") {
+    throw new Error(`Invalid sift-light config at ${path}: vectorSearchEnabled must be a boolean`);
+  }
+  const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
+  return {
+    locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
+    enforceSearch: enforcement,
+    vectorSearchEnabled: vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
+    semanticJudge: parseSemanticJudge(value.semanticJudge, path)
+  };
+}
+function normalizeSearchEnforcement(value, source) {
+  if (value === undefined || value === "hard")
+    return "hard";
+  if (value === "prefer")
+    return "prefer";
+  if (value === "off")
+    return "off";
+  throw new Error(`Invalid sift-light ${source}: enforceSearch must be "hard", "prefer", or "off"`);
+}
+async function readSiftLightConfigFile(path, options = {}) {
+  try {
+    const content = await readFile2(path, "utf8");
+    return parseConfig(JSON.parse(content), path);
+  } catch (error) {
+    if (isMissingFile(error)) {
+      if (options.missing === "error") {
+        throw new Error(`sift-light config was not found at ${path}; create it or unset ${SIFT_LIGHT_CONFIG_ENV}`, { cause: error });
+      }
+      return { ...DEFAULT_SIFT_LIGHT_CONFIG };
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`Invalid sift-light config at ${path}: ${error.message}`, {
+        cause: error
+      });
+    }
+    throw error;
+  }
+}
+
 // src/semantic-judge-batches.ts
 var MAX_SEMANTIC_JUDGE_BATCH_CANDIDATES = 8;
 var MAX_SEMANTIC_JUDGE_REQUEST_BYTES = 64 * 1024;
@@ -9664,7 +9863,7 @@ function requestBody(query, candidates, model) {
   for (const candidate of candidates) {
     questions[candidate.id] = {
       type: "choice",
-      instructions: "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      instructions: `Classify only candidate ${candidate.id} in state.candidates for state.query. Judge that candidate's excerpt by its actual behavior, not by matching words or the other candidates.`,
       criteria: {
         "implementation-candidate": "The excerpt appears to implement the requested behavior or its core decision/side effect.",
         "caller-candidate": "The excerpt invokes or wires an implementation but does not implement the behavior itself.",
@@ -9826,6 +10025,10 @@ function createSemanticJudgeIntegration(config, environment = process.env, fetch
     throw new SemanticJudgeConfigurationError(`Unsupported semantic judge provider: ${String(config.provider)}`);
   }
   return { config, runner: createJevRunner(config, key, fetcher) };
+}
+function createConfiguredSemanticJudgeIntegration(config, environment = process.env) {
+  const judge = config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG;
+  return config.vectorSearchEnabled === true ? createSemanticJudgeIntegration(judge, environment) : createDisabledSemanticJudgeIntegration(judge);
 }
 function baseDetails(config) {
   return {
@@ -10133,6 +10336,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
   const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
   const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed" || judgedConcept.semanticJudge?.status === "partial";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
+  const firstScore = Number(eligibleConcept[0]?.details?.rankingScore ?? eligibleConcept[0]?.details?.score);
+  const secondScore = Number(eligibleConcept[1]?.details?.rankingScore ?? eligibleConcept[1]?.details?.score);
+  const closeRanking = Number.isFinite(firstScore) && Number.isFinite(secondScore) && firstScore - secondScore < 0.01;
   return {
     kind: "hybrid",
     unit: "evidence-items",
@@ -10144,6 +10350,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
       ...selectionReason ? [selectionReason] : [],
+      ...closeRanking ? [
+        "Semantic ranks are close; verify the leading candidates with source inspection or literal terms."
+      ] : [],
       ...judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
@@ -11036,7 +11245,7 @@ import { resolve as resolve24 } from "node:path";
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
 
 // src/format.ts
-import { readFile as readFile2 } from "node:fs/promises";
+import { readFile as readFile3 } from "node:fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -11170,7 +11379,7 @@ async function loadContextLines(match, expectedRevision, cache, signal) {
       cache.set(match.absolutePath, changed);
       return changed;
     }
-    const content = await readFile2(match.absolutePath, { encoding: "utf8", signal });
+    const content = await readFile3(match.absolutePath, { encoding: "utf8", signal });
     const afterRevision = await getSourceRevision(match.absolutePath);
     if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
       const changed = { status: "changed" };
@@ -12601,6 +12810,7 @@ class SiftLightService {
   #runRipgrep;
   #snapshots;
   #summaryFileLimit;
+  #vectorSearchEnabled;
   #capabilities = new LanguageCapabilityCatalog;
   #evidence;
   #lifecycle = new AbortController;
@@ -12611,12 +12821,16 @@ class SiftLightService {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
     validateRequestContract(input);
+    if (!this.#vectorSearchEnabled && (input.mode === "concept" || input.mode === "hybrid")) {
+      throw new SiftLightError(`${input.mode} search is disabled; set vectorSearchEnabled to true in sift-light.json and restart the host`);
+    }
     let request;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);
@@ -13015,160 +13229,11 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
   }
 }
 
-// src/config-reader.ts
-import { readFile as readFile3 } from "node:fs/promises";
-var SIFT_LIGHT_CONFIG_ENV = "SIFT_LIGHT_CONFIG";
-var SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFT_LIGHT_JEV_API_KEY"];
-var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
-  enabled: false,
-  provider: "jev",
-  endpoint: "https://api.typesafe.ai/v1/systemone",
-  apiKeyEnv: SEMANTIC_JUDGE_API_KEY_ENVS[0],
-  model: "jev-latest",
-  timeoutMs: 120000,
-  maxCandidates: 20,
-  maxRetries: 2
-};
-var DEFAULT_SIFT_LIGHT_CONFIG = {
-  locale: "en",
-  enforceSearch: "hard",
-  semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
-};
-function hasErrorCode(error, codes) {
-  return error instanceof Error && "code" in error && codes.includes(String(error.code));
-}
-function isMissingFile(error) {
-  return hasErrorCode(error, ["ENOENT"]);
-}
-function isRawSiftLightConfig(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function isRawSemanticJudgeConfig(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function boundedInteger2(value, fallback, minimum, maximum, field) {
-  const candidate = value ?? fallback;
-  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
-    throw new Error(`Invalid sift-light ${field}: expected an integer from ${String(minimum)} through ${String(maximum)}`);
-  }
-  return candidate;
-}
-function parseSemanticJudge(value, path) {
-  if (value === undefined)
-    return { ...DEFAULT_SEMANTIC_JUDGE_CONFIG };
-  if (!isRawSemanticJudgeConfig(value)) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge must be an object`);
-  }
-  const unknown = Object.keys(value).filter((key) => ![
-    "enabled",
-    "provider",
-    "endpoint",
-    "apiKeyEnv",
-    "model",
-    "timeoutMs",
-    "maxCandidates",
-    "maxRetries"
-  ].includes(key));
-  if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported semanticJudge fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxCandidates and maxRetries`);
-  }
-  const enabled = value.enabled ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.enabled;
-  if (typeof enabled !== "boolean") {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.enabled must be a boolean`);
-  }
-  const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
-  if (provider !== "jev") {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.provider must be "jev"`);
-  }
-  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
-  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
-  }
-  let parsedEndpoint;
-  try {
-    parsedEndpoint = new URL(endpoint);
-  } catch (error) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a URL`, {
-      cause: error
-    });
-  }
-  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
-  const secureEndpoint = parsedEndpoint.protocol === "https:" || parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname);
-  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`);
-  }
-  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
-  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
-  }
-  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
-  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.model must be bounded single-line text`);
-  }
-  return {
-    enabled,
-    provider,
-    endpoint,
-    apiKeyEnv,
-    model,
-    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
-    maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
-    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
-  };
-}
-function parseConfig(value, path) {
-  if (!isRawSiftLightConfig(value)) {
-    throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
-  }
-  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "semanticJudge"].includes(key));
-  if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`);
-  }
-  const { locale, enforceSearch } = value;
-  if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
-    throw new Error(`Invalid sift-light config at ${path}: locale must be "en" or "zh-CN"`);
-  }
-  const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
-  return {
-    locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
-    enforceSearch: enforcement,
-    semanticJudge: parseSemanticJudge(value.semanticJudge, path)
-  };
-}
-function normalizeSearchEnforcement(value, source) {
-  if (value === undefined || value === "hard")
-    return "hard";
-  if (value === "prefer")
-    return "prefer";
-  if (value === "off")
-    return "off";
-  throw new Error(`Invalid sift-light ${source}: enforceSearch must be "hard", "prefer", or "off"`);
-}
-async function readSiftLightConfigFile(path, options = {}) {
-  try {
-    const content = await readFile3(path, "utf8");
-    return parseConfig(JSON.parse(content), path);
-  } catch (error) {
-    if (isMissingFile(error)) {
-      if (options.missing === "error") {
-        throw new Error(`sift-light config was not found at ${path}; create it or unset ${SIFT_LIGHT_CONFIG_ENV}`, { cause: error });
-      }
-      return { ...DEFAULT_SIFT_LIGHT_CONFIG };
-    }
-    if (error instanceof SyntaxError) {
-      throw new Error(`Invalid sift-light config at ${path}: ${error.message}`, {
-        cause: error
-      });
-    }
-    throw error;
-  }
-}
-
 // src/prompt-guidelines.ts
 var SOURCE_OUTPUT_GUIDANCE = "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 function siftLightPromptGuidelines(structuredOutput = true) {
   return [
-    `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
+    `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} For routine development searches, start with fast exact content, filename or applicable structural modes when the request has a usable name, symbol, error text or other literal clue. Omitted mode is ordinary exact search and never loads the local embedding model. Vector search is disabled by default; concept/hybrid require vectorSearchEnabled:true in sift-light.json and an installed model. They can take tens of seconds on an uncached scope, so select them only when semantic recall is needed. Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
@@ -13177,7 +13242,7 @@ function siftLightPromptGuidelines(structuredOutput = true) {
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
     `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path for symbol counts and locations, mode:"imports" for static relationships, and mode:"tests" for related-test candidates. Their text pages summarize metadata; structured details can retain source evidence.`,
-    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
+    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; use hybrid/concept only for business concepts that cannot be located by a literal clue. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
     `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; the text page reports structural counts and locations; structured details can retain matched source evidence.`,
     `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Results expose candidate counts, score statistics, paths and the bounded ranked passage behind each candidate. Similarity scores identify candidates, not correctness.`,
     `Use mode:"hybrid" plus query when wording may differ from the source. It reports exact and semantic counts separately, removes overlap, and retains one pageable evidence snapshot. conceptLimit changes only the semantic candidate count; retained candidates keep their bounded source passages.`,
@@ -13188,9 +13253,9 @@ function siftLightPromptGuidelines(structuredOutput = true) {
 }
 function siftLightModelGuidelines() {
   return [
-    `Search with pattern and optional path. ${SOURCE_OUTPUT_GUIDANCE} Omit mode/limit for automatic detail/summary selection. Compact model analysis pages may defer source excerpts to inspect.`,
-    `Use ranked paths and condition counts to choose evidence. Cursor continuation pages the retained snapshot; summary file selection returns ordinary match metadata. Use mode="inspect" when an edit requires exact source.`,
-    `Modes: capabilities for language prerequisites; files+query for filenames; anyOf/allOf for literal condition statistics; outline/imports/tests for structural and relationship summaries; structure for AST match statistics; concept/hybrid for semantic candidate statistics. Similarity and static links are not proof.`,
+    `Search with pattern and optional path. ${SOURCE_OUTPUT_GUIDANCE} Default search is exact and model-free. concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model; uncached runs may take tens of seconds. Omit mode/limit for auto pages.`,
+    `Use ranked paths and counts; Cursor continuation pages retained results. Use mode="inspect" for exact source before editing.`,
+    `Modes: files+query for filenames; anyOf/allOf for literals; outline/imports/tests for static code; structure for AST; concept/hybrid for semantic candidates. Similarity is not proof.`,
     `On rejection keep the strongest applicable mode and apply the stated repair once. Do not repeat the rejected request or include its error. Only explicit capability-unavailable permits a visibly partial alternative.`
   ];
 }
@@ -13213,12 +13278,12 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
-var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
+var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var siftLightSchema = Type.Object({
   query: Type.Optional(Type.String({
     maxLength: 256,
-    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
+    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require vectorSearchEnabled:true in sift-light.json and an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
   })),
   scope: Type.Optional(stringEnum(["strict", "expand"], {
     description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
@@ -13421,11 +13486,12 @@ function siftLightTool(outputMode) {
     tool.outputSchema = SIFT_LIGHT_OUTPUT_SCHEMA;
   return tool;
 }
-function createDefaultSiftLightMcpService(semanticJudge) {
+function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false) {
   const resolvedSemanticJudge = semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
+    vectorSearchEnabled,
     semanticJudge: resolvedSemanticJudge
   });
 }
@@ -13848,12 +13914,18 @@ function configuredPath(environment) {
   const value = environment[SIFT_LIGHT_CONFIG_ENV]?.trim();
   return value || undefined;
 }
-async function createMcpSemanticJudgeIntegration(environment = process.env) {
+async function createMcpSearchFeatures(environment = process.env) {
   const path = configuredPath(environment);
   if (!path)
-    return createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
+    return {
+      semanticJudge: createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG),
+      vectorSearchEnabled: DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled === true
+    };
   const config = await readSiftLightConfigFile(path, { missing: "error" });
-  return createSemanticJudgeIntegration(config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG, environment);
+  return {
+    semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
+    vectorSearchEnabled: config.vectorSearchEnabled === true
+  };
 }
 function mcpSemanticJudgeConfigSource(environment = process.env) {
   return configuredPath(environment) ? "explicit-config" : "not-configured";
@@ -13967,20 +14039,17 @@ function environmentInteger(name, fallback, minimum, maximum) {
 function allowedOrigins() {
   return (process.env.SIFT_LIGHT_MCP_ALLOWED_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter((origin) => origin.length > 0);
 }
-async function configuredSemanticJudge() {
-  return createMcpSemanticJudgeIntegration();
-}
 function logSemanticJudgeStatus(integration) {
   const status = integration.config.enabled ? "enabled" : "disabled";
   process.stderr.write(`sift-light MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}
 `);
 }
-async function runHttpServer(outputMode, semanticJudge) {
+async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled) {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65535),
-    createService: () => createDefaultSiftLightMcpService(semanticJudge),
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled),
     maxSessions: environmentInteger("SIFT_LIGHT_MCP_MAX_SESSIONS", DEFAULT_MCP_MAX_SESSIONS, 1, Number.MAX_SAFE_INTEGER),
     sessionIdleTimeoutMs: environmentInteger("SIFT_LIGHT_MCP_SESSION_IDLE_MS", DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS, 1, Number.MAX_SAFE_INTEGER),
     allowedOrigins: allowedOrigins(),
@@ -14014,11 +14083,11 @@ async function runHttpServer(outputMode, semanticJudge) {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-async function runStdioServer(outputMode, semanticJudge) {
+async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled) {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSiftLightMcpService(semanticJudge)
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled)
   });
   process.stderr.write(`sift-light MCP serving one local client over stdio
 `);
@@ -14047,13 +14116,15 @@ async function main() {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const semanticJudge = await configuredSemanticJudge();
+  const { semanticJudge, vectorSearchEnabled } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
+  process.stderr.write(`sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}
+`);
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge);
+    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled);
     return;
   }
-  await runHttpServer(outputMode, semanticJudge);
+  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled);
 }
 try {
   await main();

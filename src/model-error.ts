@@ -73,19 +73,14 @@ export interface RequestContractProjection {
   text: string;
 }
 
-function projectRequestContract(
-  projected: RequestContractDetails,
-  serialized: string,
-  message: string,
-): string {
-  const prefix = `sift-light failed: request rejected [${projected.code}]: ${message}`;
+function projectRequestContract(projected: RequestContractDetails, serialized: string): string {
   const recovery = projected.recovery;
   const next = recovery.nextRequest
     ? "\nCopy the nested recovery.nextRequest object unchanged; do not repeat the original query."
-    : `\nRecovery action: ${recovery.action}. ${recovery.reason}`;
+    : `\nRecovery action: ${recovery.action}.`;
   // Put the machine payload first so simple host adapters that locate the
   // first `nextRequest` marker see the exact nested request object.
-  return `\nError details: ${serialized}\n${prefix}${next}`;
+  return `\nsift-light failed: request rejected [${projected.code}].\nError details: ${serialized}${next}`;
 }
 
 /** Build the one bounded contract projection consumed by structured and text hosts. */
@@ -94,11 +89,10 @@ export function requestContractProjection(
 ): RequestContractProjection {
   const details = boundedRequestContractDetails(error.details);
   const serializedDetails = JSON.stringify(details);
-  const boundedMessage = error.message.toWellFormed().slice(0, 1_024);
-  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  const result = projectRequestContract(details, serializedDetails);
   if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES) return { details, text: result };
   const compact: RequestContractDetails = {
-    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    code: details.code,
     ...(details.mode ? { mode: details.mode } : {}),
     issues: [
       {
@@ -111,10 +105,6 @@ export function requestContractProjection(
       reason: "Exact recovery was omitted; correct the request explicitly.",
     },
   };
-  const compactText = projectRequestContract(
-    compact,
-    JSON.stringify(compact),
-    "The request-contract error exceeded the bounded payload budget; correct the request explicitly.",
-  );
+  const compactText = projectRequestContract(compact, JSON.stringify(compact));
   return { details: compact, text: compactText };
 }

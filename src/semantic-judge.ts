@@ -1,4 +1,8 @@
-import type { SemanticJudgeConfig } from "./config-reader.js";
+import {
+  DEFAULT_SEMANTIC_JUDGE_CONFIG,
+  type SemanticJudgeConfig,
+  type SiftLightConfig,
+} from "./config-reader.js";
 import {
   SEMANTIC_JUDGE_CLASSIFICATIONS,
   SEMANTIC_JUDGE_NON_PROOF_CLAIM,
@@ -134,8 +138,7 @@ function requestBody(
   for (const candidate of candidates) {
     questions[candidate.id] = {
       type: "choice",
-      instructions:
-        "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      instructions: `Classify only candidate ${candidate.id} in state.candidates for state.query. Judge that candidate's excerpt by its actual behavior, not by matching words or the other candidates.`,
       criteria: {
         "implementation-candidate":
           "The excerpt appears to implement the requested behavior or its core decision/side effect.",
@@ -374,6 +377,17 @@ export function createSemanticJudgeIntegration(
   }
   return { config, runner: createJevRunner(config, key, fetcher) };
 }
+
+export function createConfiguredSemanticJudgeIntegration(
+  config: SiftLightConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): SemanticJudgeIntegration {
+  const judge = config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG;
+  return config.vectorSearchEnabled === true
+    ? createSemanticJudgeIntegration(judge, environment)
+    : createDisabledSemanticJudgeIntegration(judge);
+}
+
 function baseDetails(config: SemanticJudgeConfig): SemanticJudgeDetails {
   return {
     enabled: config.enabled,

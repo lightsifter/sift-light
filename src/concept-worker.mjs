@@ -27,10 +27,10 @@ class SiftLightError extends Error {
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
-var CONCEPT_MODEL_TOKENS = 512;
+var CONCEPT_MODEL_TOKENS = 256;
 var CONCEPT_WINDOW_OVERLAP_TOKENS = 64;
 var CONCEPT_EMBEDDING_DIMENSIONS = 384;
-var CONCEPT_CACHE_VERSION = 1;
+var CONCEPT_CACHE_VERSION = 2;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MAX_CONCEPT_TIMEOUT_MS = 60 * 60000;
@@ -222,7 +222,7 @@ async function enforceConceptCacheLimit(root, maximumBytes = CONCEPT_CACHE_MAX_B
 }
 
 // src/concept-inference.ts
-var INFERENCE_BATCH_SIZE = 16;
+var INFERENCE_BATCH_SIZE = 4;
 function safeUtf16End(text, end) {
   if (end <= 0 || end >= text.length)
     return end;
@@ -247,6 +247,8 @@ function binarySearchBudget(span) {
   return 2 * Math.max(span, 1) + 32;
 }
 function maximumTokenSafeEnd(extractor, prefix, text, start) {
+  if (tokenCount(extractor, `${prefix}${text.slice(start)}`) <= CONCEPT_MODEL_TOKENS)
+    return text.length;
   let low = start + 1;
   let high = text.length;
   let accepted = start;
@@ -312,25 +314,49 @@ function tokenSafeWindows(extractor, pending) {
 async function embedConceptInputs(extractor, pending, callbacks = {}) {
   const layouts = pending.map((item) => tokenSafeWindows(extractor, item));
   const inputs = layouts.flatMap((windows) => windows.map((window) => window.input));
-  const vectors = [];
+  const vectors = Array(inputs.length);
   const layoutEnds = [];
+  const remainingWindows = layouts.map((windows) => windows.length);
   let layoutEnd = 0;
   for (const windows of layouts) {
     layoutEnd += windows.length;
     layoutEnds.push(layoutEnd);
   }
+  const orderedInputs = inputs.map((input, index) => ({ input, index, tokens: tokenCount(extractor, input) })).toSorted((left, right) => right.tokens - left.tokens || left.index - right.index);
+  const vectorFor = (index) => {
+    const vector = vectors[index];
+    if (!vector)
+      throw new Error("Missing concept embedding vector");
+    return vector;
+  };
+  const ownerOf = (index) => {
+    let low = 0;
+    let high = layoutEnds.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (index < layoutEnds[middle])
+        high = middle;
+      else
+        low = middle + 1;
+    }
+    return low;
+  };
   let completedEmbedding = 0;
-  for (let offset = 0;offset < inputs.length; offset += INFERENCE_BATCH_SIZE) {
-    const batch = inputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
+  let completedWindows = 0;
+  for (let offset = 0;offset < orderedInputs.length; ) {
+    const orderedBatch = orderedInputs.slice(offset, offset + INFERENCE_BATCH_SIZE);
+    const batch = orderedBatch.map((item) => item.input);
     const tensor = await extractor(batch, { pooling: "mean", normalize: true });
     if (tensor.data.length !== batch.length * CONCEPT_EMBEDDING_DIMENSIONS)
       throw new Error("Unexpected concept embedding dimensions");
     for (let index = 0;index < batch.length; index += 1) {
       const start = index * CONCEPT_EMBEDDING_DIMENSIONS;
-      vectors.push(Array.from(tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS), Number));
+      const inputIndex = orderedBatch[index].index;
+      vectors[inputIndex] = Array.from(tensor.data.slice(start, start + CONCEPT_EMBEDDING_DIMENSIONS), Number);
+      remainingWindows[ownerOf(inputIndex)]--;
     }
-    const completedWindows = Math.min(offset + batch.length, inputs.length);
-    while (layoutEnds[completedEmbedding] !== undefined && layoutEnds[completedEmbedding] <= completedWindows) {
+    completedWindows += batch.length;
+    while (remainingWindows[completedEmbedding] !== undefined && remainingWindows[completedEmbedding] === 0) {
       const start = completedEmbedding === 0 ? 0 : layoutEnds[completedEmbedding - 1];
       const item = pending[completedEmbedding];
       if (!item)
@@ -340,12 +366,13 @@ async function embedConceptInputs(extractor, pending, callbacks = {}) {
         windows: (layouts[completedEmbedding] ?? []).map((window, index) => ({
           start: window.start,
           end: window.end,
-          vector: vectors[start + index] ?? []
+          vector: vectorFor(start + index)
         }))
       }, completedEmbedding + 1, pending.length);
       completedEmbedding += 1;
     }
     callbacks.onBatch?.(completedWindows, inputs.length);
+    offset += batch.length;
   }
   let vectorIndex = 0;
   return pending.map((item, index) => ({
@@ -353,7 +380,7 @@ async function embedConceptInputs(extractor, pending, callbacks = {}) {
     windows: (layouts[index] ?? []).map((window) => ({
       start: window.start,
       end: window.end,
-      vector: vectors[vectorIndex++] ?? []
+      vector: vectorFor(vectorIndex++)
     }))
   }));
 }
@@ -504,7 +531,7 @@ async function search() {
       local_files_only: true,
       dtype: "q8",
       device: "cpu",
-      session_options: { intraOpNumThreads: 2, interOpNumThreads: 1 }
+      session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 }
     });
     try {
       created = await embedConceptInputs(extractor, missing, {

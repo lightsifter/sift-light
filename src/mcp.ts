@@ -93,12 +93,14 @@ export interface SiftLightMcpService {
 
 export function createDefaultSiftLightMcpService(
   semanticJudge?: SemanticJudgeIntegration,
+  vectorSearchEnabled = false,
 ): SiftLightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
+    vectorSearchEnabled,
     semanticJudge: resolvedSemanticJudge,
   });
 }

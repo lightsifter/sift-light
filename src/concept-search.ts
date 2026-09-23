@@ -86,6 +86,14 @@ function scoreProfile(scores: readonly number[]): ConceptScoreProfile {
   };
 }
 
+/** E5 cosine scores favor very short, generic passages in close races. Keep the
+ * raw cosine as evidence and apply a bounded length correction only to rank. */
+export function conceptRankingScore(cosine: number, passageLength: number): number {
+  const referenceLength = 500;
+  const maximumCorrection = 0.02;
+  return cosine - maximumCorrection * (1 - Math.sqrt(Math.min(passageLength / referenceLength, 1)));
+}
+
 function passage(document: SourceDocument, start: number): { value: Passage; next: number } {
   let end = Math.min(document.text.length, start + MAX_CONCEPT_CHARS);
   if (end < document.text.length) {
@@ -433,6 +441,7 @@ async function runConceptSearch(
     const batchItems = passages.map((item, index) => {
       const similarity = inferred.scores[index];
       if (similarity === undefined) throw new Error("Missing concept similarity");
+      const rankingScore = conceptRankingScore(similarity, item.text.length);
       const evidence = rangeEvidence(item.document, item.range);
       return {
         path: item.document.path,
@@ -445,8 +454,9 @@ async function runConceptSearch(
           kind: "concept-candidate",
           certainty: "candidate",
           score: similarity,
+          rankingScore,
           rankingReason:
-            "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
+            "local multilingual E5 cosine similarity with bounded short-passage rank correction; relevance candidate, no binding or execution claim",
           model: CONCEPT_MODEL,
           revision: CONCEPT_REVISION,
           tokenTruncated: false,
@@ -457,7 +467,7 @@ async function runConceptSearch(
     });
     const ranked = [...result.items, ...batchItems].toSorted(
       (a, b) =>
-        Number(b.details?.score) - Number(a.details?.score) ||
+        Number(b.details?.rankingScore) - Number(a.details?.rankingScore) ||
         a.path.localeCompare(b.path) ||
         a.line - b.line,
     );

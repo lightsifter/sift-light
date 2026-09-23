@@ -12,6 +12,7 @@ export const SIFT_LIGHT_ENFORCEMENT_ENV = "SIFT_LIGHT_ENFORCE_SEARCH";
 export interface SiftLightConfig {
   locale: SiftLightLocale;
   enforceSearch?: SearchEnforcementMode;
+  vectorSearchEnabled?: boolean;
   semanticJudge?: SemanticJudgeConfig;
 }
 
@@ -44,12 +45,14 @@ export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
 export const DEFAULT_SIFT_LIGHT_CONFIG: Readonly<SiftLightConfig> = {
   locale: "en",
   enforceSearch: "hard",
+  vectorSearchEnabled: false,
   semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG,
 };
 
 interface RawSiftLightConfig {
   locale?: unknown;
   enforceSearch?: unknown;
+  vectorSearchEnabled?: unknown;
   semanticJudge?: unknown;
 }
 
@@ -221,21 +224,26 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
     throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
   }
   const unknown = Object.keys(value).filter(
-    (key) => !["locale", "enforceSearch", "semanticJudge"].includes(key),
+    (key) => !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge"].includes(key),
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`,
+      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled and semanticJudge are accepted`,
     );
   }
-  const { locale, enforceSearch } = value;
+  const { locale, enforceSearch, vectorSearchEnabled } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
     throw new Error(`Invalid sift-light config at ${path}: locale must be "en" or "zh-CN"`);
+  }
+  if (vectorSearchEnabled !== undefined && typeof vectorSearchEnabled !== "boolean") {
+    throw new Error(`Invalid sift-light config at ${path}: vectorSearchEnabled must be a boolean`);
   }
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
   return {
     locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
     enforceSearch: enforcement,
+    vectorSearchEnabled:
+      vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path),
   };
 }

@@ -71,6 +71,7 @@ var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
 var DEFAULT_SIFT_LIGHT_CONFIG = {
   locale: "en",
   enforceSearch: "hard",
+  vectorSearchEnabled: false,
   semanticJudge: DEFAULT_SEMANTIC_JUDGE_CONFIG
 };
 function resolveSiftLightConfigPath(agentDirectory, environment = process.env) {
@@ -163,18 +164,22 @@ function parseConfig(value, path) {
   if (!isRawSiftLightConfig(value)) {
     throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
   }
-  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "semanticJudge"].includes(key));
+  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge"].includes(key));
   if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch and semanticJudge are accepted`);
+    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled and semanticJudge are accepted`);
   }
-  const { locale, enforceSearch } = value;
+  const { locale, enforceSearch, vectorSearchEnabled } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
     throw new Error(`Invalid sift-light config at ${path}: locale must be "en" or "zh-CN"`);
+  }
+  if (vectorSearchEnabled !== undefined && typeof vectorSearchEnabled !== "boolean") {
+    throw new Error(`Invalid sift-light config at ${path}: vectorSearchEnabled must be a boolean`);
   }
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
   return {
     locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
     enforceSearch: enforcement,
+    vectorSearchEnabled: vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path)
   };
 }
@@ -1814,7 +1819,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.0",
+  version: "1.0.1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -2185,7 +2190,7 @@ var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
 var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
-var CONCEPT_CACHE_VERSION = 1;
+var CONCEPT_CACHE_VERSION = 2;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MIN_CONCEPT_TIMEOUT_MS = 1000;
@@ -4687,6 +4692,11 @@ function scoreProfile(scores) {
     spread: top - min
   };
 }
+function conceptRankingScore(cosine, passageLength) {
+  const referenceLength = 500;
+  const maximumCorrection = 0.02;
+  return cosine - maximumCorrection * (1 - Math.sqrt(Math.min(passageLength / referenceLength, 1)));
+}
 function passage(document2, start2) {
   let end = Math.min(document2.text.length, start2 + MAX_CONCEPT_CHARS);
   if (end < document2.text.length) {
@@ -4945,6 +4955,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
       const similarity = inferred.scores[index];
       if (similarity === undefined)
         throw new Error("Missing concept similarity");
+      const rankingScore = conceptRankingScore(similarity, item.text.length);
       const evidence = rangeEvidence(item.document, item.range);
       return {
         path: item.document.path,
@@ -4957,7 +4968,8 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
           kind: "concept-candidate",
           certainty: "candidate",
           score: similarity,
-          rankingReason: "local multilingual E5 cosine similarity; relevance candidate, no binding or execution claim",
+          rankingScore,
+          rankingReason: "local multilingual E5 cosine similarity with bounded short-passage rank correction; relevance candidate, no binding or execution claim",
           model: CONCEPT_MODEL,
           revision: CONCEPT_REVISION,
           tokenTruncated: false,
@@ -4966,7 +4978,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
         }
       };
     });
-    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.score) - Number(a.details?.score) || a.path.localeCompare(b.path) || a.line - b.line);
+    const ranked = [...result.items, ...batchItems].toSorted((a, b) => Number(b.details?.rankingScore) - Number(a.details?.rankingScore) || a.path.localeCompare(b.path) || a.line - b.line);
     if (ranked.length > MAX_ANALYSIS_RESULTS)
       retentionTruncated = true;
     result.items = ranked.slice(0, MAX_ANALYSIS_RESULTS);
@@ -9312,7 +9324,7 @@ function requestBody(query, candidates, model) {
   for (const candidate of candidates) {
     questions[candidate.id] = {
       type: "choice",
-      instructions: "Classify the candidate by what it actually does for the requested behavior. Judge the code excerpt, not just matching words.",
+      instructions: `Classify only candidate ${candidate.id} in state.candidates for state.query. Judge that candidate's excerpt by its actual behavior, not by matching words or the other candidates.`,
       criteria: {
         "implementation-candidate": "The excerpt appears to implement the requested behavior or its core decision/side effect.",
         "caller-candidate": "The excerpt invokes or wires an implementation but does not implement the behavior itself.",
@@ -9474,6 +9486,10 @@ function createSemanticJudgeIntegration(config, environment = process.env, fetch
     throw new SemanticJudgeConfigurationError(`Unsupported semantic judge provider: ${String(config.provider)}`);
   }
   return { config, runner: createJevRunner(config, key, fetcher) };
+}
+function createConfiguredSemanticJudgeIntegration(config, environment = process.env) {
+  const judge = config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG;
+  return config.vectorSearchEnabled === true ? createSemanticJudgeIntegration(judge, environment) : createDisabledSemanticJudgeIntegration(judge);
 }
 function baseDetails(config) {
   return {
@@ -9781,6 +9797,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
   const deduplicationCoverage = scan.snapshotComplete && literal.sourceCoverage === "complete" && conceptSourceCoverage === "complete" ? "complete" : "partial";
   const partial = !scan.snapshotComplete || concept.partial || conceptCoverage === "skipped" || conceptSourceCoverage === "partial" || literal.sourceCoverage === "partial" || deduplicationCoverage === "partial" || judgedConcept.semanticJudge?.status === "failed" || judgedConcept.semanticJudge?.status === "partial";
   const selectionReason = conceptCandidatesOmitted ? `Hybrid concept limit retained the top ${String(selectedConcept.length)} of ${String(eligibleConcept.length)} non-overlapping semantic candidates` : undefined;
+  const firstScore = Number(eligibleConcept[0]?.details?.rankingScore ?? eligibleConcept[0]?.details?.score);
+  const secondScore = Number(eligibleConcept[1]?.details?.rankingScore ?? eligibleConcept[1]?.details?.score);
+  const closeRanking = Number.isFinite(firstScore) && Number.isFinite(secondScore) && firstScore - secondScore < 0.01;
   return {
     kind: "hybrid",
     unit: "evidence-items",
@@ -9792,6 +9811,9 @@ async function combineHybridSearch(scan, execution, access, conceptLimit, query,
       ...literal.reasons,
       ...execution.sourceGeneration.reasons,
       ...selectionReason ? [selectionReason] : [],
+      ...closeRanking ? [
+        "Semantic ranks are close; verify the leading candidates with source inspection or literal terms."
+      ] : [],
       ...judgedConcept.semanticJudge?.reason ? [judgedConcept.semanticJudge.reason] : []
     ],
     filesRead: (concept.filesRead ?? 0) + access.filesRead,
@@ -10215,15 +10237,23 @@ function schemaError(input, field, reason) {
     recovery: { action: "manual", reason }
   }, `${field} is invalid: ${reason}`);
 }
+function plainFilePatternRecovery(mode, input, invalid) {
+  return mode === "files" && invalid.includes("pattern") && input.query === undefined && typeof input.pattern === "string" && input.pattern.trim().length > 0 && input.pattern.length <= 256 && input.pattern.isWellFormed() && !/[\\^$.*+?()[\]{}|\r\n\0]/u.test(input.pattern);
+}
 function safeNextRequest(input, mode, invalid) {
   if (input.redact === true && containsSensitiveText(input))
     return;
   const safe = new Set(SAFE_DROP_FIELDS[mode] ?? []);
+  const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
+  if (plainFilePattern)
+    safe.add("pattern");
   if (invalid.some((field) => !safe.has(field)))
     return;
   const next = { ...input };
   for (const field of invalid)
     delete next[field];
+  if (plainFilePattern)
+    next.query = input.pattern;
   if (selectorIssuesFor(next, mode).length > 0)
     return;
   try {
@@ -10252,20 +10282,26 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
     });
   const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
   const reason = omitted > 0 ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)` : `mode=${mode} does not accept ${visibleFields}`;
-  const flatRule = `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`;
+  const nestedModeObject = invalid.includes(mode);
+  const flatRule = nestedModeObject ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.` : "";
+  const filesPatternRule = mode === "files" && invalid.includes("pattern") ? "For filename or path discovery, put the literal name text in query; pattern is a content-search regex, so check any regex syntax before copying it." : "";
   return new RequestContractError({
     code: "E_MODE_FIELDS",
     mode,
     issues,
     recovery: nextRequest ? {
       action: "retry",
-      reason: `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+      reason: plainFilePatternRecovery(mode, input, invalid) ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved." : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
       nextRequest
     } : {
       action: "manual",
-      reason: `${reason}; choose the mode explicitly or remove the fields yourself without changing the requested scope. ${flatRule}`
+      reason: [
+        reason,
+        filesPatternRule || "Choose the mode explicitly or remove unsupported fields without changing the requested scope.",
+        flatRule
+      ].filter(Boolean).join(" ")
     }
-  }, nextRequest ? `${reason}; retry the exact nextRequest without repeating the original query.` : `${reason}; no semantics-preserving automatic request is available. ${flatRule} Preserve valid path, filters, redact and cursor fields when choosing the next request.`);
+  }, nextRequest ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}.` : `${reason}; no semantics-preserving automatic request is available. ${filesPatternRule || flatRule || "Check the mode's accepted fields."}`);
 }
 function selectorIssuesFor(input, mode) {
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof input.cursor === "string" && input.cursor.trim().length > 0 && !input.cursor.includes(".analysis")) {
@@ -12743,6 +12779,7 @@ class SiftLightService {
   #runRipgrep;
   #snapshots;
   #summaryFileLimit;
+  #vectorSearchEnabled;
   #capabilities = new LanguageCapabilityCatalog;
   #evidence;
   #lifecycle = new AbortController;
@@ -12753,12 +12790,16 @@ class SiftLightService {
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore;
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
+    this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge);
   }
   async search(input, cwd, signal, options = {}) {
     validateRawSearchInput(input);
     validateRequestContract(input);
+    if (!this.#vectorSearchEnabled && (input.mode === "concept" || input.mode === "hybrid")) {
+      throw new SiftLightError(`${input.mode} search is disabled; set vectorSearchEnabled to true in sift-light.json and restart the host`);
+    }
     let request;
     if (input.mode === "await" || input.mode === "cancel") {
       request = this.#operationCommand(input, cwd, signal);
@@ -13161,7 +13202,7 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
 var SOURCE_OUTPUT_GUIDANCE = "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 function siftLightPromptGuidelines(structuredOutput = true) {
   return [
-    `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
+    `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} For routine development searches, start with fast exact content, filename or applicable structural modes when the request has a usable name, symbol, error text or other literal clue. Omitted mode is ordinary exact search and never loads the local embedding model. Vector search is disabled by default; concept/hybrid require vectorSearchEnabled:true in sift-light.json and an installed model. They can take tens of seconds on an uncached scope, so select them only when semantic recall is needed. Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
@@ -13170,7 +13211,7 @@ function siftLightPromptGuidelines(structuredOutput = true) {
     `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
     `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path for symbol counts and locations, mode:"imports" for static relationships, and mode:"tests" for related-test candidates. Their text pages summarize metadata; structured details can retain source evidence.`,
-    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; business concepts belong in hybrid/concept. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
+    `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; use hybrid/concept only for business concepts that cannot be located by a literal clue. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
     `Use mode:"structure" only for JS/TS/TSX/Go, with a required nonempty ast-grep pattern such as "compare($X, $X)" or "send()" for code shapes across whitespace; the text page reports structural counts and locations; structured details can retain matched source evidence.`,
     `Use mode:"concept" plus a natural-language query when names are unknown. It runs a pinned local multilingual model only after explicit installation; no search downloads weights or sends code to a remote model. Results expose candidate counts, score statistics, paths and the bounded ranked passage behind each candidate. Similarity scores identify candidates, not correctness.`,
     `Use mode:"hybrid" plus query when wording may differ from the source. It reports exact and semantic counts separately, removes overlap, and retains one pageable evidence snapshot. conceptLimit changes only the semantic candidate count; retained candidates keep their bounded source passages.`,
@@ -20526,12 +20567,12 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
-var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
+var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var siftLightSchema = _Object_({
   query: Optional(String2({
     maxLength: 256,
-    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
+    description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require vectorSearchEnabled:true in sift-light.json and an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
   })),
   scope: Optional(stringEnum(["strict", "expand"], {
     description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
@@ -20750,25 +20791,23 @@ function modelErrorText(error) {
 function requestContractErrorText(error) {
   return requestContractProjection(error).text;
 }
-function projectRequestContract(projected, serialized, message) {
-  const prefix = `sift-light failed: request rejected [${projected.code}]: ${message}`;
+function projectRequestContract(projected, serialized) {
   const recovery = projected.recovery;
   const next = recovery.nextRequest ? `
 Copy the nested recovery.nextRequest object unchanged; do not repeat the original query.` : `
-Recovery action: ${recovery.action}. ${recovery.reason}`;
+Recovery action: ${recovery.action}.`;
   return `
-Error details: ${serialized}
-${prefix}${next}`;
+sift-light failed: request rejected [${projected.code}].
+Error details: ${serialized}${next}`;
 }
 function requestContractProjection(error) {
   const details = boundedRequestContractDetails(error.details);
   const serializedDetails = JSON.stringify(details);
-  const boundedMessage = error.message.toWellFormed().slice(0, 1024);
-  const result = projectRequestContract(details, serializedDetails, boundedMessage);
+  const result = projectRequestContract(details, serializedDetails);
   if (Buffer.byteLength(result) <= MAX_REQUEST_RECOVERY_BYTES)
     return { details, text: result };
   const compact = {
-    code: boundedMessage.length > 0 ? details.code : "E_REQUEST_CONTRACT_PAYLOAD",
+    code: details.code,
     ...details.mode ? { mode: details.mode } : {},
     issues: [
       {
@@ -20781,7 +20820,7 @@ function requestContractProjection(error) {
       reason: "Exact recovery was omitted; correct the request explicitly."
     }
   };
-  const compactText = projectRequestContract(compact, JSON.stringify(compact), "The request-contract error exceeded the bounded payload budget; correct the request explicitly.");
+  const compactText = projectRequestContract(compact, JSON.stringify(compact));
   return { details: compact, text: compactText };
 }
 
@@ -20839,10 +20878,11 @@ async function registerOmpSiftLightExtension(pi, searchPolicyAssets = new URL(".
   const resolvedConfig = config ?? await readSiftLightConfigFile(resolveSiftLightConfigPath(ompAgentDir()), {
     missing: process.env[SIFT_LIGHT_CONFIG_ENV]?.trim() ? "error" : "defaults"
   });
-  const semanticJudge = createSemanticJudgeIntegration(resolvedConfig.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG);
+  const semanticJudge = createConfiguredSemanticJudgeIntegration(resolvedConfig);
   const runtime = new SiftLightRuntime(new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
+    vectorSearchEnabled: resolvedConfig.vectorSearchEnabled === true,
     semanticJudge
   }));
   const { locale } = resolvedConfig;
@@ -20861,7 +20901,7 @@ async function registerOmpSiftLightExtension(pi, searchPolicyAssets = new URL(".
   pi.registerTool({
     name: SIFT_LIGHT_LABEL,
     label: SIFT_LIGHT_LABEL,
-    description: "Search and navigate code with bounded, verifiable evidence. Use pattern for content or mode=files with query for filenames.",
+    description: "Search code with bounded evidence. Routine searches use pattern for fast exact content or mode=files with query for filenames; concept/hybrid require vectorSearchEnabled:true in sift-light.json.",
     approval: "read",
     promptSnippet: "Search file contents without flooding context",
     promptGuidelines: siftLightPromptGuidelines(),
