@@ -7,6 +7,18 @@ import { resolve } from "node:path";
 import { CursorError, SiftLightError } from "./errors.js";
 import { DISCOVERY_MODE_REQUIRED_ERROR } from "./discovery-errors.js";
 import { validateRequestContract } from "./request-contract.js";
+import { normalizeRequestAliases, type SiftLightRequest } from "./request-aliases.js";
+
+export type { SiftLightRequest } from "./request-aliases.js";
+
+/** Normalizations are part of the evidence: show them in text and details. */
+function withRequestNotes(result: SiftLightResult, notes: readonly string[]): SiftLightResult {
+  if (notes.length === 0) return result;
+  return {
+    text: `${notes.map((note) => `[Request note: ${note}]`).join("\n")}\n${result.text}`,
+    details: { ...result.details, requestNotes: [...notes] },
+  };
+}
 import {
   formatMatchMetadataPage,
   formatMatchPage,
@@ -392,10 +404,20 @@ export class SiftLightService {
   }
 
   async search(
-    input: SiftLightInput,
+    request: SiftLightRequest,
     cwd: string,
     signal?: AbortSignal,
     options: SiftLightSearchOptions = {},
+  ): Promise<SiftLightResult> {
+    const { input, notes } = normalizeRequestAliases(request);
+    return withRequestNotes(await this.#searchNormalized(input, cwd, signal, options), notes);
+  }
+
+  async #searchNormalized(
+    input: SiftLightInput,
+    cwd: string,
+    signal: AbortSignal | undefined,
+    options: SiftLightSearchOptions,
   ): Promise<SiftLightResult> {
     validateRawSearchInput(input);
     validateRequestContract(input);

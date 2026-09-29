@@ -53,11 +53,11 @@ Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: 
 完整快照表示匹配保留完整，不代表源码正文没有截断。长行摘录会明确标记限制，并给出最后一页之后仍可执行的 `inspectRequest`。需要更多结果时沿游标继续，不要仅为翻页而修改 limit 重搜。
 Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已返回的新查询，区分完整、部分和未完成结果，并报告未取消的失败调用。cursor 与 operation 续接不会重复计入新查询。
 
-普通搜索继续遵循仓库 ignore 规则，但只要存在被忽略文件，就会明确说明文件系统覆盖受策略过滤，不再把“接纳文件里没找到”说成“整个目录绝对不存在”。需要发布前收口时，可以用 `mode: "audit"` 配合带名字的字面量 `patterns`，一次拿到声明范围、枚举/搜索/跳过文件、ignore 策略、每个模式的 `present`、`absent_with_complete_coverage` 或 `unknown` 结论，以及搜索前后的来源稳定性。审计必须包含被忽略的配置或生成文件时，设置 `ignorePolicy: "include"`；`.git` 内部和受保护路径仍然不会开放。
+普通搜索继续遵循仓库 ignore 规则，但只要存在被忽略文件，就会明确说明文件系统覆盖受策略过滤，不再把“接纳文件里没找到”说成“整个目录绝对不存在”。文件名发现（`mode: "files"`）同样会说明有多少文件被忽略、其中哪些匹配查询，`ignorePolicy: "include"` 可以把它们列出来；每个候选都显示分数以及是精确、子串还是模糊匹配。需要发布前收口时，可以用 `mode: "audit"` 配合带名字的字面量 `patterns`，一次拿到声明范围、枚举/搜索/跳过文件、ignore 策略、每个模式的 `present`、`absent_with_complete_coverage` 或 `unknown` 结论，以及搜索前后的来源稳定性。审计必须包含被忽略的配置或生成文件时，设置 `ignorePolicy: "include"`；`.git` 内部和受保护路径仍然不会开放。
 
 ### 先发现语言能力，再按需加载提供方
 
-使用 `mode: "capabilities"` 和项目根目录，可以获取紧凑的文件语言清单。JavaScript、TypeScript 和 TSX 支持 AST 结构、角色、outline、静态 imports 和关联测试候选；Go 支持 AST 结构和角色；Python 支持基于缩进的有界 outline。Swift 和其他语言仍可使用普通内容搜索、文件发现和源码 inspect。能力清单不会启动 parser 或 Concept 模型。
+使用 `mode: "capabilities"` 和项目根目录，可以获取紧凑的文件语言清单。JavaScript、TypeScript 和 TSX 支持 AST 结构、角色、outline、静态 imports 和关联测试候选；Go 支持 AST 结构和角色；Python 支持基于缩进的有界 outline 和词法角色（注释、字符串、代码、声明、导入和调用候选）。Swift 和其他语言仍可使用普通内容搜索、文件发现和源码 inspect。能力清单不会启动 parser 或 Concept 模型。
 
 语言服务导航不在范围内。请求 `definitions`、`references`、`implementations`、`callers`、`callees`、`dependencies`、`dependents`、`trace` 或 `impact` 都会明确报错——用文本搜索伪装精确导航，比直接说清楚更糟。使用期间不会启动任何语言服务。
 
@@ -69,7 +69,7 @@ Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已
 
 工作区搜索支持用 Unix 毫秒时间戳传入 `modifiedAfter` 和 `modifiedBefore`。下界包含、上界不包含，因此可以准确表示一个时间窗口，不必改动搜索关键词。内容搜索和文件名搜索使用同一过滤条件；无法核验文件元数据时会明确报告证据不完整，不会静默当作命中。
 
-对具体的 JS/TS/TSX 或 Python 文件使用 `mode: "outline"`，可以查看有界符号范围。JS/TS/TSX 使用 ast-grep，Python 使用基于缩进的类、函数和方法范围；它们不证明编译器绑定、运行时调用或测试覆盖。`mode: "tests"` 提供 JS/TS/TSX 关联测试候选，不支持的语言操作会明确报错。Swift 源码可使用普通搜索和 `inspect`。
+对具体的 JS/TS/TSX 或 Python 文件使用 `mode: "outline"`，可以查看有界符号范围。JS/TS/TSX 使用 ast-grep，Python 使用基于缩进的类、函数和方法范围；对 outline 条目执行 inspect 会返回该符号经版本校验的源码。它们不证明编译器绑定、运行时调用或测试覆盖。`mode: "tests"` 提供 JS/TS/TSX 关联测试候选，不支持的语言操作会明确报错。Swift 源码可使用普通搜索和 `inspect`。
 
 可读正文会保持精简；每项证据的范围、计数、覆盖状态和继续请求仍保留在结构化 `details` 中，客户端无需为了拿到这些字段再次搜索。
 

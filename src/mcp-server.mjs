@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.1",
+  version: "1.0.2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -346,7 +346,7 @@ function compactRows(analysis) {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    const label = analysis.kind === "outline" && analysis.modelOutput ? item.label : "metadata";
+    const label = analysis.kind === "outline" && analysis.modelOutput || analysis.kind === "files" ? item.label : "metadata";
     const semanticJudge = item.details?.semanticJudge;
     const judgment = isRecord(semanticJudge) && typeof semanticJudge.classification === "string" && typeof semanticJudge.probability === "number" && typeof semanticJudge.model === "string" ? ` Jev: ${semanticJudge.classification}; probability=${String(semanticJudge.probability)};${typeof semanticJudge.confidence === "number" ? ` confidence=${String(semanticJudge.confidence)};` : ""} model=${JSON.stringify(semanticJudge.model)}.` : "";
     rows.push(`#${String(item.index)} L${String(item.line)} ${label}${judgment}`);
@@ -386,6 +386,7 @@ function compactMcpModelText(result) {
   const inspect = compactInspectInstruction(analysis);
   const nextRequest = distinctNextRequest(result.details, analysis);
   const compact = [
+    ...(result.details.requestNotes ?? []).map((note) => `[Request note: ${note}]`),
     header,
     ...compactMetadata(result.details, analysis),
     ...compactRows(analysis),
@@ -417,7 +418,7 @@ var MAX_ANALYSIS_STORAGE_BYTES = 32 * 1024 * 1024;
 var ANALYSIS_METADATA_RESERVE_BYTES = 64 * 1024;
 var MAX_ANALYSIS_REASONS = 64;
 var MAX_ANALYSIS_REASON_BYTES = 4 * 1024;
-var MIN_ANY_OF_TERMS = 2;
+var MIN_ANY_OF_TERMS = 1;
 var MAX_ANY_OF_TERMS = 8;
 var MAX_ANY_OF_TOTAL_TERMS = 64;
 var MAX_LITERAL_TERM_BYTES = 256;
@@ -437,6 +438,7 @@ var ESTIMATED_CHARACTERS_PER_TOKEN = 4;
 var DEFAULT_SUMMARY_FILE_LIMIT = 30;
 var MAX_SELECTED_PATHS = 20;
 var MAX_INSPECT_TARGETS = 5;
+var MAX_INSPECT_REQUEST_TARGETS = 20;
 var MAX_DISPLAYED_OCCURRENCES = 20;
 var MAX_STORED_MATCHES = 50000;
 var MAX_STORED_OCCURRENCES = 200000;
@@ -458,6 +460,7 @@ var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1----
 var SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
 var SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`, "gi");
 var SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
+var CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*[([]/u;
 var TYPE_ONLY_VALUES = new Set([
   "boolean",
   "number",
@@ -477,10 +480,11 @@ function redactString(value) {
   });
   redacted = redacted.replace(SENSITIVE_ASSIGNMENT, (match, prefix, rawValue) => {
     const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
-    if (TYPE_ONLY_VALUES.has(unquoted))
+    if (TYPE_ONLY_VALUES.has(unquoted) || CODE_EXPRESSION.test(rawValue))
       return match;
     count += 1;
-    return `${prefix}"[REDACTED]"`;
+    const quote = rawValue.startsWith('"') || rawValue.startsWith("'") ? rawValue[0] : "";
+    return `${prefix}${quote}[REDACTED]${quote}`;
   });
   redacted = redacted.replace(SENSITIVE_TOKEN, () => {
     count += 1;
@@ -738,6 +742,15 @@ var PYTHON_LANGUAGE_CAPABILITIES = [
     evidence: "syntax",
     availability: "implemented",
     load: "lazy"
+  },
+  {
+    id: "python-lexical.roles",
+    name: "roles",
+    provider: "bounded Python lexical role scanner",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy"
   }
 ];
 var DEFAULT_LANGUAGE_CAPABILITIES = [
@@ -865,7 +878,17 @@ var MODE_FIELDS_BY_MODE = {
   auto: ordinaryFields,
   summary: ordinaryFields,
   matches: ordinaryFields,
-  inspect: [...commonFields, "path", "line", "cursor", "matchIndex", "matchIndices", "targets"],
+  inspect: [
+    ...commonFields,
+    "path",
+    "paths",
+    "line",
+    "cursor",
+    "matchIndex",
+    "matchIndices",
+    "targets",
+    "scope"
+  ],
   outline: [...commonFields, "path", "line", "symbol", "cursor", "matchIndex", "maxFilesToParse"],
   imports: [
     ...commonFields,
@@ -885,7 +908,16 @@ var MODE_FIELDS_BY_MODE = {
     "matchIndex",
     "maxFilesToParse"
   ],
-  files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
+  files: [
+    ...commonFields,
+    "query",
+    ...sourceFilters,
+    "ignorePolicy",
+    "limit",
+    "scope",
+    "modifiedAfter",
+    "modifiedBefore"
+  ],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
   concept: [...commonFields, "query", ...sourceFilters, "maxFilesToParse"],
   hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit", "maxFilesToParse"],
@@ -894,9 +926,7 @@ var MODE_FIELDS_BY_MODE = {
   await: ["mode", "operationId"],
   cancel: ["mode", "operationId"]
 };
-var SAFE_DROP_FIELDS = {
-  files: ["scope"]
-};
+var SAFE_DROP_FIELDS = {};
 var SUPPORTED_OUTLINE_EXTENSIONS = new Set(DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) => descriptor.capabilities.some((capability) => capability.name === "outline") ? descriptor.extensions : []));
 function modeFields(mode) {
   return MODE_FIELDS_BY_MODE[mode];
@@ -925,8 +955,8 @@ var REQUEST_FIELD_GUIDANCE = {
   allOf: "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
   context: "context is an output-context budget and is never silently dropped",
   limit: "limit is an output/page budget and is never silently dropped",
-  scope: "scope applies to ordinary content search; mode=files rejects this field because its scope is fixed strict, and only redundant strict may be removed",
-  ignorePolicy: "respect keeps repository ignore rules; include searches ignored files but always excludes .git internals and protected paths",
+  scope: "scope applies to ordinary content search; mode=files is always strict, so it accepts only the redundant scope=strict",
+  ignorePolicy: "respect keeps repository ignore rules and discloses ignored files; include also searches or lists ignored files but always excludes .git internals and protected paths",
   patterns: "audit accepts named exact-literal patterns and returns one closure receipt",
   maxFilesToParse: "concept/hybrid automatically batch the requested scope; this optional field sets an advanced hard file ceiling"
 };
@@ -1025,12 +1055,15 @@ function schemaError(input, field, reason) {
 function plainFilePatternRecovery(mode, input, invalid) {
   return mode === "files" && invalid.includes("pattern") && input.query === undefined && typeof input.pattern === "string" && input.pattern.trim().length > 0 && input.pattern.length <= 256 && input.pattern.isWellFormed() && !/[\\^$.*+?()[\]{}|\r\n\0]/u.test(input.pattern);
 }
+function matchAllFilePatternRecovery(mode, input, invalid) {
+  return mode === "files" && invalid.includes("pattern") && input.query === undefined && typeof input.pattern === "string" && /^(?:\.\*|\.\+|\*+)$/u.test(input.pattern.trim());
+}
 function safeNextRequest(input, mode, invalid) {
   if (input.redact === true && containsSensitiveText(input))
     return;
   const safe = new Set(SAFE_DROP_FIELDS[mode] ?? []);
   const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
-  if (plainFilePattern)
+  if (plainFilePattern || matchAllFilePatternRecovery(mode, input, invalid))
     safe.add("pattern");
   if (invalid.some((field) => !safe.has(field)))
     return;
@@ -1076,7 +1109,7 @@ function fieldsError(input, mode, invalid, selectorIssues = []) {
     issues,
     recovery: nextRequest ? {
       action: "retry",
-      reason: plainFilePatternRecovery(mode, input, invalid) ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved." : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+      reason: plainFilePatternRecovery(mode, input, invalid) ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved." : matchAllFilePatternRecovery(mode, input, invalid) ? "A match-all pattern lists every file; omitting query does that, so copy nextRequest; all filters are preserved." : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
       nextRequest
     } : {
       action: "manual",
@@ -1232,7 +1265,7 @@ function validateRequestContract(input) {
   const allowed = new Set(MODE_FIELDS_BY_MODE[mode]);
   if (mode === "inspect" && raw.sourceCursor !== undefined) {
     allowed.clear();
-    for (const field of ["mode", "sourceCursor", "redact"])
+    for (const field of ["mode", "sourceCursor", "redact", "path"])
       allowed.add(field);
   }
   if ((mode === "auto" || mode === "summary" || mode === "matches") && typeof raw.cursor === "string" && raw.cursor.includes(".analysis")) {
@@ -2948,7 +2981,7 @@ function normalizeRequest(input) {
     throw new SiftLightError("ignorePolicy must be respect or include");
   const pattern = input.pattern;
   if (pattern === undefined) {
-    throw new SiftLightError("pattern is required when cursor is not provided");
+    throw new SiftLightError('pattern is required when cursor is not provided; to list files use mode="files" (query optional), to read a known file use mode="inspect" with path');
   }
   const path = input.path?.replace(/^@/, "");
   return {
@@ -5872,7 +5905,7 @@ function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   return {
     path: item.path,
     line: item.line,
-    label: result.kind === "outline" && modelOutput ? item.label : publicAnalysisLabel(result),
+    label: result.kind === "outline" && modelOutput || result.kind === "files" ? item.label : publicAnalysisLabel(result),
     index: index + 1,
     ...inspect ? { inspect } : {},
     ...publicDetails ? { details: publicDetails } : {}
@@ -6083,7 +6116,8 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           break;
       }
     } else {
-      for (let index = offset;index < result.items.length && items.length < 30; index += 1) {
+      const pageSize = result.pageSize ?? 30;
+      for (let index = offset;index < result.items.length && items.length < pageSize; index += 1) {
         if (!appendItem(index))
           break;
       }
@@ -6197,6 +6231,8 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   }
   if (!path)
     throw new SiftLightError("path is required when mode=inspect");
+  if (line === undefined && input.cursor === undefined)
+    line = 1;
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SiftLightError("line must be a positive integer when mode=inspect");
   }
@@ -7925,6 +7961,28 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
 // src/file-discovery.ts
 var graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 var FILE_QUERY_GLOB_WILDCARD = /[*?]/u;
+var FILE_QUERY_MATCH_ALL = /^(?:[*/]+|\.\*|\.\+|\*\.\*)$/u;
+var FILE_QUERY_REGEX_SYNTAX = /[()|^$\\+]/u;
+var IGNORED_MATCH_SAMPLES = 5;
+function normalizeFileQuery(query, hasGlob) {
+  const trimmed = query.trim();
+  if (FILE_QUERY_MATCH_ALL.test(trimmed))
+    return {
+      query: "",
+      note: `Query ${JSON.stringify(query)} was treated as listing every file under path; omit query for the same result.`
+    };
+  if (!FILE_QUERY_GLOB_WILDCARD.test(trimmed))
+    return { query };
+  if (!hasGlob && !FILE_QUERY_REGEX_SYNTAX.test(trimmed) && !/\s/u.test(trimmed)) {
+    const glob = trimmed.includes("/") ? trimmed : `**/${trimmed}`;
+    return {
+      query: "",
+      glob,
+      note: `Query ${JSON.stringify(query)} contains glob wildcards and was applied as glob ${JSON.stringify(glob)}; mode=files query otherwise matches filename text.`
+    };
+  }
+  throw new SiftLightError(`File query ${JSON.stringify(query)} uses wildcard or regex syntax; mode=files matches filename and path text, not patterns. Omit query to retain every file under path, use glob for one name pattern, or run one files request per name.`);
+}
 function subsequenceScore(text, query) {
   const characters = Array.from(graphemes.segment(text), (item) => item.segment);
   const queryCharacters = Array.from(graphemes.segment(query), (item) => item.segment);
@@ -7975,39 +8033,79 @@ function pathRelativeToDiscoveryRoot(cwd, root, path) {
   return scoped || platformBasename(absolutePath);
 }
 async function discoverFiles(input, cwd, signal) {
-  const query = input.query ?? "";
-  if (query.length > 256 || !query.isWellFormed() || /[\r\n\0]/.test(query))
+  const rawQuery = input.query ?? "";
+  if (rawQuery.length > 256 || !rawQuery.isWellFormed() || /[\r\n\0]/.test(rawQuery))
     throw new SiftLightError("File query must be well-formed single-line text of at most 256 characters");
-  if (FILE_QUERY_GLOB_WILDCARD.test(query))
-    throw new SiftLightError(`File query ${JSON.stringify(query)} uses glob wildcards; mode=files matches filename and path text, not glob patterns. Omit query to retain every file under path, or use glob to filter by name pattern.`);
-  const request = normalizeRequest({ ...input, pattern: "" });
+  const requestedGlobs = input.glob === undefined ? [] : Array.isArray(input.glob) ? input.glob : [input.glob];
+  const normalizedQuery = normalizeFileQuery(rawQuery, requestedGlobs.length > 0);
+  const query = normalizedQuery.query;
+  const request = normalizeRequest({
+    ...input,
+    pattern: "",
+    ...normalizedQuery.glob ? { glob: [...requestedGlobs, normalizedQuery.glob] } : {}
+  });
   const policy = new SearchPathPolicy(cwd);
   const discoveryRoot = request.path ?? ".";
   const scoringRoot = await policy.resolveSearchTarget(discoveryRoot);
-  const files = await listWorkspaceFiles(cwd, signal, {
+  const includeIgnored = request.ignorePolicy === "include";
+  const listOptions = {
     path: scoringRoot,
     glob: request.glob,
     exclude: request.exclude,
     hidden: request.hidden
+  };
+  const files = await listWorkspaceFiles(cwd, signal, {
+    ...listOptions,
+    ...includeIgnored ? { ignore: false, ignoreParents: false } : {}
   });
   const filtered = await filterPathsByModificationTime(cwd, files.paths, request.modifiedAfterMs, request.modifiedBeforeMs, signal);
+  const rank = (path) => scoreFilePath(pathRelativeToDiscoveryRoot(cwd, scoringRoot, path), query);
   const selected = filtered.paths.flatMap((path) => {
-    const rank = scoreFilePath(pathRelativeToDiscoveryRoot(cwd, scoringRoot, path), query);
-    return rank ? [{ path, ...rank }] : [];
+    const score = rank(path);
+    return score ? [{ path, ...score }] : [];
   }).toSorted((left, right) => right.score - left.score || left.path.localeCompare(right.path));
   for (let offset = 0;offset < selected.length; offset += 16) {
     await Promise.all(selected.slice(offset, offset + 16).map((item) => policy.assertExistingPath(item.path)));
     signal?.throwIfAborted();
   }
+  const reasons = new Set([...files.reasons, ...filtered.reasons]);
+  if (normalizedQuery.note)
+    reasons.add(normalizedQuery.note);
+  let ignoredFiles = 0;
+  let ignoredMatches = 0;
+  let ignoredComparisonPartial = false;
+  if (!includeIgnored) {
+    const everything = await listWorkspaceFiles(cwd, signal, {
+      ...listOptions,
+      ignore: false,
+      ignoreParents: false
+    });
+    ignoredComparisonPartial = everything.partial;
+    const admitted = new Set(files.paths);
+    const ignored = everything.paths.filter((path) => !admitted.has(path));
+    ignoredFiles = ignored.length;
+    const ignoredCandidates = ignored.flatMap((path) => {
+      const score = rank(path);
+      return score ? [{ path, ...score }] : [];
+    }).toSorted((left, right) => right.score - left.score || left.path.localeCompare(right.path));
+    ignoredMatches = ignoredCandidates.length;
+    if (ignoredFiles > 0) {
+      const samples = ignoredCandidates.slice(0, IGNORED_MATCH_SAMPLES).map((item) => `${JSON.stringify(item.path)} (${item.reason})`);
+      reasons.add(ignoredMatches > 0 ? `${String(ignoredFiles)} file(s) were excluded by ignore rules; ${String(ignoredMatches)} of them match this query${samples.length ? `, e.g. ${samples.join(", ")}` : ""}. Retry with ignorePolicy "include" to list them.` : `${String(ignoredFiles)} file(s) were excluded by ignore rules; none of them match this query.`);
+    }
+    if (ignoredComparisonPartial)
+      reasons.add("Ignored-file comparison was incomplete; the ignored-file count is a lower bound");
+  }
+  const enumerationPartial = files.partial || filtered.partial;
   return {
     kind: "files",
     unit: "files",
-    partial: files.partial || filtered.partial,
-    reasons: [...new Set([...files.reasons, ...filtered.reasons])],
+    partial: enumerationPartial,
+    reasons: [...reasons],
     items: selected.map((item) => ({
       path: item.path,
       line: 1,
-      label: `File candidate (${item.reason})`,
+      label: `File candidate (score ${String(item.score)}: ${item.reason})`,
       details: {
         kind: "file",
         score: item.score,
@@ -8015,8 +8113,13 @@ async function discoverFiles(input, cwd, signal) {
         inspect: { mode: "inspect", path: item.path, line: 1 }
       }
     })),
-    coverage: { fileEnumeration: files.partial || filtered.partial ? "partial" : "complete" },
-    stats: { filesEnumerated: files.paths.length },
+    coverage: {
+      fileEnumeration: enumerationPartial ? "partial" : ignoredFiles > 0 || ignoredComparisonPartial ? "policy-filtered" : "complete"
+    },
+    stats: {
+      filesEnumerated: files.paths.length,
+      ...includeIgnored ? {} : { ignoredFiles, ignoredMatches }
+    },
     scope: {
       path: request.path ?? ".",
       requestedPath: request.path ?? ".",
@@ -8029,7 +8132,8 @@ async function discoverFiles(input, cwd, signal) {
       ...request.modifiedAfterMs !== undefined ? { modifiedAfterMs: request.modifiedAfterMs } : {},
       ...request.modifiedBeforeMs !== undefined ? { modifiedBeforeMs: request.modifiedBeforeMs } : {}
     },
-    redact: input.redact ?? false
+    redact: input.redact ?? false,
+    ...input.limit !== undefined ? { pageSize: request.pageSize } : {}
   };
 }
 
@@ -8270,7 +8374,19 @@ async function prepare(target, access, structure) {
   let range = target.range;
   let details = { status: "no-symbol" };
   const language = syntaxLanguage(document.path);
-  if (document.utf8 && language && language !== "go") {
+  if (target.range && target.structure) {
+    document.checkRange(target.range);
+    const lines = {
+      startLine: document.lineAt(target.range.start),
+      endLine: document.lineAt(Math.max(target.range.start, target.range.end - 1))
+    };
+    range = document.lineRange(lines.startLine, lines.endLine);
+    details = {
+      ...target.structure,
+      range: lines,
+      ...target.structure.symbol ? { symbol: { ...target.structure.symbol, range: lines } } : {}
+    };
+  } else if (document.utf8 && language && language !== "go") {
     const syntax = await access.syntax(document);
     details = {
       status: syntax.status === "ok" ? "no-symbol" : syntax.status === "unsupported" ? "provider-unavailable" : "parse-error",
@@ -8322,7 +8438,7 @@ async function prepare(target, access, structure) {
     details = { status: "provider-unavailable", ...language ? { language } : {} };
   }
   range ??= document.lineRange(Math.max(1, target.line - 10), Math.min(document.lineStarts.length, target.line + 10));
-  const boundary = target.range ? "requested-range" : details.status === "available" && details.range ? "syntax" : "line-window";
+  const boundary = target.range ? target.structure ? "syntax" : "requested-range" : details.status === "available" && details.range ? "syntax" : "line-window";
   document.checkRange(range);
   return { target, document, range, structure: details, boundary, focus };
 }
@@ -8681,8 +8797,10 @@ ${preview.text}`);
     }
   };
 }
-async function continueSource(cursor, access, continuations) {
+async function continueSource(cursor, access, continuations, expectedPath) {
   const state = continuations.resolve(cursor);
+  if (expectedPath !== undefined && resolve18(access.cwd, expectedPath.replace(/^@/, "")) !== resolve18(access.cwd, state.source.path))
+    throw new SiftLightError(`sourceCursor continues ${JSON.stringify(state.source.path)}, not ${JSON.stringify(expectedPath)}; copy the returned nextRequest exactly`);
   const document = await access.load(state.source.path, state.source);
   const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
   const next = continuations.advance(cursor, page.fragment);
@@ -9557,6 +9675,221 @@ function parsePythonOutline(document) {
     active.push(declaration);
     return item;
   });
+}
+
+// src/python-roles.ts
+var KEYWORDS = new Set([
+  "and",
+  "as",
+  "assert",
+  "async",
+  "await",
+  "case",
+  "del",
+  "elif",
+  "else",
+  "except",
+  "for",
+  "from",
+  "global",
+  "if",
+  "import",
+  "in",
+  "is",
+  "lambda",
+  "match",
+  "nonlocal",
+  "not",
+  "or",
+  "raise",
+  "return",
+  "while",
+  "with",
+  "yield"
+]);
+var STRING_PREFIX = /^(?:[rRbBuUfF]|[rR][bBfF]|[bBfF][rR])?$/u;
+var IDENTIFIER_START = /[\p{ID_Start}_]/u;
+var IDENTIFIER_PART = /[\p{ID_Continue}]/u;
+function lex(text) {
+  const comments = [];
+  const strings = [];
+  const code = new Uint8Array(text.length).fill(1);
+  const mark = (start, end) => {
+    code.fill(0, start, end);
+  };
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index];
+    if (character === "#") {
+      const newline = text.indexOf(`
+`, index);
+      const end = newline < 0 ? text.length : newline;
+      comments.push({ start: index, end });
+      mark(index, end);
+      index = end;
+      continue;
+    }
+    if (character !== "'" && character !== '"') {
+      index += 1;
+      continue;
+    }
+    let prefixStart = index;
+    while (prefixStart > 0 && /[rRbBuUfF]/u.test(text[prefixStart - 1] ?? ""))
+      prefixStart -= 1;
+    const prefix = text.slice(prefixStart, index);
+    const beforePrefix = text[prefixStart - 1] ?? "";
+    const start = STRING_PREFIX.test(prefix) && !IDENTIFIER_PART.test(beforePrefix) ? prefixStart : index;
+    const triple = text.slice(index, index + 3) === character.repeat(3);
+    const delimiter = triple ? character.repeat(3) : character;
+    let cursor = index + delimiter.length;
+    let end = text.length;
+    while (cursor < text.length) {
+      const current = text[cursor];
+      if (current === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (!triple && current === `
+`) {
+        end = cursor;
+        break;
+      }
+      if (text.startsWith(delimiter, cursor)) {
+        end = cursor + delimiter.length;
+        break;
+      }
+      cursor += 1;
+    }
+    strings.push({ start, end });
+    mark(start, end);
+    index = end;
+  }
+  return { comments, strings, code };
+}
+function codeRanges(code) {
+  const ranges = [];
+  let start = -1;
+  for (let index = 0;index <= code.length; index += 1) {
+    const inCode = index < code.length && code[index] === 1;
+    if (inCode && start < 0)
+      start = index;
+    else if (!inCode && start >= 0) {
+      ranges.push({ start, end: index });
+      start = -1;
+    }
+  }
+  return ranges;
+}
+function identifierEnd(text, start) {
+  let end = start;
+  while (end < text.length && IDENTIFIER_PART.test(text[end] ?? ""))
+    end += 1;
+  return end;
+}
+function skipSpaces(text, index, code) {
+  let cursor = index;
+  while (cursor < text.length && code[cursor] === 1 && /[ \t]/u.test(text[cursor] ?? ""))
+    cursor += 1;
+  return cursor;
+}
+function statementEnd(text, start, code) {
+  let depth = 0;
+  for (let index = start;index < text.length; index += 1) {
+    if (code[index] !== 1)
+      continue;
+    const character = text[index];
+    if (character === "(" || character === "[" || character === "{")
+      depth += 1;
+    else if (character === ")" || character === "]" || character === "}")
+      depth = Math.max(0, depth - 1);
+    else if (character === "\\" && text[index + 1] === `
+`)
+      index += 1;
+    else if (character === `
+` && depth === 0)
+      return index;
+  }
+  return text.length;
+}
+function pythonRoleAnalysis(document) {
+  const text = document.text;
+  const { comments, strings, code } = lex(text);
+  const roles = [];
+  const push = (start, end, role, certainty, subkind) => {
+    if (start < end)
+      roles.push({ start, end, role, certainty, node: 0, ...subkind ? { subkind } : {} });
+  };
+  for (const span of comments)
+    push(span.start, span.end, "comment", "syntax");
+  for (const span of strings)
+    push(span.start, span.end, "string", "syntax");
+  for (const span of codeRanges(code))
+    push(span.start, span.end, "code", "syntax");
+  let index = 0;
+  let lineStart = true;
+  while (index < text.length) {
+    const character = text[index] ?? "";
+    if (character === `
+`) {
+      lineStart = true;
+      index += 1;
+      continue;
+    }
+    if (code[index] !== 1 || !IDENTIFIER_START.test(character)) {
+      if (!/[ \t]/u.test(character))
+        lineStart = false;
+      index += 1;
+      continue;
+    }
+    const previous = text[index - 1] ?? "";
+    if (IDENTIFIER_PART.test(previous)) {
+      index += 1;
+      continue;
+    }
+    const end = identifierEnd(text, index);
+    const word = text.slice(index, end);
+    const atStatementStart = lineStart;
+    lineStart = false;
+    if (atStatementStart && (word === "import" || word === "from")) {
+      const statement = statementEnd(text, index, code);
+      const body = text.slice(index, statement);
+      if (word === "import" || /\bimport\b/u.test(body)) {
+        push(index, statement, "import", "syntax", word === "from" ? "from-import" : "import");
+        index = statement;
+        continue;
+      }
+    }
+    if (word === "def" || word === "class") {
+      const nameStart = skipSpaces(text, end, code);
+      if (IDENTIFIER_START.test(text[nameStart] ?? "")) {
+        const nameEnd = identifierEnd(text, nameStart);
+        push(nameStart, nameEnd, "declaration", "syntax", word === "def" ? "function" : "class");
+        index = nameEnd;
+        continue;
+      }
+    }
+    let chainEnd = end;
+    while (text[chainEnd] === "." && IDENTIFIER_START.test(text[chainEnd + 1] ?? "")) {
+      chainEnd = identifierEnd(text, chainEnd + 1);
+    }
+    const open = skipSpaces(text, chainEnd, code);
+    const lastSegment = text.slice(text.lastIndexOf(".", chainEnd - 1) + 1, chainEnd);
+    const before = text.slice(Math.max(0, index - 4), index);
+    if (text[open] === "(" && code[open] === 1 && !KEYWORDS.has(word) && !KEYWORDS.has(lastSegment) && !/\bdef\s+$|\bclass\s+$/u.test(before)) {
+      push(index, open + 1, "call", "candidate", "lexical-call");
+    }
+    index = chainEnd;
+  }
+  roles.sort((a, b) => a.start - b.start || a.end - b.end || a.role.localeCompare(b.role));
+  return {
+    status: "ok",
+    nodes: [],
+    children: [],
+    symbols: [],
+    roles,
+    diagnostics: [],
+    limited: false
+  };
 }
 
 // src/hybrid-search.ts
@@ -10506,6 +10839,69 @@ import { realpath as realpath6 } from "node:fs/promises";
 function isEvidenceRequest(input) {
   return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
+function pageInspectRequest(input) {
+  if (input.scope === "expand")
+    throw new SiftLightError("mode=inspect reads exact locations; scope=expand does not apply (omit scope)");
+  const { scope: _scope, paths, ...rest } = input;
+  let request = rest;
+  if (paths !== undefined) {
+    if (input.cursor !== undefined || input.targets !== undefined || input.matchIndices !== undefined || input.path !== undefined || input.line !== undefined || input.matchIndex !== undefined)
+      throw new SiftLightError("mode=inspect paths opens files from line 1 and cannot be combined with cursor, targets, matchIndices, path, line or matchIndex");
+    request = { ...rest, targets: paths.map((path) => ({ path, line: 1 })) };
+  }
+  const redact = input.redact ? { redact: true } : {};
+  const requested = request.targets?.length ?? request.matchIndices?.length ?? 0;
+  if (requested > MAX_INSPECT_REQUEST_TARGETS)
+    throw new SiftLightError(`mode=inspect accepts at most ${String(MAX_INSPECT_REQUEST_TARGETS)} targets per request; ${String(MAX_INSPECT_TARGETS)} are inspected per response`);
+  if (request.targets && request.targets.length > MAX_INSPECT_TARGETS)
+    return {
+      current: { ...request, targets: request.targets.slice(0, MAX_INSPECT_TARGETS) },
+      remaining: {
+        mode: "inspect",
+        targets: request.targets.slice(MAX_INSPECT_TARGETS),
+        ...redact
+      }
+    };
+  if (request.matchIndices && request.matchIndices.length > MAX_INSPECT_TARGETS)
+    return {
+      current: { ...request, matchIndices: request.matchIndices.slice(0, MAX_INSPECT_TARGETS) },
+      remaining: {
+        mode: "inspect",
+        ...request.cursor !== undefined ? { cursor: request.cursor } : {},
+        matchIndices: request.matchIndices.slice(MAX_INSPECT_TARGETS),
+        ...redact
+      }
+    };
+  return { current: request };
+}
+function withRemainingInspection(result, remaining) {
+  const count = remaining.targets?.length ?? remaining.matchIndices?.length ?? 0;
+  return {
+    text: `${result.text}
+
+[${String(count)} more target(s) were not inspected; one response inspects ${String(MAX_INSPECT_TARGETS)}.]
+Next request: ${JSON.stringify(remaining)}`,
+    details: {
+      ...result.details,
+      status: "partial",
+      snapshotComplete: false,
+      nextRequest: remaining
+    }
+  };
+}
+function analysisItemStructure(item) {
+  const details = item.details ?? {};
+  const language = typeof details.language === "string" ? details.language : undefined;
+  const name = typeof details.name === "string" ? details.name : undefined;
+  const scope = Array.isArray(details.scope) ? details.scope.filter((entry) => typeof entry === "string") : typeof details.scope === "string" ? [details.scope] : [];
+  const kind = details.kind === "function" ? "function" : item.label.split(" ", 1)[0] ?? "symbol";
+  return {
+    status: "available",
+    provider: language === "python" ? "python-outline" : "tree-sitter",
+    ...language ? { language } : {},
+    ...name ? { symbol: { name, kind, scope, range: { startLine: item.line, endLine: item.line } } } : {}
+  };
+}
 function maxFilesToParse(value, defaultValue = MAX_STRUCTURE_FILES) {
   const candidate = value ?? defaultValue;
   if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > MAX_CONFIGURABLE_STRUCTURE_FILES) {
@@ -10521,8 +10917,8 @@ function validateTerms(input) {
     }
     return;
   }
-  if (!Array.isArray(terms) || terms.length < 2 || terms.length > 3 || terms.some((term) => typeof term !== "string" || !term.trim() || /[\r\n\0]/.test(term)) || new Set(terms).size !== terms.length)
-    throw new SiftLightError("allOf requires 2–3 distinct, nonempty, single-line literal terms");
+  if (!Array.isArray(terms) || terms.length < 1 || terms.length > 3 || terms.some((term) => typeof term !== "string" || !term.trim() || /[\r\n\0]/.test(term)) || new Set(terms).size !== terms.length)
+    throw new SiftLightError("allOf requires 1–3 distinct, nonempty, single-line literal terms");
   if (input.pattern !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
     throw new SiftLightError("allOf is an explicit case-sensitive literal conjunction; omit pattern, roles, literal and ignoreCase");
   if (input.within !== undefined && input.within !== "file" && input.within !== "function")
@@ -10720,11 +11116,13 @@ class EvidenceService {
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect")
         throw new SiftLightError("sourceCursor requires mode=inspect");
-      return continueSource(input.sourceCursor, access, this.#continuations);
+      return continueSource(input.sourceCursor, access, this.#continuations, input.path);
     }
     if (input.mode === "inspect") {
-      const targets = this.#inspectionTargets(input, cwd);
-      return targets.some((target) => target.range !== undefined) ? inspectDocumentsMetadata(targets, access, this.#structure) : inspectDocuments(targets, access, this.#continuations, this.#structure);
+      const { current, remaining } = pageInspectRequest(input);
+      const targets = this.#inspectionTargets(current, cwd);
+      const result = await inspectDocuments(targets, access, this.#continuations, this.#structure);
+      return remaining ? withRemainingInspection(result, remaining) : result;
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
@@ -10813,7 +11211,7 @@ class EvidenceService {
       if (input.pattern !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.literal !== undefined || input.ignoreCase !== undefined || input.wholeWord !== undefined)
         throw new SiftLightError("anyOf is an explicit case-sensitive literal union; omit pattern, allOf, within, roles, literal and ignoreCase");
       if (input.mode !== undefined && input.mode !== "auto" && input.mode !== "matches")
-        throw new SiftLightError("anyOf mode must be omitted, auto, or matches");
+        throw new SiftLightError("anyOf mode must be omitted, auto, matches or summary");
       const chunks = Array.from({ length: Math.ceil(anyOf.length / MAX_ANY_OF_TERMS) }, (_, index) => anyOf.slice(index * MAX_ANY_OF_TERMS, (index + 1) * MAX_ANY_OF_TERMS));
       const { path: _inputPath, ...unscopedInput } = input;
       let chunkAccess = access;
@@ -10951,9 +11349,10 @@ class EvidenceService {
           if (item)
             result.items.push(item);
         } else if (terms || input.roles) {
-          if (syntaxLanguage(file.document.path))
+          const pythonRoles = !terms && /\.py$/iu.test(file.document.path);
+          if (pythonRoles || syntaxLanguage(file.document.path))
             syntaxCapableFiles += 1;
-          const syntax = await access.syntax(file.document);
+          const syntax = pythonRoles ? pythonRoleAnalysis(file.document) : await access.syntax(file.document);
           const classified = terms ? findFunctionConjunctions(file.document, syntax, terms, input.changes?.scope === "lines" ? file.changedRanges : undefined) : filterRoleOccurrences(file.document, syntax, file.occurrences, input.roles ?? []);
           result.items.push(...classified.items);
           result.partial ||= classified.partial;
@@ -11030,12 +11429,12 @@ class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
+      const bounded = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
-        ...metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }
+        ...bounded ? { range: item.range, structure: analysisItemStructure(item) } : { absoluteFocus: item.range.start }
       };
     }
     return {
@@ -11243,6 +11642,29 @@ import { resolve as resolve24 } from "node:path";
 
 // src/discovery-errors.ts
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
+
+// src/request-aliases.ts
+var MODE_ALIASES = ["anyOf", "allOf"];
+function normalizeRequestAliases(request) {
+  const notes = [];
+  const { mode, ...rest } = request;
+  let input = rest;
+  if (mode === "anyOf" || mode === "allOf") {
+    if (request[mode] === undefined)
+      throw new SiftLightError(`mode=${mode} is not a mode; pass ${mode}:[...terms] and omit mode`);
+    notes.push(`mode="${mode}" is not a mode; the ${mode} field alone selects this search.`);
+  } else if (mode === "summary" && request.anyOf !== undefined) {
+    notes.push("anyOf returns one analysis page whose header already carries per-file statistics; mode=summary was served by that page.");
+  } else if (mode !== undefined) {
+    input = { ...rest, mode };
+  }
+  if (input.sourceCursor !== undefined && input.line !== undefined) {
+    const { line: _line, ...withoutLine } = input;
+    input = withoutLine;
+    notes.push("line is ignored with sourceCursor; the continuation selects its own source range.");
+  }
+  return { input, notes };
+}
 
 // src/format.ts
 import { readFile as readFile3 } from "node:fs/promises";
@@ -12597,6 +13019,16 @@ class LanguageCapabilityCatalog {
 }
 
 // src/service.ts
+function withRequestNotes(result, notes) {
+  if (notes.length === 0)
+    return result;
+  return {
+    text: `${notes.map((note) => `[Request note: ${note}]`).join(`
+`)}
+${result.text}`,
+    details: { ...result.details, requestNotes: [...notes] }
+  };
+}
 function filterList(value) {
   return value === undefined ? [] : Array.isArray(value) ? [...value] : [value];
 }
@@ -12825,7 +13257,11 @@ class SiftLightService {
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge);
   }
-  async search(input, cwd, signal, options = {}) {
+  async search(request, cwd, signal, options = {}) {
+    const { input, notes } = normalizeRequestAliases(request);
+    return withRequestNotes(await this.#searchNormalized(input, cwd, signal, options), notes);
+  }
+  async#searchNormalized(input, cwd, signal, options) {
     validateRawSearchInput(input);
     validateRequestContract(input);
     if (!this.#vectorSearchEnabled && (input.mode === "concept" || input.mode === "hybrid")) {
@@ -13297,9 +13733,9 @@ var siftLightSchema = Type.Object({
     description: `${fieldGuidance("anyOf")}. ${String(MIN_ANY_OF_TERMS)}-${String(MAX_ANY_OF_TOTAL_TERMS)} distinct case-sensitive single-line terms, at most ${String(MAX_LITERAL_TERM_BYTES)} UTF-8 bytes each. Requests above ${String(MAX_ANY_OF_TERMS)} terms are split into version-checked chunks and merged. Returns every retained occurrence attributed to its term.`
   })),
   allOf: Type.Optional(Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
-    minItems: 2,
+    minItems: 1,
     maxItems: 3,
-    description: `${fieldGuidance("allOf")}. 2-3 distinct terms must occur in one file (default) or one function.`
+    description: `${fieldGuidance("allOf")}. 1-3 distinct terms must occur in one file (default) or one function; one term lists the files or functions containing it.`
   })),
   within: Type.Optional(stringEnum(["file", "function"], {
     description: "Only valid with allOf; omit for ordinary single-pattern searches. function requires JS/TS/TSX and counts only that implementation's own code, excluding nested callbacks, strings/comments/types. Not proof of a shared execution path."
@@ -13316,7 +13752,7 @@ var siftLightSchema = Type.Object({
     "unknown"
   ]), {
     minItems: 1,
-    description: "Filter each single-pattern occurrence by syntax role (JS/TS/TSX/Go). Roles may be candidates, especially Go call/conversion ambiguity. Cannot combine with allOf."
+    description: "Filter each single-pattern occurrence by syntax role (JS/TS/TSX/Go parsed; Python lexical: comment, string, code, declaration, import, call candidates). Roles may be candidates, especially Go call/conversion and Python calls. Cannot combine with allOf."
   })),
   changes: Type.Optional(Type.Object({
     base: Type.Optional(Type.String({
@@ -13349,7 +13785,7 @@ var siftLightSchema = Type.Object({
   paths: Type.Optional(Type.Array(Type.String(), {
     minItems: 1,
     maxItems: MAX_SELECTED_PATHS,
-    description: "Exact retained files to select together from a cursor. A new search accepts one path; split multiple roots into separate requests."
+    description: "Exact retained files to select together from a cursor. A new search accepts one path; split multiple roots into separate requests. With mode=inspect and no cursor, opens each file from line 1 (same as targets with line 1)."
   })),
   glob: Type.Optional(Type.Union([
     Type.String({ maxLength: MAX_PATH_CHARACTERS }),
@@ -13373,7 +13809,7 @@ var siftLightSchema = Type.Object({
   })),
   hidden: Type.Optional(Type.Boolean({ description: "Search hidden files (default true; .git is always excluded)." })),
   ignorePolicy: Type.Optional(stringEnum(["respect", "include"], {
-    description: "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted. include searches ignored files while still excluding .git internals and protected paths."
+    description: "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted, including mode=files. include searches or lists ignored files while still excluding .git internals and protected paths."
   })),
   patterns: Type.Optional(Type.Array(Type.Object({
     id: Type.String({ minLength: 1, maxLength: 64 }),
@@ -13418,29 +13854,29 @@ var siftLightSchema = Type.Object({
   limit: Type.Optional(Type.Integer({
     minimum: 1,
     maximum: MAX_PAGE_SIZE,
-    description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`
+    description: `${fieldGuidance("limit")}. Ordinary search: explicit detail-page match limit (max 100); mode=files: files per page (default 30). Normally omit to preserve automatic summarization; other analysis and inspect modes reject it.`
   })),
-  mode: Type.Optional(stringEnum(SIFT_LIGHT_MODES, {
-    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION}`
+  mode: Type.Optional(stringEnum([...SIFT_LIGHT_MODES, ...MODE_ALIASES], {
+    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} anyOf/allOf are field names, not modes; as mode values they are accepted aliases for omitting mode, disclosed in a request note.`
   })),
   line: Type.Optional(Type.Number({
-    description: "1-indexed source line for path inspection/navigation. Omit with matchIndex, matchIndices or targets."
+    description: "1-indexed source line for path inspection/navigation; path-only inspect starts at line 1. Omit with matchIndex, matchIndices or targets."
   })),
   matchIndex: Type.Optional(Type.Number({
     description: "1-based retained match index for cursor-scoped inspect; replaces path and line."
   })),
   matchIndices: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), {
     minItems: 1,
-    maxItems: MAX_INSPECT_TARGETS,
-    description: "Inspect up to five visible match numbers together using the same cursor; mutually exclusive with matchIndex, path, line and targets."
+    maxItems: MAX_INSPECT_REQUEST_TARGETS,
+    description: `Inspect visible match numbers together using the same cursor; mutually exclusive with matchIndex, path, line and targets. One response inspects ${String(MAX_INSPECT_TARGETS)}; the rest are returned as an exact nextRequest.`
   })),
   targets: Type.Optional(Type.Array(Type.Object({
     path: Type.String({ maxLength: MAX_PATH_CHARACTERS }),
     line: Type.Integer({ minimum: 1 })
   }), {
     minItems: 1,
-    maxItems: MAX_INSPECT_TARGETS,
-    description: "Inspect known path/line locations together without a cursor. The complete batch shares one 16 KiB response budget."
+    maxItems: MAX_INSPECT_REQUEST_TARGETS,
+    description: `Inspect known path/line locations together without a cursor. One response inspects ${String(MAX_INSPECT_TARGETS)} within a shared 16 KiB budget; the rest are returned as an exact nextRequest.`
   })),
   cursor: Type.Optional(Type.String({ description: "Opaque cursor from a previous stable search snapshot." })),
   operationId: Type.Optional(Type.String({

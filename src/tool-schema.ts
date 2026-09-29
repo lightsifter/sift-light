@@ -10,6 +10,7 @@ import {
 } from "./analysis-limits.js";
 import {
   MAX_CONTEXT_LINES,
+  MAX_INSPECT_REQUEST_TARGETS,
   MAX_INSPECT_TARGETS,
   MAX_PAGE_SIZE,
   MAX_SELECTED_PATHS,
@@ -25,6 +26,7 @@ import {
   SIFT_LIGHT_MODES,
   fieldGuidance,
 } from "./request-contract.js";
+import { MODE_ALIASES } from "./request-aliases.js";
 
 function stringEnum<const Values extends readonly string[]>(
   values: Values,
@@ -68,9 +70,9 @@ export const siftLightSchema = Type.Object({
   ),
   allOf: Type.Optional(
     Type.Array(Type.String({ maxLength: MAX_PATH_CHARACTERS }), {
-      minItems: 2,
+      minItems: 1,
       maxItems: 3,
-      description: `${fieldGuidance("allOf")}. 2-3 distinct terms must occur in one file (default) or one function.`,
+      description: `${fieldGuidance("allOf")}. 1-3 distinct terms must occur in one file (default) or one function; one term lists the files or functions containing it.`,
     }),
   ),
   within: Type.Optional(
@@ -95,7 +97,7 @@ export const siftLightSchema = Type.Object({
       {
         minItems: 1,
         description:
-          "Filter each single-pattern occurrence by syntax role (JS/TS/TSX/Go). Roles may be candidates, especially Go call/conversion ambiguity. Cannot combine with allOf.",
+          "Filter each single-pattern occurrence by syntax role (JS/TS/TSX/Go parsed; Python lexical: comment, string, code, declaration, import, call candidates). Roles may be candidates, especially Go call/conversion and Python calls. Cannot combine with allOf.",
       },
     ),
   ),
@@ -151,7 +153,7 @@ export const siftLightSchema = Type.Object({
       minItems: 1,
       maxItems: MAX_SELECTED_PATHS,
       description:
-        "Exact retained files to select together from a cursor. A new search accepts one path; split multiple roots into separate requests.",
+        "Exact retained files to select together from a cursor. A new search accepts one path; split multiple roots into separate requests. With mode=inspect and no cursor, opens each file from line 1 (same as targets with line 1).",
     }),
   ),
   glob: Type.Optional(
@@ -193,7 +195,7 @@ export const siftLightSchema = Type.Object({
   ignorePolicy: Type.Optional(
     stringEnum(["respect", "include"] as const, {
       description:
-        "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted. include searches ignored files while still excluding .git internals and protected paths.",
+        "respect (default) honors ignore rules and reports policy-filtered coverage when files are omitted, including mode=files. include searches or lists ignored files while still excluding .git internals and protected paths.",
     }),
   ),
   patterns: Type.Optional(
@@ -264,19 +266,19 @@ export const siftLightSchema = Type.Object({
     Type.Integer({
       minimum: 1,
       maximum: MAX_PAGE_SIZE,
-      description: `${fieldGuidance("limit")}. Ordinary search only: explicit detail-page match limit (max 100). Normally omit to preserve automatic summarization; analysis and inspect modes reject it.`,
+      description: `${fieldGuidance("limit")}. Ordinary search: explicit detail-page match limit (max 100); mode=files: files per page (default 30). Normally omit to preserve automatic summarization; other analysis and inspect modes reject it.`,
     }),
   ),
   mode: Type.Optional(
-    stringEnum(SIFT_LIGHT_MODES, {
-      description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION}`,
+    stringEnum([...SIFT_LIGHT_MODES, ...MODE_ALIASES], {
+      description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} anyOf/allOf are field names, not modes; as mode values they are accepted aliases for omitting mode, disclosed in a request note.`,
     }),
   ),
 
   line: Type.Optional(
     Type.Number({
       description:
-        "1-indexed source line for path inspection/navigation. Omit with matchIndex, matchIndices or targets.",
+        "1-indexed source line for path inspection/navigation; path-only inspect starts at line 1. Omit with matchIndex, matchIndices or targets.",
     }),
   ),
   matchIndex: Type.Optional(
@@ -288,9 +290,8 @@ export const siftLightSchema = Type.Object({
   matchIndices: Type.Optional(
     Type.Array(Type.Integer({ minimum: 1 }), {
       minItems: 1,
-      maxItems: MAX_INSPECT_TARGETS,
-      description:
-        "Inspect up to five visible match numbers together using the same cursor; mutually exclusive with matchIndex, path, line and targets.",
+      maxItems: MAX_INSPECT_REQUEST_TARGETS,
+      description: `Inspect visible match numbers together using the same cursor; mutually exclusive with matchIndex, path, line and targets. One response inspects ${String(MAX_INSPECT_TARGETS)}; the rest are returned as an exact nextRequest.`,
     }),
   ),
   targets: Type.Optional(
@@ -301,9 +302,8 @@ export const siftLightSchema = Type.Object({
       }),
       {
         minItems: 1,
-        maxItems: MAX_INSPECT_TARGETS,
-        description:
-          "Inspect known path/line locations together without a cursor. The complete batch shares one 16 KiB response budget.",
+        maxItems: MAX_INSPECT_REQUEST_TARGETS,
+        description: `Inspect known path/line locations together without a cursor. One response inspects ${String(MAX_INSPECT_TARGETS)} within a shared 16 KiB budget; the rest are returned as an exact nextRequest.`,
       },
     ),
   ),

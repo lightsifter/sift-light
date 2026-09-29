@@ -1,5 +1,5 @@
 import type { SiftLightLocale } from "./config.js";
-import type { SiftLightInput, SiftLightSearchOptions, SiftLightService } from "./service.js";
+import type { SiftLightRequest, SiftLightSearchOptions, SiftLightService } from "./service.js";
 import { type SessionSummarySnapshot, SessionSummary } from "./session-summary.js";
 import type { ContextBudget, SiftLightResult } from "./types.js";
 
@@ -12,7 +12,7 @@ export class SiftLightRuntime {
   }
 
   async search(
-    input: SiftLightInput,
+    input: SiftLightRequest,
     cwd: string,
     signal?: AbortSignal,
     contextBudget?: ContextBudget,

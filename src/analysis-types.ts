@@ -4,7 +4,12 @@ import type { SearchScopeDetails, ResultStatistics } from "./types.js";
 import type { ValidationDetails } from "./validation-types.js";
 import type { ConceptSourceSummary } from "./concept-source-generation.js";
 
-export type CoverageStatus = "complete" | "partial" | "skipped" | "not-applicable";
+export type CoverageStatus =
+  | "complete"
+  | "partial"
+  | "policy-filtered"
+  | "skipped"
+  | "not-applicable";
 
 export const SEMANTIC_JUDGE_CLASSIFICATIONS = [
   "implementation-candidate",
@@ -125,6 +130,8 @@ export interface AnalysisDetails {
     passagesRanked?: number;
     elapsedMs?: number;
     filesEnumerated?: number;
+    ignoredFiles?: number;
+    ignoredMatches?: number;
     filesAdmitted?: number;
     filesParsed?: number;
     filesSkipped?: number;
@@ -159,4 +166,6 @@ export interface AnalysisResultSet {
   stats?: AnalysisDetails["stats"];
   sourceGeneration?: ConceptSourceSummary;
   redact?: boolean;
+  /** Explicit output page size (`limit`); pages default to 30 items. */
+  pageSize?: number;
 }

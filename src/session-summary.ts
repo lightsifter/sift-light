@@ -1,6 +1,6 @@
 import type { SiftLightLocale } from "./config.js";
 import { SIFT_LIGHT_VERSION } from "./package-version.js";
-import type { SiftLightInput } from "./service.js";
+import type { SiftLightRequest } from "./service.js";
 import type { SiftLightResult } from "./types.js";
 
 export const SESSION_STATUS_KEY = "sift-light_session";
@@ -13,7 +13,7 @@ export interface SessionSummarySnapshot {
   failedCalls: number;
 }
 
-function isNewQuery(input: SiftLightInput): boolean {
+function isNewQuery(input: SiftLightRequest): boolean {
   return (
     input.cursor === undefined &&
     input.sourceCursor === undefined &&
@@ -21,7 +21,7 @@ function isNewQuery(input: SiftLightInput): boolean {
   );
 }
 
-function wasAutomaticallyOrganized(input: SiftLightInput, result: SiftLightResult): boolean {
+function wasAutomaticallyOrganized(input: SiftLightRequest, result: SiftLightResult): boolean {
   const autoMode = input.mode === undefined || input.mode === "auto";
   return autoMode && input.limit === undefined && result.details.summaryFilesShown !== undefined;
 }
@@ -59,7 +59,7 @@ export class SessionSummary {
     failedCalls: 0,
   };
 
-  record(input: SiftLightInput, result: SiftLightResult): void {
+  record(input: SiftLightRequest, result: SiftLightResult): void {
     if (!isNewQuery(input)) return;
     this.#snapshot.queries += 1;
     if (result.details.status === "complete") this.#snapshot.completeQueries += 1;

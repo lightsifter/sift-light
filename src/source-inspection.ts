@@ -33,6 +33,8 @@ export interface SourceInspectionTarget {
   /** Raw source byte offset; retained-match focus is line-relative. */
   absoluteFocus?: number;
   focus?: number;
+  /** Structure already proven by the analysis that produced `range`. */
+  structure?: StructureDetails;
   expectedRevision?: SourceRevision;
   unverified?: boolean;
   retry?: SiftLightInput;
@@ -121,7 +123,20 @@ async function prepare(
   let range = target.range;
   let details: StructureDetails = { status: "no-symbol" };
   const language = syntaxLanguage(document.path);
-  if (document.utf8 && language && language !== "go") {
+  if (target.range && target.structure) {
+    document.checkRange(target.range);
+    const lines = {
+      startLine: document.lineAt(target.range.start),
+      endLine: document.lineAt(Math.max(target.range.start, target.range.end - 1)),
+    };
+    // Whole lines keep leading modifiers such as `export` or decorators readable.
+    range = document.lineRange(lines.startLine, lines.endLine);
+    details = {
+      ...target.structure,
+      range: lines,
+      ...(target.structure.symbol ? { symbol: { ...target.structure.symbol, range: lines } } : {}),
+    };
+  } else if (document.utf8 && language && language !== "go") {
     const syntax = await access.syntax(document);
     details = {
       status:
@@ -205,7 +220,9 @@ async function prepare(
     Math.min(document.lineStarts.length, target.line + 10),
   );
   const boundary: Exclude<SourceBoundary, "mixed"> = target.range
-    ? "requested-range"
+    ? target.structure
+      ? "syntax"
+      : "requested-range"
     : details.status === "available" && details.range
       ? "syntax"
       : "line-window";
@@ -692,8 +709,16 @@ export async function continueSource(
   cursor: string,
   access: SourceAccess,
   continuations: SourceContinuations,
+  expectedPath?: string,
 ): Promise<SiftLightResult> {
   const state = continuations.resolve(cursor);
+  if (
+    expectedPath !== undefined &&
+    resolve(access.cwd, expectedPath.replace(/^@/, "")) !== resolve(access.cwd, state.source.path)
+  )
+    throw new SiftLightError(
+      `sourceCursor continues ${JSON.stringify(state.source.path)}, not ${JSON.stringify(expectedPath)}; copy the returned nextRequest exactly`,
+    );
   const document = await access.load(state.source.path, state.source);
   const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
   const next = continuations.advance(cursor, page.fragment);

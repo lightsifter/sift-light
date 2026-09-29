@@ -119,6 +119,15 @@ const PYTHON_LANGUAGE_CAPABILITIES: readonly LanguageCapabilitySpec[] = [
     availability: "implemented",
     load: "lazy",
   },
+  {
+    id: "python-lexical.roles",
+    name: "roles",
+    provider: "bounded Python lexical role scanner",
+    providerKind: "builtin",
+    evidence: "syntax",
+    availability: "implemented",
+    load: "lazy",
+  },
 ];
 
 export const DEFAULT_LANGUAGE_CAPABILITIES: readonly LanguageCapabilityDescriptor[] = [

@@ -1,6 +1,6 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { SiftLightLocale } from "../config.js";
-import type { SiftLightInput } from "../service.js";
+import type { SiftLightRequest } from "../service.js";
 import type { Dashboard } from "./dashboard.js";
 
 import { candy, type SiftLightTheme } from "./palette.js";
@@ -254,7 +254,7 @@ export function renderDashboard(
 }
 
 export function renderSiftLightCallLines(
-  input: SiftLightInput,
+  input: SiftLightRequest,
   locale: SiftLightLocale,
   theme: SiftLightTheme,
   width: number,

@@ -7,6 +7,10 @@ const SENSITIVE_ASSIGNMENT = new RegExp(
   "gi",
 );
 const SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
+// An unquoted value that starts as a call or index expression (`env.get(`,
+// `os.environ[`) is source code that reads a secret, not the secret itself.
+// Masking it hides the evidence a reader needs, such as which key is read.
+const CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*[([]/u;
 const TYPE_ONLY_VALUES = new Set([
   "boolean",
   "number",
@@ -27,9 +31,12 @@ function redactString(value: string): { value: string; count: number } {
     SENSITIVE_ASSIGNMENT,
     (match: string, prefix: string, rawValue: string) => {
       const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
-      if (TYPE_ONLY_VALUES.has(unquoted)) return match;
+      if (TYPE_ONLY_VALUES.has(unquoted) || CODE_EXPRESSION.test(rawValue)) return match;
       count += 1;
-      return `${prefix}"[REDACTED]"`;
+      // Keep the source's own quoting: adding quotes to an unquoted value would
+      // misrepresent the file (for example, a bare `.env` value shown as quoted).
+      const quote = rawValue.startsWith('"') || rawValue.startsWith("'") ? rawValue[0] : "";
+      return `${prefix}${quote}[REDACTED]${quote}`;
     },
   );
   redacted = redacted.replace(SENSITIVE_TOKEN, () => {

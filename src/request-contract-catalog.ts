@@ -62,7 +62,17 @@ export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]>
   auto: ordinaryFields,
   summary: ordinaryFields,
   matches: ordinaryFields,
-  inspect: [...commonFields, "path", "line", "cursor", "matchIndex", "matchIndices", "targets"],
+  inspect: [
+    ...commonFields,
+    "path",
+    "paths",
+    "line",
+    "cursor",
+    "matchIndex",
+    "matchIndices",
+    "targets",
+    "scope",
+  ],
   outline: [...commonFields, "path", "line", "symbol", "cursor", "matchIndex", "maxFilesToParse"],
   imports: [
     ...commonFields,
@@ -82,7 +92,16 @@ export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]>
     "matchIndex",
     "maxFilesToParse",
   ],
-  files: [...commonFields, "query", ...sourceFilters, "modifiedAfter", "modifiedBefore"],
+  files: [
+    ...commonFields,
+    "query",
+    ...sourceFilters,
+    "ignorePolicy",
+    "limit",
+    "scope",
+    "modifiedAfter",
+    "modifiedBefore",
+  ],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
   concept: [...commonFields, "query", ...sourceFilters, "maxFilesToParse"],
   hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit", "maxFilesToParse"],
@@ -92,9 +111,7 @@ export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]>
   cancel: ["mode", "operationId"],
 };
 
-export const SAFE_DROP_FIELDS: Partial<Record<SiftLightMode, readonly RequestField[]>> = {
-  files: ["scope"],
-};
+export const SAFE_DROP_FIELDS: Partial<Record<SiftLightMode, readonly RequestField[]>> = {};
 
 export const SUPPORTED_OUTLINE_EXTENSIONS = new Set(
   DEFAULT_LANGUAGE_CAPABILITIES.flatMap((descriptor) =>
@@ -149,9 +166,9 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   context: "context is an output-context budget and is never silently dropped",
   limit: "limit is an output/page budget and is never silently dropped",
   scope:
-    "scope applies to ordinary content search; mode=files rejects this field because its scope is fixed strict, and only redundant strict may be removed",
+    "scope applies to ordinary content search; mode=files is always strict, so it accepts only the redundant scope=strict",
   ignorePolicy:
-    "respect keeps repository ignore rules; include searches ignored files but always excludes .git internals and protected paths",
+    "respect keeps repository ignore rules and discloses ignored files; include also searches or lists ignored files but always excludes .git internals and protected paths",
   patterns: "audit accepts named exact-literal patterns and returns one closure receipt",
   maxFilesToParse:
     "concept/hybrid automatically batch the requested scope; this optional field sets an advanced hard file ceiling",
