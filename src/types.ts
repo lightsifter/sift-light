@@ -23,6 +23,8 @@ export const ESTIMATED_CHARACTERS_PER_TOKEN = 4;
 export const DEFAULT_SUMMARY_FILE_LIMIT = 30;
 export const MAX_SELECTED_PATHS = 20;
 export const MAX_INSPECT_TARGETS = 5;
+/** A request may name more targets; they are served in pages of MAX_INSPECT_TARGETS. */
+export const MAX_INSPECT_REQUEST_TARGETS = 20;
 export const MAX_DISPLAYED_OCCURRENCES = 20;
 export const MAX_STORED_MATCHES = 50_000;
 export const MAX_STORED_OCCURRENCES = 200_000;
@@ -310,6 +312,8 @@ export interface SiftLightDetails {
   source?: SourceExcerptDetails;
   inspections?: InspectBatchItemDetails[];
   scope?: SearchScopeDetails;
+  /** Disclosed request normalizations, such as a field name sent as mode. */
+  requestNotes?: string[];
   redactedCount?: number;
   redactionRequested?: boolean;
   redactionApplied?: boolean;

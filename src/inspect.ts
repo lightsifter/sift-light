@@ -78,6 +78,9 @@ export function resolveInspectionTarget(
     line = retainedMatch.lineNumber;
   }
   if (!path) throw new SiftLightError("path is required when mode=inspect");
+  // A direct path without a line opens the file from its first line. Cursor
+  // inspection still needs the exact retained line, so it keeps failing closed.
+  if (line === undefined && input.cursor === undefined) line = 1;
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SiftLightError("line must be a positive integer when mode=inspect");
   }

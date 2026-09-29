@@ -108,7 +108,9 @@ export function normalizeRequest(input: RawSearchInput): SearchRequest {
     throw new SiftLightError("ignorePolicy must be respect or include");
   const pattern = input.pattern;
   if (pattern === undefined) {
-    throw new SiftLightError("pattern is required when cursor is not provided");
+    throw new SiftLightError(
+      'pattern is required when cursor is not provided; to list files use mode="files" (query optional), to read a known file use mode="inspect" with path',
+    );
   }
 
   const path = input.path?.replace(/^@/, "");

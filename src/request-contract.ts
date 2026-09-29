@@ -132,6 +132,21 @@ function plainFilePatternRecovery(
   );
 }
 
+/** `pattern: ".*"` in files mode means "every file": the exact repair omits it. */
+function matchAllFilePatternRecovery(
+  mode: SiftLightMode,
+  input: Record<string, unknown>,
+  invalid: readonly string[],
+): boolean {
+  return (
+    mode === "files" &&
+    invalid.includes("pattern") &&
+    input.query === undefined &&
+    typeof input.pattern === "string" &&
+    /^(?:\.\*|\.\+|\*+)$/u.test(input.pattern.trim())
+  );
+}
+
 function safeNextRequest(
   input: Record<string, unknown>,
   mode: SiftLightMode,
@@ -140,7 +155,7 @@ function safeNextRequest(
   if (input.redact === true && containsSensitiveText(input)) return undefined;
   const safe = new Set<string>(SAFE_DROP_FIELDS[mode] ?? []);
   const plainFilePattern = plainFilePatternRecovery(mode, input, invalid);
-  if (plainFilePattern) safe.add("pattern");
+  if (plainFilePattern || matchAllFilePatternRecovery(mode, input, invalid)) safe.add("pattern");
   if (invalid.some((field) => !safe.has(field))) return undefined;
   const next: Record<string, unknown> = { ...input };
   for (const field of invalid) delete next[field];
@@ -203,7 +218,9 @@ function fieldsError(
             action: "retry",
             reason: plainFilePatternRecovery(mode, input, invalid)
               ? "For filename discovery, move the plain text from pattern to query and copy nextRequest; all filters are preserved."
-              : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
+              : matchAllFilePatternRecovery(mode, input, invalid)
+                ? "A match-all pattern lists every file; omitting query does that, so copy nextRequest; all filters are preserved."
+                : `Remove only ${visibleFields} and copy the exact nextRequest; all other fields are preserved.`,
             nextRequest,
           }
         : {
@@ -458,7 +475,8 @@ export function validateRequestContract(input: SiftLightInput): void {
   const allowed = new Set(MODE_FIELDS_BY_MODE[mode]);
   if (mode === "inspect" && raw.sourceCursor !== undefined) {
     allowed.clear();
-    for (const field of ["mode", "sourceCursor", "redact"] as const) allowed.add(field);
+    // path is checked against the continuation's own source; it cannot redirect it.
+    for (const field of ["mode", "sourceCursor", "redact", "path"] as const) allowed.add(field);
   }
   if (
     (mode === "auto" || mode === "summary" || mode === "matches") &&

@@ -13,7 +13,7 @@ export const MAX_ANALYSIS_STORAGE_BYTES = 32 * 1024 * 1024;
 export const ANALYSIS_METADATA_RESERVE_BYTES = 64 * 1024;
 export const MAX_ANALYSIS_REASONS = 64;
 export const MAX_ANALYSIS_REASON_BYTES = 4 * 1024;
-export const MIN_ANY_OF_TERMS = 2;
+export const MIN_ANY_OF_TERMS = 1;
 export const MAX_ANY_OF_TERMS = 8;
 /** Public union size; execution keeps the proven eight-term scan boundary per chunk. */
 export const MAX_ANY_OF_TOTAL_TERMS = 64;

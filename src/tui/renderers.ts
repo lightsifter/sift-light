@@ -1,6 +1,6 @@
 import { type Component } from "@earendil-works/pi-tui";
 import type { SiftLightLocale } from "../config.js";
-import type { SiftLightInput } from "../service.js";
+import type { SiftLightRequest } from "../service.js";
 import type { SiftLightDetails } from "../types.js";
 import { dashboard } from "./dashboard.js";
 import { fit, renderDashboard, renderSiftLightCallLines, type SiftLightTheme } from "./layout.js";
@@ -47,7 +47,7 @@ function failure(text: string, locale: SiftLightLocale): string {
 }
 
 export function renderSiftLightCall(
-  input: SiftLightInput,
+  input: SiftLightRequest,
   locale: SiftLightLocale,
   theme: SiftLightTheme,
 ): Component {

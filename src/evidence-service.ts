@@ -39,7 +39,6 @@ import {
   continueSource,
   inspectDocuments,
   matchInspectionTarget,
-  inspectDocumentsMetadata,
   type SourceInspectionTarget,
 } from "./source-inspection.js";
 import { validateSavedEvidence } from "./evidence-validation.js";
@@ -48,6 +47,7 @@ import type { CodeStructureProvider } from "./structure.js";
 import { filterRoleOccurrences, findFunctionConjunctions } from "./syntax-search.js";
 import { syntaxLanguage } from "./syntax.js";
 import { parsePythonOutline } from "./python-outline.js";
+import { pythonRoleAnalysis } from "./python-roles.js";
 import {
   combineHybridSearch,
   hybridConceptLimit,
@@ -66,10 +66,12 @@ import {
   MAX_STRUCTURE_FILES,
 } from "./analysis-limits.js";
 import {
+  MAX_INSPECT_REQUEST_TARGETS,
   MAX_INSPECT_TARGETS,
   type SearchRequest,
   type SearchScopeDetails,
   type SiftLightResult,
+  type StructureDetails,
 } from "./types.js";
 
 export function isEvidenceRequest(input: SiftLightInput): boolean {
@@ -93,6 +95,100 @@ export function isEvidenceRequest(input: SiftLightInput): boolean {
     input.conceptLimit !== undefined ||
     (input.cursor?.includes(".analysis") ?? false)
   );
+}
+
+/**
+ * Splits one inspect request into the page served now and an exact request for
+ * the rest. `paths` without a cursor opens each file from line 1.
+ */
+function pageInspectRequest(input: SiftLightInput): {
+  current: SiftLightInput;
+  remaining?: SiftLightInput;
+} {
+  if (input.scope === "expand")
+    throw new SiftLightError(
+      "mode=inspect reads exact locations; scope=expand does not apply (omit scope)",
+    );
+  const { scope: _scope, paths, ...rest } = input;
+  let request: SiftLightInput = rest;
+  if (paths !== undefined) {
+    if (
+      input.cursor !== undefined ||
+      input.targets !== undefined ||
+      input.matchIndices !== undefined ||
+      input.path !== undefined ||
+      input.line !== undefined ||
+      input.matchIndex !== undefined
+    )
+      throw new SiftLightError(
+        "mode=inspect paths opens files from line 1 and cannot be combined with cursor, targets, matchIndices, path, line or matchIndex",
+      );
+    request = { ...rest, targets: paths.map((path) => ({ path, line: 1 })) };
+  }
+  const redact = input.redact ? { redact: true } : {};
+  const requested = request.targets?.length ?? request.matchIndices?.length ?? 0;
+  if (requested > MAX_INSPECT_REQUEST_TARGETS)
+    throw new SiftLightError(
+      `mode=inspect accepts at most ${String(MAX_INSPECT_REQUEST_TARGETS)} targets per request; ${String(MAX_INSPECT_TARGETS)} are inspected per response`,
+    );
+  if (request.targets && request.targets.length > MAX_INSPECT_TARGETS)
+    return {
+      current: { ...request, targets: request.targets.slice(0, MAX_INSPECT_TARGETS) },
+      remaining: {
+        mode: "inspect",
+        targets: request.targets.slice(MAX_INSPECT_TARGETS),
+        ...redact,
+      },
+    };
+  if (request.matchIndices && request.matchIndices.length > MAX_INSPECT_TARGETS)
+    return {
+      current: { ...request, matchIndices: request.matchIndices.slice(0, MAX_INSPECT_TARGETS) },
+      remaining: {
+        mode: "inspect",
+        ...(request.cursor !== undefined ? { cursor: request.cursor } : {}),
+        matchIndices: request.matchIndices.slice(MAX_INSPECT_TARGETS),
+        ...redact,
+      },
+    };
+  return { current: request };
+}
+
+/** The unserved targets stay explicit: the page is partial and names its exact continuation. */
+function withRemainingInspection(
+  result: SiftLightResult,
+  remaining: SiftLightInput,
+): SiftLightResult {
+  const count = remaining.targets?.length ?? remaining.matchIndices?.length ?? 0;
+  return {
+    text: `${result.text}\n\n[${String(count)} more target(s) were not inspected; one response inspects ${String(MAX_INSPECT_TARGETS)}.]\nNext request: ${JSON.stringify(remaining)}`,
+    details: {
+      ...result.details,
+      status: "partial",
+      snapshotComplete: false,
+      nextRequest: remaining,
+    },
+  };
+}
+
+/** Structure facts already proven by the analysis that produced a bounded item. */
+function analysisItemStructure(item: AnalysisItem): StructureDetails {
+  const details = item.details ?? {};
+  const language = typeof details.language === "string" ? details.language : undefined;
+  const name = typeof details.name === "string" ? details.name : undefined;
+  const scope = Array.isArray(details.scope)
+    ? details.scope.filter((entry): entry is string => typeof entry === "string")
+    : typeof details.scope === "string"
+      ? [details.scope]
+      : [];
+  const kind = details.kind === "function" ? "function" : (item.label.split(" ", 1)[0] ?? "symbol");
+  return {
+    status: "available",
+    provider: language === "python" ? "python-outline" : "tree-sitter",
+    ...(language ? { language } : {}),
+    ...(name
+      ? { symbol: { name, kind, scope, range: { startLine: item.line, endLine: item.line } } }
+      : {}),
+  };
 }
 
 export interface EvidenceSearchOptions {
@@ -126,12 +222,12 @@ function validateTerms(input: SiftLightInput): string[] | undefined {
   }
   if (
     !Array.isArray(terms) ||
-    terms.length < 2 ||
+    terms.length < 1 ||
     terms.length > 3 ||
     terms.some((term) => typeof term !== "string" || !term.trim() || /[\r\n\0]/.test(term)) ||
     new Set(terms).size !== terms.length
   )
-    throw new SiftLightError("allOf requires 2–3 distinct, nonempty, single-line literal terms");
+    throw new SiftLightError("allOf requires 1–3 distinct, nonempty, single-line literal terms");
   if (
     input.pattern !== undefined ||
     input.roles !== undefined ||
@@ -396,13 +492,13 @@ export class EvidenceService {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
       if (input.mode !== "inspect") throw new SiftLightError("sourceCursor requires mode=inspect");
-      return continueSource(input.sourceCursor, access, this.#continuations);
+      return continueSource(input.sourceCursor, access, this.#continuations, input.path);
     }
     if (input.mode === "inspect") {
-      const targets = this.#inspectionTargets(input, cwd);
-      return targets.some((target) => target.range !== undefined)
-        ? inspectDocumentsMetadata(targets, access, this.#structure)
-        : inspectDocuments(targets, access, this.#continuations, this.#structure);
+      const { current, remaining } = pageInspectRequest(input);
+      const targets = this.#inspectionTargets(current, cwd);
+      const result = await inspectDocuments(targets, access, this.#continuations, this.#structure);
+      return remaining ? withRemainingInspection(result, remaining) : result;
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
@@ -518,7 +614,7 @@ export class EvidenceService {
           "anyOf is an explicit case-sensitive literal union; omit pattern, allOf, within, roles, literal and ignoreCase",
         );
       if (input.mode !== undefined && input.mode !== "auto" && input.mode !== "matches")
-        throw new SiftLightError("anyOf mode must be omitted, auto, or matches");
+        throw new SiftLightError("anyOf mode must be omitted, auto, matches or summary");
       const chunks = Array.from(
         { length: Math.ceil(anyOf.length / MAX_ANY_OF_TERMS) },
         (_, index) => anyOf.slice(index * MAX_ANY_OF_TERMS, (index + 1) * MAX_ANY_OF_TERMS),
@@ -696,8 +792,12 @@ export class EvidenceService {
           );
           if (item) result.items.push(item);
         } else if (terms || input.roles) {
-          if (syntaxLanguage(file.document.path)) syntaxCapableFiles += 1;
-          const syntax = await access.syntax(file.document);
+          // Python roles come from a bounded lexical scanner; other languages parse.
+          const pythonRoles = !terms && /\.py$/iu.test(file.document.path);
+          if (pythonRoles || syntaxLanguage(file.document.path)) syntaxCapableFiles += 1;
+          const syntax = pythonRoles
+            ? pythonRoleAnalysis(file.document)
+            : await access.syntax(file.document);
           const classified = terms
             ? findFunctionConjunctions(
                 file.document,
@@ -790,12 +890,16 @@ export class EvidenceService {
       const item = this.#analyses.item(input.cursor, input.matchIndex);
       if (!item.source || !item.range)
         throw new CursorError("This analysis item has no verified source range");
-      const metadataOnly = item.details?.kind === "symbol" || item.details?.kind === "function";
+      // Outline symbols and function conjunctions carry their exact syntax range,
+      // so inspection returns that version-checked range as source (issue #96).
+      const bounded = item.details?.kind === "symbol" || item.details?.kind === "function";
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
-        ...(metadataOnly ? { range: item.range } : { absoluteFocus: item.range.start }),
+        ...(bounded
+          ? { range: item.range, structure: analysisItemStructure(item) }
+          : { absoluteFocus: item.range.start }),
       };
     }
     return {

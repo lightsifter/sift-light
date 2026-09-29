@@ -87,7 +87,10 @@ function compactRows(analysis: AnalysisDetails): string[] {
       rows.push(JSON.stringify(item.path));
       previousPath = item.path;
     }
-    const label = analysis.kind === "outline" && analysis.modelOutput ? item.label : "metadata";
+    const label =
+      (analysis.kind === "outline" && analysis.modelOutput) || analysis.kind === "files"
+        ? item.label
+        : "metadata";
     const semanticJudge = item.details?.semanticJudge;
     const judgment =
       isRecord(semanticJudge) &&
@@ -149,6 +152,7 @@ export function compactMcpModelText(result: SiftLightResult): string {
   const inspect = compactInspectInstruction(analysis);
   const nextRequest = distinctNextRequest(result.details, analysis);
   const compact = [
+    ...(result.details.requestNotes ?? []).map((note) => `[Request note: ${note}]`),
     header,
     ...compactMetadata(result.details, analysis),
     ...compactRows(analysis),
@@ -156,6 +160,7 @@ export function compactMcpModelText(result: SiftLightResult): string {
     ...(nextRequest ? [`Next request: ${nextRequest}`] : []),
   ].join("\n");
   const standard = result.text.replace(" Structured output retains per-item evidence details.", "");
+  // Both projections carry request notes, so the byte comparison stays fair.
   if (analysis.semanticJudge) return compact;
   return Buffer.byteLength(compact) < Buffer.byteLength(standard) ? compact : standard;
 }

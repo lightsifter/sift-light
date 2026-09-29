@@ -206,7 +206,10 @@ function publicAnalysisItem(
   return {
     path: item.path,
     line: item.line,
-    label: result.kind === "outline" && modelOutput ? item.label : publicAnalysisLabel(result),
+    label:
+      (result.kind === "outline" && modelOutput) || result.kind === "files"
+        ? item.label
+        : publicAnalysisLabel(result),
     index: index + 1,
     ...(inspect ? { inspect } : {}),
     ...(publicDetails ? { details: publicDetails } : {}),
@@ -455,7 +458,8 @@ export class AnalysisStore {
         if (items.length >= 30 || !appendItem(index)) break;
       }
     } else {
-      for (let index = offset; index < result.items.length && items.length < 30; index += 1) {
+      const pageSize = result.pageSize ?? 30;
+      for (let index = offset; index < result.items.length && items.length < pageSize; index += 1) {
         if (!appendItem(index)) break;
       }
     }
