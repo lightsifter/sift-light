@@ -39,6 +39,11 @@ export function normalizeRequestAliases(request: SiftLightRequest): NormalizedRe
   } else if (mode !== undefined) {
     input = { ...rest, mode };
   }
+  if (input.mode !== "inspect" && input.sourceCursor === "") {
+    const { sourceCursor: _sourceCursor, ...withoutSourceCursor } = input;
+    input = withoutSourceCursor;
+    notes.push("Empty sourceCursor is ignored outside mode=inspect.");
+  }
   if (input.sourceCursor !== undefined && input.line !== undefined) {
     const { line: _line, ...withoutLine } = input;
     input = withoutLine;
