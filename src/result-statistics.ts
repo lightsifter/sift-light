@@ -145,7 +145,7 @@ export function formatStatistics(
 
 export function analysisExtraGroups(
   counts: Record<string, number> | undefined,
-  termCounts: readonly { retainedOccurrences: number }[] | undefined,
+  termCounts: readonly { term: string; retainedOccurrences: number }[] | undefined,
   items: readonly AnalysisItem[],
 ): StatisticsGroup[] {
   const groups: StatisticsGroup[] = [];
@@ -159,8 +159,8 @@ export function analysisExtraGroups(
   const terms = termCounts
     ? statisticsGroup(
         "conditions",
-        termCounts.map((term, index) => ({
-          label: `condition #${String(index + 1)}`,
+        termCounts.map((term) => ({
+          label: term.term,
           count: term.retainedOccurrences,
         })),
       )

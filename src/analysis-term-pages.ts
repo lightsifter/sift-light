@@ -1,5 +1,6 @@
 import type { AnalysisResultSet } from "./analysis-types.js";
 import type { SiftLightResult } from "./types.js";
+import { termCountLabel } from "./term-count-label.js";
 
 export const MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
 
@@ -23,7 +24,7 @@ export function analysisTermPage(
   for (let index = offset; index < all.length; index++) {
     const term = all[index];
     if (!term) throw new Error("Term inventory index unavailable");
-    const label = `condition #${String(index + 1)}`;
+    const label = termCountLabel(term.term, index, result.redact);
     const row = `${label}: ${String(term.retainedOccurrences)} retained occurrences`;
     const size = Buffer.byteLength(row) + 2;
     if (bytes + size > MAX_INLINE_TERM_COUNT_BYTES) break;

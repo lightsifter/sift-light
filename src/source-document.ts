@@ -216,8 +216,10 @@ export async function readWorkspaceDocument(
     new SearchPathPolicy(cwd).resolveExistingPath(absolute),
     realpath(cwd),
   ]);
-  if (!canonical) throw new SourceDocumentError("source-unavailable", "Source is unavailable");
-  const before = await getSourceRevision(absolute);
+  if (!canonical) throw new SourceDocumentError("source-unavailable", `Path not found: ${path}`);
+  const before = await getSourceRevision(absolute, (error) => {
+    throw error;
+  });
   if (!before) throw new SourceDocumentError("source-unavailable", "Source is unavailable");
   if (expected && !sameSourceRevision(before, expected.revision)) {
     throw new SourceDocumentError("source-changed", "Source changed; start a new inspection");

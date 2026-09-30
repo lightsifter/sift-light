@@ -167,6 +167,8 @@ MCP returns readable text plus structured evidence by default. If a host seriali
 
 ### Native plugins
 
+The Codex plugin includes a `local-search` skill for discovering and calling deferred MCP tools. Before declaring the tool unavailable, inspect the host's complete runtime registry (including `ALL_TOOLS` where `functions.exec` is available), then call `mcp__sift_light__sift_light` when registered. Omission from the initial expanded declarations does not mean absence. Restart or start a new session after updating the plugin to load the new skill. MCP-only clients receive the same server guidance, but the skill discovery entry requires the native plugin.
+
 For conventional search enforcement in other hosts:
 
 - **Claude Code:** `/plugin marketplace add lightsifter/sift-light`, then `/plugin install sift-light@sift-light`.

@@ -1,17 +1,21 @@
 import { DEFAULT_MCP_OUTPUT_MODE, type SiftLightMcpOutputMode } from "./mcp-output.js";
 
+export const SIFT_LIGHT_DISCOVERY_GUIDANCE =
+  "Before reporting sift-light absent, check the complete runtime registry, including ALL_TOOLS deferred entries. Read mcp__sift_light__sift_light's declaration and call it via tools in functions.exec; use host tool search otherwise. Unexpanded does not mean absent; call failures are connection/capability failures.";
+
 const SOURCE_OUTPUT_GUIDANCE =
   "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 
 export function siftLightPromptGuidelines(structuredOutput = true): string[] {
   return [
+    SIFT_LIGHT_DISCOVERY_GUIDANCE,
     `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} For routine development searches, start with fast exact content, filename or applicable structural modes when the request has a usable name, symbol, error text or other literal clue. Omitted mode is ordinary exact search and never loads the local embedding model. Vector search is disabled by default; concept/hybrid require vectorSearchEnabled:true in sift-light.json and an installed model. They can take tens of seconds on an uncached scope, so select them only when semantic recall is needed. Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
     `Mode="inspect" with a direct path/line or ordinary retained match returns bounded source windows and source-revision metadata. Some retained analysis selectors return only revision metadata; use direct path/line or the host read capability when source is needed. Do not use inspection merely to obtain a citation.`,
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrence statistics.`,
-    `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
+    `Use anyOf:["term1","term2"] when every exact occurrence of 1-64 literals is needed in one version-bound result. It is case-sensitive, labels counts with input literals unless redact:true is requested, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
     `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path for symbol counts and locations, mode:"imports" for static relationships, and mode:"tests" for related-test candidates. Their text pages summarize metadata; structured details can retain source evidence.`,
     `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; use hybrid/concept only for business concepts that cannot be located by a literal clue. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
@@ -28,10 +32,12 @@ export function siftLightPromptGuidelines(structuredOutput = true): string[] {
 
 function siftLightModelGuidelines(): string[] {
   return [
-    `Search with pattern and optional path. ${SOURCE_OUTPUT_GUIDANCE} Default search is exact and model-free. concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model; uncached runs may take tens of seconds. Omit mode/limit for auto pages.`,
-    `Use ranked paths and counts; Cursor continuation pages retained results. Use mode="inspect" for exact source before editing.`,
-    `Modes: files+query for filenames; anyOf/allOf for literals; outline/imports/tests for static code; structure for AST; concept/hybrid for semantic candidates. Similarity is not proof.`,
-    `On rejection keep the strongest applicable mode and apply the stated repair once. Do not repeat the rejected request or include its error. Only explicit capability-unavailable permits a visibly partial alternative.`,
+    SIFT_LIGHT_DISCOVERY_GUIDANCE,
+    `pattern + path: exact, model-free; omit mode/limit for auto. concept/hybrid need vectorSearchEnabled:true and an installed model; cold runs take tens of seconds.`,
+    `Auto/summary may quote source; matches: metadata-only. Inspect: bounded source, including an entire small file. Analysis may retain passages/names/signatures. Follow limits and coverage.`,
+    `Use ranked counts and paths. Cursor continuation pages retained results; inspect exact source before editing.`,
+    `files+query: filenames; anyOf/allOf: literals; outline/imports/tests: static code; structure: AST; concept/hybrid: semantic candidates, not proof.`,
+    `On rejection keep the strongest mode; repair once, without repeating request/error. Only explicit capability-unavailable permits a visibly partial alternative.`,
   ];
 }
 

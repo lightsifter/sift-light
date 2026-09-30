@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3-1 — 2026-09-30
+
+- Explain missing inspection paths explicitly while retaining the `source-unavailable` status for compatibility.
+- Label term counts with numbered input literals in text, structured output and continuation pages; keep anonymized labels when redaction is requested.
+- Bundle a Codex local-search skill and discovery guidance that checks the complete runtime registry, including deferred tools, before reporting sift-light unavailable.
+
 ## 1.0.2 — 2026-09-29
 
 ### Fixed

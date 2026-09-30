@@ -167,6 +167,8 @@ MCP 默认同时返回可读文本和结构化证据。如果宿主会把两种�
 
 ### 原生插件
 
+Codex 插件包含 `local-search` 技能，用于发现和调用延迟加载的 MCP 工具。判断工具不可用前，先检查宿主完整运行时注册表（在提供 `functions.exec` 的环境中包括 `ALL_TOOLS`），找到 `mcp__sift_light__sift_light` 后直接调用；初始声明未展开不代表工具缺失。更新插件后重启或新建会话，让宿主加载新版技能。仅配置 MCP 的客户端会收到同样的服务说明，但技能发现入口需要安装原生插件。
+
 如果希望在其他宿主中也强制常规搜索使用本插件：
 
 - **Claude Code：** 先运行 `/plugin marketplace add lightsifter/sift-light`，再运行 `/plugin install sift-light@sift-light`。
