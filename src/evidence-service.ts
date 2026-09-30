@@ -595,7 +595,7 @@ export class EvidenceService {
           "Analysis cursor cannot continue in the requested mode",
           "E_CURSOR_WRONG_KIND",
         );
-      return this.#analyses.page(input.cursor, options.modelOutput);
+      return this.#analyses.page(input.cursor, options.modelOutput, input.redact);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access, options);

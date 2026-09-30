@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.2",
+  version: "1.0.3-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -270,8 +270,8 @@ function analysisExtraGroups(counts, termCounts, items) {
   const classification = counts ? statisticsGroup("classification", Object.entries(counts).map(([label, count]) => ({ label, count }))) : undefined;
   if (classification)
     groups.push(classification);
-  const terms = termCounts ? statisticsGroup("conditions", termCounts.map((term, index) => ({
-    label: `condition #${String(index + 1)}`,
+  const terms = termCounts ? statisticsGroup("conditions", termCounts.map((term) => ({
+    label: term.term,
     count: term.retainedOccurrences
   }))) : undefined;
   if (terms)
@@ -4152,8 +4152,10 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
     realpath3(cwd)
   ]);
   if (!canonical)
-    throw new SourceDocumentError("source-unavailable", "Source is unavailable");
-  const before = await getSourceRevision(absolute);
+    throw new SourceDocumentError("source-unavailable", `Path not found: ${path}`);
+  const before = await getSourceRevision(absolute, (error) => {
+    throw error;
+  });
   if (!before)
     throw new SourceDocumentError("source-unavailable", "Source is unavailable");
   if (expected && !sameSourceRevision(before, expected.revision)) {
@@ -5707,6 +5709,11 @@ var SEMANTIC_JUDGE_CLASSIFICATIONS = [
 ];
 var SEMANTIC_JUDGE_NON_PROOF_CLAIM = "semantic classification only; local static and runtime verification is not asserted";
 
+// src/term-count-label.ts
+function termCountLabel(term, index, redact = false) {
+  return redact ? `condition #${String(index + 1)}` : `#${String(index + 1)} ${JSON.stringify(term)}`;
+}
+
 // src/analysis-term-pages.ts
 var MAX_INLINE_TERM_COUNT_BYTES = 8 * 1024;
 function termCountRequest(id, offset, redact = false) {
@@ -5724,7 +5731,7 @@ function analysisTermPage(result, id, offset) {
     const term = all[index];
     if (!term)
       throw new Error("Term inventory index unavailable");
-    const label = `condition #${String(index + 1)}`;
+    const label = termCountLabel(term.term, index, result.redact);
     const row = `${label}: ${String(term.retainedOccurrences)} retained occurrences`;
     const size = Buffer.byteLength(row) + 2;
     if (bytes + size > MAX_INLINE_TERM_COUNT_BYTES)
@@ -5911,9 +5918,9 @@ function publicAnalysisItem(result, item, index, storedId, modelOutput) {
     ...publicDetails ? { details: publicDetails } : {}
   };
 }
-function safeTermCounts(termCounts) {
+function safeTermCounts(termCounts, redact = false) {
   return termCounts?.map((entry, index) => ({
-    term: `condition #${String(index + 1)}`,
+    term: termCountLabel(entry.term, index, redact),
     retainedOccurrences: entry.retainedOccurrences
   }));
 }
@@ -6035,21 +6042,22 @@ class AnalysisStore {
       throw new CursorError("Analysis item is outside the retained result");
     return structuredClone(item);
   }
-  page(cursor, modelOutput = false) {
+  page(cursor, modelOutput = false, redact = false) {
     const { stored, offset, kind } = this.resolve(cursor);
-    const { result } = stored;
+    const result = redact ? { ...stored.result, redact: true } : stored.result;
     if (kind === "analysis-terms")
       return analysisTermPage(result, stored.id, offset);
     const hybridPreview = kind === "analysis-hybrid";
     const hybridMatchesRequest = hybridPreview ? { cursor: `${stored.id}.analysis.0`, ...result.redact ? { redact: true } : {} } : undefined;
-    const pagedTerms = result.termCounts && Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
-    const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
+    const publicTerms = safeTermCounts(result.termCounts, result.redact);
+    const pagedTerms = publicTerms && Buffer.byteLength(JSON.stringify(publicTerms)) > MAX_INLINE_TERM_COUNT_BYTES;
+    const inlineTerms = pagedTerms ? undefined : publicTerms;
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
     const items = [];
     const sources = [];
     const sourceIds = new Map;
     const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
-    const statistics = statisticsForItems(result.items, result.items.length, result.unit, analysisExtraGroups(result.counts, result.termCounts, result.items));
+    const statistics = statisticsForItems(result.items, result.items.length, result.unit, analysisExtraGroups(result.counts, inlineTerms, result.items));
     const scope = result.scope ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : "";
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
@@ -11202,7 +11210,7 @@ class EvidenceService {
       this.#analyses.resolve(input.cursor);
       if (input.mode !== undefined && input.mode !== "matches" && input.mode !== "auto")
         throw new CursorError("Analysis cursor cannot continue in the requested mode", "E_CURSOR_WRONG_KIND");
-      return this.#analyses.page(input.cursor, options.modelOutput);
+      return this.#analyses.page(input.cursor, options.modelOutput, input.redact);
     }
     if (input.mode === "outline" || input.mode === "imports" || input.mode === "tests")
       return this.#navigate(input, access, options);
@@ -13666,16 +13674,18 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
 }
 
 // src/prompt-guidelines.ts
+var SIFT_LIGHT_DISCOVERY_GUIDANCE = "Before reporting sift-light absent, check the complete runtime registry, including ALL_TOOLS deferred entries. Read mcp__sift_light__sift_light's declaration and call it via tools in functions.exec; use host tool search otherwise. Unexpanded does not mean absent; call failures are connection/capability failures.";
 var SOURCE_OUTPUT_GUIDANCE = "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
 function siftLightPromptGuidelines(structuredOutput = true) {
   return [
+    SIFT_LIGHT_DISCOVERY_GUIDANCE,
     `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} For routine development searches, start with fast exact content, filename or applicable structural modes when the request has a usable name, symbol, error text or other literal clue. Omitted mode is ordinary exact search and never loads the local embedding model. Vector search is disabled by default; concept/hybrid require vectorSearchEnabled:true in sift-light.json and an installed model. They can take tens of seconds on an uncached scope, so select them only when semantic recall is needed. Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
     `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
     `Mode="inspect" with a direct path/line or ordinary retained match returns bounded source windows and source-revision metadata. Some retained analysis selectors return only revision metadata; use direct path/line or the host read capability when source is needed. Do not use inspection merely to obtain a citation.`,
     `Use allOf:["term1","term2"] for explicit same-file literal AND. Add within:"function" only together with allOf to restrict that conjunction to one own-implementation JS/TS/TSX function; omit within for ordinary single-pattern searches. Use roles:["declaration"] or roles:["call"] with a single pattern for JS/TS/TSX/Go syntactic occurrence statistics.`,
-    `Use anyOf:["term1","term2"] when every exact occurrence of 2-64 literals is needed in one version-bound result. It is case-sensitive, reports anonymized condition counts, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
+    `Use anyOf:["term1","term2"] when every exact occurrence of 1-64 literals is needed in one version-bound result. It is case-sensitive, labels counts with input literals unless redact:true is requested, and runs requests above eight terms as bounded parallel chunks. Large condition inventories have separate continuation pages; copy those requests to retrieve the complete counts.`,
     `For a changed-code question, add changes:{base:"HEAD",scope:"lines",side:"new"}; omit target for the working tree, use side:"old" for deleted-side statistics. Copy returned continuation requests to preserve source versions.`,
     `Use mode:"capabilities" when the language or requested operation is unclear to get a compact lazy inventory. Use mode:"outline" with a concrete source file path for symbol counts and locations, mode:"imports" for static relationships, and mode:"tests" for related-test candidates. Their text pages summarize metadata; structured details can retain source evidence.`,
     `Use mode:"files" plus query for unknown filenames and fuzzy paths. Multi-word filename queries require each word literally in the path; use hybrid/concept only for business concepts that cannot be located by a literal clue. Use wholeWord:true for a single-pattern whole-word search. exclude contains file globs, not content negation.`,
@@ -13689,10 +13699,12 @@ function siftLightPromptGuidelines(structuredOutput = true) {
 }
 function siftLightModelGuidelines() {
   return [
-    `Search with pattern and optional path. ${SOURCE_OUTPUT_GUIDANCE} Default search is exact and model-free. concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model; uncached runs may take tens of seconds. Omit mode/limit for auto pages.`,
-    `Use ranked paths and counts; Cursor continuation pages retained results. Use mode="inspect" for exact source before editing.`,
-    `Modes: files+query for filenames; anyOf/allOf for literals; outline/imports/tests for static code; structure for AST; concept/hybrid for semantic candidates. Similarity is not proof.`,
-    `On rejection keep the strongest applicable mode and apply the stated repair once. Do not repeat the rejected request or include its error. Only explicit capability-unavailable permits a visibly partial alternative.`
+    SIFT_LIGHT_DISCOVERY_GUIDANCE,
+    `pattern + path: exact, model-free; omit mode/limit for auto. concept/hybrid need vectorSearchEnabled:true and an installed model; cold runs take tens of seconds.`,
+    `Auto/summary may quote source; matches: metadata-only. Inspect: bounded source, including an entire small file. Analysis may retain passages/names/signatures. Follow limits and coverage.`,
+    `Use ranked counts and paths. Cursor continuation pages retained results; inspect exact source before editing.`,
+    `files+query: filenames; anyOf/allOf: literals; outline/imports/tests: static code; structure: AST; concept/hybrid: semantic candidates, not proof.`,
+    `On rejection keep the strongest mode; repair once, without repeating request/error. Only explicit capability-unavailable permits a visibly partial alternative.`
   ];
 }
 function siftLightMcpInstructions(outputMode = DEFAULT_MCP_OUTPUT_MODE) {

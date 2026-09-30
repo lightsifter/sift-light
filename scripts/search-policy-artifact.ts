@@ -4,6 +4,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { SEMANTIC_JUDGE_API_KEY_ENVS, SIFT_LIGHT_CONFIG_ENV } from "../src/config-reader.js";
 import { buildConceptWorker } from "./concept-worker-artifact.js";
 import { buildSyntaxWorker } from "./syntax-worker-artifact.js";
+import { SIFT_LIGHT_DISCOVERY_GUIDANCE } from "../src/prompt-guidelines.js";
 
 const repository = resolve(import.meta.dirname, "..");
 export const searchPluginRoot = join(repository, "plugins/sift-light");
@@ -15,6 +16,7 @@ export const SEARCH_PLUGIN_FILES = [
   "syntax-worker.mjs",
   "syntax-worker.toml",
   ".codex-plugin/plugin.json",
+  "skills/local-search/SKILL.md",
   ".claude-plugin/plugin.json",
   "mcp-server.mjs",
   ".mcp.json",
@@ -123,11 +125,12 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     ".codex-plugin/plugin.json": {
       ...identity,
       mcpServers: "./.mcp.json",
+      skills: "./skills/",
       interface: {
         displayName: "sift-light",
         shortDescription: "Enforced local code search",
         longDescription: identity.description,
-        defaultPrompt: "Search this project's code using sift-light.",
+        defaultPrompt: `Search this project's code using sift-light. ${SIFT_LIGHT_DISCOVERY_GUIDANCE}`,
         developerName: packageJson.author,
         category: "Productivity",
         capabilities: [],
@@ -173,5 +176,25 @@ export async function buildSearchPlugin(root: string): Promise<void> {
       await mkdir(dirname(join(root, path)), { recursive: true });
       return writeFile(join(root, path), `${JSON.stringify(content, null, 2)}\n`);
     }),
+  );
+  const skillDirectory = join(root, "skills/local-search");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    [
+      "---",
+      "name: local-search",
+      "description: Use sift-light for local project content, filenames, symbols and related tests. Before reporting its MCP unavailable, inspect the complete runtime registry including ALL_TOOLS deferred entries and load mcp__sift_light__sift_light. Applies when searching local files or diagnosing sift-light discovery; ordinary exact-path reads, edits, builds and tests do not require a search.",
+      "---",
+      "",
+      "# Local search with sift-light",
+      "",
+      SIFT_LIGHT_DISCOVERY_GUIDANCE,
+      "",
+      "Use exact pattern searches for names and error text; files + query for unknown filenames; anyOf/allOf for several literal conditions. Use applicable structural modes for symbols and relationships. Select concept/hybrid only when semantic recall is needed and enabled.",
+      "",
+      "Read the live tool declaration before constructing the request. Copy continuation and argument-repair requests exactly; repair rejected arguments once. Inspect exact source when it is needed for the authorized task. Report partial coverage and connection failures accurately. This skill does not authorize edits, installations, configuration changes or remote actions.",
+      "",
+    ].join("\n"),
   );
 }

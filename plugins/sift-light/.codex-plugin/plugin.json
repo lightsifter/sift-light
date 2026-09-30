@@ -1,6 +1,6 @@
 {
   "name": "sift-light",
-  "version": "1.0.2",
+  "version": "1.0.3-1",
   "description": "Require sift-light for conventional local searches while keeping development tools available.",
   "author": {
     "name": "baoer"
@@ -8,11 +8,12 @@
   "homepage": "https://github.com/lightsifter/sift-light#readme",
   "license": "AGPL-3.0-only",
   "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
   "interface": {
     "displayName": "sift-light",
     "shortDescription": "Enforced local code search",
     "longDescription": "Require sift-light for conventional local searches while keeping development tools available.",
-    "defaultPrompt": "Search this project's code using sift-light.",
+    "defaultPrompt": "Search this project's code using sift-light. Before reporting sift-light absent, check the complete runtime registry, including ALL_TOOLS deferred entries. Read mcp__sift_light__sift_light's declaration and call it via tools in functions.exec; use host tool search otherwise. Unexpanded does not mean absent; call failures are connection/capability failures.",
     "developerName": "baoer",
     "category": "Productivity",
     "capabilities": []

@@ -25,6 +25,7 @@ import {
 } from "./analysis-term-pages.js";
 
 import { analysisExtraGroups, statisticsForItems } from "./result-statistics.js";
+import { termCountLabel } from "./term-count-label.js";
 interface StoredAnalysis {
   id: string;
   result: AnalysisResultSet;
@@ -217,10 +218,11 @@ function publicAnalysisItem(
 }
 
 function safeTermCounts(
-  termCounts: readonly { retainedOccurrences: number }[] | undefined,
+  termCounts: readonly { term: string; retainedOccurrences: number }[] | undefined,
+  redact = false,
 ): { term: string; retainedOccurrences: number }[] | undefined {
   return termCounts?.map((entry, index) => ({
-    term: `condition #${String(index + 1)}`,
+    term: termCountLabel(entry.term, index, redact),
     retainedOccurrences: entry.retainedOccurrences,
   }));
 }
@@ -368,18 +370,18 @@ export class AnalysisStore {
     return structuredClone(item);
   }
 
-  page(cursor: string, modelOutput = false): SiftLightResult {
+  page(cursor: string, modelOutput = false, redact = false): SiftLightResult {
     const { stored, offset, kind } = this.resolve(cursor);
-    const { result } = stored;
+    const result = redact ? { ...stored.result, redact: true } : stored.result;
     if (kind === "analysis-terms") return analysisTermPage(result, stored.id, offset);
     const hybridPreview = kind === "analysis-hybrid";
     const hybridMatchesRequest = hybridPreview
       ? { cursor: `${stored.id}.analysis.0`, ...(result.redact ? { redact: true } : {}) }
       : undefined;
+    const publicTerms = safeTermCounts(result.termCounts, result.redact);
     const pagedTerms =
-      result.termCounts &&
-      Buffer.byteLength(JSON.stringify(result.termCounts)) > MAX_INLINE_TERM_COUNT_BYTES;
-    const inlineTerms = pagedTerms ? undefined : safeTermCounts(result.termCounts);
+      publicTerms && Buffer.byteLength(JSON.stringify(publicTerms)) > MAX_INLINE_TERM_COUNT_BYTES;
+    const inlineTerms = pagedTerms ? undefined : publicTerms;
     const termsRequest = pagedTerms ? termCountRequest(stored.id, 0, result.redact) : undefined;
     const items: NonNullable<SiftLightResult["details"]["analysis"]>["items"] = [];
     const sources: NonNullable<SiftLightResult["details"]["analysis"]>["sources"] = [];
@@ -389,7 +391,7 @@ export class AnalysisStore {
       result.items,
       result.items.length,
       result.unit,
-      analysisExtraGroups(result.counts, result.termCounts, result.items),
+      analysisExtraGroups(result.counts, inlineTerms, result.items),
     );
     const scope = result.scope
       ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}`
