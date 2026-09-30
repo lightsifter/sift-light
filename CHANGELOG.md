@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3-2 — 2026-09-30
+
+- Accept an empty `sourceCursor` placeholder outside `mode: "inspect"` by removing the key before mode validation, with the normalization disclosed in text and `details.requestNotes` ([#101](https://github.com/lightsifter/sift-light/issues/101)). Nonempty source continuation tokens still require inspection mode; empty inspection tokens and ordinary `cursor` validation retain their existing failure behavior.
+- Apply the same normalization to Pi, OMP and MCP through the shared request boundary. This fixes the reported rejected request shape without attributing the placeholder to a particular model or host.
+
 ## 1.0.3-1 — 2026-09-30
 
 - Explain missing inspection paths explicitly while retaining the `source-unavailable` status for compatibility.

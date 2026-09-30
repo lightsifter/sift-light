@@ -127,7 +127,7 @@ export const siftLightSchema = Type.Object({
   sourceCursor: Type.Optional(
     Type.String({
       description:
-        "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly.",
+        "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly. An empty string outside mode=inspect is treated as an omitted placeholder and disclosed in request notes; nonempty tokens still require mode=inspect.",
     }),
   ),
   symbol: Type.Optional(

@@ -1822,7 +1822,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.3-1",
+  version: "1.0.3-2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -11634,6 +11634,11 @@ function normalizeRequestAliases(request) {
   } else if (mode !== undefined) {
     input = { ...rest, mode };
   }
+  if (input.mode !== "inspect" && input.sourceCursor === "") {
+    const { sourceCursor: _sourceCursor, ...withoutSourceCursor } = input;
+    input = withoutSourceCursor;
+    notes.push("Empty sourceCursor is ignored outside mode=inspect.");
+  }
   if (input.sourceCursor !== undefined && input.line !== undefined) {
     const { line: _line, ...withoutLine } = input;
     input = withoutLine;
@@ -21067,7 +21072,7 @@ var siftLightSchema = _Object_({
     })
   })),
   sourceCursor: Optional(String2({
-    description: "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly."
+    description: "Missing-source continuation token. Copy nextRequest exactly: mode=inspect plus sourceCursor only. Same token replays the same page; changed or expired sources fail clearly. An empty string outside mode=inspect is treated as an omitted placeholder and disclosed in request notes; nonempty tokens still require mode=inspect."
   })),
   symbol: Optional(String2({
     description: "Syntax name for outline/imports/tests; use a concrete source file and line to narrow repeated names."
