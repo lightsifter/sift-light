@@ -598,7 +598,11 @@ export class SiftLightService {
 
     const request = normalizeRequest(input);
     let scan = await this.#runRipgrep(request, cwd, signal);
-    if (scan.totalMatches === 0 && request.path !== undefined && request.scope !== "strict") {
+    if (
+      scan.totalMatches === 0 &&
+      request.path !== undefined &&
+      (await new SearchPathPolicy(cwd).allowsScopeExpansion(request.path, request.scope))
+    ) {
       const { path: requestedPath, ...projectRequest } = request;
       scan = await this.#runRipgrep(
         { ...projectRequest, expandedFromPath: requestedPath },

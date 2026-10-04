@@ -1,6 +1,6 @@
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { SiftLightError } from "./errors.js";
 
 const POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"] as const;
@@ -171,6 +171,26 @@ export class SearchPathPolicy {
       (!isPathInsideRoot(absolute, this.cwd) || !isPathInsideRoot(canonical, canonicalCwd))
       ? canonical
       : absolute;
+  }
+
+  async allowsScopeExpansion(path: string, scope?: "strict" | "expand"): Promise<boolean> {
+    if (scope === "strict") return false;
+    if (scope === "expand") return true;
+    const searchTarget = await this.resolveSearchTarget(path);
+    return isPathInsideRoot(searchTarget, this.cwd);
+  }
+
+  async ripgrepWorkingDirectory(searchPath: string): Promise<string> {
+    const absolute = resolve(this.cwd, searchPath);
+    if (isPathInsideRoot(absolute, this.cwd)) return this.cwd;
+    let isDirectory: boolean;
+    try {
+      isDirectory = (await stat(absolute)).isDirectory();
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return this.cwd;
+      throw error;
+    }
+    return isDirectory ? absolute : dirname(absolute);
   }
 
   ripgrepGlobArguments(searchPath: string): string[] {

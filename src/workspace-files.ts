@@ -55,6 +55,7 @@ export async function listWorkspaceFiles(
   const absolutePath = resolve(cwd, options.path ?? ".");
   const policy = new SearchPathPolicy(cwd);
   const searchPath = await policy.resolveSearchTarget(absolutePath);
+  const ripgrepCwd = await policy.ripgrepWorkingDirectory(searchPath);
   const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
     throw new SiftLightError("Candidate file limit must be a positive integer");
@@ -81,7 +82,7 @@ export async function listWorkspaceFiles(
           "--",
           searchPath,
         ],
-        cwd,
+        cwd: ripgrepCwd,
         ...(signal ? { signal } : {}),
       },
       async (stdout) => {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3-3 — 2026-10-04
+
+- Keep explicit paths outside the MCP project isolated after zero matches by default, and evaluate content-search and file-discovery globs/exclusions from the selected external root. Explicit `scope: "expand"` still retries the MCP project ([#106](https://github.com/lightsifter/sift-light/issues/106)).
+
 ## 1.0.3-2 — 2026-09-30
 
 - Accept an empty `sourceCursor` placeholder outside `mode: "inspect"` by removing the key before mode validation, with the normalization disclosed in text and `details.requestNotes` ([#101](https://github.com/lightsifter/sift-light/issues/101)). Nonempty source continuation tokens still require inspection mode; empty inspection tokens and ordinary `cursor` validation retain their existing failure behavior.
