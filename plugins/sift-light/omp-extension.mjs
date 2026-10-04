@@ -513,9 +513,9 @@ async function consumeCappedLines(stream, onLine, options = {}) {
 }
 
 // src/path-policy.ts
-import { realpath } from "fs/promises";
+import { realpath, stat } from "fs/promises";
 import { homedir } from "os";
-import { isAbsolute, join as join2, relative, resolve, sep } from "path";
+import { dirname, isAbsolute, join as join2, relative, resolve, sep } from "path";
 var POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"];
 var PORTABLE_CREDENTIAL_DIRECTORY_NAMES = [
   ".ssh",
@@ -650,6 +650,28 @@ class SearchPathPolicy {
     ]);
     return canonical && (!isPathInsideRoot(absolute, this.cwd) || !isPathInsideRoot(canonical, canonicalCwd)) ? canonical : absolute;
   }
+  async allowsScopeExpansion(path, scope) {
+    if (scope === "strict")
+      return false;
+    if (scope === "expand")
+      return true;
+    const searchTarget = await this.resolveSearchTarget(path);
+    return isPathInsideRoot(searchTarget, this.cwd);
+  }
+  async ripgrepWorkingDirectory(searchPath) {
+    const absolute = resolve(this.cwd, searchPath);
+    if (isPathInsideRoot(absolute, this.cwd))
+      return this.cwd;
+    let isDirectory;
+    try {
+      isDirectory = (await stat(absolute)).isDirectory();
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return this.cwd;
+      throw error;
+    }
+    return isDirectory ? absolute : dirname(absolute);
+  }
   ripgrepGlobArguments(searchPath) {
     const absolute = resolve(this.cwd, searchPath);
     if (isPathInsideRoot(absolute, this.cwd))
@@ -770,7 +792,7 @@ async function runOwnedProcess(options, consumeOutput) {
 
 // src/ripgrep-executable.ts
 import { constants } from "fs";
-import { access, stat } from "fs/promises";
+import { access, stat as stat2 } from "fs/promises";
 import { isAbsolute as isAbsolute2 } from "path";
 var OVERRIDE_ENV = "SIFT_LIGHT_RG_PATH";
 var BUNDLED_REPAIR = `Reinstall sift-light with optional dependencies enabled for this platform, or set ${OVERRIDE_ENV} to an absolute ripgrep executable path.`;
@@ -789,7 +811,7 @@ async function resolveRipgrepExecutable() {
     }
   }
   try {
-    if (!(await stat(executable)).isFile())
+    if (!(await stat2(executable)).isFile())
       throw new Error("Expected an executable file");
     await access(executable, constants.X_OK);
   } catch (cause) {
@@ -973,12 +995,12 @@ function describeUnreadableDiagnostics(diagnostics) {
 }
 
 // src/source.ts
-import { readFile as readFile2, realpath as realpath2, stat as stat2 } from "fs/promises";
+import { readFile as readFile2, realpath as realpath2, stat as stat3 } from "fs/promises";
 var SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
 var MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
 async function getSourceRevision(path, onError) {
   try {
-    const metadata2 = await stat2(path);
+    const metadata2 = await stat3(path);
     return sourceRevisionFromStats(metadata2);
   } catch (error) {
     onError?.(error);
@@ -1439,6 +1461,7 @@ function createRipgrepRunner(options = {}) {
     const searchPath = resolve4(cwd, request.path ?? ".");
     const policy = new SearchPathPolicy(cwd);
     const validatedSearchPath = await policy.resolveSearchTarget(searchPath);
+    const ripgrepCwd = await policy.ripgrepWorkingDirectory(validatedSearchPath);
     const expectedSearchTarget = await policy.resolveExistingPath(validatedSearchPath);
     const searchTarget = isPathInsideCwd(validatedSearchPath, cwd) ? relative2(resolve4(cwd), validatedSearchPath) || "." : validatedSearchPath;
     const args2 = buildRipgrepArguments(request, cwd, validatedSearchPath);
@@ -1528,7 +1551,7 @@ function createRipgrepRunner(options = {}) {
         ...policy.ripgrepGlobArguments(validatedSearchPath),
         "--",
         searchTarget
-      ], cwd, maxSourceRevisionFiles, signal, request.redact);
+      ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact);
       let ignoredFileCount = 0;
       let ignoredFileSamples = [];
       let filesystemCoverage = "complete";
@@ -1550,7 +1573,7 @@ function createRipgrepRunner(options = {}) {
           ...policy.ripgrepGlobArguments(validatedSearchPath),
           "--",
           searchTarget
-        ], cwd, maxSourceRevisionFiles, signal, request.redact);
+        ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact);
         const ignored = [...allCandidates.revisions.keys()].filter((path) => !before.revisions.has(path));
         ignoredFileCount = ignored.length;
         ignoredFileSamples = ignored.slice(0, 20).map((path) => displayPath(path, cwd).displayPath);
@@ -1579,7 +1602,7 @@ function createRipgrepRunner(options = {}) {
       if (before.unreadable.length > 0)
         filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
       await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
-      const { code, stderr } = await runOwnedProcess({ executable, args: args2, cwd, ...signal ? { signal } : {} }, (stdout) => consumeCappedLines(stdout, onLine, {
+      const { code, stderr } = await runOwnedProcess({ executable, args: args2, cwd: ripgrepCwd, ...signal ? { signal } : {} }, (stdout) => consumeCappedLines(stdout, onLine, {
         maxLineBytes: maxEventBytes,
         onLineTooLong: ({ prefix, observedBytes }) => {
           const source = oversizedMatchPath(prefix, cwd);
@@ -1822,7 +1845,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.3-2",
+  version: "1.0.3-3",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -2179,7 +2202,7 @@ class OwnedTaskQueue {
 }
 
 // src/concept-search.ts
-import { dirname as dirname3, join as join5, resolve as resolve12 } from "path";
+import { dirname as dirname4, join as join5, resolve as resolve12 } from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { StringDecoder } from "string_decoder";
 import { mkdir as mkdir2 } from "fs/promises";
@@ -2343,7 +2366,7 @@ import { extname as extname2, resolve as resolve11 } from "path";
 import { lstat, mkdir, mkdtemp, open, rm, writeFile } from "fs/promises";
 import { constants as constants2 } from "fs";
 import { tmpdir } from "os";
-import { dirname, join as join4, parse, relative as relative4, resolve as resolve8 } from "path";
+import { dirname as dirname2, join as join4, parse, relative as relative4, resolve as resolve8 } from "path";
 
 // src/workspace-files.ts
 import { relative as relative3, resolve as resolve7, sep as sep2 } from "path";
@@ -2361,6 +2384,7 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
   const absolutePath = resolve7(cwd, options.path ?? ".");
   const policy = new SearchPathPolicy(cwd);
   const searchPath = await policy.resolveSearchTarget(absolutePath);
+  const ripgrepCwd = await policy.ripgrepWorkingDirectory(searchPath);
   const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
     throw new SiftLightError("Candidate file limit must be a positive integer");
@@ -2386,7 +2410,7 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
         "--",
         searchPath
       ],
-      cwd,
+      cwd: ripgrepCwd,
       ...signal ? { signal } : {}
     }, async (stdout) => {
       let pending = Buffer.alloc(0);
@@ -2454,11 +2478,11 @@ function partitionPaths(paths) {
 }
 function relevantDirectories(cwd, paths) {
   const directories = new Set;
-  for (const path of [cwd, ...paths.map((sourcePath) => dirname(resolve8(cwd, sourcePath)))]) {
+  for (const path of [cwd, ...paths.map((sourcePath) => dirname2(resolve8(cwd, sourcePath)))]) {
     let current = path;
     for (;; ) {
       directories.add(current);
-      const parent = dirname(current);
+      const parent = dirname2(current);
       if (current === parent)
         break;
       current = parent;
@@ -2542,12 +2566,12 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       for (const path of group) {
         const safe = workspaceRelativePath(absoluteCwd, path);
         const placeholder = resolve8(target, safe);
-        await mkdir(dirname(placeholder), { recursive: true });
+        await mkdir(dirname2(placeholder), { recursive: true });
         await writeFile(placeholder, "");
       }
       for (const ignore of ignoreFiles) {
         const destination = join4(tree, ignore.local);
-        await mkdir(dirname(destination), { recursive: true });
+        await mkdir(dirname2(destination), { recursive: true });
         await writeFile(destination, ignore.bytes);
       }
       const privacy = await listWorkspaceFiles(tree, signal, { ignoreParents: false });
@@ -3540,7 +3564,7 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
 }
 
 // src/syntax.ts
-import { dirname as dirname2 } from "path";
+import { dirname as dirname3 } from "path";
 import { fileURLToPath } from "url";
 
 // src/syntax-tree.ts
@@ -4242,7 +4266,7 @@ async function parseSyntax(path, text, signal, pattern) {
     const result = await runOwnedProcess({
       executable: process.execPath,
       args: args2,
-      cwd: dirname2(worker),
+      cwd: dirname3(worker),
       env,
       signal: controller.signal,
       input: Buffer.from(JSON.stringify({ language, text, pattern }))
@@ -4761,7 +4785,7 @@ async function similarities(query, passages, parent, onProgress) {
         worker,
         "--infer"
       ] : [worker, "--infer"],
-      cwd: dirname3(worker),
+      cwd: dirname4(worker),
       env: { ...env, SIFT_LIGHT_CONCEPT_CACHE_STAGING_DIR: stagingRoot },
       ...parent ? { signal: parent } : {},
       input: Buffer.from(JSON.stringify({
@@ -5183,7 +5207,7 @@ async function structuralSearch(input, access) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname4, extname as extname3, resolve as resolve21 } from "path";
+import { dirname as dirname5, extname as extname3, resolve as resolve21 } from "path";
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "crypto";
@@ -8440,7 +8464,7 @@ async function continueSource(cursor, access, continuations, expectedPath) {
 }
 
 // src/evidence-validation.ts
-import { realpath as realpath5, stat as stat3 } from "fs/promises";
+import { realpath as realpath5, stat as stat4 } from "fs/promises";
 import { resolve as resolve19 } from "path";
 
 // src/evidence-validity.ts
@@ -8478,9 +8502,9 @@ async function confirmWorktreeState(path, cwd, signal) {
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
-    const before = await stat3(absolute);
+    const before = await stat4(absolute);
     const beforeCanonical = await realpath5(absolute);
-    const after = await stat3(absolute);
+    const after = await stat4(absolute);
     const afterCanonical = await realpath5(absolute);
     if (!before.isFile() || !after.isFile()) {
       return { status: "stale", reason: "Source is no longer a regular file" };
@@ -8622,9 +8646,9 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
       return { path: target.path, role: "source", ...result };
     }
-    const before = await stat3(absolute);
+    const before = await stat4(absolute);
     const beforeCanonical = canonical;
-    const after = await stat3(absolute);
+    const after = await stat4(absolute);
     const afterCanonical = await realpath5(absolute);
     if (!before.isFile() || !after.isFile()) {
       return {
@@ -10951,10 +10975,10 @@ function searchScope(request) {
 }
 async function navigationRoot(cwd, path, signal) {
   const absolute = resolve21(cwd, path);
-  const repository = await findGitRepository(dirname4(absolute), signal);
+  const repository = await findGitRepository(dirname5(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve21(cwd) : dirname4(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve21(cwd) : dirname5(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -11069,7 +11093,7 @@ class EvidenceService {
       maxFiles: access.maxFiles
     });
     const candidates = await collect(request);
-    if (input.changes || request.scope === "strict" || request.path === undefined || candidates.files.length > 0 || candidates.partial) {
+    if (input.changes || request.path === undefined || !await new SearchPathPolicy(access.cwd).allowsScopeExpansion(request.path, request.scope) || candidates.files.length > 0 || candidates.partial) {
       return { candidates, request };
     }
     const { path: requestedPath, ...projectRequest } = request;
@@ -11214,7 +11238,7 @@ class EvidenceService {
         });
       }, signal);
       let chunkResults = await runChunks();
-      if (!input.changes && input.path !== undefined && input.scope !== "strict" && chunkResults.every(({ candidates }) => !candidates.partial && candidates.files.length === 0)) {
+      if (!input.changes && input.path !== undefined && await new SearchPathPolicy(cwd).allowsScopeExpansion(input.path, input.scope) && chunkResults.every(({ candidates }) => !candidates.partial && candidates.files.length === 0)) {
         chunkResults = await runChunks(input.path.replace(/^@/, ""));
       }
       const reasons = new Set;
@@ -13383,7 +13407,7 @@ class SiftLightService {
       throw new SiftLightError("line requires mode=inspect");
     const request = normalizeRequest(input);
     let scan = await this.#runRipgrep(request, cwd, signal);
-    if (scan.totalMatches === 0 && request.path !== undefined && request.scope !== "strict") {
+    if (scan.totalMatches === 0 && request.path !== undefined && await new SearchPathPolicy(cwd).allowsScopeExpansion(request.path, request.scope)) {
       const { path: requestedPath, ...projectRequest } = request;
       scan = await this.#runRipgrep({ ...projectRequest, expandedFromPath: requestedPath }, cwd, signal);
     }
@@ -13653,7 +13677,7 @@ function siftLightPromptGuidelines(structuredOutput = true) {
   return [
     SIFT_LIGHT_DISCOVERY_GUIDANCE,
     `Use sift-light for read-only content search. ${SOURCE_OUTPUT_GUIDANCE} For routine development searches, start with fast exact content, filename or applicable structural modes when the request has a usable name, symbol, error text or other literal clue. Omitted mode is ordinary exact search and never loads the local embedding model. Vector search is disabled by default; concept/hybrid require vectorSearchEnabled:true in sift-light.json and an installed model. They can take tens of seconds on an uncached scope, so select them only when semantic recall is needed. Omit mode and limit for automatic detail/summary selection; use mode="matches" for ordinary match metadata.`,
-    `An omitted path searches the project cwd. Use scope:"strict" for a question restricted to one path; otherwise, if an explicit subpath has zero matches, ordinary and content-analysis searches retry from cwd and return project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd, except protected external system areas and .git internals. Git changes mode remains cwd-scoped.`,
+    `An omitted path searches the project cwd. Use scope:"strict" to disable zero-match expansion; by default, explicit paths inside cwd that return no matches retry from cwd and report project-wide counts with an expansion notice. Explicit absolute paths and .. traversal can search outside cwd; those external targets stay isolated unless scope:"expand" opts into the same cwd retry. Protected external system areas and .git internals remain excluded. Git changes mode remains cwd-scoped.`,
     `Search output includes counts, categories, ranked paths, coverage and continuation metadata. Source excerpts may contain the searched text. Use mode="inspect" or the host read capability when exact source is required for an edit or verification.`,
     `Use file and directory distributions to choose evidence. Reuse the visible cursor with path or paths for match metadata; mode="summary" pages the remaining file statistics. Match counts are not relevance scores.`,
     `Mode="inspect" with a direct path/line or ordinary retained match returns bounded source windows and source-revision metadata. Some retained analysis selectors return only revision metadata; use direct path/line or the host read capability when source is needed. Do not use inspection merely to obtain a citation.`,

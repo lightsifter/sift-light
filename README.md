@@ -44,7 +44,7 @@ The first uncached Concept or hybrid search loads the local model and may take t
 
 Ask the agent to restrict a search to one folder when that is the scope you need. If you remember only part of a filename, start by finding the file and then inspect its contents—like narrowing a cabinet down to a shelf and then a document.
 
-Multi-word `files` queries require each word literally in the path; a single abbreviation still supports fuzzy matching. Use `hybrid` or `concept` for business intent. Ordinary content searches retain their default zero-result expansion; use `scope: "strict"` to stay within an explicit path. Expansion is announced before returned evidence.
+Multi-word `files` queries require each word literally in the path; a single abbreviation still supports fuzzy matching. Use `hybrid` or `concept` for business intent. Content searches inside the active project still expand after zero results by default. An explicit path outside the project stays isolated; pass `scope: "expand"` to retry the server project. Use `scope: "strict"` to prevent in-project expansion. Expansion is announced before returned evidence.
 
 ### Know what has been shown
 

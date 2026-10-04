@@ -10,7 +10,7 @@ import { AnalysisStore } from "./analysis-store.js";
 import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
 import { abortError, CursorError, SiftLightError } from "./errors.js";
 import { findGitRepository } from "./git-repository.js";
-import { isPathInsideCwd, isPathInsideRoot } from "./path-policy.js";
+import { isPathInsideCwd, isPathInsideRoot, SearchPathPolicy } from "./path-policy.js";
 import { resolveInspectionTarget } from "./inspect.js";
 import {
   collectEvidenceCandidates,
@@ -457,8 +457,8 @@ export class EvidenceService {
     const candidates = await collect(request);
     if (
       input.changes ||
-      request.scope === "strict" ||
       request.path === undefined ||
+      !(await new SearchPathPolicy(access.cwd).allowsScopeExpansion(request.path, request.scope)) ||
       candidates.files.length > 0 ||
       candidates.partial
     ) {
@@ -649,7 +649,7 @@ export class EvidenceService {
       if (
         !input.changes &&
         input.path !== undefined &&
-        input.scope !== "strict" &&
+        (await new SearchPathPolicy(cwd).allowsScopeExpansion(input.path, input.scope)) &&
         chunkResults.every(({ candidates }) => !candidates.partial && candidates.files.length === 0)
       ) {
         chunkResults = await runChunks(input.path.replace(/^@/, ""));

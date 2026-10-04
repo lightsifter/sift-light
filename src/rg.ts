@@ -332,6 +332,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
     const searchPath = resolve(cwd, request.path ?? ".");
     const policy = new SearchPathPolicy(cwd);
     const validatedSearchPath = await policy.resolveSearchTarget(searchPath);
+    const ripgrepCwd = await policy.ripgrepWorkingDirectory(validatedSearchPath);
     const expectedSearchTarget = await policy.resolveExistingPath(validatedSearchPath);
     const searchTarget = isPathInsideCwd(validatedSearchPath, cwd)
       ? relative(resolve(cwd), validatedSearchPath) || "."
@@ -430,7 +431,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           "--",
           searchTarget,
         ],
-        cwd,
+        ripgrepCwd,
         maxSourceRevisionFiles,
         signal,
         request.redact,
@@ -463,7 +464,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
             "--",
             searchTarget,
           ],
-          cwd,
+          ripgrepCwd,
           maxSourceRevisionFiles,
           signal,
           request.redact,
@@ -501,7 +502,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
       await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
       const { code, stderr } = await runOwnedProcess(
-        { executable, args, cwd, ...(signal ? { signal } : {}) },
+        { executable, args, cwd: ripgrepCwd, ...(signal ? { signal } : {}) },
         (stdout) =>
           consumeCappedLines(stdout, onLine, {
             maxLineBytes: maxEventBytes,
