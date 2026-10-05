@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.3-3",
+  version: "1.0.3-4",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",

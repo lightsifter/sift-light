@@ -3,7 +3,7 @@ import { recoverShellSearch } from "./search-policy-recovery.js";
 import { ShellSearchPolicy, type ShellSearchMatch } from "./search-policy-shell.js";
 
 export const SEARCH_POLICY_GUIDANCE =
-  "Local content and filename searches must use sift-light. Built-in search tools and direct search commands are blocked before execution; filtering output from an unrelated producer at a pipeline tail remains available. Use pattern for contents or mode=files with query for filenames. Keep read/edit/write, tests and builds available. After a denial, call sift-light once with the stated repair; do not paste the denial into the request, repeat the blocked call, use another shell/custom script, or weaken the search mode.";
+  "Local content and filename searches must use sift-light. Built-in search tools and direct search commands are blocked before execution; recognized stdin-only filtering of output from an unrelated producer remains available at any pipeline position. File operands, recursive search options, file-sourced patterns and input redirection are not filter exceptions. Use pattern for contents or mode=files with query for filenames. Keep read/edit/write, tests and builds available. After a denial, call sift-light once with the stated repair; do not paste the denial into the request, repeat the blocked call, use another shell/custom script, or weaken the search mode.";
 export const PI_REPLACED_SEARCH_TOOLS = new Set(["grep", "find"]);
 export const PREFERRED_SEARCH_GUIDANCE =
   "Prefer sift-light for local content and filename searches because it provides bounded evidence, coverage and continuation details. Conventional search entries remain available in advisory mode.";
