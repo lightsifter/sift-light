@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3-4 — 2026-10-05
+
+- Allow recognized stdin-only filters at any pipeline position, including `cmd | grep pattern | head` and `cmd | grep pattern | wc -l`. Deny file operands, recursive search, file-sourced patterns, input redirection, and unsafe dynamic arguments even when a filter receives piped input ([#109](https://github.com/lightsifter/sift-light/issues/109)).
+- Apply the same input-aware policy to Pi, OMP, and native plugin hooks, including PowerShell file-object pipeline handling.
+
 ## 1.0.3-3 — 2026-10-04
 
 - Keep explicit paths outside the MCP project isolated after zero matches by default, and evaluate content-search and file-discovery globs/exclusions from the selected external root. Explicit `scope: "expand"` still retries the MCP project ([#106](https://github.com/lightsifter/sift-light/issues/106)).

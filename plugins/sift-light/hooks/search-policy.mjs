@@ -3779,9 +3779,182 @@ function classifyCommand(argv, language, depth = 0) {
   return classifyCommand(args2.slice(start2), language, depth + 1);
 }
 
+// src/search-policy-stdin-filter.ts
+var GREP_SWITCHES = new Set("abcEFGHhiILlnoPqsTUuvwxyzZ".split(""));
+var GREP_VALUE_OPTIONS = new Set(["A", "B", "C", "m"]);
+var GREP_LONG_SWITCHES = new Set([
+  "--basic-regexp",
+  "--extended-regexp",
+  "--fixed-strings",
+  "--perl-regexp",
+  "--ignore-case",
+  "--no-ignore-case",
+  "--invert-match",
+  "--word-regexp",
+  "--line-regexp",
+  "--count",
+  "--files-with-matches",
+  "--files-without-match",
+  "--only-matching",
+  "--quiet",
+  "--silent",
+  "--no-messages",
+  "--byte-offset",
+  "--line-number",
+  "--with-filename",
+  "--no-filename",
+  "--initial-tab",
+  "--null",
+  "--null-data",
+  "--text",
+  "--binary",
+  "--line-buffered",
+  "--no-group-separator"
+]);
+var GREP_LONG_VALUES = new Set([
+  "--after-context",
+  "--before-context",
+  "--context",
+  "--max-count",
+  "--binary-files",
+  "--label",
+  "--group-separator",
+  "--include",
+  "--exclude",
+  "--exclude-dir"
+]);
+function isStdinOnlyGrep(args2) {
+  const positionals = [];
+  let hasPatternOption = false;
+  let optionsEnded = false;
+  for (let index = 0;index < args2.length; index += 1) {
+    const arg = args2[index];
+    if (arg === null || arg === undefined)
+      return false;
+    if (positionals.length > 0 && arg !== "-")
+      return false;
+    if (!optionsEnded && arg === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && arg.startsWith("--")) {
+      const separator = arg.indexOf("=");
+      const option = separator < 0 ? arg : arg.slice(0, separator);
+      const attached = separator < 0 ? undefined : arg.slice(separator + 1);
+      if (option === "--regexp") {
+        hasPatternOption = true;
+      } else if (option === "--color" || option === "--colour") {
+        continue;
+      } else if (GREP_LONG_SWITCHES.has(option) && attached === undefined) {
+        continue;
+      } else if (!GREP_LONG_VALUES.has(option)) {
+        return false;
+      }
+      if (attached === undefined) {
+        index += 1;
+        if (args2[index] === null || args2[index] === undefined)
+          return false;
+      }
+      continue;
+    }
+    if (!optionsEnded && arg.startsWith("-") && arg !== "-") {
+      for (let optionIndex = 1;optionIndex < arg.length; optionIndex += 1) {
+        const option = arg[optionIndex];
+        if (option === "e") {
+          hasPatternOption = true;
+        } else if (option !== undefined && GREP_SWITCHES.has(option)) {
+          continue;
+        } else if (option === undefined || !GREP_VALUE_OPTIONS.has(option)) {
+          return false;
+        }
+        if (optionIndex === arg.length - 1) {
+          index += 1;
+          if (args2[index] === null || args2[index] === undefined)
+            return false;
+        }
+        break;
+      }
+      continue;
+    }
+    positionals.push(arg);
+  }
+  return hasPatternOption ? positionals.every((operand) => operand === "-") : positionals.length > 0 && positionals.slice(1).every((operand) => operand === "-");
+}
+var SELECT_STRING_SWITCHES = new Set([
+  "simplematch",
+  "casesensitive",
+  "quiet",
+  "list",
+  "noemphasis",
+  "notmatch",
+  "allmatches",
+  "raw",
+  "verbose",
+  "debug"
+]);
+var SELECT_STRING_VALUES = new Set([
+  "culture",
+  "encoding",
+  "context",
+  "erroraction",
+  "warningaction",
+  "informationaction",
+  "outvariable",
+  "pipelinevariable"
+]);
+function isPipelineOnlySelectString(args2, namedParameters) {
+  let hasPattern = false;
+  for (let index = 0;index < args2.length; index += 1) {
+    const arg = args2[index];
+    if (arg === null || arg === undefined)
+      return false;
+    if (!namedParameters[index]) {
+      if (hasPattern)
+        return false;
+      hasPattern = true;
+      continue;
+    }
+    const separator = arg.indexOf(":");
+    const option = (separator < 0 ? arg.slice(1) : arg.slice(1, separator)).toLowerCase();
+    if (SELECT_STRING_SWITCHES.has(option) && separator < 0)
+      continue;
+    if (option !== "pattern" && !SELECT_STRING_VALUES.has(option))
+      return false;
+    if (option === "pattern") {
+      if (hasPattern)
+        return false;
+      hasPattern = true;
+    }
+    if (separator < 0) {
+      index += 1;
+      if (args2[index] === null || args2[index] === undefined)
+        return false;
+    }
+  }
+  return hasPattern;
+}
+function isStdinOnlySearchFilter(words, language, namedParameters) {
+  const executable = words[0];
+  if (executable === null || executable === undefined)
+    return false;
+  const name2 = executableName(executable);
+  if (language === "powershell")
+    return ["select-string", "sls"].includes(name2.toLowerCase()) && isPipelineOnlySelectString(words.slice(1), namedParameters.slice(1));
+  return ["grep", "egrep", "fgrep"].includes(name2) && isStdinOnlyGrep(words.slice(1));
+}
+
 // src/search-policy-shell.ts
 var MAX_POLICY_COMMAND_BYTES = 64 * 1024;
 var MAX_SHELL_NESTING = 4;
+var POWERSHELL_FILE_OBJECT_PRODUCERS = new Set([
+  "get-item",
+  "gi",
+  "get-childitem",
+  "gci",
+  "dir",
+  "ls"
+]);
+var POWERSHELL_STRING_CONVERTERS = new Set(["out-string", "oss", "convertto-json"]);
 function decodeBashDoubleQuoted(value) {
   let result = "";
   for (let index = 0;index < value.length; index += 1) {
@@ -3867,6 +4040,18 @@ function commandWordNodes(node, language) {
 function commandWords(node, language) {
   return commandWordNodes(node, language).map((word) => literalWord(word, language));
 }
+function hasBashWordExpansion(text) {
+  if (text.startsWith("~") || text.startsWith("="))
+    return true;
+  for (let index = 0;index < text.length; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+    } else if ("*?[]{}".includes(text[index] ?? "")) {
+      return true;
+    }
+  }
+  return false;
+}
 function hasUntranslatedShellSyntax(node, language) {
   const text = node.text;
   if (language === "powershell") {
@@ -3879,30 +4064,70 @@ function hasUntranslatedShellSyntax(node, language) {
   if (["raw_string", "string", "string_content"].includes(node.type))
     return false;
   if (["word", "number", "command_name"].includes(node.type))
-    return /[*?[\]{}]/u.test(text) || text.startsWith("~") || text.startsWith("=");
+    return hasBashWordExpansion(text);
   if (node.type === "concatenation")
     return node.namedChildren.some((child) => child !== null && hasUntranslatedShellSyntax(child, language));
   return false;
 }
+function hasInputRedirectNodes(owner) {
+  return owner.descendantsOfType(["file_redirect", "herestring_redirect", "heredoc_redirect"]).some((redirect) => redirect !== null && /^(?:\d+)?</u.test(redirect.text));
+}
+function hasInputRedirect(node) {
+  if (hasInputRedirectNodes(node))
+    return true;
+  for (let parent = node.parent;parent; parent = parent.parent) {
+    if (parent.type !== "redirected_statement")
+      continue;
+    const body2 = parent.childForFieldName("body");
+    const last = body2?.descendantsOfType("command").at(-1) ?? (body2?.type === "command" ? body2 : undefined);
+    if (last?.startIndex === node.startIndex && last.endIndex === node.endIndex && parent.childrenForFieldName("redirect").some((redirect) => redirect !== null && hasInputRedirectNodes(redirect)))
+      return true;
+  }
+  return false;
+}
 function isSafePipelineFilter(node, language, words) {
-  const executable = words[0];
-  if (executable === null || executable === undefined)
+  const wordNodes = commandWordNodes(node, language);
+  if (!isStdinOnlySearchFilter(words, language, wordNodes.map((word) => word.type === "command_parameter")))
     return false;
-  const name2 = executableName(executable);
-  const filterNames = language === "powershell" ? new Set(["select-string", "sls"]) : new Set(["grep", "egrep", "fgrep"]);
-  if (!filterNames.has(language === "powershell" ? name2.toLowerCase() : name2))
+  if (wordNodes.some((word) => hasUntranslatedShellSyntax(word, language)))
+    return false;
+  if (hasInputRedirect(node))
     return false;
   const pipeline = node.parent;
-  if (!pipeline || pipeline.type !== "pipeline")
+  if (!pipeline || !["pipeline", "pipeline_chain"].includes(pipeline.type))
     return false;
-  const commands = pipeline.namedChildren.filter((child) => child !== null && child.type === "command");
-  const last = commands.at(-1);
-  if (!last || last.startIndex !== node.startIndex || last.endIndex !== node.endIndex || commands.length < 2)
+  const stages = pipeline.namedChildren.filter((child) => child !== null);
+  const position = stages.findIndex((stage) => stage.startIndex <= node.startIndex && stage.endIndex >= node.endIndex);
+  if (position < 1)
     return false;
-  return commands.slice(0, -1).every((candidate) => {
-    const decision = classifyCommand(commandWords(candidate, language), language);
-    return !decision.kind && !decision.nested;
-  });
+  let fileObjectFlow = false;
+  for (const [index, stage] of stages.entries()) {
+    if (index === position)
+      continue;
+    const commands = stage.descendantsOfType("command");
+    for (const candidate of commands) {
+      if (candidate === null)
+        continue;
+      const candidateWords = commandWords(candidate, language);
+      const decision = classifyCommand(candidateWords, language);
+      if (decision.kind || decision.nested)
+        return false;
+      if (language !== "powershell" || index > position)
+        continue;
+      const executable = candidateWords[0];
+      if (executable === null || executable === undefined)
+        continue;
+      const name2 = executableName(executable).toLowerCase();
+      if (POWERSHELL_FILE_OBJECT_PRODUCERS.has(name2))
+        fileObjectFlow = true;
+    }
+    if (language === "powershell" && index < position && stage.type === "command") {
+      const executable = commandWords(stage, language)[0];
+      if (executable !== null && executable !== undefined && POWERSHELL_STRING_CONVERTERS.has(executableName(executable).toLowerCase()))
+        fileObjectFlow = false;
+    }
+  }
+  return !fileObjectFlow;
 }
 
 class ShellSearchPolicy {

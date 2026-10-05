@@ -179,7 +179,7 @@ Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相
 
 安装后重启。原生钩子默认使用严格模式。如需保留原生插件、MCP 工具和模型指引，但不硬性拒绝其他搜索，请使用 `SIFT_LIGHT_ENFORCE_SEARCH=prefer` 启动宿主；设置为 `off` 只关闭钩子强制策略。可用值为 `hard`、`prefer` 和 `off`，非法值会安全拒绝并明确报错，不会静默放行。该设置由宿主进程继承，因此项目不能仅靠提交仓库配置文件降低用户的全局策略。仍可通过 Claude Code `/plugin`、Codex `/hooks`，或 Kimi `/plugins disable sift-light` 后执行 `/reload` 来关闭整个集成。
 
-严格模式下，`grep warning report.txt` 这类直接搜索会被拒绝；`cat report.txt | grep warning` 仍可用，因为它只是过滤一个非搜索命令的输出。`find src | grep test` 和 `rg warning src | grep result` 仍会被拒绝，因为管道中已经包含直接搜索来源。复合 shell 调用中只要一个子命令被拒绝，宿主就不会执行其中任何操作；拒绝信息会指出检测到的搜索，并要求 Agent 单独重试非搜索操作。
+严格模式下，`grep warning report.txt` 这类直接搜索会被拒绝；`cat report.txt | grep warning | head` 这类可静态确认只读取标准输入的过滤命令可放在管道中的任意位置，因为它过滤的是非搜索命令的输出。即使位于管道中，带文件参数、递归选项、从文件读取模式或输入重定向的过滤命令仍会被拒绝。请把 grep 选项放在模式之前，并用引号保护 shell 通配符；无法识别的选项和动态参数会保守拦截。PowerShell 中，`Get-Item` 等已知会输出文件对象的命令接入 `Select-String` 时也会被拒绝。`find src | grep test` 和 `rg warning src | grep result` 仍会被拒绝，因为管道中包含直接搜索来源。复合 shell 调用中只要一个子命令被拒绝，宿主就不会执行其中任何操作；拒绝信息会指出检测到的搜索，并要求 Agent 单独重试非搜索操作。
 
 本地搜索在你的机器上进行。请只允许 Agent 读取已获授权的文件。HTTP 服务对外开放前需要认证网关，详见[安全说明](SECURITY.md)。
 

@@ -6,9 +6,19 @@ import {
   type SearchKind,
   type ShellLanguage,
 } from "./search-policy-commands.js";
+import { isStdinOnlySearchFilter } from "./search-policy-stdin-filter.js";
 
 export const MAX_POLICY_COMMAND_BYTES = 64 * 1024;
 const MAX_SHELL_NESTING = 4;
+const POWERSHELL_FILE_OBJECT_PRODUCERS = new Set([
+  "get-item",
+  "gi",
+  "get-childitem",
+  "gci",
+  "dir",
+  "ls",
+]);
+const POWERSHELL_STRING_CONVERTERS = new Set(["out-string", "oss", "convertto-json"]);
 
 export interface ShellSearchMatch {
   kind: SearchKind;
@@ -116,6 +126,18 @@ function commandWords(node: Node, language: ShellLanguage): Array<string | null>
   return commandWordNodes(node, language).map((word) => literalWord(word, language));
 }
 
+function hasBashWordExpansion(text: string): boolean {
+  if (text.startsWith("~") || text.startsWith("=")) return true;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+    } else if ("*?[]{}".includes(text[index] ?? "")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function hasUntranslatedShellSyntax(node: Node, language: ShellLanguage): boolean {
   const text = node.text;
   if (language === "powershell") {
@@ -131,12 +153,36 @@ function hasUntranslatedShellSyntax(node: Node, language: ShellLanguage): boolea
     );
   }
   if (["raw_string", "string", "string_content"].includes(node.type)) return false;
-  if (["word", "number", "command_name"].includes(node.type))
-    return /[*?[\]{}]/u.test(text) || text.startsWith("~") || text.startsWith("=");
+  if (["word", "number", "command_name"].includes(node.type)) return hasBashWordExpansion(text);
   if (node.type === "concatenation")
     return node.namedChildren.some(
       (child) => child !== null && hasUntranslatedShellSyntax(child, language),
     );
+  return false;
+}
+
+function hasInputRedirectNodes(owner: Node): boolean {
+  return owner
+    .descendantsOfType(["file_redirect", "herestring_redirect", "heredoc_redirect"])
+    .some((redirect) => redirect !== null && /^(?:\d+)?</u.test(redirect.text));
+}
+
+function hasInputRedirect(node: Node): boolean {
+  if (hasInputRedirectNodes(node)) return true;
+  for (let parent = node.parent; parent; parent = parent.parent) {
+    if (parent.type !== "redirected_statement") continue;
+    const body = parent.childForFieldName("body");
+    const last =
+      body?.descendantsOfType("command").at(-1) ?? (body?.type === "command" ? body : undefined);
+    if (
+      last?.startIndex === node.startIndex &&
+      last.endIndex === node.endIndex &&
+      parent
+        .childrenForFieldName("redirect")
+        .some((redirect) => redirect !== null && hasInputRedirectNodes(redirect))
+    )
+      return true;
+  }
   return false;
 }
 
@@ -145,31 +191,50 @@ function isSafePipelineFilter(
   language: ShellLanguage,
   words: Array<string | null>,
 ): boolean {
-  const executable = words[0];
-  if (executable === null || executable === undefined) return false;
-  const name = executableName(executable);
-  const filterNames =
-    language === "powershell"
-      ? new Set(["select-string", "sls"])
-      : new Set(["grep", "egrep", "fgrep"]);
-  if (!filterNames.has(language === "powershell" ? name.toLowerCase() : name)) return false;
-  const pipeline = node.parent;
-  if (!pipeline || pipeline.type !== "pipeline") return false;
-  const commands = pipeline.namedChildren.filter(
-    (child): child is Node => child !== null && child.type === "command",
-  );
-  const last = commands.at(-1);
+  const wordNodes = commandWordNodes(node, language);
   if (
-    !last ||
-    last.startIndex !== node.startIndex ||
-    last.endIndex !== node.endIndex ||
-    commands.length < 2
+    !isStdinOnlySearchFilter(
+      words,
+      language,
+      wordNodes.map((word) => word.type === "command_parameter"),
+    )
   )
     return false;
-  return commands.slice(0, -1).every((candidate) => {
-    const decision = classifyCommand(commandWords(candidate, language), language);
-    return !decision.kind && !decision.nested;
-  });
+  if (wordNodes.some((word) => hasUntranslatedShellSyntax(word, language))) return false;
+  if (hasInputRedirect(node)) return false;
+  const pipeline = node.parent;
+  if (!pipeline || !["pipeline", "pipeline_chain"].includes(pipeline.type)) return false;
+  const stages = pipeline.namedChildren.filter((child): child is Node => child !== null);
+  const position = stages.findIndex(
+    (stage) => stage.startIndex <= node.startIndex && stage.endIndex >= node.endIndex,
+  );
+  if (position < 1) return false;
+  let fileObjectFlow = false;
+  for (const [index, stage] of stages.entries()) {
+    if (index === position) continue;
+    const commands = stage.descendantsOfType("command");
+    for (const candidate of commands) {
+      if (candidate === null) continue;
+      const candidateWords = commandWords(candidate, language);
+      const decision = classifyCommand(candidateWords, language);
+      if (decision.kind || decision.nested) return false;
+      if (language !== "powershell" || index > position) continue;
+      const executable = candidateWords[0];
+      if (executable === null || executable === undefined) continue;
+      const name = executableName(executable).toLowerCase();
+      if (POWERSHELL_FILE_OBJECT_PRODUCERS.has(name)) fileObjectFlow = true;
+    }
+    if (language === "powershell" && index < position && stage.type === "command") {
+      const executable = commandWords(stage, language)[0];
+      if (
+        executable !== null &&
+        executable !== undefined &&
+        POWERSHELL_STRING_CONVERTERS.has(executableName(executable).toLowerCase())
+      )
+        fileObjectFlow = false;
+    }
+  }
+  return !fileObjectFlow;
 }
 
 /** WASM grammars are shipped with the hook; parsing never reads shell scripts or executes code. */
