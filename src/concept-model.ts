@@ -11,7 +11,8 @@ export const CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
 export const CONCEPT_MODEL_TOKENS = 256;
 export const CONCEPT_WINDOW_OVERLAP_TOKENS = 64;
 export const CONCEPT_EMBEDDING_DIMENSIONS = 384;
-export const CONCEPT_CACHE_VERSION = 2;
+// Transformers 4 / ONNX 1.30 embeddings must not reuse the previous runtime's vectors.
+export const CONCEPT_CACHE_VERSION = 3;
 export const CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 export const CONCEPT_TIMEOUT_MS = 10 * 60_000;
 export const MIN_CONCEPT_TIMEOUT_MS = 1_000;

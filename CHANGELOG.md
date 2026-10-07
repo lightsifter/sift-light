@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3-5 — 2026-10-07
+
+- Update the MCP SDK to 1.31.0 and Transformers.js to 4.3.1 to remove the dependency vulnerabilities reported in [#111](https://github.com/lightsifter/sift-light/issues/111), including the old ONNX proxy/logging dependency chain. Refresh compatible SDK transitive dependencies in the lockfile.
+- Recompute cached text embeddings after the inference runtime upgrade; the pinned offline model and search interfaces remain unchanged.
+
 ## 1.0.3-4 — 2026-10-05
 
 - Allow recognized stdin-only filters at any pipeline position, including `cmd | grep pattern | head` and `cmd | grep pattern | wc -l`. Deny file operands, recursive search, file-sourced patterns, input redirection, and unsafe dynamic arguments even when a filter receives piped input ([#109](https://github.com/lightsifter/sift-light/issues/109)).
