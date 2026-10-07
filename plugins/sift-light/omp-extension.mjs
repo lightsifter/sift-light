@@ -1845,7 +1845,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.3-4",
+  version: "1.0.3-5",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -1929,8 +1929,8 @@ var package_default = {
   dependencies: {
     "@ast-grep/lang-go": "0.0.6",
     "@ast-grep/napi": "0.45.2",
-    "@huggingface/transformers": "3.8.1",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@huggingface/transformers": "4.3.1",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@vscode/ripgrep": "1.18.0",
     typebox: "1.3.19",
     "web-tree-sitter": "0.25.10",
@@ -2216,7 +2216,7 @@ var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
 var CONCEPT_PASSAGE_OVERLAP_CHARS = 160;
-var CONCEPT_CACHE_VERSION = 2;
+var CONCEPT_CACHE_VERSION = 3;
 var CONCEPT_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 var CONCEPT_TIMEOUT_MS = 10 * 60000;
 var MIN_CONCEPT_TIMEOUT_MS = 1000;
