@@ -2,6 +2,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function validateHostProvidedDependencyContract(packageJson: Record<string, unknown>): void {
+  const dependencies = packageJson.dependencies;
+  const peerDependencies = packageJson.peerDependencies;
+  const devDependencies = packageJson.devDependencies;
+  if (isRecord(dependencies) && "typebox" in dependencies) {
+    throw new Error("typebox must not be published as a regular dependency for Pi extensions");
+  }
+  if (!isRecord(peerDependencies) || peerDependencies.typebox !== "*") {
+    throw new Error('typebox must be declared in peerDependencies with the "*" range');
+  }
+  if (!isRecord(devDependencies) || typeof devDependencies.typebox !== "string") {
+    throw new Error("typebox must remain a development dependency for repository checks");
+  }
+}
+
 export function validateNpmPublishOutput(stdout: string, stderr: string, expectedId: string): void {
   if (stderr.includes("auto-corrected") || stderr.includes("errors corrected")) {
     throw new Error(`npm would rewrite the published package metadata\n${stderr}`);
@@ -51,6 +66,7 @@ async function main(): Promise<void> {
   ) {
     throw new Error("package.json must contain string name and version fields");
   }
+  validateHostProvidedDependencyContract(packageJson);
   const expectedId = `${packageJson.name}@${packageJson.version}`;
   validateNpmPublishOutput(stdout, stderr, expectedId);
   process.stdout.write(`npm ${npmVersion} publish dry run verified ${expectedId}\n`);
