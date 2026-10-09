@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.3-6",
+  version: "1.0.5-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -1506,7 +1506,7 @@ function requestContractProjection(error) {
 }
 
 // src/rg.ts
-import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve4 } from "node:path";
+import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve5 } from "node:path";
 
 // src/excerpt.ts
 function boundedCharacter(value, maximum) {
@@ -1977,9 +1977,27 @@ async function runOwnedProcess(options, consumeOutput) {
 // src/ripgrep-executable.ts
 import { constants } from "node:fs";
 import { access, stat as stat2 } from "node:fs/promises";
-import { isAbsolute as isAbsolute2 } from "node:path";
+import { delimiter, isAbsolute as isAbsolute2, resolve as resolve2 } from "node:path";
 var OVERRIDE_ENV = "SIFT_LIGHT_RG_PATH";
-var BUNDLED_REPAIR = `Reinstall sift-light with optional dependencies enabled for this platform, or set ${OVERRIDE_ENV} to an absolute ripgrep executable path.`;
+var PATH_RIPGREP_NAME = process.platform === "win32" ? "rg.exe" : "rg";
+var BUNDLED_REPAIR = `Reinstall sift-light with optional dependencies enabled for this platform, set ${OVERRIDE_ENV} to an absolute ripgrep executable path, or ensure ${PATH_RIPGREP_NAME} is available on PATH.`;
+async function findExecutableOnPath() {
+  const pathValue = process.env.PATH;
+  if (!pathValue)
+    return;
+  const candidates = pathValue.split(delimiter).map((directory) => resolve2(directory || ".", PATH_RIPGREP_NAME));
+  const available = await Promise.all(candidates.map(async (candidate) => {
+    try {
+      if (!(await stat2(candidate)).isFile())
+        return;
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      return;
+    }
+  }));
+  return available.find((candidate) => candidate !== undefined);
+}
 async function resolveRipgrepExecutable() {
   const configured = process.env[OVERRIDE_ENV];
   if (configured !== undefined && !isAbsolute2(configured))
@@ -1991,7 +2009,10 @@ async function resolveRipgrepExecutable() {
     try {
       executable = (await import("@vscode/ripgrep")).rgPath;
     } catch (cause) {
-      throw new SiftLightError(`Bundled ripgrep is unavailable. ${BUNDLED_REPAIR}`, { cause });
+      const pathExecutable = await findExecutableOnPath();
+      if (pathExecutable === undefined)
+        throw new SiftLightError(`Bundled ripgrep is unavailable. ${BUNDLED_REPAIR}`, { cause });
+      executable = pathExecutable;
     }
   }
   try {
@@ -2008,7 +2029,7 @@ async function resolveRipgrepExecutable() {
 }
 
 // src/ripgrep-diagnostics.ts
-import { resolve as resolve2 } from "node:path";
+import { resolve as resolve3 } from "node:path";
 var UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
 var UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
 var RECOVERABLE_FILESYSTEM_CODE = /\(os error (?:4|5|22)\)\s*$/iu;
@@ -2091,8 +2112,8 @@ function classifyRipgrepDiagnostics(stderr) {
   return { unreadable, recoverable, other };
 }
 function hasRequestedRootUnreadable(diagnostics, cwd, searchPath) {
-  const expected = resolve2(cwd, searchPath);
-  return diagnostics.some((diagnostic) => diagnostic.path === undefined || resolve2(cwd, diagnostic.path) === expected);
+  const expected = resolve3(cwd, searchPath);
+  return diagnostics.some((diagnostic) => diagnostic.path === undefined || resolve3(cwd, diagnostic.path) === expected);
 }
 function describeUnreadableDiagnostics(diagnostics) {
   const messages = [...new Set(diagnostics.map((diagnostic) => diagnostic.message))];
@@ -2256,7 +2277,7 @@ function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLin
 }
 
 // src/scan-revisions.ts
-import { resolve as resolve3 } from "node:path";
+import { resolve as resolve4 } from "node:path";
 async function captureRevision(path, revisions, onRevisionError) {
   let failed = false;
   let failure;
@@ -2306,7 +2327,7 @@ async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal
         if (Buffer.from(path, "utf8").equals(rawPath)) {
           if (candidateCount < maxFiles) {
             candidateCount += 1;
-            batch.push(resolve3(cwd, path));
+            batch.push(resolve4(cwd, path));
           } else {
             enumerationTruncated = true;
           }
@@ -2382,7 +2403,7 @@ function decodeRgText(value, field) {
   throw new SiftLightError(`ripgrep JSON event omitted ${field}`);
 }
 function displayPath(rawPath, cwd) {
-  const absolutePath = isAbsolute3(rawPath) ? rawPath : resolve4(cwd, rawPath);
+  const absolutePath = isAbsolute3(rawPath) ? rawPath : resolve5(cwd, rawPath);
   const localPath = relative2(cwd, absolutePath).replaceAll("\\", "/");
   const isInsideCwd = localPath !== ".." && !localPath.startsWith("../") && !isAbsolute3(localPath);
   return {
@@ -2530,7 +2551,7 @@ function fileScopeArguments(request) {
   return args;
 }
 function buildRipgrepArguments(request, cwd, validatedSearchPath) {
-  const searchPath = validatedSearchPath ?? resolve4(cwd, request.path ?? ".");
+  const searchPath = validatedSearchPath ?? resolve5(cwd, request.path ?? ".");
   const policy = new SearchPathPolicy(cwd);
   policy.assertPath(searchPath);
   const args = [
@@ -2544,7 +2565,7 @@ function buildRipgrepArguments(request, cwd, validatedSearchPath) {
     ...policy.ripgrepGlobArguments(searchPath)
   ];
   args.push(...patternArguments(request));
-  const searchTarget = isPathInsideCwd(searchPath, cwd) ? relative2(resolve4(cwd), searchPath) || "." : searchPath;
+  const searchTarget = isPathInsideCwd(searchPath, cwd) ? relative2(resolve5(cwd), searchPath) || "." : searchPath;
   args.push("--", request.pattern, searchTarget);
   return args;
 }
@@ -2563,12 +2584,12 @@ function createRipgrepRunner(options = {}) {
     if (signal?.aborted)
       throw abortError();
     const executable = options.executable ?? await resolveRipgrepExecutable();
-    const searchPath = resolve4(cwd, request.path ?? ".");
+    const searchPath = resolve5(cwd, request.path ?? ".");
     const policy = new SearchPathPolicy(cwd);
     const validatedSearchPath = await policy.resolveSearchTarget(searchPath);
     const ripgrepCwd = await policy.ripgrepWorkingDirectory(validatedSearchPath);
     const expectedSearchTarget = await policy.resolveExistingPath(validatedSearchPath);
-    const searchTarget = isPathInsideCwd(validatedSearchPath, cwd) ? relative2(resolve4(cwd), validatedSearchPath) || "." : validatedSearchPath;
+    const searchTarget = isPathInsideCwd(validatedSearchPath, cwd) ? relative2(resolve5(cwd), validatedSearchPath) || "." : validatedSearchPath;
     const args = buildRipgrepArguments(request, cwd, validatedSearchPath);
     if (signal?.aborted)
       throw abortError();
@@ -2785,7 +2806,7 @@ function createRipgrepRunner(options = {}) {
 }
 
 // src/structure.ts
-import { isAbsolute as isAbsolute4, resolve as resolve5 } from "node:path";
+import { isAbsolute as isAbsolute4, resolve as resolve6 } from "node:path";
 var CTAGS_CAPABILITY_ARGUMENTS = [
   "--output-format=json",
   "--fields=+ne",
@@ -2875,7 +2896,7 @@ async function runCtagsCommand(executable, absolutePath, cwd, signal) {
   return tags;
 }
 function pathMatches(tagPath, absolutePath, cwd) {
-  return resolve5(isAbsolute4(tagPath) ? tagPath : resolve5(cwd, tagPath)) === resolve5(absolutePath);
+  return resolve6(isAbsolute4(tagPath) ? tagPath : resolve6(cwd, tagPath)) === resolve6(absolutePath);
 }
 function symbolFromTag(tag) {
   if (tag.line === undefined || tag.end === undefined || tag.end < tag.line)
@@ -3357,7 +3378,7 @@ import { StringDecoder } from "node:string_decoder";
 // src/concept-model.ts
 import { stat as stat4 } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
-import { join as join2, resolve as resolve6 } from "node:path";
+import { join as join2, resolve as resolve7 } from "node:path";
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
@@ -3393,7 +3414,7 @@ var CONCEPT_ASSETS = [
   }
 ];
 function conceptModelDirectory() {
-  return resolve6(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), CONCEPT_REVISION);
+  return resolve7(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), CONCEPT_REVISION);
 }
 async function inspectConceptModel(directory = conceptModelDirectory()) {
   for (const asset of CONCEPT_ASSETS) {
@@ -3417,7 +3438,7 @@ async function inspectConceptModel(directory = conceptModelDirectory()) {
   };
 }
 function conceptCacheDirectory() {
-  return resolve6(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+  return resolve7(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
 }
 function resolveConceptTimeoutMs(environment = process.env) {
   const raw = environment[CONCEPT_TIMEOUT_ENV];
@@ -3929,7 +3950,7 @@ function rangeEvidence(document, range) {
 }
 
 // src/concept-search.ts
-import { resolve as resolve12 } from "node:path";
+import { resolve as resolve13 } from "node:path";
 import { createHash as createHash4 } from "node:crypto";
 
 // src/request.ts
@@ -4607,28 +4628,28 @@ async function parseSyntax(path, text, signal, pattern) {
 import { createHash as createHash3 } from "node:crypto";
 
 // src/source-access.ts
-import { extname as extname2, resolve as resolve11 } from "node:path";
+import { extname as extname2, resolve as resolve12 } from "node:path";
 
 // src/historical-paths.ts
 import { lstat, mkdir as mkdir2, mkdtemp, open as open2, rm as rm2, writeFile } from "node:fs/promises";
 import { constants as constants2 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname as dirname4, join as join4, parse, relative as relative4, resolve as resolve8 } from "node:path";
+import { dirname as dirname4, join as join4, parse, relative as relative4, resolve as resolve9 } from "node:path";
 
 // src/workspace-files.ts
-import { relative as relative3, resolve as resolve7, sep as sep2 } from "node:path";
+import { relative as relative3, resolve as resolve8, sep as sep2 } from "node:path";
 class EnumerationLimit extends Error {
 }
 function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
-  const absolute = resolve7(cwd, path);
+  const absolute = resolve8(cwd, path);
   policy.assertPath(absolute);
-  const local = relative3(resolve7(cwd), absolute);
+  const local = relative3(resolve8(cwd), absolute);
   if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
     throw new SiftLightError("Git internals are excluded from source candidates");
   return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
 }
 async function listWorkspaceFiles(cwd, signal, options = {}) {
-  const absolutePath = resolve7(cwd, options.path ?? ".");
+  const absolutePath = resolve8(cwd, options.path ?? ".");
   const policy = new SearchPathPolicy(cwd);
   const searchPath = await policy.resolveSearchTarget(absolutePath);
   const ripgrepCwd = await policy.ripgrepWorkingDirectory(searchPath);
@@ -4727,7 +4748,7 @@ function partitionPaths(paths) {
 }
 function relevantDirectories(cwd, paths) {
   const directories = new Set;
-  for (const path of [cwd, ...paths.map((sourcePath) => dirname4(resolve8(cwd, sourcePath)))]) {
+  for (const path of [cwd, ...paths.map((sourcePath) => dirname4(resolve9(cwd, sourcePath)))]) {
     let current = path;
     for (;; ) {
       directories.add(current);
@@ -4740,7 +4761,7 @@ function relevantDirectories(cwd, paths) {
   return [...directories];
 }
 async function filterHistoricalPaths(cwd, paths, request, signal) {
-  if (!isPathInsideCwd(resolve8(cwd, request.path ?? "."), cwd)) {
+  if (!isPathInsideCwd(resolve9(cwd, request.path ?? "."), cwd)) {
     throw new SiftLightError("Historical path filtering requires a path inside cwd");
   }
   const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
@@ -4752,7 +4773,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
   if (bounded.length === 0)
     return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
   const root = await mkdtemp(join4(tmpdir(), "sift-light-paths-"));
-  const absoluteCwd = resolve8(cwd);
+  const absoluteCwd = resolve9(cwd);
   const volumeRoot = parse(absoluteCwd).root;
   const ignoreFiles = [];
   let ignoreBytesRead = 0;
@@ -4814,7 +4835,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       await mkdir2(target, { recursive: true });
       for (const path of group) {
         const safe = workspaceRelativePath(absoluteCwd, path);
-        const placeholder = resolve8(target, safe);
+        const placeholder = resolve9(target, safe);
         await mkdir2(dirname4(placeholder), { recursive: true });
         await writeFile(placeholder, "");
       }
@@ -5012,7 +5033,7 @@ async function sourceSimilarity(oldContent, newContent, budget) {
 import { createHash } from "node:crypto";
 import { constants as constants3 } from "node:fs";
 import { lstat as lstat2, open as open3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute6, relative as relative5, resolve as resolve9, sep as sep3 } from "node:path";
+import { isAbsolute as isAbsolute6, relative as relative5, resolve as resolve10, sep as sep3 } from "node:path";
 
 // src/git-process.ts
 var GIT_READ_ARGUMENTS = [
@@ -5156,8 +5177,8 @@ function splitGitRecords(output) {
 // src/git-repository.ts
 async function verifyWorktreeRevision(cwd, path, expected) {
   try {
-    const current = await lstat2(resolve9(cwd, path));
-    await assertExistingPathInsideCwd(resolve9(cwd, path), cwd);
+    const current = await lstat2(resolve10(cwd, path));
+    await assertExistingPathInsideCwd(resolve10(cwd, path), cwd);
     if (current.isFile() && sameSourceRevision(sourceRevisionFromStats(current), expected))
       return;
   } catch (error) {
@@ -5169,8 +5190,8 @@ async function verifyWorktreeRevision(cwd, path, expected) {
 function gitPath(cwd, path) {
   if (path.length === 0 || path.includes("\x00"))
     throw new SiftLightError("Git source path is invalid");
-  const absolute = resolve9(cwd, path);
-  const local = relative5(resolve9(cwd), absolute).split(sep3).join("/");
+  const absolute = resolve10(cwd, path);
+  const local = relative5(resolve10(cwd), absolute).split(sep3).join("/");
   if (!isPathInsideCwd(absolute, cwd) || local.split("/").some((part) => part.toLowerCase() === ".git")) {
     throw new SiftLightError("Git source path must stay within the working directory and outside .git");
   }
@@ -5194,7 +5215,7 @@ async function resolveGitRepository(cwd, signal) {
   const root = decodeGitPath(output).replace(/\r?\n$/, "");
   if (!isAbsolute6(root))
     throw new SiftLightError("Git returned an invalid repository root");
-  return resolve9(root);
+  return resolve10(root);
 }
 async function findGitRepository(cwd, signal) {
   try {
@@ -5292,7 +5313,7 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
   };
 }
 async function readWorktreeSource(cwd, path, budget, signal) {
-  const absolute = resolve9(cwd, path);
+  const absolute = resolve10(cwd, path);
   if (signal?.aborted)
     throw abortError();
   let discovered = false;
@@ -5597,7 +5618,7 @@ async function readGitSource(cwd, identity, signal, options = {}) {
 import { isUtf8 } from "node:buffer";
 import { createHash as createHash2 } from "node:crypto";
 import { open as open4, realpath as realpath3 } from "node:fs/promises";
-import { relative as relative6, resolve as resolve10 } from "node:path";
+import { relative as relative6, resolve as resolve11 } from "node:path";
 class SourceDocumentError extends SiftLightError {
   reason;
   constructor(reason, message) {
@@ -5749,7 +5770,7 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
   if (expected?.kind === "git") {
     throw new SiftLightError("A Git source reference cannot be read from the worktree");
   }
-  const absolute = resolve10(cwd, path);
+  const absolute = resolve11(cwd, path);
   const [canonical, canonicalCwd] = await Promise.all([
     new SearchPathPolicy(cwd).resolveExistingPath(absolute),
     realpath3(cwd)
@@ -5931,10 +5952,10 @@ class SourceAccess {
   async load(path, expected) {
     if (this.signal?.aborted)
       throw abortError();
-    if (expected && resolve11(this.cwd, expected.path) !== resolve11(this.cwd, path)) {
+    if (expected && resolve12(this.cwd, expected.path) !== resolve12(this.cwd, path)) {
       throw new SiftLightError("Source reference path does not match the requested file");
     }
-    const key = JSON.stringify([resolve11(this.cwd, path), expected?.origin]);
+    const key = JSON.stringify([resolve12(this.cwd, path), expected?.origin]);
     const existing = this.#documents.get(key);
     if (existing)
       return existing;
@@ -5966,7 +5987,7 @@ class SourceAccess {
     if (remaining <= 0)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     if (expected?.origin.kind !== "git") {
-      const metadata = await getSourceRevision(resolve11(this.cwd, path));
+      const metadata = await getSourceRevision(resolve12(this.cwd, path));
       if (metadata && metadata.size > remaining)
         throw new SourceBudgetError("Next source exceeds the remaining 32 MiB structural read budget");
     }
@@ -6363,7 +6384,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
     const inferred = await infer(query, passages, access.signal, onProgress);
     const retainedPathSet = retainPaths === undefined ? undefined : await retainPaths;
     for (const document of generation.documents) {
-      if (retainedPathSet?.has(resolve12(access.cwd, document.path))) {
+      if (retainedPathSet?.has(resolve13(access.cwd, document.path))) {
         retainedDocuments.push(document);
       }
     }
@@ -6616,7 +6637,7 @@ async function structuralSearch(input, access) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname5, extname as extname3, resolve as resolve21 } from "node:path";
+import { dirname as dirname5, extname as extname3, resolve as resolve22 } from "node:path";
 
 // src/analysis-store.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -7155,7 +7176,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
 }
 
 // src/inspect.ts
-import { resolve as resolve13 } from "node:path";
+import { resolve as resolve14 } from "node:path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -7184,7 +7205,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SiftLightError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve13(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve14(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -7206,7 +7227,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve14 } from "node:path";
+import { resolve as resolve15 } from "node:path";
 class CandidateLimit extends SiftLightError {
 }
 function record3(value) {
@@ -7371,7 +7392,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve14(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve15(options.cwd, options.request.path), options.cwd)) {
     throw new SiftLightError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -7429,7 +7450,7 @@ async function collectEvidenceCandidates(options) {
 // src/import-model.ts
 import { posix } from "node:path";
 import { realpath as realpath4 } from "node:fs/promises";
-import { relative as relative7, resolve as resolve15 } from "node:path";
+import { relative as relative7, resolve as resolve16 } from "node:path";
 class NavigationFailure extends Error {
   reason;
   constructor(reason) {
@@ -7809,7 +7830,7 @@ class NavigationContext {
     const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map((path) => this.host.normalizePath?.(path) ?? navigationPath(path));
     const canonicalPaths = await Promise.all(normalizedPaths.map(async (normalized) => {
       try {
-        const target = await realpath4(resolve15(this.host.cwd, normalized));
+        const target = await realpath4(resolve16(this.host.cwd, normalized));
         const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative7(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
         return [normalized, canonical];
       } catch {
@@ -8877,10 +8898,10 @@ async function runOwnedParallel(start, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve17, sep as sep4 } from "node:path";
+import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve18, sep as sep4 } from "node:path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve16 } from "node:path";
+import { resolve as resolve17 } from "node:path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -8891,7 +8912,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve16(cwd, path));
+      const revision = await getSourceRevision(resolve17(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -8975,8 +8996,8 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve17(cwd, root);
-  const absolutePath = resolve17(cwd, path);
+  const absoluteRoot = resolve18(cwd, root);
+  const absolutePath = resolve18(cwd, path);
   const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
@@ -9283,7 +9304,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve18 } from "node:path";
+import { resolve as resolve19 } from "node:path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -9370,7 +9391,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document.utf8 && structure && document.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve18(access.cwd, target.path),
+      absolutePath: resolve19(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document.reference.origin.revision
@@ -9471,7 +9492,7 @@ function metadataStructure(details) {
 async function sourceDocumentIsCurrent(document, access) {
   if (document.reference.origin.kind !== "worktree")
     return true;
-  const current = await getSourceRevision(resolve18(access.cwd, document.path));
+  const current = await getSourceRevision(resolve19(access.cwd, document.path));
   return current !== undefined && sameSourceRevision(current, document.reference.origin.revision);
 }
 async function inspectDocumentsMetadata(targets, access, structure) {
@@ -9690,7 +9711,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve18(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve19(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -9747,7 +9768,7 @@ ${preview.text}`);
 }
 async function continueSource(cursor, access, continuations, expectedPath) {
   const state = continuations.resolve(cursor);
-  if (expectedPath !== undefined && resolve18(access.cwd, expectedPath.replace(/^@/, "")) !== resolve18(access.cwd, state.source.path))
+  if (expectedPath !== undefined && resolve19(access.cwd, expectedPath.replace(/^@/, "")) !== resolve19(access.cwd, state.source.path))
     throw new SiftLightError(`sourceCursor continues ${JSON.stringify(state.source.path)}, not ${JSON.stringify(expectedPath)}; copy the returned nextRequest exactly`);
   const document = await access.load(state.source.path, state.source);
   const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
@@ -9787,7 +9808,7 @@ async function continueSource(cursor, access, continuations, expectedPath) {
 
 // src/evidence-validation.ts
 import { realpath as realpath5, stat as stat5 } from "node:fs/promises";
-import { resolve as resolve19 } from "node:path";
+import { resolve as resolve20 } from "node:path";
 
 // src/evidence-validity.ts
 function aggregateEvidenceValidity(sources) {
@@ -9820,7 +9841,7 @@ function policyFailure(error) {
   return error instanceof SiftLightError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
 }
 async function confirmWorktreeState(path, cwd, signal) {
-  const absolute = resolve19(cwd, path);
+  const absolute = resolve20(cwd, path);
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
@@ -9962,7 +9983,7 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
   if (!target.revision)
     throw new Error("Snapshot validation target omitted its revision");
   try {
-    const absolute = resolve19(cwd, target.path);
+    const absolute = resolve20(cwd, target.path);
     const canonical = await policy.resolveExistingPath(absolute);
     if (!canonical) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
@@ -10054,14 +10075,14 @@ function evidenceScope(cwd, scope, request) {
   const exclude = scope?.exclude ?? request?.exclude;
   const hidden = scope?.hidden ?? request?.hidden;
   return {
-    root: resolve19(cwd, path),
+    root: resolve20(cwd, path),
     ...include && include.length > 0 ? { include: [...include] } : {},
     ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
     ...hidden === undefined ? {} : { hidden }
   };
 }
 async function validateSavedEvidence(options) {
-  let scope = { root: resolve19(options.cwd) };
+  let scope = { root: resolve20(options.cwd) };
   const reasons = [];
   let storedPartial = false;
   let targets;
@@ -10841,7 +10862,7 @@ function pythonRoleAnalysis(document) {
 }
 
 // src/hybrid-search.ts
-import { resolve as resolve20 } from "node:path";
+import { resolve as resolve21 } from "node:path";
 
 // src/config-reader.ts
 import { readFile as readFile2 } from "node:fs/promises";
@@ -11488,14 +11509,14 @@ function absoluteOccurrenceRanges(document, line, match) {
 async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
-  const generatedDocuments = new Map(generation.documents.map((document) => [resolve20(access.cwd, document.path), document]));
+  const generatedDocuments = new Map(generation.documents.map((document) => [resolve21(access.cwd, document.path), document]));
   let reusedDocuments = 0;
   let loadedDocuments = 0;
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const generated = generatedDocuments.get(resolve20(access.cwd, match.absolutePath));
+      const generated = generatedDocuments.get(resolve21(access.cwd, match.absolutePath));
       const document = generated ?? await access.load(match.absolutePath);
       if (generated)
         reusedDocuments += 1;
@@ -11923,11 +11944,11 @@ function searchScope(request) {
   };
 }
 async function navigationRoot(cwd, path, signal) {
-  const absolute = resolve21(cwd, path);
+  const absolute = resolve22(cwd, path);
   const repository = await findGitRepository(dirname5(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve21(cwd) : dirname5(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve22(cwd) : dirname5(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -11940,8 +11961,8 @@ function navigationFilters(input) {
 }
 async function navigationScope(cwd, root, requestedPath, filters) {
   const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath6(resolve21(cwd)).catch(() => resolve21(cwd)),
-    realpath6(root).catch(() => resolve21(root))
+    realpath6(resolve22(cwd)).catch(() => resolve22(cwd)),
+    realpath6(root).catch(() => resolve22(root))
   ]);
   const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
@@ -11956,13 +11977,13 @@ async function navigationScope(cwd, root, requestedPath, filters) {
   };
 }
 async function canonicalNavigationPath(path) {
-  return realpath6(path).catch(() => resolve21(path));
+  return realpath6(path).catch(() => resolve22(path));
 }
 async function canonicalNavigationFiles(cwd, root, files, primaryPath) {
   const canonicalRoot = await canonicalNavigationPath(root);
   const [enumerated, canonicalPrimary] = await Promise.all([
-    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve21(cwd, file)))),
-    canonicalNavigationPath(resolve21(cwd, primaryPath))
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve22(cwd, file)))),
+    canonicalNavigationPath(resolve22(cwd, primaryPath))
   ]);
   const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
   if (isPathInsideRoot(canonicalPrimary, canonicalRoot))
@@ -12114,7 +12135,7 @@ class EvidenceService {
         conceptAccess = ownedConceptAccess;
         const literalOperation = this.#runner(literalRequest, cwd, groupSignal).then((result) => {
           literalResult = result;
-          return new Set(result.matches.map((match) => resolve21(match.absolutePath)));
+          return new Set(result.matches.map((match) => resolve22(match.absolutePath)));
         });
         return [
           literalOperation.then(() => {
@@ -12560,7 +12581,7 @@ class EvidenceService {
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = await canonicalNavigationPath(resolve21(access.cwd, file));
+        const absolutePath = await canonicalNavigationPath(resolve22(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SiftLightError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -12602,7 +12623,7 @@ class EvidenceService {
 }
 
 // src/service.ts
-import { resolve as resolve24 } from "node:path";
+import { resolve as resolve25 } from "node:path";
 
 // src/discovery-errors.ts
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
@@ -13638,7 +13659,7 @@ function operationOutcome(outcome, mode) {
 }
 
 // src/audit-search.ts
-import { resolve as resolve22 } from "node:path";
+import { resolve as resolve23 } from "node:path";
 var MAX_AUDIT_PATTERNS = 32;
 var MAX_AUDIT_CHANGED_FILES = 20;
 var MAX_AUDIT_EVIDENCE = 3;
@@ -13671,7 +13692,7 @@ async function revisionsFor(cwd, paths, signal) {
       throw signal.reason;
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve22(cwd, path), () => unavailable.push(path));
+      const revision = await getSourceRevision(resolve23(cwd, path), () => unavailable.push(path));
       if (revision)
         revisions.set(path, revision);
     }));
@@ -13912,7 +13933,7 @@ async function runAuditSearch(input, cwd, runRipgrep, signal) {
 }
 
 // src/language-capabilities.ts
-import { resolve as resolve23 } from "node:path";
+import { resolve as resolve24 } from "node:path";
 function normalizeLists(values) {
   return values === undefined ? [] : [...values];
 }
@@ -13965,7 +13986,7 @@ class LanguageCapabilityCatalog {
       ...new Map(entries.flatMap((entry) => this.descriptor(entry.language)?.capabilities ?? []).map((capability) => [capability.id, capability])).values()
     ];
     return {
-      root: resolve23(request.cwd),
+      root: resolve24(request.cwd),
       ...path ? { path } : {},
       partial: files.partial,
       reasons: files.reasons,
@@ -14059,7 +14080,7 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SiftLightError("Cursor paths cannot be empty");
-    const absolutePath = resolve24(cwd, label);
+    const absolutePath = resolve25(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
@@ -14326,7 +14347,7 @@ class SiftLightService {
       throw new SiftLightError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
-    if (resolve24(cwd) !== resolve24(existing.metadata.cwd))
+    if (resolve25(cwd) !== resolve25(existing.metadata.cwd))
       throw new SiftLightError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
