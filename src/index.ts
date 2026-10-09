@@ -28,6 +28,7 @@ export async function registerSiftLightExtension(
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
       vectorSearchEnabled: config.vectorSearchEnabled === true,
+      dataSources: config.dataSources ?? [],
       semanticJudge,
     }),
   );

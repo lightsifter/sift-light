@@ -174,14 +174,35 @@ function publicSemanticJudgeDetails(item: AnalysisItem): Record<string, unknown>
 
 function publicItemDetails(item: AnalysisItem): Record<string, unknown> | undefined {
   const structure = publicStructureDetails(item);
+  const relevance =
+    item.details?.ranking === "relevance"
+      ? {
+          ranking: "relevance",
+          ...Object.fromEntries(
+            [
+              "bm25",
+              "score",
+              "rankingScore",
+              "relevanceScore",
+              "semanticRank",
+              "lexicalRank",
+              "identifierDeclaration",
+            ].flatMap((name) => {
+              const value = item.details?.[name];
+              return typeof value === "number" && Number.isFinite(value) ? [[name, value]] : [];
+            }),
+          ),
+        }
+      : undefined;
   const semanticJudge = publicSemanticJudgeDetails(item);
   const source =
     item.details?.source === "literal" || item.details?.source === "concept"
       ? item.details.source
       : undefined;
-  if (!structure && !semanticJudge && !source) return undefined;
+  if (!structure && !semanticJudge && !source && !relevance) return undefined;
   return {
     ...structure,
+    ...relevance,
     ...(source ? { source } : {}),
     ...(semanticJudge ? { semanticJudge } : {}),
   };
@@ -316,7 +337,7 @@ export class AnalysisStore {
     }
     const id = randomUUID();
     this.#items.set(id, { id, result: bounded, bytes, touched: this.#now() });
-    return `${id}.${result.kind === "hybrid" ? "analysis-hybrid" : "analysis"}.0`;
+    return `${id}.${result.kind === "hybrid" && !result.counts?.relevanceRanking ? "analysis-hybrid" : "analysis"}.0`;
   }
 
   resolve(cursor: string): {

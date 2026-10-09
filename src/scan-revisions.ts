@@ -112,7 +112,7 @@ export async function captureCandidateRevisions(
   );
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
   const inputError = createRipgrepInputError(result.stderr, redact);
-  const unreadable = [...diagnostics.unreadable, ...metadataFailures];
+  const unreadable = [...diagnostics.unreadable, ...diagnostics.recoverable, ...metadataFailures];
   if (inputError) throw inputError;
   if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
     return { revisions, unreadable, enumerationTruncated, invalidPathCount };

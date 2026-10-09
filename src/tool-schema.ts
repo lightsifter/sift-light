@@ -41,9 +41,21 @@ function stringEnum<const Values extends readonly string[]>(
 
 export const SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 
-export const SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
+export const SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. source-list/source-search/source-read. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 
 export const siftLightSchema = Type.Object({
+  sourceId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 64,
+      description:
+        "Configured external source id. Discover with source-list; source-search and source-read never accept arbitrary URLs or SQL.",
+    }),
+  ),
+  recordId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  revision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  recordKey: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+  pageToken: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
   query: Type.Optional(
     Type.String({
       maxLength: 256,
@@ -246,6 +258,12 @@ export const siftLightSchema = Type.Object({
       minimum: 1,
       maximum: MAX_CONFIGURABLE_STRUCTURE_FILES,
       description: `Advanced hard ceiling for source files admitted by one analysis request (max ${String(MAX_CONFIGURABLE_STRUCTURE_FILES)}). Concept and hybrid automatically process the requested scope in bounded batches when omitted; other structural modes default to 200. Candidate discovery still searches the full requested scope.`,
+    }),
+  ),
+  ranking: Type.Optional(
+    stringEnum(["exact-first", "relevance"] as const, {
+      description:
+        "hybrid only: exact-first (default) preserves exhaustive literal priority; relevance ranks passages using BM25 plus semantic RRF, with stable inspect and pagination. conceptLimit is not accepted with relevance.",
     }),
   ),
   conceptLimit: Type.Optional(

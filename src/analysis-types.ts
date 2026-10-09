@@ -137,6 +137,9 @@ export interface AnalysisDetails {
     filesSkipped?: number;
     cacheHits?: number;
     conceptCacheHits?: number;
+    conceptQueueWaitMs?: number;
+    conceptModelLoads?: number;
+    conceptModelReused?: boolean;
     conceptCacheMisses?: number;
     conceptCacheBytes?: number;
     conceptCacheMaxBytes?: number;

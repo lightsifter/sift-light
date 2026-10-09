@@ -1,5 +1,5 @@
 import {
-  conceptSearch,
+  createManagedConceptSearch,
   type ConceptSearchExecution,
   type ConceptSearchRunner,
   validateConceptQuery,
@@ -363,6 +363,7 @@ export class EvidenceService {
   readonly #snapshots: SnapshotStore;
   readonly #structure: CodeStructureProvider | undefined;
   readonly #conceptSearch: ConceptSearchRunner;
+  readonly #closeConcept: (() => Promise<void>) | undefined;
   readonly #semanticJudge: SemanticJudgeIntegration | undefined;
   readonly #queue = new SyntaxQueue();
   readonly #analyses = new AnalysisStore();
@@ -371,13 +372,15 @@ export class EvidenceService {
     runner: RipgrepRunner,
     snapshots: SnapshotStore,
     structure?: CodeStructureProvider,
-    runConceptSearch: ConceptSearchRunner = conceptSearch,
+    runConceptSearch?: ConceptSearchRunner,
     semanticJudge?: SemanticJudgeIntegration,
   ) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
-    this.#conceptSearch = runConceptSearch;
+    const managed = runConceptSearch ? undefined : createManagedConceptSearch();
+    this.#conceptSearch = runConceptSearch ?? managed!.search;
+    this.#closeConcept = managed?.close;
     this.#semanticJudge = semanticJudge;
   }
   clear(): void {
@@ -388,6 +391,7 @@ export class EvidenceService {
   async shutdown(): Promise<void> {
     this.clear();
     await this.#queue.shutdown();
+    await this.#closeConcept?.();
   }
 
   async #validateSavedEvidence(
@@ -504,7 +508,17 @@ export class EvidenceService {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
       return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
     }
+    if (input.mode === "hybrid" && input.ranking === "relevance") {
+      if (input.conceptLimit !== undefined)
+        throw new SiftLightError(
+          "conceptLimit only applies to exact-first hybrid; omit it for relevance ranking",
+        );
+      const execution = await this.#conceptSearch(input, access, options.onProgress);
+      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+    }
     if (input.mode === "hybrid") {
+      if (input.ranking !== undefined && input.ranking !== "exact-first")
+        throw new SiftLightError("ranking must be exact-first or relevance");
       const query = validateConceptQuery(input.query);
       const limit = hybridConceptLimit(input.conceptLimit);
       const literalRequest = normalizeRequest({
@@ -893,13 +907,22 @@ export class EvidenceService {
       // Outline symbols and function conjunctions carry their exact syntax range,
       // so inspection returns that version-checked range as source (issue #96).
       const bounded = item.details?.kind === "symbol" || item.details?.kind === "function";
+      const identifierOffset = item.details?.identifierOffset;
+      if (
+        identifierOffset !== undefined &&
+        (typeof identifierOffset !== "number" ||
+          !Number.isSafeInteger(identifierOffset) ||
+          identifierOffset < item.range.start ||
+          identifierOffset >= item.range.end)
+      )
+        throw new CursorError("Invalid retained identifier location");
       return {
         path: item.path,
         line: item.line,
         reference: item.source,
         ...(bounded
           ? { range: item.range, structure: analysisItemStructure(item) }
-          : { absoluteFocus: item.range.start }),
+          : { absoluteFocus: identifierOffset ?? item.range.start }),
       };
     }
     return {

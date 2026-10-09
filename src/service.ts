@@ -1,3 +1,5 @@
+import { DataSources } from "./data-sources.js";
+import type { DataSourceConfig } from "./data-source-config.js";
 import { createHash } from "node:crypto";
 import { EvidenceService, isEvidenceRequest } from "./evidence-service.js";
 import { ConceptSourceChangedError } from "./concept-source-generation.js";
@@ -51,7 +53,7 @@ import {
   operationStateResult,
 } from "./operation-output.js";
 import { modificationTimeBoundsText } from "./source.js";
-import { resolveConceptTimeoutMs } from "./concept-model.js";
+import { inspectConceptModel, resolveConceptTimeoutMs } from "./concept-model.js";
 import { runAuditSearch } from "./audit-search.js";
 import {
   LanguageCapabilityCatalog,
@@ -73,6 +75,11 @@ import {
 } from "./types.js";
 
 export interface SiftLightInput extends RawSearchInput {
+  sourceId?: string;
+  recordId?: string;
+  revision?: string;
+  recordKey?: string;
+  pageToken?: string;
   query?: string;
   mode?: SearchMode;
   cursor?: string;
@@ -90,11 +97,13 @@ export interface SiftLightInput extends RawSearchInput {
   symbol?: string;
   maxFilesToParse?: number;
   conceptLimit?: number;
+  ranking?: "exact-first" | "relevance";
   operationId?: string;
   patterns?: AuditPatternInput[];
 }
 
 export interface SiftLightServiceOptions {
+  dataSources?: readonly DataSourceConfig[];
   runRipgrep: RipgrepRunner;
   snapshots?: SnapshotStore;
   summaryFileLimit?: number;
@@ -136,7 +145,11 @@ function capabilitiesResult(inventory: LanguageCapabilityInventory): SiftLightRe
     : "No recognized language source files were found in the requested scope.";
   const partial = inventory.partial ? "partial" : "complete";
   const reason = inventory.reasons.length ? `\nReasons: ${inventory.reasons.join("; ")}` : "";
-  const text = `Project language capability inventory (${partial}; names-only; providers load lazily).\nLanguage-specific modes:\n${languageText}\nLanguage-neutral modes: ${inventory.neutral.map((capability) => `${capability.name} [${capability.availability}; ${capability.load}]`).join(", ")}.${reason}`;
+  const readiness = inventory.searchReadiness;
+  const readinessText = readiness
+    ? `\nSearch readiness:\nvector search: ${readiness.vectorSearch.enabled ? "enabled" : "disabled"}; model assets: ${readiness.vectorSearch.modelInstalled ? "present" : "missing"}; ${readiness.vectorSearch.reason}; config changes require host restart: ${readiness.vectorSearch.restartRequiredAfterConfigChange ? "yes" : "no"}.\nsemantic judge: ${readiness.semanticJudge.configured ? "configured" : "not configured"}; ${readiness.semanticJudge.enabled ? "enabled" : "disabled"}; provider=${readiness.semanticJudge.provider ?? "none"}; remote candidate ranking only=${readiness.semanticJudge.remote ? "yes" : "no"}.`
+    : "";
+  const text = `Project language capability inventory (${partial}; names-only; providers load lazily).\nLanguage-specific modes:\n${languageText}\nLanguage-neutral modes: ${inventory.neutral.map((capability) => `${capability.name} [${capability.availability}; ${capability.load}]`).join(", ")}.${readinessText}${reason}`;
   return {
     text,
     details: {
@@ -218,6 +231,7 @@ function baseDetails(snapshot: SearchSnapshot, mode: SearchMode): SiftLightDetai
       ignoredFileSamples: [...(snapshot.ignoredFileSamples ?? [])],
       searchedFiles: snapshot.searchedFileCount ?? 0,
       reasons: [...(snapshot.filesystemCoverageReasons ?? [])],
+      filesystemErrorSamples: [...(snapshot.filesystemErrorSamples ?? [])],
     },
     ...(snapshot.retention ? { retention: snapshot.retention } : {}),
     scope: searchScope(snapshot.request),
@@ -377,10 +391,12 @@ async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promi
 }
 
 export class SiftLightService {
+  readonly #dataSources: DataSources;
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
   readonly #summaryFileLimit: number;
   readonly #vectorSearchEnabled: boolean;
+  readonly #semanticJudge: SemanticJudgeIntegration | undefined;
   readonly #capabilities = new LanguageCapabilityCatalog();
   readonly #evidence: EvidenceService;
   #lifecycle = new AbortController();
@@ -389,10 +405,12 @@ export class SiftLightService {
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
   constructor(options: SiftLightServiceOptions) {
+    this.#dataSources = new DataSources(options.dataSources);
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
     this.#summaryFileLimit = options.summaryFileLimit ?? DEFAULT_SUMMARY_FILE_LIMIT;
     this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
+    this.#semanticJudge = options.semanticJudge;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
     this.#evidence = new EvidenceService(
       this.#runRipgrep,
@@ -566,6 +584,8 @@ export class SiftLightService {
       throw new CursorError("Invalid cursor. Copy a nonempty cursor from a previous result.");
     }
     const mode = input.mode ?? "auto";
+    if (mode === "source-list" || mode === "source-search" || mode === "source-read")
+      return this.#dataSources.execute(input, signal);
     if (mode === "capabilities") {
       const inventory = await this.#capabilities.inspect({
         cwd,
@@ -575,7 +595,25 @@ export class SiftLightService {
         ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
         ...(signal ? { signal } : {}),
       });
-      return capabilitiesResult(inventory);
+      const modelStatus = await inspectConceptModel();
+      const semanticJudge = this.#semanticJudge;
+      return capabilitiesResult({
+        ...inventory,
+        searchReadiness: {
+          vectorSearch: {
+            enabled: this.#vectorSearchEnabled,
+            modelInstalled: modelStatus.installed,
+            reason: this.#vectorSearchEnabled ? modelStatus.reason : "vectorSearchEnabled is false",
+            restartRequiredAfterConfigChange: true,
+          },
+          semanticJudge: {
+            configured: semanticJudge?.config.enabled === true,
+            enabled: semanticJudge?.runner !== undefined,
+            ...(semanticJudge?.config.provider ? { provider: semanticJudge.config.provider } : {}),
+            remote: semanticJudge?.runner !== undefined,
+          },
+        },
+      });
     }
     if (mode === "audit") return runAuditSearch(input, cwd, this.#runRipgrep, signal);
     const contextBudget = selectContextBudget(input, mode, options.contextBudget);

@@ -1,6 +1,6 @@
 {
   "name": "sift-light",
-  "version": "1.0.3-5",
+  "version": "1.0.3-6",
   "description": "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   "keywords": [
     "ai-agent",
@@ -38,6 +38,7 @@
     "src/syntax-worker.mjs",
     "src/mcp-server.mjs",
     "src/syntax-worker.toml",
+    "src/package-smoke.mjs",
     "README.md",
     "README.zh-CN.md",
     "CONTRIBUTING.md",
@@ -62,8 +63,9 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test ./doc/testing/test",
-    "test:node": "bun run doc/testing/scripts/node-smoke.ts",
+    "test:repo": "bun test ./doc/testing/test",
+    "test": "node src/package-smoke.mjs",
+    "test:node:repo": "bun run doc/testing/scripts/node-smoke.ts",
     "benchmark": "bun run doc/testing/scripts/benchmark.ts",
     "check": "bun run format:check && bun run lint && bun run typecheck && bun run build",
     "pack:check": "bun pm pack --dry-run && bun run scripts/check-npm-publish.ts",
@@ -71,6 +73,7 @@
     "build:concept-worker": "bun run scripts/build-concept-worker.ts",
     "check:concept-worker": "bun run doc/testing/scripts/check-concept-worker.ts",
     "test:concept": "bun run doc/testing/scripts/test-concept.ts",
+    "evaluate:relevance": "bun run doc/testing/scripts/relevance-eval.ts",
     "evaluate:investigations": "bun run doc/testing/scripts/investigation-eval.ts",
     "build:search-plugin": "bun run scripts/build-search-plugin.ts",
     "check:search-plugin": "bun run doc/testing/scripts/check-search-plugin.ts",
@@ -79,7 +82,7 @@
     "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
     "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
     "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
-    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test && bun run test:node && bun run benchmark"
+    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark"
   },
   "dependencies": {
     "@ast-grep/lang-go": "0.0.6",

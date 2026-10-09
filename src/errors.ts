@@ -12,6 +12,10 @@ export interface SiftLightDiagnosticIssue {
   reason: string;
 }
 
+export interface SiftLightDiagnosticRepairExample {
+  label: string;
+  request: Record<string, unknown>;
+}
 export interface SiftLightDiagnosticRecovery {
   action: SiftLightRecoveryAction;
   reason: string;
@@ -23,6 +27,8 @@ export interface SiftLightDiagnosticDetails {
   mode?: string;
   issues: readonly SiftLightDiagnosticIssue[];
   recovery: SiftLightDiagnosticRecovery;
+  acceptedFields?: readonly string[];
+  repairExamples?: readonly SiftLightDiagnosticRepairExample[];
 }
 
 export interface SiftLightDiagnosticError extends Error {

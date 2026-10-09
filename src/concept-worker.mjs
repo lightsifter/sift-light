@@ -462,8 +462,12 @@ async function installConceptModel() {
 
 // src/concept-worker.ts
 var CACHE_IO_CONCURRENCY = 64;
+var activeRequestId;
+var extractor;
+var modelVerified = false;
+var modelLoads = 0;
 function emitProgress(progress) {
-  process.stdout.write(`${JSON.stringify({ type: "progress", ...progress })}
+  process.stdout.write(`${JSON.stringify({ type: "progress", id: activeRequestId, ...progress })}
 `);
 }
 async function readCachedEmbeddings(root, requested, onProgress) {
@@ -475,7 +479,7 @@ async function readCachedEmbeddings(root, requested, onProgress) {
   }
   return cached;
 }
-async function requestFromStdin() {
+async function readSingleRequest() {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of process.stdin) {
@@ -485,7 +489,9 @@ async function requestFromStdin() {
     if (bytes > MAX_CONCEPT_WORKER_INPUT_BYTES)
       throw new Error("Concept worker input exceeds its 64 MiB source protocol budget");
   }
-  const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+function decodeRequest(request) {
   if (!isRecordValue(request) || typeof request.query !== "string" || request.query.length === 0 || request.query.length > 256 || !request.query.isWellFormed() || /[\r\n\0]/u.test(request.query) || !Array.isArray(request.encodedPassages) || request.encodedPassages.some((item) => typeof item !== "string" || item.length === 0 || item.length % 4 !== 0 || item.length > Math.ceil((MAX_CONCEPT_CHARS + 256) * 4 / 3 * 4) + 4 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(item)))
     throw new Error("Invalid concept worker input");
   const encodedPassages = request.encodedPassages.filter((item) => typeof item === "string");
@@ -497,12 +503,16 @@ async function requestFromStdin() {
     throw new Error("Invalid decoded concept worker passage");
   return { query: request.query, passages };
 }
-async function search() {
-  const request = await requestFromStdin();
+async function search(raw) {
+  const request = decodeRequest(raw);
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
   const stagingRoot = process.env.SIFT_LIGHT_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
-  await verifyConceptModel(directory);
+  if (!modelVerified) {
+    await verifyConceptModel(directory);
+    modelVerified = true;
+  }
+  const modelReused = extractor !== undefined;
   const requested = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
     ...request.passages.map((text) => ({
@@ -526,28 +536,27 @@ async function search() {
     env.useFSCache = false;
     env.useBrowserCache = false;
     env.localModelPath = "/";
-    emitProgress({ phase: "model-loading", ...progressContext });
-    const extractor = await pipeline("feature-extraction", directory, {
-      local_files_only: true,
-      dtype: "q8",
-      device: "cpu",
-      session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 }
-    });
-    try {
-      created = await embedConceptInputs(extractor, missing, {
-        onCompletedEmbedding: async (embedding, completed, total) => {
-          try {
-            await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
-          } catch {
-            cacheWriteFailed = true;
-          }
-          emitProgress({ phase: "cache-write", completed, total, ...progressContext });
-        },
-        onBatch: (completed, total) => emitProgress({ phase: "embedding", completed, total, ...progressContext })
+    if (!extractor) {
+      emitProgress({ phase: "model-loading", ...progressContext });
+      extractor = await pipeline("feature-extraction", directory, {
+        local_files_only: true,
+        dtype: "q8",
+        device: "cpu",
+        session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 }
       });
-    } finally {
-      await extractor.dispose();
+      modelLoads += 1;
     }
+    created = await embedConceptInputs(extractor, missing, {
+      onCompletedEmbedding: async (embedding, completed, total) => {
+        try {
+          await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
+        } catch {
+          cacheWriteFailed = true;
+        }
+        emitProgress({ phase: "cache-write", completed, total, ...progressContext });
+      },
+      onBatch: (completed, total) => emitProgress({ phase: "embedding", completed, total, ...progressContext })
+    });
     if (cacheWriteFailed)
       warnings.push("Concept embedding cache write failed; ranking completed but some work may repeat");
   }
@@ -575,6 +584,9 @@ async function search() {
   }
   process.stdout.write(JSON.stringify({
     type: "result",
+    id: activeRequestId,
+    modelLoads,
+    modelReused,
     scores,
     cacheHits: cached.filter(Boolean).length,
     cacheMisses: missing.length,
@@ -584,11 +596,49 @@ async function search() {
     warnings: [...new Set(warnings)],
     peakRssBytes: process.resourceUsage().maxRSS * 1024,
     modelBytes: CONCEPT_ASSETS.reduce((sum, asset) => sum + asset.bytes, 0)
-  }));
+  }) + `
+`);
 }
-if (process.argv.includes("--install-model"))
-  await installConceptModel();
-else if (process.argv.includes("--infer"))
-  await search();
-else
-  throw new Error("Usage: sift-light-model --install-model");
+async function serve() {
+  let buffer = Buffer.alloc(0);
+  for await (const chunk of process.stdin) {
+    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+    if (buffer.length > MAX_CONCEPT_WORKER_INPUT_BYTES)
+      throw new Error("Concept request frame exceeds 64 MiB");
+    let newline = buffer.indexOf(10);
+    while (newline >= 0) {
+      const line = buffer.subarray(0, newline);
+      buffer = buffer.subarray(newline + 1);
+      const raw = JSON.parse(line.toString("utf8"));
+      if (!isRecordValue(raw) || typeof raw.id !== "string" || !/^[a-f0-9-]{36}$/u.test(raw.id))
+        throw new Error("Invalid concept request identity");
+      activeRequestId = raw.id;
+      try {
+        await search(raw);
+      } catch (error) {
+        process.stdout.write(JSON.stringify({
+          type: "error",
+          id: activeRequestId,
+          message: error instanceof Error ? error.message.slice(0, 512) : "Concept inference failed"
+        }) + `
+`);
+        return;
+      }
+      newline = buffer.indexOf(10);
+    }
+  }
+  if (buffer.length)
+    throw new Error("Incomplete concept request frame");
+}
+try {
+  if (process.argv.includes("--install-model"))
+    await installConceptModel();
+  else if (process.argv.includes("--infer"))
+    await search(await readSingleRequest());
+  else if (process.argv.includes("--serve"))
+    await serve();
+  else
+    throw new Error("Usage: sift-light-model --install-model");
+} finally {
+  await extractor?.dispose();
+}

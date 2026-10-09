@@ -3,6 +3,7 @@ import {
   type SiftLightDiagnosticDetails,
   type SiftLightDiagnosticIssue,
   type SiftLightDiagnosticRecovery,
+  type SiftLightDiagnosticRepairExample,
   type SiftLightRecoveryAction,
 } from "./errors.js";
 
@@ -18,6 +19,7 @@ export function boundedDisplay(value: string, maximum = MAX_REQUEST_DISPLAY_CHAR
 export type RequestIssue = SiftLightDiagnosticIssue;
 export type RequestRecoveryAction = SiftLightRecoveryAction;
 export type RequestRecovery = SiftLightDiagnosticRecovery;
+export type RequestRepairExample = SiftLightDiagnosticRepairExample;
 export type RequestContractDetails = SiftLightDiagnosticDetails;
 
 /** A typed boundary error; callers can project it without parsing message text. */
