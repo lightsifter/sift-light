@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import type { DataSourceConfig } from "./data-source-config.js";
 import {
   DEFAULT_MCP_HOST,
   DEFAULT_MCP_MAX_SESSIONS,
@@ -49,12 +50,14 @@ async function runHttpServer(
   outputMode: SiftLightMcpOutputMode,
   semanticJudge: SemanticJudgeIntegration | undefined,
   vectorSearchEnabled: boolean,
+  dataSources: DataSourceConfig[],
 ): Promise<void> {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65_535),
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled),
+    createService: () =>
+      createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources),
     maxSessions: environmentInteger(
       "SIFT_LIGHT_MCP_MAX_SESSIONS",
       DEFAULT_MCP_MAX_SESSIONS,
@@ -103,11 +106,13 @@ async function runStdioServer(
   outputMode: SiftLightMcpOutputMode,
   semanticJudge: SemanticJudgeIntegration | undefined,
   vectorSearchEnabled: boolean,
+  dataSources: DataSourceConfig[],
 ): Promise<void> {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled),
+    createService: () =>
+      createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources),
   });
   process.stderr.write("sift-light MCP serving one local client over stdio\n");
   process.stderr.write(`sift-light MCP working directory: ${running.cwd}\n`);
@@ -135,16 +140,16 @@ async function main(): Promise<void> {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled } = await createMcpSearchFeatures();
+  const { semanticJudge, vectorSearchEnabled, dataSources } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(
     `sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}\n`,
   );
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled);
+    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
     return;
   }
-  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled);
+  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
 }
 
 try {

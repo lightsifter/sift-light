@@ -193,6 +193,7 @@ export async function registerOmpSiftLightExtension(
       runRipgrep: createRipgrepRunner(),
       structure: createCtagsStructureProvider(),
       vectorSearchEnabled: resolvedConfig.vectorSearchEnabled === true,
+      dataSources: resolvedConfig.dataSources ?? [],
       semanticJudge,
     }),
   );

@@ -6,6 +6,9 @@ import {
 } from "./language-capability-definitions.js";
 
 export const SIFT_LIGHT_MODES = [
+  "source-list",
+  "source-search",
+  "source-read",
   "audit",
   "auto",
   "summary",
@@ -58,6 +61,9 @@ const ordinaryFields = [
 ] as const satisfies readonly RequestField[];
 
 export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]> = {
+  "source-list": commonFields,
+  "source-search": [...commonFields, "sourceId", "query", "limit", "pageToken"],
+  "source-read": [...commonFields, "sourceId", "recordId", "revision", "recordKey"],
   audit: [...commonFields, "patterns", ...sourceFilters, "ignorePolicy"],
   auto: ordinaryFields,
   summary: ordinaryFields,
@@ -104,7 +110,14 @@ export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]>
   ],
   structure: [...commonFields, "pattern", ...sourceFilters, "maxFilesToParse"],
   concept: [...commonFields, "query", ...sourceFilters, "maxFilesToParse"],
-  hybrid: [...commonFields, "query", ...sourceFilters, "conceptLimit", "maxFilesToParse"],
+  hybrid: [
+    ...commonFields,
+    "query",
+    ...sourceFilters,
+    "conceptLimit",
+    "maxFilesToParse",
+    "ranking",
+  ],
   validate: [...commonFields, "cursor", "matchIndex"],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],

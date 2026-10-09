@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3-6 — 2026-10-09
+
+- Add bounded, read-only configured data-source adapters with explicit HTTPS/loopback validation, credential references and revision-aware source reads.
+- Improve hybrid relevance ranking with request-scoped BM25 and semantic rank fusion, identifier-declaration candidates and distinct passage handling.
+- Harden MCP/request-contract integration and add a packaged MCP smoke test so the published artifact is exercised through the real stdio transport.
+
 ## 1.0.3-5 — 2026-10-07
 
 - Update the MCP SDK to 1.31.0 and Transformers.js to 4.3.1 to remove the dependency vulnerabilities reported in [#111](https://github.com/lightsifter/sift-light/issues/111), including the old ONNX proxy/logging dependency chain. Refresh compatible SDK transitive dependencies in the lockfile.

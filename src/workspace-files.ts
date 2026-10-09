@@ -70,6 +70,9 @@ export async function listWorkspaceFiles(
         args: [
           "--no-config",
           "--files",
+          // The admission cap must select the same prefix when the generation is re-enumerated.
+          "--sort",
+          "path",
           "--null",
           ...(options.ignore === false ? ["--no-ignore"] : []),
           ...(options.ignoreParents === false ? ["--no-ignore-parent"] : []),

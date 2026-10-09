@@ -42,6 +42,9 @@ export const MAX_SOURCE_REVISION_CONCURRENCY = 16;
 export const MAX_SOURCE_REVISION_FILES = 50_000;
 
 export type SearchMode =
+  | "source-list"
+  | "source-search"
+  | "source-read"
   | "audit"
   | "concept"
   | "hybrid"
@@ -231,6 +234,7 @@ export interface SearchScan {
   snapshotComplete: boolean;
   filesystemCoverage?: "complete" | "policy-filtered" | "partial";
   filesystemCoverageReasons?: string[];
+  filesystemErrorSamples?: string[];
   ignoredFileCount?: number;
   ignoredFileSamples?: string[];
   searchedFileCount?: number;
@@ -275,6 +279,7 @@ export interface ResultStatistics {
 }
 
 export interface SiftLightDetails {
+  external?: import("./data-sources.js").ExternalEvidence;
   inspectRequest?: SiftLightInput;
   version: 1;
   mode: SearchMode;
@@ -327,6 +332,7 @@ export interface SiftLightDetails {
     ignoredFileSamples: string[];
     searchedFiles: number;
     reasons: string[];
+    filesystemErrorSamples: string[];
   };
 }
 

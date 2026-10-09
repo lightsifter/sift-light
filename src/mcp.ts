@@ -1,3 +1,4 @@
+import type { DataSourceConfig } from "./data-source-config.js";
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
@@ -94,6 +95,7 @@ export interface SiftLightMcpService {
 export function createDefaultSiftLightMcpService(
   semanticJudge?: SemanticJudgeIntegration,
   vectorSearchEnabled = false,
+  dataSources: readonly DataSourceConfig[] = [],
 ): SiftLightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
@@ -101,6 +103,7 @@ export function createDefaultSiftLightMcpService(
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
     vectorSearchEnabled,
+    dataSources,
     semanticJudge: resolvedSemanticJudge,
   });
 }

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { SiftLightError } from "./errors.js";
@@ -47,6 +48,38 @@ export function conceptModelDirectory(): string {
     process.env.SIFT_LIGHT_MODEL_DIR ?? join(homedir(), ".cache", "sift-light", "models"),
     CONCEPT_REVISION,
   );
+}
+
+export interface ConceptModelStatus {
+  installed: boolean;
+  reason: string;
+}
+
+/** Check model asset presence without hashing or starting the inference worker. */
+export async function inspectConceptModel(
+  directory = conceptModelDirectory(),
+): Promise<ConceptModelStatus> {
+  for (const asset of CONCEPT_ASSETS) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- stop at the first deterministic asset diagnostic.
+      const information = await stat(join(directory, asset.path));
+      if (!information.isFile() || information.size !== asset.bytes)
+        return {
+          installed: false,
+          reason: `local concept model asset ${asset.path} is missing or has an unexpected size`,
+        };
+    } catch {
+      return {
+        installed: false,
+        reason: `local concept model asset ${asset.path} is missing`,
+      };
+    }
+  }
+  return {
+    installed: true,
+    reason:
+      "expected local model assets are present; full integrity is checked when the worker starts",
+  };
 }
 
 export function conceptCacheDirectory(): string {

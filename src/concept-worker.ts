@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { env, pipeline } from "@huggingface/transformers";
+import { env, pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
 import { isUtf8 } from "node:buffer";
 import {
   conceptEmbeddingKey,
@@ -27,6 +27,10 @@ import { installConceptModel } from "./concept-setup.js";
 import { isRecordValue } from "./record-value.js";
 
 const CACHE_IO_CONCURRENCY = 64;
+let activeRequestId: string | undefined;
+let extractor: FeatureExtractionPipeline | undefined;
+let modelVerified = false;
+let modelLoads = 0;
 
 interface WorkerProgress {
   phase: "cache-read" | "model-loading" | "embedding" | "cache-write" | "cache-cleanup";
@@ -37,7 +41,9 @@ interface WorkerProgress {
 }
 
 function emitProgress(progress: WorkerProgress): void {
-  process.stdout.write(`${JSON.stringify({ type: "progress", ...progress })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ type: "progress", id: activeRequestId, ...progress })}\n`,
+  );
 }
 
 async function readCachedEmbeddings(
@@ -59,7 +65,7 @@ async function readCachedEmbeddings(
   return cached;
 }
 
-async function requestFromStdin(): Promise<{ query: string; passages: string[] }> {
+async function readSingleRequest(): Promise<unknown> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const chunk of process.stdin) {
@@ -69,7 +75,10 @@ async function requestFromStdin(): Promise<{ query: string; passages: string[] }
     if (bytes > MAX_CONCEPT_WORKER_INPUT_BYTES)
       throw new Error("Concept worker input exceeds its 64 MiB source protocol budget");
   }
-  const request: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function decodeRequest(request: unknown): { query: string; passages: string[] } {
   if (
     !isRecordValue(request) ||
     typeof request.query !== "string" ||
@@ -104,12 +113,16 @@ async function requestFromStdin(): Promise<{ query: string; passages: string[] }
   return { query: request.query, passages };
 }
 
-async function search(): Promise<void> {
-  const request = await requestFromStdin();
+async function search(raw: unknown): Promise<void> {
+  const request = decodeRequest(raw);
   const directory = conceptModelDirectory();
   const cacheRoot = conceptCacheDirectory();
   const stagingRoot = process.env.SIFT_LIGHT_CONCEPT_CACHE_STAGING_DIR ?? cacheRoot;
-  await verifyConceptModel(directory);
+  if (!modelVerified) {
+    await verifyConceptModel(directory);
+    modelVerified = true;
+  }
+  const modelReused = extractor !== undefined;
   const requested: PendingConceptEmbedding[] = [
     { key: conceptEmbeddingKey("query", request.query), role: "query", text: request.query },
     ...request.passages.map((text): PendingConceptEmbedding => ({
@@ -135,29 +148,28 @@ async function search(): Promise<void> {
     env.useFSCache = false;
     env.useBrowserCache = false;
     env.localModelPath = "/";
-    emitProgress({ phase: "model-loading", ...progressContext });
-    const extractor = await pipeline("feature-extraction", directory, {
-      local_files_only: true,
-      dtype: "q8",
-      device: "cpu",
-      session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 },
-    });
-    try {
-      created = await embedConceptInputs(extractor, missing, {
-        onCompletedEmbedding: async (embedding, completed, total) => {
-          try {
-            await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
-          } catch {
-            cacheWriteFailed = true;
-          }
-          emitProgress({ phase: "cache-write", completed, total, ...progressContext });
-        },
-        onBatch: (completed, total) =>
-          emitProgress({ phase: "embedding", completed, total, ...progressContext }),
+    if (!extractor) {
+      emitProgress({ phase: "model-loading", ...progressContext });
+      extractor = await pipeline("feature-extraction", directory, {
+        local_files_only: true,
+        dtype: "q8",
+        device: "cpu",
+        session_options: { intraOpNumThreads: 4, interOpNumThreads: 1 },
       });
-    } finally {
-      await extractor.dispose();
+      modelLoads += 1;
     }
+    created = await embedConceptInputs(extractor, missing, {
+      onCompletedEmbedding: async (embedding, completed, total) => {
+        try {
+          await writeConceptEmbedding(cacheRoot, embedding, stagingRoot);
+        } catch {
+          cacheWriteFailed = true;
+        }
+        emitProgress({ phase: "cache-write", completed, total, ...progressContext });
+      },
+      onBatch: (completed, total) =>
+        emitProgress({ phase: "embedding", completed, total, ...progressContext }),
+    });
     if (cacheWriteFailed)
       warnings.push(
         "Concept embedding cache write failed; ranking completed but some work may repeat",
@@ -189,6 +201,9 @@ async function search(): Promise<void> {
   process.stdout.write(
     JSON.stringify({
       type: "result",
+      id: activeRequestId,
+      modelLoads,
+      modelReused,
       scores,
       cacheHits: cached.filter(Boolean).length,
       cacheMisses: missing.length,
@@ -201,10 +216,49 @@ async function search(): Promise<void> {
       warnings: [...new Set(warnings)],
       peakRssBytes: process.resourceUsage().maxRSS * 1024,
       modelBytes: CONCEPT_ASSETS.reduce((sum, asset) => sum + asset.bytes, 0),
-    }),
+    }) + "\n",
   );
 }
 
-if (process.argv.includes("--install-model")) await installConceptModel();
-else if (process.argv.includes("--infer")) await search();
-else throw new Error("Usage: sift-light-model --install-model");
+async function serve(): Promise<void> {
+  let buffer = Buffer.alloc(0);
+  for await (const chunk of process.stdin) {
+    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+    if (buffer.length > MAX_CONCEPT_WORKER_INPUT_BYTES)
+      throw new Error("Concept request frame exceeds 64 MiB");
+    let newline = buffer.indexOf(10);
+    while (newline >= 0) {
+      const line = buffer.subarray(0, newline);
+      buffer = buffer.subarray(newline + 1);
+      const raw: unknown = JSON.parse(line.toString("utf8"));
+      if (!isRecordValue(raw) || typeof raw.id !== "string" || !/^[a-f0-9-]{36}$/u.test(raw.id))
+        throw new Error("Invalid concept request identity");
+      activeRequestId = raw.id;
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- exactly one inference request is active per resident worker.
+        await search(raw);
+      } catch (error) {
+        process.stdout.write(
+          JSON.stringify({
+            type: "error",
+            id: activeRequestId,
+            message:
+              error instanceof Error ? error.message.slice(0, 512) : "Concept inference failed",
+          }) + "\n",
+        );
+        return;
+      }
+      newline = buffer.indexOf(10);
+    }
+  }
+  if (buffer.length) throw new Error("Incomplete concept request frame");
+}
+
+try {
+  if (process.argv.includes("--install-model")) await installConceptModel();
+  else if (process.argv.includes("--infer")) await search(await readSingleRequest());
+  else if (process.argv.includes("--serve")) await serve();
+  else throw new Error("Usage: sift-light-model --install-model");
+} finally {
+  await extractor?.dispose();
+}

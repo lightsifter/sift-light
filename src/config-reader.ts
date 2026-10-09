@@ -1,3 +1,4 @@
+import { parseDataSources, type DataSourceConfig } from "./data-source-config.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -10,6 +11,7 @@ export type SearchEnforcementMode = "hard" | "prefer" | "off";
 export const SIFT_LIGHT_ENFORCEMENT_ENV = "SIFT_LIGHT_ENFORCE_SEARCH";
 
 export interface SiftLightConfig {
+  dataSources?: DataSourceConfig[];
   locale: SiftLightLocale;
   enforceSearch?: SearchEnforcementMode;
   vectorSearchEnabled?: boolean;
@@ -50,6 +52,7 @@ export const DEFAULT_SIFT_LIGHT_CONFIG: Readonly<SiftLightConfig> = {
 };
 
 interface RawSiftLightConfig {
+  dataSources?: unknown;
   locale?: unknown;
   enforceSearch?: unknown;
   vectorSearchEnabled?: unknown;
@@ -224,11 +227,14 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
     throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
   }
   const unknown = Object.keys(value).filter(
-    (key) => !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge"].includes(key),
+    (key) =>
+      !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge", "dataSources"].includes(
+        key,
+      ),
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled and semanticJudge are accepted`,
+      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge and dataSources are accepted`,
     );
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
@@ -245,6 +251,9 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
     vectorSearchEnabled:
       vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path),
+    ...(value.dataSources === undefined
+      ? {}
+      : { dataSources: parseDataSources(value.dataSources) }),
   };
 }
 

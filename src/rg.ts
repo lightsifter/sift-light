@@ -440,6 +440,13 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       let ignoredFileSamples: string[] = [];
       let filesystemCoverage: SearchScan["filesystemCoverage"] = "complete";
       const filesystemCoverageReasons = new Set<string>();
+      const filesystemErrorSamples = new Set<string>();
+      const noteFilesystemDiagnostics = (diagnostics: readonly { message: string }[]): void => {
+        for (const diagnostic of diagnostics) {
+          if (filesystemErrorSamples.size >= 20) break;
+          filesystemErrorSamples.add(boundedRipgrepDiagnostic(diagnostic.message, request.redact));
+        }
+      };
       if (before.enumerationTruncated) {
         filesystemCoverage = "partial";
         filesystemCoverageReasons.add(
@@ -478,6 +485,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         if (allCandidates.unreadable.length > 0) {
           filesystemCoverage = "partial";
           retention.noteLimit(describeUnreadableDiagnostics(allCandidates.unreadable));
+          noteFilesystemDiagnostics(allCandidates.unreadable);
         }
         if (allCandidates.enumerationTruncated) {
           filesystemCoverage = "partial";
@@ -495,8 +503,10 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
         throw new SiftLightError(describeUnreadableDiagnostics(before.unreadable));
       candidateRevisions = before.revisions;
-      if (before.unreadable.length > 0)
+      if (before.unreadable.length > 0) {
         retention.noteLimit(describeUnreadableDiagnostics(before.unreadable));
+        noteFilesystemDiagnostics(before.unreadable);
+      }
       if (before.unreadable.length > 0) filesystemCoverage = "partial";
       if (before.unreadable.length > 0)
         filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
@@ -520,15 +530,27 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
       const diagnostics = classifyRipgrepDiagnostics(stderr);
       const inputError = createRipgrepInputError(stderr, request.redact);
       if (inputError) throw inputError;
+      const filesystemDiagnostics = [...diagnostics.unreadable, ...diagnostics.recoverable];
       if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
         throw new SiftLightError(describeUnreadableDiagnostics(diagnostics.unreadable));
-      if (diagnostics.unreadable.length > 0)
-        retention.noteLimit(describeUnreadableDiagnostics(diagnostics.unreadable));
-      if (diagnostics.unreadable.length > 0) filesystemCoverage = "partial";
-      if (diagnostics.unreadable.length > 0)
-        filesystemCoverageReasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
-      if (code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0)) {
+      if (filesystemDiagnostics.length > 0) {
+        retention.noteLimit(describeUnreadableDiagnostics(filesystemDiagnostics));
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(describeUnreadableDiagnostics(filesystemDiagnostics));
+        noteFilesystemDiagnostics(filesystemDiagnostics);
+      }
+      if (code === 2 && (diagnostics.other.length > 0 || filesystemDiagnostics.length === 0)) {
         throw new SiftLightError(stderr.trim() || `ripgrep exited with status ${String(code)}`);
+      }
+      if (
+        (before.unreadable.length > 0 || filesystemDiagnostics.length > 0) &&
+        totalMatches === 0 &&
+        before.revisions.size === 0
+      ) {
+        const diagnosticsForFailure = [...before.unreadable, ...filesystemDiagnostics];
+        throw new SiftLightError(
+          `ripgrep traversal was incomplete and produced no reliable match result; ${describeUnreadableDiagnostics(diagnosticsForFailure)}`,
+        );
       }
       await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
       const retainedPaths = new Set(
@@ -552,6 +574,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           !modificationTimeFilterIncomplete &&
           retention.details.reasons.length === 0,
         filesystemCoverage,
+        filesystemErrorSamples: [...filesystemErrorSamples],
         filesystemCoverageReasons: [...filesystemCoverageReasons],
         ignoredFileCount,
         ignoredFileSamples,

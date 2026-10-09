@@ -9,11 +9,19 @@ export interface RipgrepUnreadableDiagnostic {
 
 export interface RipgrepDiagnostics {
   unreadable: RipgrepUnreadableDiagnostic[];
+  recoverable: RipgrepUnreadableDiagnostic[];
   other: string[];
 }
 
 const UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
 const UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
+const RECOVERABLE_FILESYSTEM_CODE = /\(os error (?:4|5|22)\)\s*$/iu;
+const RECOVERABLE_FILESYSTEM_SUFFIXES = [
+  /:\s+Invalid argument(?:\s+\(os error 22\))?\s*$/iu,
+  /:\s+Interrupted system call\s*$/iu,
+  /:\s+Input\/output error(?:\s+\(os error 5\))?\s*$/iu,
+  /:\s+No message available on STREAM\s*$/iu,
+] as const;
 const INVALID_REGEX_DIAGNOSTIC = /(?:^|\n)\s*(?:rg:\s*)?regex parse error:/iu;
 const MISSING_PATH_DIAGNOSTIC =
   /(?:IO error for operation on .+?:\s*)?No such file or directory \(os error 2\)\s*$/iu;
@@ -84,6 +92,7 @@ function unreadablePath(line: string, suffix: RegExp): string | undefined {
   const match = suffix.exec(line);
   if (!match || match.index === undefined) return undefined;
   const prefix = line.slice(0, match.index).trim();
+  if (prefix === "rg") return undefined;
   const separator = prefix.indexOf(": ");
   const path = (separator < 0 ? prefix : prefix.slice(separator + 2)).trim();
   return path.replace(/^['"]|['"]$/gu, "") || undefined;
@@ -91,16 +100,25 @@ function unreadablePath(line: string, suffix: RegExp): string | undefined {
 
 export function classifyRipgrepDiagnostics(stderr: string): RipgrepDiagnostics {
   const unreadable: RipgrepUnreadableDiagnostic[] = [];
+  const recoverable: RipgrepUnreadableDiagnostic[] = [];
   const other: string[] = [];
   for (const line of diagnosticLines(stderr)) {
     const path = unreadablePath(line, UNREADABLE_SUFFIX);
     if (path !== undefined || UNREADABLE_CODE.test(line)) {
       unreadable.push({ message: line, ...(path ? { path } : {}) });
-    } else {
-      other.push(line);
+      continue;
     }
+    const recoverableSuffix = RECOVERABLE_FILESYSTEM_SUFFIXES.find((suffix) => suffix.test(line));
+    if (recoverableSuffix || RECOVERABLE_FILESYSTEM_CODE.test(line)) {
+      const recoverablePath = recoverableSuffix
+        ? unreadablePath(line, recoverableSuffix)
+        : undefined;
+      recoverable.push({ message: line, ...(recoverablePath ? { path: recoverablePath } : {}) });
+      continue;
+    }
+    other.push(line);
   }
-  return { unreadable, other };
+  return { unreadable, recoverable, other };
 }
 
 export function hasRequestedRootUnreadable(

@@ -1,3 +1,4 @@
+import type { DataSourceConfig } from "./data-source-config.js";
 import {
   DEFAULT_SIFT_LIGHT_CONFIG,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
@@ -22,11 +23,16 @@ function configuredPath(environment: NodeJS.ProcessEnv): string | undefined {
  */
 export async function createMcpSearchFeatures(
   environment: NodeJS.ProcessEnv = process.env,
-): Promise<{ semanticJudge: SemanticJudgeIntegration; vectorSearchEnabled: boolean }> {
+): Promise<{
+  semanticJudge: SemanticJudgeIntegration;
+  vectorSearchEnabled: boolean;
+  dataSources: DataSourceConfig[];
+}> {
   const path = configuredPath(environment);
   if (!path)
     return {
       semanticJudge: createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG),
+      dataSources: [],
       vectorSearchEnabled: DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled === true,
     };
 
@@ -34,6 +40,7 @@ export async function createMcpSearchFeatures(
   return {
     semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
     vectorSearchEnabled: config.vectorSearchEnabled === true,
+    dataSources: config.dataSources ?? [],
   };
 }
 

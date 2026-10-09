@@ -37,6 +37,21 @@ export interface LanguageCapabilityEntry {
   readonly evidence: "inventory" | "target-extension";
 }
 
+export interface SearchReadiness {
+  readonly vectorSearch: {
+    readonly enabled: boolean;
+    readonly modelInstalled: boolean;
+    readonly reason: string;
+    readonly restartRequiredAfterConfigChange: boolean;
+  };
+  readonly semanticJudge: {
+    readonly configured: boolean;
+    readonly enabled: boolean;
+    readonly provider?: string;
+    readonly remote: boolean;
+  };
+}
+
 export interface LanguageCapabilityRequest {
   readonly cwd: string;
   readonly path?: string;
@@ -56,6 +71,7 @@ export interface LanguageCapabilityInventory {
   /** Deduplicated implementation facts, referenced by capability id above. */
   readonly capabilityDefinitions: readonly LanguageCapabilitySpec[];
   readonly neutral: readonly NeutralCapabilitySpec[];
+  readonly searchReadiness?: SearchReadiness;
 }
 
 function normalizeLists(values: readonly string[] | undefined): string[] {

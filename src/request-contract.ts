@@ -6,6 +6,7 @@ import {
   MAX_REQUEST_RECOVERY_BYTES,
   RequestContractError,
   type RequestIssue,
+  type RequestRepairExample,
   boundedDisplay,
 } from "./request-contract-error.js";
 import {
@@ -38,6 +39,7 @@ export type {
   RequestContractDetails,
   RequestIssue,
   RequestRecovery,
+  RequestRepairExample,
 } from "./request-contract-error.js";
 
 /**
@@ -65,6 +67,108 @@ function inputModeLabel(input: Record<string, unknown>): string | undefined {
   return typeof input.mode === "string" ? input.mode.slice(0, 128) : undefined;
 }
 
+const CONTENT_REPAIR_FIELDS: readonly RequestField[] = [
+  "path",
+  "glob",
+  "exclude",
+  "hidden",
+  "ignorePolicy",
+  "literal",
+  "ignoreCase",
+  "wholeWord",
+  "modifiedAfter",
+  "modifiedBefore",
+  "context",
+  "limit",
+  "scope",
+];
+const FILE_REPAIR_FIELDS: readonly RequestField[] = [
+  "path",
+  "glob",
+  "exclude",
+  "hidden",
+  "ignorePolicy",
+  "limit",
+  "modifiedAfter",
+  "modifiedBefore",
+];
+const CONCEPT_REPAIR_FIELDS: readonly RequestField[] = [
+  "path",
+  "glob",
+  "exclude",
+  "hidden",
+  "maxFilesToParse",
+];
+
+function copyDefinedFields(
+  input: Record<string, unknown>,
+  fields: readonly RequestField[],
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (input[field] !== undefined) result[field] = input[field];
+  }
+  return result;
+}
+
+function repairExamplesForFields(
+  input: Record<string, unknown>,
+  mode: SiftLightMode,
+  invalid: readonly string[],
+): readonly RequestRepairExample[] {
+  if (input.redact === true && containsSensitiveText(input)) return [];
+  const examples: RequestRepairExample[] = [];
+  const query = typeof input.query === "string" && input.query.trim() ? input.query : undefined;
+  const pattern =
+    typeof input.pattern === "string" && input.pattern.trim() ? input.pattern : undefined;
+  if (invalid.includes("query") && query !== undefined) {
+    if (mode === "auto" || mode === "matches" || mode === "summary") {
+      const contentMode = mode === "summary" ? "summary" : "matches";
+      examples.push({
+        label: "按内容查找",
+        request: {
+          mode: contentMode,
+          pattern: query,
+          ...copyDefinedFields(input, CONTENT_REPAIR_FIELDS),
+          literal: true,
+        },
+      });
+      examples.push({
+        label: "按文件名查找",
+        request: { mode: "files", query, ...copyDefinedFields(input, FILE_REPAIR_FIELDS) },
+      });
+      if (mode === "auto")
+        examples.push({
+          label: "按语义查找",
+          request: { mode: "concept", query, ...copyDefinedFields(input, CONCEPT_REPAIR_FIELDS) },
+        });
+    }
+  }
+  if (invalid.includes("pattern") && pattern !== undefined && mode === "inspect") {
+    examples.push({
+      label: "先查内容位置",
+      request: {
+        mode: "matches",
+        pattern,
+        ...copyDefinedFields(input, CONTENT_REPAIR_FIELDS),
+        literal: true,
+      },
+    });
+  }
+  if (invalid.includes("literal") && pattern !== undefined && mode !== "files") {
+    examples.push({
+      label: "按原文查找",
+      request: {
+        mode: "matches",
+        pattern,
+        ...copyDefinedFields(input, CONTENT_REPAIR_FIELDS),
+        literal: true,
+      },
+    });
+  }
+  return examples.slice(0, 4);
+}
+
 function outlineCapability(
   path: string | undefined,
   resolvedDocument = false,
@@ -80,12 +184,18 @@ function outlineCapability(
   };
 }
 
+interface CapabilityRecoveryOptions {
+  acceptedFields?: readonly string[];
+  repairExamples?: readonly RequestRepairExample[];
+}
+
 function capabilityError(
   code: string,
   mode: string | undefined,
   field: string,
   reason: string,
   message: string,
+  options: CapabilityRecoveryOptions = {},
 ): RequestContractError {
   return new RequestContractError(
     {
@@ -93,6 +203,8 @@ function capabilityError(
       ...(mode ? { mode } : {}),
       issues: [{ field, reason }],
       recovery: { action: "choose-capability", reason },
+      ...(options.acceptedFields ? { acceptedFields: options.acceptedFields } : {}),
+      ...(options.repairExamples?.length ? { repairExamples: options.repairExamples } : {}),
     },
     message,
   );
@@ -192,6 +304,8 @@ function fieldsError(
       reason: `${String(omitted)} additional fields are not accepted`,
     });
   const visibleFields = visibleInvalid.map((field) => boundedField(field)).join(", ");
+  const acceptedFields = modeFields(mode).map((field) => boundedField(field));
+  const repairExamples = repairExamplesForFields(input, mode, invalid);
   const reason =
     omitted > 0
       ? `mode=${mode} does not accept ${visibleFields} and ${String(omitted)} additional field(s)`
@@ -202,17 +316,29 @@ function fieldsError(
   // puzzling rejection with the rule and the valid names.
   const nestedModeObject = invalid.includes(mode);
   const flatRule = nestedModeObject
-    ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${modeFields(mode).join(", ")}.`
+    ? `Fields are flat: pass them at the top level, not inside a per-mode object. mode=${mode} accepts: ${acceptedFields.join(", ")}.`
     : "";
   const filesPatternRule =
     mode === "files" && invalid.includes("pattern")
       ? "For filename or path discovery, put the literal name text in query; pattern is a content-search regex, so check any regex syntax before copying it."
       : "";
+  const inspectPatternRule =
+    mode === "inspect" && invalid.includes("pattern")
+      ? " Inspect opens only known source positions; no semantics-preserving automatic request is available. First search with pattern using mode=matches, then pass the returned path and line to inspect."
+      : "";
+  const acceptedRule = `Accepted fields for mode=${mode}: ${acceptedFields.join(", ")}.`;
+  const repairRule = `${
+    repairExamples.length
+      ? "Copy one of repairExamples when it matches the intended task."
+      : "No safe repair example was generated for this request; no semantics-preserving automatic request is available."
+  }${inspectPatternRule}`;
   return new RequestContractError(
     {
       code: "E_MODE_FIELDS",
       mode,
       issues,
+      acceptedFields,
+      ...(repairExamples.length ? { repairExamples } : {}),
       recovery: nextRequest
         ? {
             action: "retry",
@@ -225,19 +351,14 @@ function fieldsError(
           }
         : {
             action: "manual",
-            reason: [
-              reason,
-              filesPatternRule ||
-                "Choose the mode explicitly or remove unsupported fields without changing the requested scope.",
-              flatRule,
-            ]
+            reason: [reason, acceptedRule, filesPatternRule || repairRule, flatRule]
               .filter(Boolean)
               .join(" "),
           },
     },
     nextRequest
-      ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}.`
-      : `${reason}; no semantics-preserving automatic request is available. ${filesPatternRule || flatRule || "Check the mode's accepted fields."}`,
+      ? `${reason}; ${plainFilePatternRecovery(mode, input, invalid) ? "move plain filename text to query" : "retry the exact nextRequest"}. ${acceptedRule}`
+      : `${reason}; ${acceptedRule} ${filesPatternRule || repairRule || flatRule}`,
   );
 }
 
@@ -453,6 +574,10 @@ export function validateRequestContract(input: SiftLightInput): void {
       "query",
       "query is ambiguous without an explicit discovery or semantic mode",
       'Use mode="files" for filename discovery or mode="concept" for semantic discovery',
+      {
+        acceptedFields: modeFields("auto"),
+        repairExamples: repairExamplesForFields(raw, mode, ["query"]),
+      },
     );
 
   if (mode === "files" && raw.scope === "expand")
