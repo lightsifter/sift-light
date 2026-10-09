@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.5-1 — 2026-10-09
+
+- Fix OMP plugin-cache searches when the generated bundle cannot resolve its platform ripgrep package. Bundled ripgrep remains preferred; an executable `rg` on `PATH` is now a bounded compatibility fallback, while explicit `SIFT_LIGHT_RG_PATH` values retain strict absolute-path and executable validation.
+- Document the fallback and update the packaged Pi, OMP, MCP and Codex plugin artifacts.
+
 ## 1.0.3-6 — 2026-10-09
 
 - Add bounded, read-only configured data-source adapters with explicit HTTPS/loopback validation, credential references and revision-aware source reads.

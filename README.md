@@ -98,7 +98,7 @@ MCP needs Node.js 22.19+. Pi needs Pi 0.84.3+ with Node.js 22.19+ or Bun 1.4+. T
 
 When upgrading from a release published under an earlier package identity, remove that earlier plugin and MCP registration before installing sift-light. This avoids loading two search tools or enforcement hooks in the same host.
 
-To use your own ripgrep, set `SIFT_LIGHT_RG_PATH` to the absolute path of the executable in the MCP server or Pi process environment, then restart the host. It applies to content, filename and Git-source searches. Paths containing spaces work; aliases, shell functions, relative paths and `~` are not expanded. An unusable value fails explicitly instead of silently choosing another executable. If the bundled engine is missing, reinstall with optional dependencies enabled or point this setting at your own binary.
+To use your own ripgrep, set `SIFT_LIGHT_RG_PATH` to the absolute path of the executable in the MCP server or Pi process environment, then restart the host. It applies to content, filename and Git-source searches. Paths containing spaces work; aliases, shell functions, relative paths and `~` are not expanded. An unusable value fails explicitly instead of silently choosing another executable. If the bundled engine is missing, sift-light uses an executable `rg` found on `PATH` as a compatibility fallback; otherwise reinstall with optional dependencies enabled or point this setting at your own binary.
 
 ### Pi
 
