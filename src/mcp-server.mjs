@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.5-1",
+  version: "1.0.5-2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -97,7 +97,6 @@ var package_default = {
     "@huggingface/transformers": "4.3.1",
     "@modelcontextprotocol/sdk": "1.31.0",
     "@vscode/ripgrep": "1.18.0",
-    typebox: "1.3.19",
     "web-tree-sitter": "0.25.10",
     zod: "4.5.4"
   },
@@ -111,12 +110,14 @@ var package_default = {
     "oxlint-tsgolint": "^7.0.2001",
     "tree-sitter-bash": "0.25.1",
     "tree-sitter-powershell": "0.26.4",
+    typebox: "1.3.19",
     typescript: "7.0.2"
   },
   peerDependencies: {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    typebox: "*"
   },
   peerDependenciesMeta: {
     "@earendil-works/pi-ai": {
