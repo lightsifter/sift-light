@@ -169,6 +169,8 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   pattern: "pattern is regex by default; literal=true matches source text exactly",
   literal:
     "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
+  redact:
+    "redact=true masks credential-like values and private-key bodies in displayed evidence; it does not sandbox search or change counts",
   path: "path must be an existing exact file or root; use mode=files+query for unknown names",
   query:
     "files+query matches known filename/path text (not glob patterns); omit files query to list every file under path; concept/hybrid query is natural language",
@@ -193,6 +195,7 @@ export function fieldGuidance(field: RequestField): string {
 
 const GUIDANCE_FIELDS = [
   "pattern",
+  "redact",
   "literal",
   "path",
   "query",
@@ -219,12 +222,13 @@ export const REQUEST_USAGE_GUIDANCE = [
 
 export const MODEL_USAGE_GUIDANCE = [
   "pattern is regex by default; literal=true matches source text exactly",
-  "path is an existing exact file or root; use files+query for an unknown name",
-  "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
-  `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
-  "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
-  "outline supports JS/TS/TSX and bounded Python syntax; imports/tests are static candidates for JS/TS/TSX",
-  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("capabilities")}`,
+  "redact=true masks credentials and private-key bodies in displayed evidence; use it for configs, logs or user directories; it does not sandbox search",
+  "path is an existing exact file/root; use files+query for unknown names",
+  "anyOf/allOf are exact-literal OR/AND variants; exclude pattern/literal",
+  `limit/context are ordinary-search budgets (limit <= ${String(MAX_PAGE_SIZE)}); omit for hybrid/concept/outline/structure/inspect`,
+  "outline needs a concrete JS/TS/TSX/Python-capable source file, not a directory; structure needs a nonempty AST pattern for JS/TS/TSX/Go, no lang; use capabilities before unfamiliar language operations",
+  "imports/tests are static JS/TS/TSX candidates",
+  "selectors: inspect, hybrid and capabilities use their cataloged fields",
   "exact, any-of and max_results are not parameters",
 ].join("; ");
 

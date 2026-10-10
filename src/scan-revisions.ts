@@ -5,6 +5,7 @@ import {
   boundedRipgrepDiagnostic,
   classifyRipgrepDiagnostics,
   createRipgrepInputError,
+  type RipgrepRecoveryRequest,
   type RipgrepUnreadableDiagnostic,
 } from "./ripgrep-diagnostics.js";
 import { getSourceRevision, sameSourceRevision } from "./source.js";
@@ -48,6 +49,7 @@ export async function captureCandidateRevisions(
   maxFiles: number,
   signal?: AbortSignal,
   redact = false,
+  request?: RipgrepRecoveryRequest,
 ): Promise<{
   revisions: Map<string, SourceRevision>;
   unreadable: RipgrepUnreadableDiagnostic[];
@@ -111,7 +113,7 @@ export async function captureCandidateRevisions(
     },
   );
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
-  const inputError = createRipgrepInputError(result.stderr, redact);
+  const inputError = createRipgrepInputError(result.stderr, redact, request);
   const unreadable = [...diagnostics.unreadable, ...diagnostics.recoverable, ...metadataFailures];
   if (inputError) throw inputError;
   if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)

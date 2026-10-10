@@ -234,7 +234,7 @@ export const siftLightSchema = Type.Object({
   redact: Type.Optional(
     Type.Boolean({
       description:
-        "Optional display-only masking for credential-like values and private-key bodies. Default false. It never changes searched files, admitted matches, counts, or cursor completeness.",
+        "Optional display-only masking for credential-like values and private-key bodies. Default false. Use it for configuration, logs and user-directory searches when returned text may contain secrets. It never changes the search scope, searched files, admitted matches, counts or cursor completeness, and it is not a sandbox.",
     }),
   ),
   modifiedAfter: Type.Optional(

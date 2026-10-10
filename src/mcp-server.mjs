@@ -7,7 +7,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.5-2",
+  version: "1.0.5-6",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -571,7 +571,7 @@ class RipgrepInputError extends SiftLightError {
   code;
   guidance;
   details;
-  constructor(code, message, guidance) {
+  constructor(code, message, guidance, repairExamples = []) {
     super(`${message} ${guidance}`);
     this.name = "RipgrepInputError";
     this.code = code;
@@ -584,7 +584,8 @@ class RipgrepInputError extends SiftLightError {
           reason: guidance
         }
       ],
-      recovery: { action: "manual", reason: guidance }
+      recovery: { action: "manual", reason: guidance },
+      ...repairExamples.length > 0 ? { repairExamples } : {}
     };
   }
 }
@@ -966,6 +967,7 @@ var MODE_FIELD_SUMMARY = MODE_SUMMARY_MODES.map((mode) => modeFieldSummary(mode)
 var REQUEST_FIELD_GUIDANCE = {
   pattern: "pattern is regex by default; literal=true matches source text exactly",
   literal: "literal=true makes pattern exact source text; anyOf/allOf already use literal semantics",
+  redact: "redact=true masks credential-like values and private-key bodies in displayed evidence; it does not sandbox search or change counts",
   path: "path must be an existing exact file or root; use mode=files+query for unknown names",
   query: "files+query matches known filename/path text (not glob patterns); omit files query to list every file under path; concept/hybrid query is natural language",
   anyOf: "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
@@ -982,6 +984,7 @@ function fieldGuidance(field) {
 }
 var GUIDANCE_FIELDS = [
   "pattern",
+  "redact",
   "literal",
   "path",
   "query",
@@ -1003,12 +1006,13 @@ var REQUEST_USAGE_GUIDANCE = [
 ].join("; ");
 var MODEL_USAGE_GUIDANCE = [
   "pattern is regex by default; literal=true matches source text exactly",
-  "path is an existing exact file or root; use files+query for an unknown name",
-  "anyOf/allOf are exact-literal OR/AND variants and exclude pattern/literal",
-  `limit/context are ordinary-search output budgets; limit <= ${String(MAX_PAGE_SIZE)}; omit both for hybrid/concept/outline/structure/inspect`,
-  "outline requires a concrete source file, not a directory; structure requires a nonempty AST pattern and JS/TS/TSX/Go sources, no lang field; use capabilities before unfamiliar language operations",
-  "outline supports JS/TS/TSX and bounded Python syntax; imports/tests are static candidates for JS/TS/TSX",
-  `selectors: ${modeFieldSummary("inspect")}; ${modeFieldSummary("hybrid")}; ${modeFieldSummary("capabilities")}`,
+  "redact=true masks credentials and private-key bodies in displayed evidence; use it for configs, logs or user directories; it does not sandbox search",
+  "path is an existing exact file/root; use files+query for unknown names",
+  "anyOf/allOf are exact-literal OR/AND variants; exclude pattern/literal",
+  `limit/context are ordinary-search budgets (limit <= ${String(MAX_PAGE_SIZE)}); omit for hybrid/concept/outline/structure/inspect`,
+  "outline needs a concrete JS/TS/TSX/Python-capable source file, not a directory; structure needs a nonempty AST pattern for JS/TS/TSX/Go, no lang; use capabilities before unfamiliar language operations",
+  "imports/tests are static JS/TS/TSX candidates",
+  "selectors: inspect, hybrid and capabilities use their cataloged fields",
   "exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODE_CONTRACT_DESCRIPTION = [
@@ -2030,7 +2034,7 @@ async function resolveRipgrepExecutable() {
 }
 
 // src/ripgrep-diagnostics.ts
-import { resolve as resolve3 } from "node:path";
+import { basename, resolve as resolve3 } from "node:path";
 var UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
 var UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
 var RECOVERABLE_FILESYSTEM_CODE = /\(os error (?:4|5|22)\)\s*$/iu;
@@ -2069,15 +2073,70 @@ function missingPathFromDiagnostics(stderr) {
   }
   return;
 }
-function createRipgrepInputError(stderr, redact = false) {
+var RIPGREP_RECOVERY_FIELDS = [
+  "path",
+  "glob",
+  "exclude",
+  "literal",
+  "ignoreCase",
+  "hidden",
+  "ignorePolicy",
+  "wholeWord",
+  "context",
+  "scope",
+  "redact"
+];
+function copyRipgrepRecoveryFields(request) {
+  const result = {};
+  for (const field of RIPGREP_RECOVERY_FIELDS) {
+    const value = request[field];
+    if (value !== undefined)
+      result[field] = value;
+  }
+  return result;
+}
+function ripgrepRepairExamples(code, request, redact) {
+  if (request === undefined || redact && containsSensitiveText(request))
+    return [];
+  if (code === "E_REGEX_INVALID") {
+    return [
+      {
+        label: "按原文查找",
+        request: {
+          mode: "matches",
+          ...copyRipgrepRecoveryFields(request),
+          pattern: request.pattern,
+          literal: true
+        }
+      }
+    ];
+  }
+  if (code === "E_SEARCH_PATH_NOT_FOUND" && request.path !== undefined) {
+    const fileName = basename(request.path.replaceAll("\\", "/"));
+    if (fileName === "." || fileName === "/" || fileName.length === 0)
+      return [];
+    return [
+      {
+        label: "按文件名查找",
+        request: {
+          mode: "files",
+          query: fileName,
+          ...request.redact === true ? { redact: true } : {}
+        }
+      }
+    ];
+  }
+  return [];
+}
+function createRipgrepInputError(stderr, redact = false, request) {
   const code = classifyRipgrepInputFailure(stderr);
   if (code === "E_REGEX_INVALID") {
-    return new RipgrepInputError(code, "ripgrep regex parse error: pattern is not a valid regular expression.", "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.");
+    return new RipgrepInputError(code, "ripgrep regex parse error: pattern is not a valid regular expression.", "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.", ripgrepRepairExamples(code, request, redact));
   }
   if (code === "E_SEARCH_PATH_NOT_FOUND") {
     const path = missingPathFromDiagnostics(stderr);
     const location = path ? ` (${JSON.stringify(boundedRipgrepDiagnostic(path, redact))})` : "";
-    return new RipgrepInputError(code, `A searched path${location} does not exist or became unavailable.`, "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.");
+    return new RipgrepInputError(code, `A searched path${location} does not exist or became unavailable.`, "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.", ripgrepRepairExamples(code, request, redact));
   }
   return;
 }
@@ -2298,7 +2357,7 @@ async function captureBatch(paths, revisions, signal, onRevisionError) {
   if (signal?.aborted)
     throw abortError();
 }
-async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal, redact = false) {
+async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal, redact = false, request) {
   const revisions = new Map;
   let candidateCount = 0;
   let enumerationTruncated = false;
@@ -2352,7 +2411,7 @@ async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal
     await captureBatch(batch, revisions, signal, recordMetadataFailure);
   });
   const diagnostics = classifyRipgrepDiagnostics(result.stderr);
-  const inputError = createRipgrepInputError(result.stderr, redact);
+  const inputError = createRipgrepInputError(result.stderr, redact, request);
   const unreadable = [...diagnostics.unreadable, ...diagnostics.recoverable, ...metadataFailures];
   if (inputError)
     throw inputError;
@@ -2678,7 +2737,7 @@ function createRipgrepRunner(options = {}) {
         ...policy.ripgrepGlobArguments(validatedSearchPath),
         "--",
         searchTarget
-      ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact);
+      ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
       let ignoredFileCount = 0;
       let ignoredFileSamples = [];
       let filesystemCoverage = "complete";
@@ -2708,7 +2767,7 @@ function createRipgrepRunner(options = {}) {
           ...policy.ripgrepGlobArguments(validatedSearchPath),
           "--",
           searchTarget
-        ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact);
+        ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
         const ignored = [...allCandidates.revisions.keys()].filter((path) => !before.revisions.has(path));
         ignoredFileCount = ignored.length;
         ignoredFileSamples = ignored.slice(0, 20).map((path) => displayPath(path, cwd).displayPath);
@@ -2752,7 +2811,7 @@ function createRipgrepRunner(options = {}) {
         }
       }));
       const diagnostics = classifyRipgrepDiagnostics(stderr);
-      const inputError = createRipgrepInputError(stderr, request.redact);
+      const inputError = createRipgrepInputError(stderr, request.redact, request);
       if (inputError)
         throw inputError;
       const filesystemDiagnostics = [...diagnostics.unreadable, ...diagnostics.recoverable];
@@ -14858,7 +14917,7 @@ var siftLightSchema = Type.Object({
     description: "Named exact-literal checks for mode=audit. Each finding is present, absent_with_complete_coverage, or unknown."
   })),
   redact: Type.Optional(Type.Boolean({
-    description: "Optional display-only masking for credential-like values and private-key bodies. Default false. It never changes searched files, admitted matches, counts, or cursor completeness."
+    description: "Optional display-only masking for credential-like values and private-key bodies. Default false. Use it for configuration, logs and user-directory searches when returned text may contain secrets. It never changes the search scope, searched files, admitted matches, counts or cursor completeness, and it is not a sandbox."
   })),
   modifiedAfter: Type.Optional(Type.Integer({
     minimum: 0,

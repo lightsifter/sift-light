@@ -51,7 +51,12 @@ export class RipgrepInputError extends SiftLightError {
   readonly guidance: string;
   readonly details: SiftLightDiagnosticDetails;
 
-  constructor(code: RipgrepInputErrorCode, message: string, guidance: string) {
+  constructor(
+    code: RipgrepInputErrorCode,
+    message: string,
+    guidance: string,
+    repairExamples: readonly SiftLightDiagnosticRepairExample[] = [],
+  ) {
     super(`${message} ${guidance}`);
     this.name = "RipgrepInputError";
     this.code = code;
@@ -65,6 +70,7 @@ export class RipgrepInputError extends SiftLightError {
         },
       ],
       recovery: { action: "manual", reason: guidance },
+      ...(repairExamples.length > 0 ? { repairExamples } : {}),
     };
   }
 }
