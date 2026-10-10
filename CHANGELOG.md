@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.5-6 — 2026-10-10
+
+- Add structured `repairExamples` to invalid-regex and missing-path diagnostics. The examples preserve bounded search filters, never auto-convert regex input, and are omitted when redaction would make request data unsafe to echo.
+- Extend model-facing guidance for `redact=true`, including its sensitive-search use cases and its boundary as display masking rather than filesystem sandboxing.
+- Add regression coverage for the audited request failures and verify the same typed recovery details through the real MCP, ripgrep and packaged host paths.
+
 ## 1.0.5-1 — 2026-10-09
 
 - Fix OMP plugin-cache searches when the generated bundle cannot resolve its platform ripgrep package. Bundled ripgrep remains preferred; an executable `rg` on `PATH` is now a bounded compatibility fallback, while explicit `SIFT_LIGHT_RG_PATH` values retain strict absolute-path and executable validation.

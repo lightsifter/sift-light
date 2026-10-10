@@ -435,6 +435,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         maxSourceRevisionFiles,
         signal,
         request.redact,
+        request,
       );
       let ignoredFileCount = 0;
       let ignoredFileSamples: string[] = [];
@@ -475,6 +476,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           maxSourceRevisionFiles,
           signal,
           request.redact,
+          request,
         );
         const ignored = [...allCandidates.revisions.keys()].filter(
           (path) => !before.revisions.has(path),
@@ -528,7 +530,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
           }),
       );
       const diagnostics = classifyRipgrepDiagnostics(stderr);
-      const inputError = createRipgrepInputError(stderr, request.redact);
+      const inputError = createRipgrepInputError(stderr, request.redact, request);
       if (inputError) throw inputError;
       const filesystemDiagnostics = [...diagnostics.unreadable, ...diagnostics.recoverable];
       if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))

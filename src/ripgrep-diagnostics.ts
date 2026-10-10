@@ -1,6 +1,11 @@
-import { resolve } from "node:path";
-import { RipgrepInputError, type RipgrepInputErrorCode } from "./errors.js";
-import { redactDiagnosticText } from "./redaction.js";
+import { basename, resolve } from "node:path";
+import {
+  RipgrepInputError,
+  type RipgrepInputErrorCode,
+  type SiftLightDiagnosticRepairExample,
+} from "./errors.js";
+import { containsSensitiveText, redactDiagnosticText } from "./redaction.js";
+import type { SearchRequest } from "./types.js";
 
 export interface RipgrepUnreadableDiagnostic {
   message: string;
@@ -63,9 +68,85 @@ function missingPathFromDiagnostics(stderr: string): string | undefined {
   return undefined;
 }
 
+export type RipgrepRecoveryRequest = Pick<
+  SearchRequest,
+  | "pattern"
+  | "path"
+  | "glob"
+  | "exclude"
+  | "literal"
+  | "ignoreCase"
+  | "hidden"
+  | "ignorePolicy"
+  | "wholeWord"
+  | "context"
+  | "scope"
+  | "redact"
+>;
+
+const RIPGREP_RECOVERY_FIELDS = [
+  "path",
+  "glob",
+  "exclude",
+  "literal",
+  "ignoreCase",
+  "hidden",
+  "ignorePolicy",
+  "wholeWord",
+  "context",
+  "scope",
+  "redact",
+] as const satisfies readonly (keyof RipgrepRecoveryRequest)[];
+
+function copyRipgrepRecoveryFields(request: RipgrepRecoveryRequest): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const field of RIPGREP_RECOVERY_FIELDS) {
+    const value = request[field];
+    if (value !== undefined) result[field] = value;
+  }
+  return result;
+}
+
+function ripgrepRepairExamples(
+  code: RipgrepInputErrorCode,
+  request: RipgrepRecoveryRequest | undefined,
+  redact: boolean,
+): readonly SiftLightDiagnosticRepairExample[] {
+  if (request === undefined || (redact && containsSensitiveText(request))) return [];
+  if (code === "E_REGEX_INVALID") {
+    return [
+      {
+        label: "按原文查找",
+        request: {
+          mode: "matches",
+          ...copyRipgrepRecoveryFields(request),
+          pattern: request.pattern,
+          literal: true,
+        },
+      },
+    ];
+  }
+  if (code === "E_SEARCH_PATH_NOT_FOUND" && request.path !== undefined) {
+    const fileName = basename(request.path.replaceAll("\\", "/"));
+    if (fileName === "." || fileName === "/" || fileName.length === 0) return [];
+    return [
+      {
+        label: "按文件名查找",
+        request: {
+          mode: "files",
+          query: fileName,
+          ...(request.redact === true ? { redact: true } : {}),
+        },
+      },
+    ];
+  }
+  return [];
+}
+
 export function createRipgrepInputError(
   stderr: string,
   redact = false,
+  request?: RipgrepRecoveryRequest,
 ): RipgrepInputError | undefined {
   const code = classifyRipgrepInputFailure(stderr);
   if (code === "E_REGEX_INVALID") {
@@ -73,6 +154,7 @@ export function createRipgrepInputError(
       code,
       "ripgrep regex parse error: pattern is not a valid regular expression.",
       "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.",
+      ripgrepRepairExamples(code, request, redact),
     );
   }
   if (code === "E_SEARCH_PATH_NOT_FOUND") {
@@ -82,6 +164,7 @@ export function createRipgrepInputError(
       code,
       `A searched path${location} does not exist or became unavailable.`,
       "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.",
+      ripgrepRepairExamples(code, request, redact),
     );
   }
   // Known input failures above intentionally omit ripgrep's raw pattern and path echo.
