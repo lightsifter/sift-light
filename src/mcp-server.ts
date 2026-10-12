@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import type { DataSourceConfig } from "./data-source-config.js";
 import type { NativeTextConfig } from "./native-text-config.js";
+import type { MediaConfig } from "./media-config.js";
 import {
   DEFAULT_MCP_HOST,
   DEFAULT_MCP_MAX_SESSIONS,
@@ -54,6 +55,7 @@ async function runHttpServer(
   dataSources: DataSourceConfig[],
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
+  media?: MediaConfig,
 ): Promise<void> {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
@@ -66,6 +68,7 @@ async function runHttpServer(
         dataSources,
         nativeText,
         nativeMedia,
+        media,
       ),
     maxSessions: environmentInteger(
       "SIFT_LIGHT_MCP_MAX_SESSIONS",
@@ -118,6 +121,7 @@ async function runStdioServer(
   dataSources: DataSourceConfig[],
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
+  media?: MediaConfig,
 ): Promise<void> {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
@@ -129,6 +133,7 @@ async function runStdioServer(
         dataSources,
         nativeText,
         nativeMedia,
+        media,
       ),
   });
   process.stderr.write("sift-light MCP serving one local client over stdio\n");
@@ -157,7 +162,7 @@ async function main(): Promise<void> {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia } =
+  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media } =
     await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(
@@ -171,6 +176,7 @@ async function main(): Promise<void> {
       dataSources,
       nativeText,
       nativeMedia,
+      media,
     );
     return;
   }
@@ -181,6 +187,7 @@ async function main(): Promise<void> {
     dataSources,
     nativeText,
     nativeMedia,
+    media,
   );
 }
 

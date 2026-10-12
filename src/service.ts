@@ -2,6 +2,7 @@ import { MediaSearch, type MediaResult } from "./media-search.js";
 import { DataSources } from "./data-sources.js";
 import type { DataSourceConfig } from "./data-source-config.js";
 import type { NativeTextConfig } from "./native-text-config.js";
+import type { MediaConfig } from "./media-config.js";
 import { createHash } from "node:crypto";
 import { EvidenceService, isEvidenceRequest } from "./evidence-service.js";
 import { ConceptSourceChangedError } from "./concept-source-generation.js";
@@ -107,6 +108,7 @@ export interface SiftLightInput extends RawSearchInput {
 export interface SiftLightServiceOptions {
   nativeText?: NativeTextConfig;
   nativeMedia?: NativeTextConfig;
+  media?: MediaConfig;
   dataSources?: readonly DataSourceConfig[];
   runRipgrep: RipgrepRunner;
   snapshots?: SnapshotStore;
@@ -402,7 +404,7 @@ export class SiftLightService {
   mediaSearch(value: unknown, cwd: string, signal?: AbortSignal): Promise<MediaResult> {
     if (!this.#media)
       throw new SiftLightError(
-        "Visual search is disabled; configure nativeMedia and restart the host",
+        "Visual search is disabled; configure nativeMedia or media and restart the host",
       );
     return this.#media.search(value, cwd, signal);
   }
@@ -420,7 +422,8 @@ export class SiftLightService {
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
   constructor(options: SiftLightServiceOptions) {
-    this.#media = options.nativeMedia ? new MediaSearch(options.nativeMedia) : undefined;
+    const mediaConfig = options.nativeMedia ?? options.media;
+    this.#media = mediaConfig ? new MediaSearch(mediaConfig) : undefined;
     this.#dataSources = new DataSources(options.dataSources);
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();

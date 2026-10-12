@@ -18,6 +18,7 @@ export {
   type SearchEnforcementMode,
   type SemanticJudgeConfig,
   type SemanticJudgeProvider,
+  type MediaConfig,
 } from "./config-reader.js";
 
 export function siftLightConfigPath(

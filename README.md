@@ -235,6 +235,34 @@ The additional `sift-light-media` tool accepts `mode: "search"`, an exact local 
 
 Results retain up to ten distinct files, content hashes, original PDF page numbers, and exact `inspect`/`validate` requests for this tool. `inspect` returns actual PNG pixels at a maximum dimension of 1024; scan results render the corresponding original PDF page. Changed sources reject inspection and validation reports stale evidence. Scanned pages in mixed PDFs retain their original page numbers. Visual similarity remains candidate evidence; small print recognition and region-level text location are not guaranteed.
 
-Cold indexing returns `nextRequest` with `mode: "await"`; copy it to the same tool. `mode: "cancel"` and its `operationId` stop that work. The service reuses one resident visual model for consecutive requests, releases it after 60 seconds idle, and owns shutdown and cancellation. Each request admits at most 512 media files, 20 MiB per file and 256 MiB total; corpus limits and enumeration limits are explicit partial coverage. Request deadline is five minutes. Results expire after ten minutes and are scoped to the originating workspace. Office documents, audio and video are outside this tool's current contract.
+### Bring your own provider
+
+The local model path remains available through `nativeMedia`. To use a provider you supply, add `media` to the same `sift-light.json`. The endpoint must implement the HTTP JSON contract below; it may be a third-party service or a local gateway that translates another vendor's API. A local service can omit `apiKeyEnv`; remote services should use HTTPS.
+
+```json
+{
+  "media": {
+    "provider": "http-json",
+    "endpoint": "https://your-provider.example/v1/media-search",
+    "model": "your-vision-model",
+    "apiKeyEnv": "YOUR_MEDIA_KEY",
+    "timeoutMs": 120000,
+    "maxRetries": 2,
+    "maxRequestBytes": 33554432,
+    "renderer": {
+      "executable": "/absolute/native-media",
+      "modelDirectory": "/absolute/model-directory"
+    }
+  }
+}
+```
+
+The plugin sends admitted files as bounded Base64 content with opaque `fileId` values; it never sends local absolute paths. A response must contain `version: 1`, `indexedFiles`, and `hits`. Each hit contains `fileId`, `score`, `kind`, `chunkCount`, `width`, and `height`; scanned PDF hits also contain a one-based `page`. The plugin maps IDs back to local sources and then performs hash, page, `inspect`, and `validate` checks. The remote service does not decide whether source evidence is trustworthy.
+
+Jev also accepts `semanticJudge.provider: "http-json"`. The request is `{ "version": 1, "model", "query", "candidates" }`; the response is `{ "version": 1, "model", "judgments", "usage" }`. Each judgment contains a candidate `id`, a `choice`, and a `probability` from 0 to 1. When `apiKeyEnv` is configured, the key is read only from that environment variable and is never written to configuration, logs, or result content. A keyless local provider is valid. Remote failures retain local candidates and mark coverage as partial.
+
+The remote path uses the same `sift-light-media` tool and source verification as the local path. PNG hits can be inspected directly; PDF or other image previews require a local renderer in `media.renderer`. Validation does not require a renderer.
+
+Cold indexing returns `nextRequest` with `mode: "await"`; copy it to the same tool. `mode: "cancel"` and its `operationId` stop that work. The local provider reuses one resident visual model for consecutive requests and releases it after 60 seconds idle; remote provider timeouts, retries, and request limits come from its configuration. The service owns shutdown and cancellation. Each request admits at most 512 media files, 20 MiB per file and 256 MiB total; corpus limits and enumeration limits are explicit partial coverage. Request deadline is five minutes. Results expire after ten minutes and are scoped to the originating workspace. Office documents, audio and video are outside this tool's current contract.
 
 Native text and visual workers reserve 1 GB of inference headroom above the loaded model and its working space, and return unused compute cache after each query. This is not a hard limit on total process memory. The model still uses several GB, with additional allocations during indexing and inference. Each MCP service session owns its models; multiple connections and simultaneous text/visual workers add their memory use. Ordinary exact search does not load these models. Measure memory and latency for the actual model, machine and file scope.

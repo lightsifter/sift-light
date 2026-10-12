@@ -2,6 +2,9 @@ import { parseDataSources, type DataSourceConfig } from "./data-source-config.js
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseNativeTextConfig, type NativeTextConfig } from "./native-text-config.js";
+import type { MediaConfig } from "./media-config.js";
+
+export type { MediaConfig } from "./media-config.js";
 
 export const SIFT_LIGHT_CONFIG_FILE = "sift-light.json";
 export const SIFT_LIGHT_CONFIG_ENV = "SIFT_LIGHT_CONFIG";
@@ -14,6 +17,7 @@ export const SIFT_LIGHT_ENFORCEMENT_ENV = "SIFT_LIGHT_ENFORCE_SEARCH";
 export interface SiftLightConfig {
   nativeText?: NativeTextConfig;
   nativeMedia?: NativeTextConfig;
+  media?: MediaConfig;
   dataSources?: DataSourceConfig[];
   locale: SiftLightLocale;
   enforceSearch?: SearchEnforcementMode;
@@ -21,7 +25,7 @@ export interface SiftLightConfig {
   semanticJudge?: SemanticJudgeConfig;
 }
 
-export type SemanticJudgeProvider = "jev";
+export type SemanticJudgeProvider = "jev" | "http-json";
 
 export const SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFT_LIGHT_JEV_API_KEY"] as const;
 
@@ -29,7 +33,7 @@ export interface SemanticJudgeConfig {
   enabled: boolean;
   provider: SemanticJudgeProvider;
   endpoint: string;
-  apiKeyEnv: string;
+  apiKeyEnv?: string;
   model: string;
   timeoutMs: number;
   maxCandidates: number;
@@ -57,6 +61,7 @@ export const DEFAULT_SIFT_LIGHT_CONFIG: Readonly<SiftLightConfig> = {
 interface RawSiftLightConfig {
   nativeText?: unknown;
   nativeMedia?: unknown;
+  media?: unknown;
   dataSources?: unknown;
   locale?: unknown;
   enforceSearch?: unknown;
@@ -87,6 +92,17 @@ interface RawSemanticJudgeConfig {
   maxRetries?: unknown;
 }
 
+interface RawMediaConfig {
+  provider?: unknown;
+  endpoint?: unknown;
+  apiKeyEnv?: unknown;
+  model?: unknown;
+  timeoutMs?: unknown;
+  maxRetries?: unknown;
+  maxRequestBytes?: unknown;
+  renderer?: unknown;
+}
+
 function hasErrorCode(error: unknown, codes: string[]): boolean {
   return error instanceof Error && "code" in error && codes.includes(String(error.code));
 }
@@ -101,6 +117,58 @@ function isRawSiftLightConfig(value: unknown): value is RawSiftLightConfig {
 
 function isRawSemanticJudgeConfig(value: unknown): value is RawSemanticJudgeConfig {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRawMediaConfig(value: unknown): value is RawMediaConfig {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseEndpoint(value: unknown, path: string, field: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be a nonempty URL`);
+  }
+  let parsedEndpoint: URL;
+  try {
+    parsedEndpoint = new URL(value);
+  } catch (error) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be a URL`, {
+      cause: error,
+    });
+  }
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const secureEndpoint =
+    parsedEndpoint.protocol === "https:" ||
+    (parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname));
+  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
+    throw new Error(
+      `Invalid sift-light config at ${path}: ${field} must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`,
+    );
+  }
+  return value;
+}
+
+function parseApiKeyEnv(value: unknown, path: string, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(value)) {
+    throw new Error(
+      `Invalid sift-light config at ${path}: ${field} must be an uppercase environment variable name`,
+    );
+  }
+  return value;
+}
+
+function parseBoundedModel(value: unknown, path: string, field: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 128 ||
+    /[\r\n\0]/u.test(value)
+  ) {
+    throw new Error(
+      `Invalid sift-light config at ${path}: ${field} must be bounded single-line text`,
+    );
+  }
+  return value;
 }
 
 function boundedInteger(
@@ -154,54 +222,29 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
     );
   }
   const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
-  if (provider !== "jev") {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.provider must be "jev"`);
-  }
-  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
-  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2_048) {
+  if (provider !== "jev" && provider !== "http-json") {
     throw new Error(
-      `Invalid sift-light config at ${path}: semanticJudge.endpoint must be a nonempty URL`,
+      `Invalid sift-light config at ${path}: semanticJudge.provider must be "jev" or "http-json"`,
     );
   }
-  let parsedEndpoint: URL;
-  try {
-    parsedEndpoint = new URL(endpoint);
-  } catch (error) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a URL`, {
-      cause: error,
-    });
-  }
-  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
-  const secureEndpoint =
-    parsedEndpoint.protocol === "https:" ||
-    (parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname));
-  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
-    throw new Error(
-      `Invalid sift-light config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`,
-    );
-  }
-  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
-  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
-    throw new Error(
-      `Invalid sift-light config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`,
-    );
-  }
-  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
-  if (
-    typeof model !== "string" ||
-    model.length === 0 ||
-    model.length > 128 ||
-    /[\r\n\0]/u.test(model)
-  ) {
-    throw new Error(
-      `Invalid sift-light config at ${path}: semanticJudge.model must be bounded single-line text`,
-    );
-  }
+  const endpoint = parseEndpoint(
+    value.endpoint ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint : undefined),
+    path,
+    "semanticJudge.endpoint",
+  );
+  const apiKeyEnv =
+    parseApiKeyEnv(value.apiKeyEnv, path, "semanticJudge.apiKeyEnv") ??
+    (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv : undefined);
+  const model = parseBoundedModel(
+    value.model ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.model : undefined),
+    path,
+    "semanticJudge.model",
+  );
   return {
     enabled,
     provider,
     endpoint,
-    apiKeyEnv,
+    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
     model,
     timeoutMs: boundedInteger(
       value.timeoutMs,
@@ -227,6 +270,61 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
   };
 }
 
+function parseMedia(value: unknown, path: string): MediaConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRawMediaConfig(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: media must be an object`);
+  }
+  const unknown = Object.keys(value).filter(
+    (key) =>
+      ![
+        "provider",
+        "endpoint",
+        "apiKeyEnv",
+        "model",
+        "timeoutMs",
+        "maxRetries",
+        "maxRequestBytes",
+        "renderer",
+      ].includes(key),
+  );
+  if (unknown.length > 0) {
+    throw new Error(
+      `Invalid sift-light config at ${path}: unsupported media fields; accepted fields are provider, endpoint, apiKeyEnv, model, timeoutMs, maxRetries, maxRequestBytes and renderer`,
+    );
+  }
+  const provider = value.provider ?? "http-json";
+  if (provider !== "http-json") {
+    throw new Error(`Invalid sift-light config at ${path}: media.provider must be "http-json"`);
+  }
+  const endpoint = parseEndpoint(value.endpoint, path, "media.endpoint");
+  const apiKeyEnv = parseApiKeyEnv(value.apiKeyEnv, path, "media.apiKeyEnv");
+  const model = parseBoundedModel(value.model, path, "media.model");
+  const renderer = parseNativeTextConfig(value.renderer, "media.renderer");
+  return {
+    provider,
+    endpoint,
+    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
+    model,
+    timeoutMs: boundedInteger(
+      value.timeoutMs,
+      120_000,
+      1_000,
+      1_200_000,
+      `config at ${path}: media.timeoutMs`,
+    ),
+    maxRetries: boundedInteger(value.maxRetries, 2, 0, 5, `config at ${path}: media.maxRetries`),
+    maxRequestBytes: boundedInteger(
+      value.maxRequestBytes,
+      32 * 1024 * 1024,
+      1 * 1024 * 1024,
+      64 * 1024 * 1024,
+      `config at ${path}: media.maxRequestBytes`,
+    ),
+    ...(renderer === undefined ? {} : { renderer }),
+  };
+}
+
 function parseConfig(value: unknown, path: string): SiftLightConfig {
   if (!isRawSiftLightConfig(value)) {
     throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
@@ -241,11 +339,12 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
         "dataSources",
         "nativeText",
         "nativeMedia",
+        "media",
       ].includes(key),
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText and nativeMedia are accepted`,
+      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText, nativeMedia and media are accepted`,
     );
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
@@ -258,11 +357,15 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
   const nativeText = parseNativeTextConfig(value.nativeText);
   const nativeMedia = parseNativeTextConfig(value.nativeMedia, "nativeMedia");
+  const media = parseMedia(value.media, `${path}: media`);
+  if (nativeMedia && media)
+    throw new Error(`Invalid sift-light config at ${path}: choose nativeMedia or media, not both`);
   if (nativeText && vectorSearchEnabled !== true)
     throw new Error("nativeText requires vectorSearchEnabled:true");
   return {
     ...(nativeText ? { nativeText } : {}),
     ...(nativeMedia ? { nativeMedia } : {}),
+    ...(media ? { media } : {}),
     locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
     enforceSearch: enforcement,
     vectorSearchEnabled:

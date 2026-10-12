@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/mcp.ts
-import { z as z3 } from "zod";
+import { z as z4 } from "zod";
 
 // src/operation-lifecycle.ts
 import { randomUUID } from "node:crypto";
@@ -334,11 +334,11 @@ class OperationLifecycle {
 }
 
 // src/media-search.ts
-import { createHash, randomUUID as randomUUID3 } from "node:crypto";
-import { mkdtemp, mkdir, readFile as readFile2, realpath as realpath3, rm, stat as stat4, writeFile } from "node:fs/promises";
+import { createHash, randomUUID as randomUUID4 } from "node:crypto";
+import { mkdtemp, mkdir, readFile as readFile3, realpath as realpath3, rm, stat as stat5, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename as basename2, dirname as dirname2, extname, join as join2, resolve as resolve7 } from "node:path";
-import { z } from "zod";
+import { basename as basename2, dirname as dirname2, extname as extname2, join as join2, resolve as resolve7 } from "node:path";
+import { z as z2 } from "zod";
 
 // src/resident-worker-client.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
@@ -715,11 +715,284 @@ class ResidentWorkerClient {
   }
 }
 
+// src/remote-media-client.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { extname } from "node:path";
+import { z } from "zod";
+var MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+var MAX_FILE_ID_LENGTH = 128;
+
+class RemoteMediaRequestError extends SiftLightError {
+  retryable;
+  constructor(message, retryable, options) {
+    super(message, options);
+    this.name = "RemoteMediaRequestError";
+    this.retryable = retryable;
+  }
+}
+var remoteResponseSchema = z.object({
+  version: z.literal(1),
+  indexedFiles: z.number().int().nonnegative(),
+  hits: z.array(z.object({
+    fileId: z.string().min(1).max(MAX_FILE_ID_LENGTH),
+    score: z.number().finite(),
+    kind: z.enum(["image", "scan"]),
+    page: z.number().int().positive().nullable().optional(),
+    chunkCount: z.number().int().positive(),
+    width: z.number().int().nonnegative(),
+    height: z.number().int().nonnegative()
+  }).strict()).max(10)
+}).strict();
+function mimeType(path) {
+  switch (extname(path).toLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".bmp":
+      return "image/bmp";
+    case ".tif":
+    case ".tiff":
+      return "image/tiff";
+    case ".heic":
+      return "image/heic";
+    case ".heif":
+      return "image/heif";
+    case ".webp":
+      return "image/webp";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
+}
+async function boundedResponseText(response) {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES)
+    throw new SiftLightError("Remote media response exceeded the 4 MiB limit");
+  if (!response.body) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES)
+      throw new SiftLightError("Remote media response exceeded the 4 MiB limit");
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done)
+        break;
+      bytes += result.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new SiftLightError("Remote media response exceeded the 4 MiB limit");
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(all);
+}
+function retryableStatus(status) {
+  return status === 408 || status === 429 || status === 529 || status >= 500;
+}
+function retryDelay(attempt) {
+  return Math.min(20000, 400 * 2 ** attempt);
+}
+async function waitForRetry(delayMs, signal) {
+  if (signal?.aborted)
+    throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("Operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function base64(bytes) {
+  return bytes.toString("base64");
+}
+function base64Length(bytes) {
+  return Math.ceil(bytes / 3) * 4;
+}
+
+class RemoteMediaClient {
+  #config;
+  #key;
+  #fetcher;
+  constructor(config, environment = process.env, fetcher = fetch) {
+    this.#config = config;
+    this.#key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
+    if (config.apiKeyEnv && !this.#key) {
+      throw new SiftLightError(`Media provider is configured with ${config.apiKeyEnv}, but that environment variable is missing or empty`);
+    }
+    this.#fetcher = fetcher;
+  }
+  async search(request) {
+    const id = randomUUID3();
+    const paths = new Map;
+    const files = [];
+    const fileSizes = [];
+    for (const file of request.files) {
+      if (file.id.length === 0 || file.id.length > MAX_FILE_ID_LENGTH || /[\r\n\0]/u.test(file.id) || paths.has(file.id))
+        throw new SiftLightError("Remote media file ids must be unique bounded text");
+      paths.set(file.id, file.path);
+      const metadata = await stat(file.path);
+      if (!metadata.isFile())
+        throw new SiftLightError("Remote media files must be regular files");
+      fileSizes.push(metadata.size);
+    }
+    let imageSize;
+    if (request.imagePath !== undefined) {
+      const metadata = await stat(request.imagePath);
+      if (!metadata.isFile())
+        throw new SiftLightError("Remote media query image must be a regular file");
+      imageSize = metadata.size;
+    }
+    const requestSkeleton = JSON.stringify({
+      version: 1,
+      model: this.#config.model,
+      ...request.query === undefined ? {} : { query: request.query },
+      ...request.imagePath === undefined ? {} : { image: { mimeType: mimeType(request.imagePath), data: "" } },
+      kind: request.kind,
+      expectedFiles: request.expectedFiles,
+      files: []
+    });
+    let estimatedBytes = new TextEncoder().encode(requestSkeleton).byteLength;
+    if (imageSize !== undefined)
+      estimatedBytes += base64Length(imageSize);
+    for (let index = 0;index < request.files.length; index += 1) {
+      const file = request.files[index];
+      const fileSkeleton = JSON.stringify({
+        id: file?.id,
+        mimeType: file ? mimeType(file.path) : "application/octet-stream",
+        data: ""
+      });
+      estimatedBytes += new TextEncoder().encode(fileSkeleton).byteLength;
+      estimatedBytes += base64Length(fileSizes[index] ?? 0);
+    }
+    if (request.files.length > 1)
+      estimatedBytes += request.files.length - 1;
+    if (estimatedBytes > this.#config.maxRequestBytes)
+      throw new SiftLightError(`Remote media request exceeded the configured ${String(this.#config.maxRequestBytes)} byte limit`);
+    for (const file of request.files) {
+      files.push({
+        id: file.id,
+        mimeType: mimeType(file.path),
+        data: base64(await readFile(file.path, { signal: request.signal }))
+      });
+    }
+    const image = request.imagePath === undefined ? undefined : {
+      mimeType: mimeType(request.imagePath),
+      data: base64(await readFile(request.imagePath, { signal: request.signal }))
+    };
+    const body = JSON.stringify({
+      version: 1,
+      model: this.#config.model,
+      ...request.query === undefined ? {} : { query: request.query },
+      ...image === undefined ? {} : { image },
+      kind: request.kind,
+      expectedFiles: request.expectedFiles,
+      files
+    });
+    if (new TextEncoder().encode(body).byteLength > this.#config.maxRequestBytes)
+      throw new SiftLightError(`Remote media request exceeded the configured ${String(this.#config.maxRequestBytes)} byte limit`);
+    for (let attempt = 0;attempt <= this.#config.maxRetries; attempt += 1) {
+      const controller = new AbortController;
+      const onParentAbort = () => controller.abort(request.signal?.reason);
+      request.signal?.addEventListener("abort", onParentAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(new Error("Remote media request timed out")), this.#config.timeoutMs);
+      try {
+        const headers = { "content-type": "application/json" };
+        if (this.#key)
+          headers.authorization = `Bearer ${this.#key}`;
+        const response = await this.#fetcher(this.#config.endpoint, {
+          method: "POST",
+          headers,
+          body,
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          throw new RemoteMediaRequestError(`Remote media provider returned HTTP ${String(response.status)}`, retryableStatus(response.status));
+        }
+        let parsed;
+        try {
+          const raw = JSON.parse(await boundedResponseText(response));
+          parsed = remoteResponseSchema.parse(raw);
+        } catch (error) {
+          throw new SiftLightError("Remote media provider returned an invalid response", {
+            cause: error
+          });
+        }
+        if (parsed.indexedFiles !== request.expectedFiles)
+          throw new SiftLightError("Remote media provider indexed an unexpected file count");
+        return {
+          version: 1,
+          id,
+          indexedFiles: parsed.indexedFiles,
+          modelLoads: 0,
+          modelReused: true,
+          processId: process.pid,
+          hits: parsed.hits.map((hit) => {
+            const path = paths.get(hit.fileId);
+            if (!path)
+              throw new SiftLightError("Remote media provider returned an unknown file id");
+            return {
+              path,
+              score: hit.score,
+              kind: hit.kind,
+              page: hit.page ?? null,
+              chunkCount: hit.chunkCount,
+              width: hit.width,
+              height: hit.height
+            };
+          })
+        };
+      } catch (error) {
+        if (request.signal?.aborted)
+          throw error;
+        const retryable = error instanceof RemoteMediaRequestError ? error.retryable : !(error instanceof SiftLightError);
+        if (!retryable || attempt >= this.#config.maxRetries)
+          throw error;
+        await waitForRetry(retryDelay(attempt), request.signal);
+      } finally {
+        clearTimeout(timeout);
+        request.signal?.removeEventListener("abort", onParentAbort);
+      }
+    }
+    throw new SiftLightError("Remote media request failed");
+  }
+  async close() {}
+}
+function mediaMimeType(path) {
+  const type = mimeType(path);
+  return type === "application/octet-stream" ? undefined : type;
+}
+
 // src/workspace-files.ts
 import { relative as relative3, resolve as resolve6, sep as sep2 } from "node:path";
 
 // src/path-policy.ts
-import { realpath, stat } from "node:fs/promises";
+import { realpath, stat as stat2 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 var POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"];
@@ -870,7 +1143,7 @@ class SearchPathPolicy {
       return this.cwd;
     let isDirectory;
     try {
-      isDirectory = (await stat(absolute)).isDirectory();
+      isDirectory = (await stat2(absolute)).isDirectory();
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT")
         return this.cwd;
@@ -1118,7 +1391,7 @@ async function consumeCappedLines(stream, onLine, options = {}) {
 
 // src/ripgrep-executable.ts
 import { constants } from "node:fs";
-import { access, stat as stat2 } from "node:fs/promises";
+import { access, stat as stat3 } from "node:fs/promises";
 import { delimiter, isAbsolute as isAbsolute2, resolve as resolve2 } from "node:path";
 var OVERRIDE_ENV = "SIFT_LIGHT_RG_PATH";
 var PATH_RIPGREP_NAME = process.platform === "win32" ? "rg.exe" : "rg";
@@ -1130,7 +1403,7 @@ async function findExecutableOnPath() {
   const candidates = pathValue.split(delimiter).map((directory) => resolve2(directory || ".", PATH_RIPGREP_NAME));
   const available = await Promise.all(candidates.map(async (candidate) => {
     try {
-      if (!(await stat2(candidate)).isFile())
+      if (!(await stat3(candidate)).isFile())
         return;
       await access(candidate, constants.X_OK);
       return candidate;
@@ -1158,7 +1431,7 @@ async function resolveRipgrepExecutable() {
     }
   }
   try {
-    if (!(await stat2(executable)).isFile())
+    if (!(await stat3(executable)).isFile())
       throw new Error("Expected an executable file");
     await access(executable, constants.X_OK);
   } catch (cause) {
@@ -1413,12 +1686,12 @@ function describeUnreadableDiagnostics(diagnostics) {
 }
 
 // src/source.ts
-import { readFile, realpath as realpath2, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile2, realpath as realpath2, stat as stat4 } from "node:fs/promises";
 var SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
 var MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
 async function getSourceRevision(path, onError) {
   try {
-    const metadata = await stat3(path);
+    const metadata = await stat4(path);
     return sourceRevisionFromStats(metadata);
   } catch (error) {
     onError?.(error);
@@ -2195,40 +2468,40 @@ async function listWorkspaceFiles(cwd, signal, options = {}) {
 }
 
 // src/media-search.ts
-var mediaRequestSchema = z.discriminatedUnion("mode", [
-  z.object({ mode: z.enum(["await", "cancel"]), operationId: z.string().uuid() }).strict(),
-  z.object({
-    mode: z.literal("search"),
-    path: z.string().min(1).max(4096),
-    query: z.string().min(1).max(256).optional(),
-    image: z.string().min(1).max(4096).optional(),
-    kind: z.enum(["all", "image", "scan"]).default("all"),
-    glob: z.array(z.string().max(4096)).max(64).optional(),
-    exclude: z.array(z.string().max(4096)).max(64).optional(),
-    hidden: z.boolean().default(true),
-    ignorePolicy: z.enum(["respect", "include"]).default("respect")
+var mediaRequestSchema = z2.discriminatedUnion("mode", [
+  z2.object({ mode: z2.enum(["await", "cancel"]), operationId: z2.string().uuid() }).strict(),
+  z2.object({
+    mode: z2.literal("search"),
+    path: z2.string().min(1).max(4096),
+    query: z2.string().min(1).max(256).optional(),
+    image: z2.string().min(1).max(4096).optional(),
+    kind: z2.enum(["all", "image", "scan"]).default("all"),
+    glob: z2.array(z2.string().max(4096)).max(64).optional(),
+    exclude: z2.array(z2.string().max(4096)).max(64).optional(),
+    hidden: z2.boolean().default(true),
+    ignorePolicy: z2.enum(["respect", "include"]).default("respect")
   }).strict().refine((r) => r.query === undefined !== (r.image === undefined), "Supply exactly one query or image"),
-  z.object({
-    mode: z.enum(["inspect", "validate"]),
-    cursor: z.string().uuid(),
-    matchIndex: z.number().int().min(1).max(10)
+  z2.object({
+    mode: z2.enum(["inspect", "validate"]),
+    cursor: z2.string().uuid(),
+    matchIndex: z2.number().int().min(1).max(10)
   }).strict()
 ]);
-var responseSchema = z.object({
-  version: z.literal(1),
-  id: z.string(),
-  indexedFiles: z.number().int().nonnegative(),
-  modelLoads: z.literal(1),
-  modelReused: z.boolean(),
-  processId: z.number().int().positive(),
-  hits: z.array(z.object({
-    path: z.string(),
-    score: z.number().finite(),
-    kind: z.enum(["image", "scan"]),
-    page: z.number().int().positive().nullish().transform((value) => value ?? null),
-    chunkCount: z.number().int().positive(),
-    width: z.number().int().nonnegative(),
-    height: z.number().int().nonnegative()
+var responseSchema = z2.object({
+  version: z2.literal(1),
+  id: z2.string(),
+  indexedFiles: z2.number().int().nonnegative(),
+  modelLoads: z2.number().int().nonnegative(),
+  modelReused: z2.boolean(),
+  processId: z2.number().int().positive(),
+  hits: z2.array(z2.object({
+    path: z2.string(),
+    score: z2.number().finite(),
+    kind: z2.enum(["image", "scan"]),
+    page: z2.number().int().positive().nullish().transform((value) => value ?? null),
+    chunkCount: z2.number().int().positive(),
+    width: z2.number().int().nonnegative(),
+    height: z2.number().int().nonnegative()
   })).max(10)
 });
 var extensions = new Set([
@@ -2254,11 +2527,11 @@ async function sourceBytes(cwd, path, signal) {
   const canonical = await policy.resolveExistingPath(path);
   if (!canonical)
     throw new SiftLightError(`Media source unavailable: ${path}`);
-  const before = await stat4(canonical);
+  const before = await stat5(canonical);
   if (!before.isFile() || before.size > maxFileBytes)
     throw new SiftLightError(`Media source must be a regular file at most ${String(maxFileBytes)} bytes: ${path}`);
-  const bytes = await readFile2(canonical, { signal });
-  const after = await stat4(canonical);
+  const bytes = await readFile3(canonical, { signal });
+  const after = await stat5(canonical);
   if (bytes.length > maxFileBytes || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || await policy.resolveExistingPath(path) !== canonical)
     throw new SiftLightError(`Media source changed during read: ${path}`);
   return { canonical, bytes };
@@ -2266,6 +2539,7 @@ async function sourceBytes(cwd, path, signal) {
 
 class MediaSearch {
   #config;
+  #remoteConfig;
   #operations = new OperationLifecycle({ deadlineMs: 300000 });
   #queue = new OwnedTaskQueue;
   #lifecycle = new AbortController;
@@ -2273,9 +2547,13 @@ class MediaSearch {
   #known = new Map;
   #directory;
   #worker;
+  #remote;
   #closed = false;
   constructor(config) {
-    this.#config = config;
+    if ("provider" in config)
+      this.#remoteConfig = config;
+    else
+      this.#config = config;
   }
   async search(value, cwd, signal) {
     const request = mediaRequestSchema.parse(value);
@@ -2331,7 +2609,7 @@ class MediaSearch {
     const reasons = [...inventory.reasons];
     let total = 0;
     for (const path of inventory.paths) {
-      if (!extensions.has(extname(path).toLowerCase()))
+      if (!extensions.has(extname2(path).toLowerCase()))
         continue;
       if (signal.aborted)
         throw abortError();
@@ -2369,20 +2647,37 @@ class MediaSearch {
     let imageSource;
     let queryImage;
     if (r.image) {
-      if (!extensions.has(extname(r.image).toLowerCase()) || extname(r.image).toLowerCase() === ".pdf")
+      if (!extensions.has(extname2(r.image).toLowerCase()) || extname2(r.image).toLowerCase() === ".pdf")
         throw new SiftLightError("image must be a supported local image file");
       imageSource = await sourceBytes(cwd, r.image, signal);
-      queryImage = join2(root, "query" + extname(r.image).toLowerCase());
+      queryImage = join2(root, "query" + extname2(r.image).toLowerCase());
       await writeFile(queryImage, imageSource.bytes, { mode: 384 });
     }
     let response;
     if (admitted.size) {
-      this.#worker ??= new ResidentWorkerClient(this.#config, root, corpus, join2(root, "index.sqlite"), { parse: (value) => responseSchema.parse(value), maxResponseBytes: 128 * 1024 });
-      response = await this.#worker.search({
-        ...queryImage ? { image: queryImage } : { query: r.query },
-        kind: r.kind,
-        expectedFiles: admitted.size
-      }, signal);
+      if (this.#config) {
+        this.#worker ??= new ResidentWorkerClient(this.#config, root, corpus, join2(root, "index.sqlite"), { parse: (value) => responseSchema.parse(value), maxResponseBytes: 128 * 1024 });
+        response = await this.#worker.search({
+          ...queryImage ? { image: queryImage } : { query: r.query },
+          kind: r.kind,
+          expectedFiles: admitted.size
+        }, signal);
+      } else if (this.#remoteConfig) {
+        this.#remote ??= new RemoteMediaClient(this.#remoteConfig);
+        const remoteFiles = [...admitted.values()].map((entry) => ({
+          id: createHash("sha256").update(entry.staged).digest("hex").slice(0, 32),
+          path: entry.staged
+        }));
+        response = await this.#remote.search({
+          ...queryImage ? { imagePath: queryImage } : { query: r.query },
+          kind: r.kind,
+          expectedFiles: admitted.size,
+          files: remoteFiles,
+          signal
+        });
+      }
+      if (!response)
+        throw new SiftLightError("Media provider is not configured");
       if (response.indexedFiles !== admitted.size)
         throw new SiftLightError("Media index inventory mismatch");
     }
@@ -2390,7 +2685,7 @@ class MediaSearch {
     const seen = new Set;
     for (const hit of response?.hits ?? []) {
       const source = admitted.get(resolve7(hit.path));
-      if (!source || hit.kind === "scan" !== (extname(source.path).toLowerCase() === ".pdf") || seen.has(hit.path) || hit.kind === "scan" !== (hit.page !== null) || hit.page !== null && hit.page > hit.chunkCount)
+      if (!source || hit.kind === "scan" !== (extname2(source.path).toLowerCase() === ".pdf") || seen.has(hit.path) || hit.kind === "scan" !== (hit.page !== null) || hit.page !== null && hit.page > hit.chunkCount)
         throw new SiftLightError("Media result source or page is inconsistent");
       seen.add(hit.path);
       saved.push({ hit, source });
@@ -2410,7 +2705,7 @@ class MediaSearch {
     }
     if (signal.aborted)
       throw abortError();
-    const cursor = randomUUID3();
+    const cursor = randomUUID4();
     for (const [id, snapshot] of this.#snapshots)
       if (Date.now() - snapshot.createdAt > 600000)
         this.#snapshots.delete(id);
@@ -2473,11 +2768,23 @@ ${JSON.stringify(details)}`,
       throw new SiftLightError("Media source changed; search again before inspection");
     const folder = await mkdtemp(join2(await this.#root(), "inspect-"));
     try {
-      const input = join2(folder, "source" + extname(item.source.path));
+      const input = join2(folder, "source" + extname2(item.source.path));
       const output = join2(folder, "preview.png");
       await writeFile(input, current.bytes, { mode: 384 });
+      const renderer = this.#config ?? this.#remoteConfig?.renderer;
+      if (!renderer) {
+        const mimeType = mediaMimeType(item.source.path);
+        if (mimeType?.startsWith("image/") && mimeType === "image/png") {
+          return {
+            text: JSON.stringify(details),
+            details,
+            image: { data: current.bytes.toString("base64"), mimeType }
+          };
+        }
+        throw new SiftLightError("Media preview requires nativeMedia or media.renderer; validate still works without a local renderer");
+      }
       const result = await runOwnedProcess({
-        executable: this.#config.executable,
+        executable: renderer.executable,
         args: ["--render", input, String(item.hit.page ?? 0), output],
         cwd: folder,
         signal
@@ -2488,7 +2795,7 @@ ${JSON.stringify(details)}`,
       });
       if (result.code !== 0)
         throw new SiftLightError(`Media preview failed: ${result.stderr}`);
-      const preview = await readFile2(output);
+      const preview = await readFile3(output);
       if (preview.length > 4 * 1024 * 1024)
         throw new SiftLightError("Media preview exceeds 4 MiB");
       return {
@@ -2513,6 +2820,7 @@ ${JSON.stringify(details)}`,
     await this.#queue.run(async () => {
       try {
         await this.#worker?.close();
+        await this.#remote?.close();
       } finally {
         this.#snapshots.clear();
         if (this.#directory)
@@ -2523,13 +2831,13 @@ ${JSON.stringify(details)}`,
 }
 
 // src/mcp.ts
-import { randomUUID as randomUUID8 } from "node:crypto";
+import { randomUUID as randomUUID9 } from "node:crypto";
 import { createServer } from "node:http";
 import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.0-1",
+  version: "1.1.0",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -3035,7 +3343,7 @@ function boundedRequestContractDetails(details) {
 }
 
 // src/language-capability-definitions.ts
-import { extname as extname2 } from "node:path";
+import { extname as extname3 } from "node:path";
 var TYPESCRIPT_LANGUAGE_CAPABILITIES = [
   {
     id: "ast-grep.outline",
@@ -3184,14 +3492,14 @@ var DEFAULT_NEUTRAL_CAPABILITIES = [
   }
 ];
 function descriptorForPath(descriptors, path) {
-  const extension = extname2(path).toLowerCase();
+  const extension = extname3(path).toLowerCase();
   return descriptors.find((item) => item.extensions.includes(extension));
 }
 function languageForPath(descriptors, path) {
   return descriptorForPath(descriptors, path)?.language;
 }
 function outlineExtension(path) {
-  const extension = extname2(path).toLowerCase();
+  const extension = extname3(path).toLowerCase();
   return extension || undefined;
 }
 
@@ -4134,7 +4442,7 @@ class DataSourceError extends Error {
     this.code = code;
   }
 }
-var MAX_RESPONSE_BYTES = 1024 * 1024;
+var MAX_RESPONSE_BYTES2 = 1024 * 1024;
 async function credential(config) {
   let value;
   if (config.tokenEnv)
@@ -4189,7 +4497,7 @@ async function sourcePost(config, path, payload, signal) {
         if (part.done)
           break;
         size += part.value.byteLength;
-        if (size > MAX_RESPONSE_BYTES) {
+        if (size > MAX_RESPONSE_BYTES2) {
           await reader.cancel();
           throw new DataSourceError("protocol");
         }
@@ -4439,14 +4747,14 @@ class DataSources {
 import { createHash as createHash7 } from "node:crypto";
 
 // src/concept-worker-client.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
+import { randomUUID as randomUUID5 } from "node:crypto";
 import { mkdir as mkdir2, rm as rm2 } from "node:fs/promises";
 import { dirname as dirname3, join as join4 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder as StringDecoder2 } from "node:string_decoder";
 
 // src/concept-model.ts
-import { stat as stat5 } from "node:fs/promises";
+import { stat as stat6 } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
 import { join as join3, resolve as resolve9 } from "node:path";
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
@@ -4489,7 +4797,7 @@ function conceptModelDirectory() {
 async function inspectConceptModel(directory = conceptModelDirectory()) {
   for (const asset of CONCEPT_ASSETS) {
     try {
-      const information = await stat5(join3(directory, asset.path));
+      const information = await stat6(join3(directory, asset.path));
       if (!information.isFile() || information.size !== asset.bytes)
         return {
           installed: false,
@@ -4585,7 +4893,7 @@ class ConceptWorkerClient {
       throw new SiftLightError("Concept worker idle timeout must be 1–300000 ms");
   }
   async#start() {
-    const stagingRoot = join4(conceptCacheDirectory(), ".staging", randomUUID4());
+    const stagingRoot = join4(conceptCacheDirectory(), ".staging", randomUUID5());
     await mkdir2(stagingRoot, { recursive: true });
     const ready = Promise.withResolvers();
     ready.promise.catch(() => {
@@ -4719,7 +5027,7 @@ class ConceptWorkerClient {
         const input = await session.ready;
         if (combined.aborted)
           throw abortError();
-        const id = randomUUID4();
+        const id = randomUUID5();
         const body = JSON.stringify({
           id,
           query,
@@ -5657,7 +5965,7 @@ async function parseSyntax(path, text, signal, pattern) {
 import { createHash as createHash4 } from "node:crypto";
 
 // src/source-access.ts
-import { extname as extname3, resolve as resolve13 } from "node:path";
+import { extname as extname4, resolve as resolve13 } from "node:path";
 
 // src/historical-paths.ts
 import { lstat, mkdir as mkdir3, mkdtemp as mkdtemp2, open as open2, rm as rm3, writeFile as writeFile2 } from "node:fs/promises";
@@ -6790,7 +7098,7 @@ class SyntaxQueue {
         throw new SourceDocumentError("encoding", "Syntax requires lossless UTF-8 source");
       const origin = document.reference.origin;
       const revision = origin.kind === "worktree" ? origin.contentHash : origin.blob;
-      const key = `${extname3(document.path).toLowerCase()}\x00${revision}\x00${pattern ?? ""}`;
+      const key = `${extname4(document.path).toLowerCase()}\x00${revision}\x00${pattern ?? ""}`;
       const cached = this.#cache.get(key);
       if (cached) {
         this.#cache.delete(key);
@@ -7569,25 +7877,25 @@ async function structuralSearch(input, access) {
 
 // src/native-text-search.ts
 import { createHash as createHash6 } from "node:crypto";
-import { mkdtemp as mkdtemp3, mkdir as mkdir4, readFile as readFile3, realpath as realpath5, rm as rm4, writeFile as writeFile3 } from "node:fs/promises";
+import { mkdtemp as mkdtemp3, mkdir as mkdir4, readFile as readFile4, realpath as realpath5, rm as rm4, writeFile as writeFile3 } from "node:fs/promises";
 import { tmpdir as tmpdir3 } from "node:os";
 import { basename as basename3, dirname as dirname6, isAbsolute as isAbsolute7, join as join6, resolve as resolve15 } from "node:path";
 
 // src/native-text-worker-client.ts
-import { z as z2 } from "zod";
-var responseSchema2 = z2.object({
-  version: z2.literal(2),
-  id: z2.string(),
-  indexedFiles: z2.number().int().nonnegative(),
-  modelLoads: z2.literal(1),
-  modelReused: z2.boolean(),
-  processId: z2.number().int().positive(),
-  hits: z2.array(z2.object({
-    path: z2.string(),
-    score: z2.number().finite(),
-    line: z2.number().int().positive(),
-    chunkIndex: z2.number().int().nonnegative(),
-    locator: z2.string()
+import { z as z3 } from "zod";
+var responseSchema2 = z3.object({
+  version: z3.literal(2),
+  id: z3.string(),
+  indexedFiles: z3.number().int().nonnegative(),
+  modelLoads: z3.literal(1),
+  modelReused: z3.boolean(),
+  processId: z3.number().int().positive(),
+  hits: z3.array(z3.object({
+    path: z3.string(),
+    score: z3.number().finite(),
+    line: z3.number().int().positive(),
+    chunkIndex: z3.number().int().nonnegative(),
+    locator: z3.string()
   })).max(10)
 });
 
@@ -7694,7 +8002,7 @@ function createNativeTextSearch(config, search) {
         if (!entry || seen.has(entry.staged))
           throw new SiftLightError("Native text returned an unknown or duplicate source");
         seen.add(entry.staged);
-        const content = await readFile3(entry.staged);
+        const content = await readFile4(entry.staged);
         if (createHash6("sha256").update(content).digest("hex") !== entry.hash)
           throw new SiftLightError("Native staged source changed");
         const document = new SourceDocument(entry.source, content);
@@ -7775,10 +8083,10 @@ function rankRetrievalFiles(current, native) {
 }
 
 // src/evidence-service.ts
-import { dirname as dirname7, extname as extname4, resolve as resolve24 } from "node:path";
+import { dirname as dirname7, extname as extname5, resolve as resolve24 } from "node:path";
 
 // src/analysis-store.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 
 // src/analysis-types.ts
 var SEMANTIC_JUDGE_CLASSIFICATIONS = [
@@ -8060,7 +8368,7 @@ class AnalysisStore {
   }
   create(result, summarize) {
     this.#expire();
-    const id = randomUUID5();
+    const id = randomUUID6();
     const bounded = {
       ...result,
       ...result.retrievalLanes ? {
@@ -10305,7 +10613,7 @@ async function discoverFiles(input, cwd, signal) {
 }
 
 // src/source-continuations.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
+import { randomUUID as randomUUID7 } from "node:crypto";
 
 // src/source-pages.ts
 function mergeByteRanges(ranges) {
@@ -10409,7 +10717,7 @@ class SourceContinuations {
   create(source, target, gaps, boundary) {
     this.#sweep();
     const item = {
-      id: randomUUID6(),
+      id: randomUUID7(),
       source: structuredClone(source),
       target: mergeByteRanges(target),
       gaps: mergeByteRanges(gaps),
@@ -11005,7 +11313,7 @@ async function continueSource(cursor, access, continuations, expectedPath) {
 }
 
 // src/evidence-validation.ts
-import { realpath as realpath7, stat as stat6 } from "node:fs/promises";
+import { realpath as realpath7, stat as stat7 } from "node:fs/promises";
 import { resolve as resolve22 } from "node:path";
 
 // src/evidence-validity.ts
@@ -11043,9 +11351,9 @@ async function confirmWorktreeState(path, cwd, signal) {
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
-    const before = await stat6(absolute);
+    const before = await stat7(absolute);
     const beforeCanonical = await realpath7(absolute);
-    const after = await stat6(absolute);
+    const after = await stat7(absolute);
     const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return { status: "stale", reason: "Source is no longer a regular file" };
@@ -11187,9 +11495,9 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
       return { path: target.path, role: "source", ...result };
     }
-    const before = await stat6(absolute);
+    const before = await stat7(absolute);
     const beforeCanonical = canonical;
-    const after = await stat6(absolute);
+    const after = await stat7(absolute);
     const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return {
@@ -12063,7 +12371,7 @@ function pythonRoleAnalysis(document) {
 import { resolve as resolve23 } from "node:path";
 
 // src/config-reader.ts
-import { readFile as readFile4 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 
 // src/native-text-config.ts
 import { isAbsolute as isAbsolute8 } from "node:path";
@@ -12111,6 +12419,42 @@ function isRawSiftLightConfig(value) {
 function isRawSemanticJudgeConfig(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function isRawMediaConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function parseEndpoint(value, path, field) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be a nonempty URL`);
+  }
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(value);
+  } catch (error) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be a URL`, {
+      cause: error
+    });
+  }
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const secureEndpoint = parsedEndpoint.protocol === "https:" || parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname);
+  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`);
+  }
+  return value;
+}
+function parseApiKeyEnv(value, path, field) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be an uppercase environment variable name`);
+  }
+  return value;
+}
+function parseBoundedModel(value, path, field) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128 || /[\r\n\0]/u.test(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: ${field} must be bounded single-line text`);
+  }
+  return value;
+}
 function boundedInteger2(value, fallback, minimum, maximum, field) {
   const candidate = value ?? fallback;
   if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < minimum || candidate > maximum) {
@@ -12142,43 +12486,59 @@ function parseSemanticJudge(value, path) {
     throw new Error(`Invalid sift-light config at ${path}: semanticJudge.enabled must be a boolean`);
   }
   const provider = value.provider ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.provider;
-  if (provider !== "jev") {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.provider must be "jev"`);
+  if (provider !== "jev" && provider !== "http-json") {
+    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.provider must be "jev" or "http-json"`);
   }
-  const endpoint = value.endpoint ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint;
-  if (typeof endpoint !== "string" || endpoint.length === 0 || endpoint.length > 2048) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a nonempty URL`);
-  }
-  let parsedEndpoint;
-  try {
-    parsedEndpoint = new URL(endpoint);
-  } catch (error) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must be a URL`, {
-      cause: error
-    });
-  }
-  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
-  const secureEndpoint = parsedEndpoint.protocol === "https:" || parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname);
-  if (!secureEndpoint || parsedEndpoint.username || parsedEndpoint.password) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.endpoint must use HTTPS, except that HTTP is allowed for localhost loopback development; URL credentials are not allowed`);
-  }
-  const apiKeyEnv = value.apiKeyEnv ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv;
-  if (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/u.test(apiKeyEnv)) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.apiKeyEnv must be an uppercase environment variable name`);
-  }
-  const model = value.model ?? DEFAULT_SEMANTIC_JUDGE_CONFIG.model;
-  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
-    throw new Error(`Invalid sift-light config at ${path}: semanticJudge.model must be bounded single-line text`);
-  }
+  const endpoint = parseEndpoint(value.endpoint ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint : undefined), path, "semanticJudge.endpoint");
+  const apiKeyEnv = parseApiKeyEnv(value.apiKeyEnv, path, "semanticJudge.apiKeyEnv") ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv : undefined);
+  const model = parseBoundedModel(value.model ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.model : undefined), path, "semanticJudge.model");
   return {
     enabled,
     provider,
     endpoint,
-    apiKeyEnv,
+    ...apiKeyEnv === undefined ? {} : { apiKeyEnv },
     model,
     timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_SEMANTIC_JUDGE_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: semanticJudge.timeoutMs`),
     maxCandidates: boundedInteger2(value.maxCandidates, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxCandidates, 1, 20, `config at ${path}: semanticJudge.maxCandidates`),
     maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
+  };
+}
+function parseMedia(value, path) {
+  if (value === undefined)
+    return;
+  if (!isRawMediaConfig(value)) {
+    throw new Error(`Invalid sift-light config at ${path}: media must be an object`);
+  }
+  const unknown = Object.keys(value).filter((key) => ![
+    "provider",
+    "endpoint",
+    "apiKeyEnv",
+    "model",
+    "timeoutMs",
+    "maxRetries",
+    "maxRequestBytes",
+    "renderer"
+  ].includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid sift-light config at ${path}: unsupported media fields; accepted fields are provider, endpoint, apiKeyEnv, model, timeoutMs, maxRetries, maxRequestBytes and renderer`);
+  }
+  const provider = value.provider ?? "http-json";
+  if (provider !== "http-json") {
+    throw new Error(`Invalid sift-light config at ${path}: media.provider must be "http-json"`);
+  }
+  const endpoint = parseEndpoint(value.endpoint, path, "media.endpoint");
+  const apiKeyEnv = parseApiKeyEnv(value.apiKeyEnv, path, "media.apiKeyEnv");
+  const model = parseBoundedModel(value.model, path, "media.model");
+  const renderer = parseNativeTextConfig(value.renderer, "media.renderer");
+  return {
+    provider,
+    endpoint,
+    ...apiKeyEnv === undefined ? {} : { apiKeyEnv },
+    model,
+    timeoutMs: boundedInteger2(value.timeoutMs, 120000, 1000, 1200000, `config at ${path}: media.timeoutMs`),
+    maxRetries: boundedInteger2(value.maxRetries, 2, 0, 5, `config at ${path}: media.maxRetries`),
+    maxRequestBytes: boundedInteger2(value.maxRequestBytes, 32 * 1024 * 1024, 1 * 1024 * 1024, 64 * 1024 * 1024, `config at ${path}: media.maxRequestBytes`),
+    ...renderer === undefined ? {} : { renderer }
   };
 }
 function parseConfig(value, path) {
@@ -12192,10 +12552,11 @@ function parseConfig(value, path) {
     "semanticJudge",
     "dataSources",
     "nativeText",
-    "nativeMedia"
+    "nativeMedia",
+    "media"
   ].includes(key));
   if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText and nativeMedia are accepted`);
+    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText, nativeMedia and media are accepted`);
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
@@ -12207,11 +12568,15 @@ function parseConfig(value, path) {
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
   const nativeText = parseNativeTextConfig(value.nativeText);
   const nativeMedia = parseNativeTextConfig(value.nativeMedia, "nativeMedia");
+  const media = parseMedia(value.media, `${path}: media`);
+  if (nativeMedia && media)
+    throw new Error(`Invalid sift-light config at ${path}: choose nativeMedia or media, not both`);
   if (nativeText && vectorSearchEnabled !== true)
     throw new Error("nativeText requires vectorSearchEnabled:true");
   return {
     ...nativeText ? { nativeText } : {},
     ...nativeMedia ? { nativeMedia } : {},
+    ...media ? { media } : {},
     locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
     enforceSearch: enforcement,
     vectorSearchEnabled: vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
@@ -12230,7 +12595,7 @@ function normalizeSearchEnforcement(value, source) {
 }
 async function readSiftLightConfigFile(path, options = {}) {
   try {
-    const content = await readFile4(path, "utf8");
+    const content = await readFile5(path, "utf8");
     return parseConfig(JSON.parse(content), path);
   } catch (error) {
     if (isMissingFile(error)) {
@@ -12329,7 +12694,7 @@ async function judgeSemanticCandidateBatches(runner, query, batches, signal) {
 
 // src/semantic-judge.ts
 var MAX_CANDIDATE_CHARS = 4000;
-var MAX_RESPONSE_BYTES2 = 4 * 1024 * 1024;
+var MAX_RESPONSE_BYTES3 = 4 * 1024 * 1024;
 var MAX_ERROR_CHARS = 512;
 var CLASSIFICATION_PRIORITY = {
   "implementation-candidate": 0,
@@ -12419,14 +12784,22 @@ function requestBody(query, candidates, model) {
     questions
   };
 }
+function httpJsonRequestBody(query, candidates, model) {
+  return {
+    version: 1,
+    model,
+    query,
+    candidates: candidates.map(({ id, excerpt }) => ({ id, excerpt }))
+  };
+}
 async function responseText(response) {
   if (!response.body) {
     const contentLength = response.headers.get("content-length");
-    if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES2) {
+    if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES3) {
       throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
     }
     const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES2) {
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES3) {
       throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
     }
     return text;
@@ -12441,7 +12814,7 @@ async function responseText(response) {
         break;
       const chunk = result.value;
       bytes += chunk.byteLength;
-      if (bytes > MAX_RESPONSE_BYTES2) {
+      if (bytes > MAX_RESPONSE_BYTES3) {
         await reader.cancel();
         throw new SemanticJudgeRequestError("Semantic judge response exceeded the 4 MiB limit", false);
       }
@@ -12458,10 +12831,10 @@ async function responseText(response) {
   }
   return new TextDecoder("utf-8", { fatal: true }).decode(all);
 }
-function retryDelay(attempt) {
+function retryDelay2(attempt) {
   return Math.min(20000, 400 * 2 ** attempt);
 }
-async function waitForRetry(delayMs, signal) {
+async function waitForRetry2(delayMs, signal) {
   if (signal?.aborted)
     throw signal.reason instanceof Error ? signal.reason : new Error("Operation aborted");
   await new Promise((resolve, reject) => {
@@ -12479,68 +12852,127 @@ async function waitForRetry(delayMs, signal) {
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
+async function fetchSemanticResponse(config, key, fetcher, body, parentSignal) {
+  if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
+    throw new SemanticJudgePayloadTooLargeError("Semantic judge request exceeded the 64 KiB request limit");
+  }
+  for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
+    const controller = new AbortController;
+    const onParentAbort = () => controller.abort(parentSignal?.reason);
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+    const timeout = setTimeout(() => controller.abort(new Error("Semantic judge request timed out")), config.timeoutMs);
+    try {
+      const headers = { "content-type": "application/json" };
+      if (key)
+        headers.authorization = `Bearer ${key}`;
+      const response = await fetcher(config.endpoint, {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        if (response.status === 413) {
+          throw new SemanticJudgePayloadTooLargeError("Semantic judge rejected an oversized request with HTTP 413");
+        }
+        const retryable = response.status === 408 || response.status === 429 || response.status === 529 || response.status >= 500;
+        throw new SemanticJudgeRequestError(`Semantic judge returned HTTP ${String(response.status)}`, retryable);
+      }
+      const raw = JSON.parse(await responseText(response));
+      if (!isRecord4(raw)) {
+        throw new SemanticJudgeRequestError("Semantic judge response must be an object", false);
+      }
+      return raw;
+    } catch (error) {
+      if (parentSignal?.aborted)
+        throw error;
+      const retryable = error instanceof SemanticJudgePayloadTooLargeError ? false : error instanceof SemanticJudgeRequestError ? error.retryable : true;
+      if (!retryable || attempt >= config.maxRetries)
+        throw error;
+      await waitForRetry2(retryDelay2(attempt), parentSignal);
+    } finally {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", onParentAbort);
+    }
+  }
+  throw new SemanticJudgeRequestError("Semantic judge request failed", false);
+}
+function responseModel(raw, config) {
+  const model = raw.model ?? config.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
+    throw new SemanticJudgeRequestError("Semantic judge response model must be bounded single-line text", false);
+  }
+  return model;
+}
+function responseUsage(raw) {
+  const usage = isRecord4(raw.usage) ? raw.usage : undefined;
+  const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
+  const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
+  return {
+    ...inputTokens === undefined ? {} : { inputTokens },
+    ...outputTokens === undefined ? {} : { outputTokens }
+  };
+}
+function parseHttpJsonResult(raw, candidates, config, elapsedMs) {
+  if (raw.version !== 1 || !Array.isArray(raw.judgments)) {
+    throw new SemanticJudgeRequestError("HTTP JSON semantic judge response must contain version 1 judgments", false);
+  }
+  const candidateIndexes = new Map(candidates.map((candidate, index) => [candidate.id, index]));
+  const judgments = new Map;
+  for (const value of raw.judgments) {
+    if (!isRecord4(value) || typeof value.id !== "string") {
+      throw new SemanticJudgeRequestError("HTTP JSON semantic judge judgment has an invalid id", false);
+    }
+    const candidateIndex = candidateIndexes.get(value.id);
+    if (candidateIndex === undefined || judgments.has(candidateIndex)) {
+      throw new SemanticJudgeRequestError("HTTP JSON semantic judge response contains an unknown or duplicate candidate", false);
+    }
+    if (!isClassification(value.choice)) {
+      throw new SemanticJudgeRequestError(`HTTP JSON semantic judge response has an invalid choice for ${value.id}`, false);
+    }
+    const confidence = value.confidence === undefined ? undefined : probability(value.confidence, "confidence");
+    judgments.set(candidateIndex, {
+      candidateIndex,
+      classification: value.choice,
+      probability: probability(value.probability, "probability"),
+      ...confidence === undefined ? {} : { confidence }
+    });
+  }
+  if (judgments.size !== candidates.length) {
+    throw new SemanticJudgeRequestError(`HTTP JSON semantic judge response judged ${String(judgments.size)} of ${String(candidates.length)} candidates`, false);
+  }
+  const usage = responseUsage(raw);
+  return {
+    model: responseModel(raw, config),
+    judgments: candidates.map((_candidate, index) => judgments.get(index)),
+    ...usage,
+    elapsedMs
+  };
+}
 function createJevRunner(config, key, fetcher) {
   return async (query, candidates, parentSignal) => {
     const startedAt = performance.now();
     const body = JSON.stringify(requestBody(query, candidates, config.model));
-    if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
-      throw new SemanticJudgePayloadTooLargeError("Semantic judge request exceeded the 64 KiB request limit");
+    const raw = await fetchSemanticResponse(config, key, fetcher, body, parentSignal);
+    if (!isRecord4(raw.answers)) {
+      throw new SemanticJudgeRequestError("Semantic judge response did not contain answers", false);
     }
-    for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
-      const controller = new AbortController;
-      const onParentAbort = () => controller.abort(parentSignal?.reason);
-      parentSignal?.addEventListener("abort", onParentAbort, { once: true });
-      const timeout = setTimeout(() => controller.abort(new Error("Semantic judge request timed out")), config.timeoutMs);
-      try {
-        const response = await fetcher(config.endpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${key}`
-          },
-          body,
-          signal: controller.signal
-        });
-        if (!response.ok) {
-          if (response.status === 413) {
-            throw new SemanticJudgePayloadTooLargeError("Semantic judge rejected an oversized request with HTTP 413");
-          }
-          const retryable = response.status === 408 || response.status === 429 || response.status === 529 || response.status >= 500;
-          throw new SemanticJudgeRequestError(`Semantic judge returned HTTP ${String(response.status)}`, retryable);
-        }
-        const raw = JSON.parse(await responseText(response));
-        if (!isRecord4(raw) || !isRecord4(raw.answers)) {
-          throw new SemanticJudgeRequestError("Semantic judge response did not contain answers", false);
-        }
-        const answers = raw.answers;
-        const judgments = candidates.map((candidate, index) => parseJudgment(answers[candidate.id], index));
-        const model = raw.model ?? config.model;
-        if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model)) {
-          throw new SemanticJudgeRequestError("Semantic judge response model must be bounded single-line text", false);
-        }
-        const usage = isRecord4(raw.usage) ? raw.usage : undefined;
-        const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
-        const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
-        return {
-          model,
-          judgments,
-          ...inputTokens === undefined ? {} : { inputTokens },
-          ...outputTokens === undefined ? {} : { outputTokens },
-          elapsedMs: Math.round(performance.now() - startedAt)
-        };
-      } catch (error) {
-        if (parentSignal?.aborted)
-          throw error;
-        const retryable = error instanceof SemanticJudgePayloadTooLargeError ? false : error instanceof SemanticJudgeRequestError ? error.retryable : true;
-        if (!retryable || attempt >= config.maxRetries)
-          throw error;
-        await waitForRetry(retryDelay(attempt), parentSignal);
-      } finally {
-        clearTimeout(timeout);
-        parentSignal?.removeEventListener("abort", onParentAbort);
-      }
-    }
-    throw new SemanticJudgeRequestError("Semantic judge request failed", false);
+    const answers = raw.answers;
+    const judgments = candidates.map((candidate, index) => parseJudgment(answers[candidate.id], index));
+    const usage = responseUsage(raw);
+    return {
+      model: responseModel(raw, config),
+      judgments,
+      ...usage,
+      elapsedMs: Math.round(performance.now() - startedAt)
+    };
+  };
+}
+function createHttpJsonRunner(config, key, fetcher) {
+  return async (query, candidates, parentSignal) => {
+    const startedAt = performance.now();
+    const raw = await fetchSemanticResponse(config, key, fetcher, JSON.stringify(httpJsonRequestBody(query, candidates, config.model)), parentSignal);
+    return parseHttpJsonResult(raw, candidates, config, Math.round(performance.now() - startedAt));
   };
 }
 function createDisabledSemanticJudgeIntegration(config) {
@@ -12549,14 +12981,16 @@ function createDisabledSemanticJudgeIntegration(config) {
 function createSemanticJudgeIntegration(config, environment = process.env, fetcher = fetch) {
   if (!config.enabled)
     return createDisabledSemanticJudgeIntegration(config);
-  const key = environment[config.apiKeyEnv]?.trim();
-  if (!key) {
+  const key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
+  if (config.provider === "jev" && !key) {
+    throw new SemanticJudgeConfigurationError(`Semantic judge is enabled, but environment variable ${config.apiKeyEnv ?? "TYPESAFE_API_KEY"} is missing or empty`);
+  }
+  if (config.provider === "http-json" && config.apiKeyEnv && !key) {
     throw new SemanticJudgeConfigurationError(`Semantic judge is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`);
   }
-  if (config.provider !== "jev") {
-    throw new SemanticJudgeConfigurationError(`Unsupported semantic judge provider: ${String(config.provider)}`);
-  }
-  return { config, runner: createJevRunner(config, key, fetcher) };
+  if (config.provider === "jev")
+    return { config, runner: createJevRunner(config, key, fetcher) };
+  return { config, runner: createHttpJsonRunner(config, key, fetcher) };
 }
 function createConfiguredSemanticJudgeIntegration(config, environment = process.env) {
   const judge = config.semanticJudge ?? DEFAULT_SEMANTIC_JUDGE_CONFIG;
@@ -13733,7 +14167,7 @@ class EvidenceService {
         throw new SiftLightError(`No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`);
     }
     if (!language && !isPython || language === "go") {
-      const extension = extname4(document.path) || "extensionless source";
+      const extension = extname5(document.path) || "extensionless source";
       throw new SiftLightError(`${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`);
     }
     if (input.mode === "outline") {
@@ -13926,7 +14360,7 @@ function normalizeRequestAliases(request) {
 }
 
 // src/format.ts
-import { readFile as readFile5 } from "node:fs/promises";
+import { readFile as readFile6 } from "node:fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -14060,7 +14494,7 @@ async function loadContextLines(match, expectedRevision, cache, signal) {
       cache.set(match.absolutePath, changed);
       return changed;
     }
-    const content = await readFile5(match.absolutePath, { encoding: "utf8", signal });
+    const content = await readFile6(match.absolutePath, { encoding: "utf8", signal });
     const afterRevision = await getSourceRevision(match.absolutePath);
     if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
       const changed = { status: "changed" };
@@ -14385,7 +14819,7 @@ ${lineRows.join(`
 }
 
 // src/snapshot-store.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
+import { randomUUID as randomUUID8 } from "node:crypto";
 class SnapshotStore {
   #snapshots = new Map;
   #expired = new Set;
@@ -14410,7 +14844,7 @@ class SnapshotStore {
     const now = this.#now();
     const snapshot = {
       ...scan,
-      id: randomUUID7(),
+      id: randomUUID8(),
       createdAt: now,
       lastAccessedAt: now
     };
@@ -15180,7 +15614,7 @@ class SiftLightService {
   }
   mediaSearch(value, cwd, signal) {
     if (!this.#media)
-      throw new SiftLightError("Visual search is disabled; configure nativeMedia and restart the host");
+      throw new SiftLightError("Visual search is disabled; configure nativeMedia or media and restart the host");
     return this.#media.search(value, cwd, signal);
   }
   #dataSources;
@@ -15196,7 +15630,8 @@ class SiftLightService {
   #operations;
   #reusableSummarySnapshots = new WeakSet;
   constructor(options) {
-    this.#media = options.nativeMedia ? new MediaSearch(options.nativeMedia) : undefined;
+    const mediaConfig = options.nativeMedia ?? options.media;
+    this.#media = mediaConfig ? new MediaSearch(mediaConfig) : undefined;
     this.#dataSources = new DataSources(options.dataSources);
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore;
@@ -15908,7 +16343,7 @@ function siftLightTool(outputMode) {
     tool.outputSchema = SIFT_LIGHT_OUTPUT_SCHEMA;
   return tool;
 }
-function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = [], nativeText, nativeMedia) {
+function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = [], nativeText, nativeMedia, media) {
   const resolvedSemanticJudge = semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
@@ -15917,7 +16352,8 @@ function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = f
     dataSources,
     semanticJudge: resolvedSemanticJudge,
     ...nativeText ? { nativeText } : {},
-    ...nativeMedia ? { nativeMedia } : {}
+    ...nativeMedia ? { nativeMedia } : {},
+    ...media ? { media } : {}
   });
 }
 function errorMessage2(error) {
@@ -15974,9 +16410,9 @@ function createSiftLightMcpServer(service, cwd, outputMode = DEFAULT_MCP_OUTPUT_
         {
           name: "sift-light-media",
           title: "Visual search",
-          description: "Search local image content or scanned PDF pages. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels. Local resident vision model; slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
+          description: "Search image content or scanned PDF pages through the configured local or BYO provider. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels when a renderer is configured. Slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
           inputSchema: {
-            ...z3.toJSONSchema(mediaRequestSchema, { unrepresentable: "any" }),
+            ...z4.toJSONSchema(mediaRequestSchema, { unrepresentable: "any" }),
             type: "object"
           },
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -16194,7 +16630,7 @@ async function handleMcpRequest(request, response, state, createService, cwd) {
       try {
         const service = createService();
         const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID8(),
+          sessionIdGenerator: () => randomUUID9(),
           onsessioninitialized: (initializedSessionId) => {
             if (!pendingSession)
               throw new Error("MCP session initialized before registration");
@@ -16381,7 +16817,8 @@ async function createMcpSearchFeatures(environment = process.env) {
     vectorSearchEnabled: config.vectorSearchEnabled === true,
     dataSources: config.dataSources ?? [],
     ...config.nativeText ? { nativeText: config.nativeText } : {},
-    ...config.nativeMedia ? { nativeMedia: config.nativeMedia } : {}
+    ...config.nativeMedia ? { nativeMedia: config.nativeMedia } : {},
+    ...config.media ? { media: config.media } : {}
   };
 }
 function mcpSemanticJudgeConfigSource(environment = process.env) {
@@ -16501,12 +16938,12 @@ function logSemanticJudgeStatus(integration) {
   process.stderr.write(`sift-light MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}
 `);
 }
-async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia) {
+async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media) {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65535),
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia),
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media),
     maxSessions: environmentInteger("SIFT_LIGHT_MCP_MAX_SESSIONS", DEFAULT_MCP_MAX_SESSIONS, 1, Number.MAX_SAFE_INTEGER),
     sessionIdleTimeoutMs: environmentInteger("SIFT_LIGHT_MCP_SESSION_IDLE_MS", DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS, 1, Number.MAX_SAFE_INTEGER),
     allowedOrigins: allowedOrigins(),
@@ -16540,11 +16977,11 @@ async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dat
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia) {
+async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media) {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia)
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media)
   });
   process.stderr.write(`sift-light MCP serving one local client over stdio
 `);
@@ -16573,15 +17010,15 @@ async function main() {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia } = await createMcpSearchFeatures();
+  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(`sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}
 `);
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia);
+    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media);
     return;
   }
-  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia);
+  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media);
 }
 try {
   await main();

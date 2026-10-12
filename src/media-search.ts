@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { z } from "zod";
 import type { NativeTextConfig } from "./native-text-config.js";
+import type { HttpMediaConfig } from "./media-config.js";
 import { ResidentWorkerClient } from "./resident-worker-client.js";
+import { RemoteMediaClient, mediaMimeType } from "./remote-media-client.js";
 import { OwnedTaskQueue } from "./owned-task-queue.js";
 import { listWorkspaceFiles } from "./workspace-files.js";
 import { SearchPathPolicy } from "./path-policy.js";
@@ -44,7 +46,7 @@ const responseSchema = z.object({
   version: z.literal(1),
   id: z.string(),
   indexedFiles: z.number().int().nonnegative(),
-  modelLoads: z.literal(1),
+  modelLoads: z.number().int().nonnegative(),
   modelReused: z.boolean(),
   processId: z.number().int().positive(),
   hits: z
@@ -86,7 +88,7 @@ interface Snapshot {
 export interface MediaResult {
   text: string;
   details: Record<string, unknown>;
-  image?: { data: string; mimeType: "image/png" };
+  image?: { data: string; mimeType: string };
 }
 const extensions = new Set([
   ".png",
@@ -134,7 +136,8 @@ async function sourceBytes(
 }
 /** Visual evidence owns its index and shares the local admission policy with text search. */
 export class MediaSearch {
-  readonly #config: NativeTextConfig;
+  readonly #config: NativeTextConfig | undefined;
+  readonly #remoteConfig: HttpMediaConfig | undefined;
   readonly #operations = new OperationLifecycle<MediaResult, "media">({ deadlineMs: 300_000 });
   readonly #queue = new OwnedTaskQueue();
   #lifecycle = new AbortController();
@@ -142,9 +145,11 @@ export class MediaSearch {
   readonly #known = new Map<string, Source>();
   #directory: Promise<string> | undefined;
   #worker: ResidentWorkerClient<z.infer<typeof responseSchema>> | undefined;
+  #remote: RemoteMediaClient | undefined;
   #closed = false;
-  constructor(config: NativeTextConfig) {
-    this.#config = config;
+  constructor(config: NativeTextConfig | HttpMediaConfig) {
+    if ("provider" in config) this.#remoteConfig = config;
+    else this.#config = config;
   }
   async search(value: unknown, cwd: string, signal?: AbortSignal): Promise<MediaResult> {
     const request = mediaRequestSchema.parse(value);
@@ -268,21 +273,37 @@ export class MediaSearch {
     }
     let response: z.infer<typeof responseSchema> | undefined;
     if (admitted.size) {
-      this.#worker ??= new ResidentWorkerClient(
-        this.#config,
-        root,
-        corpus,
-        join(root, "index.sqlite"),
-        { parse: (value) => responseSchema.parse(value), maxResponseBytes: 128 * 1024 },
-      );
-      response = await this.#worker.search(
-        {
-          ...(queryImage ? { image: queryImage } : { query: r.query }),
+      if (this.#config) {
+        this.#worker ??= new ResidentWorkerClient(
+          this.#config,
+          root,
+          corpus,
+          join(root, "index.sqlite"),
+          { parse: (value) => responseSchema.parse(value), maxResponseBytes: 128 * 1024 },
+        );
+        response = await this.#worker.search(
+          {
+            ...(queryImage ? { image: queryImage } : { query: r.query }),
+            kind: r.kind,
+            expectedFiles: admitted.size,
+          },
+          signal,
+        );
+      } else if (this.#remoteConfig) {
+        this.#remote ??= new RemoteMediaClient(this.#remoteConfig);
+        const remoteFiles = [...admitted.values()].map((entry) => ({
+          id: createHash("sha256").update(entry.staged).digest("hex").slice(0, 32),
+          path: entry.staged,
+        }));
+        response = await this.#remote.search({
+          ...(queryImage ? { imagePath: queryImage } : { query: r.query! }),
           kind: r.kind,
           expectedFiles: admitted.size,
-        },
-        signal,
-      );
+          files: remoteFiles,
+          signal,
+        });
+      }
+      if (!response) throw new SiftLightError("Media provider is not configured");
       if (response.indexedFiles !== admitted.size)
         throw new SiftLightError("Media index inventory mismatch");
     }
@@ -384,9 +405,23 @@ export class MediaSearch {
       const input = join(folder, "source" + extname(item.source.path));
       const output = join(folder, "preview.png");
       await writeFile(input, current.bytes, { mode: 0o600 });
+      const renderer = this.#config ?? this.#remoteConfig?.renderer;
+      if (!renderer) {
+        const mimeType = mediaMimeType(item.source.path);
+        if (mimeType?.startsWith("image/") && mimeType === "image/png") {
+          return {
+            text: JSON.stringify(details),
+            details,
+            image: { data: current.bytes.toString("base64"), mimeType },
+          };
+        }
+        throw new SiftLightError(
+          "Media preview requires nativeMedia or media.renderer; validate still works without a local renderer",
+        );
+      }
       const result = await runOwnedProcess(
         {
-          executable: this.#config.executable,
+          executable: renderer.executable,
           args: ["--render", input, String(item.hit.page ?? 0), output],
           cwd: folder,
           signal,
@@ -421,6 +456,7 @@ export class MediaSearch {
     await this.#queue.run(async () => {
       try {
         await this.#worker?.close();
+        await this.#remote?.close();
       } finally {
         this.#snapshots.clear();
         if (this.#directory) await rm(await this.#directory, { recursive: true, force: true });

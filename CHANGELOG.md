@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 — 2026-10-12
+
+- Add opt-in BYO HTTP JSON providers for Jev-compatible semantic judging and multimodal retrieval.
+- Keep local native text and visual workers as the default paths, with local source hashes, PDF page mapping, inspection and validation retained after remote ranking.
+- Bound remote request and response sizes, timeouts, retries, file identifiers and credentials; API keys remain environment references rather than configuration values.
+- Add configuration, protocol, MCP boundary and end-to-end local provider regression coverage.
+
 ## 1.1.0-1 — 2026-10-12
 
 - Add an independent native text retrieval lane and bounded rank fusion while retaining exact source inspection, validation and both text result lanes.

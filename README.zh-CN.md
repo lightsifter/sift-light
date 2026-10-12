@@ -230,6 +230,34 @@ Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相
 
 结果最多保留十个不同文件，包含原文件内容哈希、原 PDF 页码和可直接执行的 `inspect`、`validate` 请求。把这些请求继续交给本工具：`inspect` 返回最长边不超过 1024 像素的真实 PNG；扫描页返回原 PDF 中对应页面。原文件发生变化时，查看会明确拒绝，校验会报告过期。混合 PDF 中的扫描页也保留原页码。相似度只是候选依据，不保证识别所有小字，也不提供文字区域坐标。
 
-首次索引较慢时，工具返回 `nextRequest` 和 `mode: "await"`；照原请求继续等待即可。使用 `mode: "cancel"` 和对应 `operationId` 可以取消。连续请求复用一个视觉模型，空闲 60 秒后释放，取消和关闭由服务回收进程。每次最多准入 512 个媒体文件，每个文件不超过 20 MiB，总量不超过 256 MiB；数量、总量和枚举限制会明确标为部分覆盖。单次任务期限为五分钟。结果保留十分钟，且只在原工作区中可用。当前入口不包含 Office、音频或视频。
+### 第三方模型（BYO）
+
+本地模型仍然使用 `nativeMedia`。如果要接入自己提供的多模态服务，在同一份 `sift-light.json` 中增加 `media`。服务必须接受下面约定的 HTTP JSON 请求；它可以是你的第三方服务，也可以是你在本机部署的转换网关。没有 API Key 的本机服务可以省略 `apiKeyEnv`；远程服务应使用 HTTPS。
+
+```json
+{
+  "media": {
+    "provider": "http-json",
+    "endpoint": "https://your-provider.example/v1/media-search",
+    "model": "your-vision-model",
+    "apiKeyEnv": "YOUR_MEDIA_KEY",
+    "timeoutMs": 120000,
+    "maxRetries": 2,
+    "maxRequestBytes": 33554432,
+    "renderer": {
+      "executable": "/absolute/native-media",
+      "modelDirectory": "/absolute/model-directory"
+    }
+  }
+}
+```
+
+插件会把准入的文件以受限大小的 Base64 内容发送，并使用不含本地绝对路径的 `fileId`；返回结果必须包含 `version: 1`、`indexedFiles` 和 `hits`，每个命中使用 `fileId`、`score`、`kind`、`chunkCount`、`width`、`height`，扫描 PDF 还要返回从 1 开始的 `page`。插件收到结果后才把 ID 映射回本地原文件，并继续做哈希、页码、`inspect` 和 `validate` 校验。远程服务不会决定源码证据是否可信。
+
+Jev 也支持 `semanticJudge.provider: "http-json"`。它接收 `{ "version": 1, "model", "query", "candidates" }`，返回 `{ "version": 1, "model", "judgments", "usage" }`；每个 judgment 包含候选 `id`、分类 `choice` 和 0 到 1 的 `probability`。如果配置了 `apiKeyEnv`，插件只从该环境变量读取密钥，不把密钥写入配置、日志或请求内容以外的地方。没有密钥的本机 provider 可以直接使用；远程 provider 失败时，本地候选会保留并标记为 partial。
+
+远程多模态结果仍沿用同一个 `sift-light-media` 工具和同一套源文件核验。PNG 命中可以直接 inspect；PDF 或其他图片格式要返回预览时，请在 `media.renderer` 中配置本地渲染 worker。只做 `validate` 不需要 renderer。
+
+首次索引较慢时，工具返回 `nextRequest` 和 `mode: "await"`；照原请求继续等待即可。使用 `mode: "cancel"` 和对应 `operationId` 可以取消。本地 provider 的连续请求复用一个视觉模型，空闲 60 秒后释放；远程 provider 的超时、重试和请求大小由配置控制。取消和关闭由服务回收自有资源。每次最多准入 512 个媒体文件，每个文件不超过 20 MiB，总量不超过 256 MiB；数量、总量和枚举限制会明确标为部分覆盖。单次任务期限为五分钟。结果保留十分钟，且只在原工作区中可用。当前入口不包含 Office、音频或视频。
 
 原生文本和视觉程序在已加载模型之外设置 1 GB 推理余量，使用计算所需的工作空间，并在每次查询后归还空闲计算缓存；这不是进程总内存的硬上限。模型本身仍会占用数 GB，索引和计算期间还有额外内存。每个 MCP 服务会话分别持有自己的模型；多个连接或文本与视觉同时工作时，占用会相加。普通精确搜索不加载这些模型。运行内存和速度必须按实际模型、机器与文件范围测量。

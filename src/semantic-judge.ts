@@ -167,6 +167,19 @@ function requestBody(
   };
 }
 
+function httpJsonRequestBody(
+  query: string,
+  candidates: readonly SemanticJudgeCandidate[],
+  model: string,
+): RawRecord {
+  return {
+    version: 1,
+    model,
+    query,
+    candidates: candidates.map(({ id, excerpt }) => ({ id, excerpt })),
+  };
+}
+
 async function responseText(response: Response): Promise<string> {
   if (!response.body) {
     const contentLength = response.headers.get("content-length");
@@ -240,6 +253,171 @@ async function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void
   });
 }
 
+async function fetchSemanticResponse(
+  config: SemanticJudgeConfig,
+  key: string | undefined,
+  fetcher: SemanticJudgeFetcher,
+  body: string,
+  parentSignal?: AbortSignal,
+): Promise<RawRecord> {
+  if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
+    throw new SemanticJudgePayloadTooLargeError(
+      "Semantic judge request exceeded the 64 KiB request limit",
+    );
+  }
+  for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+    const controller = new AbortController();
+    const onParentAbort = (): void => controller.abort(parentSignal?.reason);
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+    const timeout = setTimeout(
+      () => controller.abort(new Error("Semantic judge request timed out")),
+      config.timeoutMs,
+    );
+    try {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (key) headers.authorization = `Bearer ${key}`;
+      // oxlint-disable-next-line no-await-in-loop -- retry attempts share one bounded provider budget.
+      const response = await fetcher(config.endpoint, {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        if (response.status === 413) {
+          throw new SemanticJudgePayloadTooLargeError(
+            "Semantic judge rejected an oversized request with HTTP 413",
+          );
+        }
+        const retryable =
+          response.status === 408 ||
+          response.status === 429 ||
+          response.status === 529 ||
+          response.status >= 500;
+        throw new SemanticJudgeRequestError(
+          `Semantic judge returned HTTP ${String(response.status)}`,
+          retryable,
+        );
+      }
+      // oxlint-disable-next-line no-await-in-loop -- consume the bounded response before deciding whether to retry.
+      const raw: unknown = JSON.parse(await responseText(response));
+      if (!isRecord(raw)) {
+        throw new SemanticJudgeRequestError("Semantic judge response must be an object", false);
+      }
+      return raw;
+    } catch (error) {
+      if (parentSignal?.aborted) throw error;
+      const retryable =
+        error instanceof SemanticJudgePayloadTooLargeError
+          ? false
+          : error instanceof SemanticJudgeRequestError
+            ? error.retryable
+            : true;
+      if (!retryable || attempt >= config.maxRetries) throw error;
+      // oxlint-disable-next-line no-await-in-loop -- retries intentionally serialize attempts.
+      await waitForRetry(retryDelay(attempt), parentSignal);
+    } finally {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", onParentAbort);
+    }
+  }
+  throw new SemanticJudgeRequestError("Semantic judge request failed", false);
+}
+
+function responseModel(raw: RawRecord, config: SemanticJudgeConfig): string {
+  const model = raw.model ?? config.model;
+  if (
+    typeof model !== "string" ||
+    model.length === 0 ||
+    model.length > 128 ||
+    /[\r\n\0]/u.test(model)
+  ) {
+    throw new SemanticJudgeRequestError(
+      "Semantic judge response model must be bounded single-line text",
+      false,
+    );
+  }
+  return model;
+}
+
+function responseUsage(raw: RawRecord): { inputTokens?: number; outputTokens?: number } {
+  const usage = isRecord(raw.usage) ? raw.usage : undefined;
+  const inputTokens =
+    typeof usage?.input_tokens === "number" &&
+    Number.isSafeInteger(usage.input_tokens) &&
+    usage.input_tokens >= 0
+      ? usage.input_tokens
+      : undefined;
+  const outputTokens =
+    typeof usage?.output_tokens === "number" &&
+    Number.isSafeInteger(usage.output_tokens) &&
+    usage.output_tokens >= 0
+      ? usage.output_tokens
+      : undefined;
+  return {
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+  };
+}
+
+function parseHttpJsonResult(
+  raw: RawRecord,
+  candidates: readonly SemanticJudgeCandidate[],
+  config: SemanticJudgeConfig,
+  elapsedMs: number,
+): SemanticJudgeResult {
+  if (raw.version !== 1 || !Array.isArray(raw.judgments)) {
+    throw new SemanticJudgeRequestError(
+      "HTTP JSON semantic judge response must contain version 1 judgments",
+      false,
+    );
+  }
+  const candidateIndexes = new Map(candidates.map((candidate, index) => [candidate.id, index]));
+  const judgments = new Map<number, SemanticJudgeJudgment>();
+  for (const value of raw.judgments) {
+    if (!isRecord(value) || typeof value.id !== "string") {
+      throw new SemanticJudgeRequestError(
+        "HTTP JSON semantic judge judgment has an invalid id",
+        false,
+      );
+    }
+    const candidateIndex = candidateIndexes.get(value.id);
+    if (candidateIndex === undefined || judgments.has(candidateIndex)) {
+      throw new SemanticJudgeRequestError(
+        "HTTP JSON semantic judge response contains an unknown or duplicate candidate",
+        false,
+      );
+    }
+    if (!isClassification(value.choice)) {
+      throw new SemanticJudgeRequestError(
+        `HTTP JSON semantic judge response has an invalid choice for ${value.id}`,
+        false,
+      );
+    }
+    const confidence =
+      value.confidence === undefined ? undefined : probability(value.confidence, "confidence");
+    judgments.set(candidateIndex, {
+      candidateIndex,
+      classification: value.choice,
+      probability: probability(value.probability, "probability"),
+      ...(confidence === undefined ? {} : { confidence }),
+    });
+  }
+  if (judgments.size !== candidates.length) {
+    throw new SemanticJudgeRequestError(
+      `HTTP JSON semantic judge response judged ${String(judgments.size)} of ${String(candidates.length)} candidates`,
+      false,
+    );
+  }
+  const usage = responseUsage(raw);
+  return {
+    model: responseModel(raw, config),
+    judgments: candidates.map((_candidate, index) => judgments.get(index)!),
+    ...usage,
+    elapsedMs,
+  };
+}
+
 function createJevRunner(
   config: SemanticJudgeConfig,
   key: string,
@@ -248,107 +426,39 @@ function createJevRunner(
   return async (query, candidates, parentSignal) => {
     const startedAt = performance.now();
     const body = JSON.stringify(requestBody(query, candidates, config.model));
-    if (new TextEncoder().encode(body).byteLength > MAX_SEMANTIC_JUDGE_REQUEST_BYTES) {
-      throw new SemanticJudgePayloadTooLargeError(
-        "Semantic judge request exceeded the 64 KiB request limit",
-      );
+    const raw = await fetchSemanticResponse(config, key, fetcher, body, parentSignal);
+    if (!isRecord(raw.answers)) {
+      throw new SemanticJudgeRequestError("Semantic judge response did not contain answers", false);
     }
-    for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
-      const controller = new AbortController();
-      const onParentAbort = (): void => controller.abort(parentSignal?.reason);
-      parentSignal?.addEventListener("abort", onParentAbort, { once: true });
-      const timeout = setTimeout(
-        () => controller.abort(new Error("Semantic judge request timed out")),
-        config.timeoutMs,
-      );
-      try {
-        // oxlint-disable-next-line no-await-in-loop -- retries intentionally serialize attempts under one request budget.
-        const response = await fetcher(config.endpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${key}`,
-          },
-          body,
-          signal: controller.signal,
-        });
-        if (!response.ok) {
-          if (response.status === 413) {
-            throw new SemanticJudgePayloadTooLargeError(
-              "Semantic judge rejected an oversized request with HTTP 413",
-            );
-          }
-          const retryable =
-            response.status === 408 ||
-            response.status === 429 ||
-            response.status === 529 ||
-            response.status >= 500;
-          throw new SemanticJudgeRequestError(
-            `Semantic judge returned HTTP ${String(response.status)}`,
-            retryable,
-          );
-        }
-        // oxlint-disable-next-line no-await-in-loop -- parse the current bounded response before deciding whether to retry.
-        const raw: unknown = JSON.parse(await responseText(response));
-        if (!isRecord(raw) || !isRecord(raw.answers)) {
-          throw new SemanticJudgeRequestError(
-            "Semantic judge response did not contain answers",
-            false,
-          );
-        }
-        const answers = raw.answers;
-        const judgments = candidates.map((candidate, index) =>
-          parseJudgment(answers[candidate.id], index),
-        );
-        const model = raw.model ?? config.model;
-        if (
-          typeof model !== "string" ||
-          model.length === 0 ||
-          model.length > 128 ||
-          /[\r\n\0]/u.test(model)
-        ) {
-          throw new SemanticJudgeRequestError(
-            "Semantic judge response model must be bounded single-line text",
-            false,
-          );
-        }
-        const usage = isRecord(raw.usage) ? raw.usage : undefined;
-        const inputTokens =
-          typeof usage?.input_tokens === "number" &&
-          Number.isSafeInteger(usage.input_tokens) &&
-          usage.input_tokens >= 0
-            ? usage.input_tokens
-            : undefined;
-        const outputTokens =
-          typeof usage?.output_tokens === "number" &&
-          Number.isSafeInteger(usage.output_tokens) &&
-          usage.output_tokens >= 0
-            ? usage.output_tokens
-            : undefined;
-        return {
-          model,
-          judgments,
-          ...(inputTokens === undefined ? {} : { inputTokens }),
-          ...(outputTokens === undefined ? {} : { outputTokens }),
-          elapsedMs: Math.round(performance.now() - startedAt),
-        };
-      } catch (error) {
-        if (parentSignal?.aborted) throw error;
-        const retryable =
-          error instanceof SemanticJudgePayloadTooLargeError
-            ? false
-            : error instanceof SemanticJudgeRequestError
-              ? error.retryable
-              : true;
-        if (!retryable || attempt >= config.maxRetries) throw error;
-        // oxlint-disable-next-line no-await-in-loop -- provider retries share one bounded request budget.
-        await waitForRetry(retryDelay(attempt), parentSignal);
-      } finally {
-        clearTimeout(timeout);
-        parentSignal?.removeEventListener("abort", onParentAbort);
-      }
-    }
-    throw new SemanticJudgeRequestError("Semantic judge request failed", false);
+    const answers = raw.answers;
+    const judgments = candidates.map((candidate, index) =>
+      parseJudgment(answers[candidate.id], index),
+    );
+    const usage = responseUsage(raw);
+    return {
+      model: responseModel(raw, config),
+      judgments,
+      ...usage,
+      elapsedMs: Math.round(performance.now() - startedAt),
+    };
+  };
+}
+
+function createHttpJsonRunner(
+  config: SemanticJudgeConfig,
+  key: string | undefined,
+  fetcher: SemanticJudgeFetcher,
+): SemanticJudgeRunner {
+  return async (query, candidates, parentSignal) => {
+    const startedAt = performance.now();
+    const raw = await fetchSemanticResponse(
+      config,
+      key,
+      fetcher,
+      JSON.stringify(httpJsonRequestBody(query, candidates, config.model)),
+      parentSignal,
+    );
+    return parseHttpJsonResult(raw, candidates, config, Math.round(performance.now() - startedAt));
   };
 }
 
@@ -364,18 +474,19 @@ export function createSemanticJudgeIntegration(
   fetcher: SemanticJudgeFetcher = fetch,
 ): SemanticJudgeIntegration {
   if (!config.enabled) return createDisabledSemanticJudgeIntegration(config);
-  const key = environment[config.apiKeyEnv]?.trim();
-  if (!key) {
+  const key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
+  if (config.provider === "jev" && !key) {
+    throw new SemanticJudgeConfigurationError(
+      `Semantic judge is enabled, but environment variable ${config.apiKeyEnv ?? "TYPESAFE_API_KEY"} is missing or empty`,
+    );
+  }
+  if (config.provider === "http-json" && config.apiKeyEnv && !key) {
     throw new SemanticJudgeConfigurationError(
       `Semantic judge is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`,
     );
   }
-  if (config.provider !== "jev") {
-    throw new SemanticJudgeConfigurationError(
-      `Unsupported semantic judge provider: ${String(config.provider)}`,
-    );
-  }
-  return { config, runner: createJevRunner(config, key, fetcher) };
+  if (config.provider === "jev") return { config, runner: createJevRunner(config, key!, fetcher) };
+  return { config, runner: createHttpJsonRunner(config, key, fetcher) };
 }
 
 export function createConfiguredSemanticJudgeIntegration(

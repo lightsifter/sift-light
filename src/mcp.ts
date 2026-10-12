@@ -2,6 +2,7 @@ import { z } from "zod";
 import { mediaRequestSchema, type MediaResult } from "./media-search.js";
 import type { DataSourceConfig } from "./data-source-config.js";
 import type { NativeTextConfig } from "./native-text-config.js";
+import type { MediaConfig } from "./media-config.js";
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
@@ -103,6 +104,7 @@ export function createDefaultSiftLightMcpService(
   dataSources: readonly DataSourceConfig[] = [],
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
+  media?: MediaConfig,
 ): SiftLightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
@@ -114,6 +116,7 @@ export function createDefaultSiftLightMcpService(
     semanticJudge: resolvedSemanticJudge,
     ...(nativeText ? { nativeText } : {}),
     ...(nativeMedia ? { nativeMedia } : {}),
+    ...(media ? { media } : {}),
   });
 }
 
@@ -193,7 +196,7 @@ export function createSiftLightMcpServer(
               name: "sift-light-media",
               title: "Visual search",
               description:
-                "Search local image content or scanned PDF pages. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels. Local resident vision model; slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
+                "Search image content or scanned PDF pages through the configured local or BYO provider. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels when a renderer is configured. Slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
               inputSchema: {
                 ...z.toJSONSchema(mediaRequestSchema, { unrepresentable: "any" }),
                 type: "object" as const,

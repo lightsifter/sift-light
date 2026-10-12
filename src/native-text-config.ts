@@ -8,7 +8,7 @@ export interface NativeTextConfig {
 
 export function parseNativeTextConfig(
   value: unknown,
-  field: "nativeText" | "nativeMedia" = "nativeText",
+  field: string = "nativeText",
 ): NativeTextConfig | undefined {
   if (value === undefined) return undefined;
   if (
