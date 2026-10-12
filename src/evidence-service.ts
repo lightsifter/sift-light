@@ -1012,7 +1012,7 @@ export class EvidenceService {
       if (selected.unverified)
         throw new SiftLightError("Snapshot source revision is unverified; refresh the search");
       if (selected.expectedRevision) {
-        const doc = await access.load(path);
+        const doc = await access.load(path, selected.reference);
         if (
           doc.reference.origin.kind !== "worktree" ||
           !sameSourceRevision(selected.expectedRevision, doc.reference.origin.revision)

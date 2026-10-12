@@ -14,7 +14,11 @@ import {
   hasRequestedRootUnreadable,
 } from "./ripgrep-diagnostics.js";
 import { matchesModificationTime } from "./source.js";
-import { captureCandidateRevisions, retainStableSourceRevisions } from "./scan-revisions.js";
+import {
+  captureCandidateRevisions,
+  captureStableSourceReferences,
+  retainStableSourceRevisions,
+} from "./scan-revisions.js";
 import {
   MAX_SOURCE_REVISION_CONCURRENCY,
   MAX_PROTOCOL_LINE_BYTES,
@@ -564,6 +568,11 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         before.revisions,
         signal,
       );
+      const sourceReferences = await captureStableSourceReferences(
+        retainedPaths,
+        sourceRevisions,
+        signal,
+      );
       if (signal?.aborted) throw abortError();
       return {
         request,
@@ -571,6 +580,7 @@ export function createRipgrepRunner(options: RipgrepRunnerOptions = {}) {
         totalMatches,
         fileCounts,
         sourceRevisions,
+        sourceReferences,
         snapshotComplete:
           matches.length === totalMatches &&
           !modificationTimeFilterIncomplete &&

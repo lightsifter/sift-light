@@ -180,6 +180,7 @@ export class SnapshotStore {
           matches: scan.matches,
           fileCounts: [...scan.fileCounts],
           sourceRevisions: [...scan.sourceRevisions],
+          sourceReferences: scan.sourceReferences ? [...scan.sourceReferences] : [],
         }),
       )
     );

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1-1 — 2026-10-12
+
+- Bind retained ordinary search results to verified worktree content identities instead of relying on file metadata alone.
+- Recheck the stored content identity before source inspection, navigation and saved-evidence validation; changed, missing or incomplete sources remain explicit.
+- Preserve exact locations, independent result lanes, source verification and existing result budgets while adding regression coverage for content changes that metadata checks can miss.
+
 ## 1.1.0 — 2026-10-12
 
 - Add opt-in BYO HTTP JSON providers for Jev-compatible semantic judging and multimodal retrieval.

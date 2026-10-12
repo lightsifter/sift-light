@@ -215,7 +215,7 @@ function cursorPathSelection(input: SiftLightInput, cwd: string): PathSelection 
 function baseDetails(snapshot: SearchSnapshot, mode: SearchMode): SiftLightDetails {
   const sourceUnverifiedFileCount = new Set(
     snapshot.matches
-      .filter((match) => !snapshot.sourceRevisions.has(match.absolutePath))
+      .filter((match) => !snapshot.sourceReferences?.has(match.absolutePath))
       .map((match) => match.absolutePath),
   ).size;
   return {

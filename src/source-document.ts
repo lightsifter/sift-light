@@ -222,7 +222,7 @@ export async function readWorkspaceDocument(
   });
   if (!before) throw new SourceDocumentError("source-unavailable", "Source is unavailable");
   if (expected && !sameSourceRevision(before, expected.revision)) {
-    throw new SourceDocumentError("source-changed", "Source changed; start a new inspection");
+    throw new SourceDocumentError("source-changed", "Source changed; refresh the search");
   }
   if (before.size > Math.min(MAX_SOURCE_FILE_BYTES, readBudget)) {
     throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
@@ -261,10 +261,7 @@ export async function readWorkspaceDocument(
   if (signal?.aborted) throw abortError();
   const hash = contentHash(bytes);
   if (expected && expected.contentHash !== hash) {
-    throw new SourceDocumentError(
-      "source-changed",
-      "Source content changed; start a new inspection",
-    );
+    throw new SourceDocumentError("source-changed", "Source content changed; refresh the search");
   }
   return new SourceDocument(
     {

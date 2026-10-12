@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 import { abortError, SiftLightError } from "./errors.js";
 import { runOwnedProcess } from "./owned-process.js";
@@ -8,12 +10,15 @@ import {
   type RipgrepRecoveryRequest,
   type RipgrepUnreadableDiagnostic,
 } from "./ripgrep-diagnostics.js";
-import { getSourceRevision, sameSourceRevision } from "./source.js";
+import { getSourceRevision, sameSourceRevision, sourceRevisionFromStats } from "./source.js";
 import {
   MAX_PROTOCOL_LINE_BYTES,
   MAX_SOURCE_REVISION_CONCURRENCY,
   type SourceRevision,
 } from "./types.js";
+import type { SourceReference } from "./source-document.js";
+
+const SOURCE_HASH_CONCURRENCY = 4;
 
 async function captureRevision(
   path: string,
@@ -147,4 +152,76 @@ export async function retainStableSourceRevisions(
       return initial !== undefined && sameSourceRevision(initial, revision);
     }),
   );
+}
+
+async function captureStableSourceReference(
+  path: string,
+  expected: SourceRevision,
+  signal?: AbortSignal,
+): Promise<SourceReference | undefined> {
+  if (signal?.aborted) throw abortError();
+  const before = await getSourceRevision(path);
+  if (!before || !sameSourceRevision(expected, before)) return undefined;
+  const handle = await open(path, "r");
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || !sameSourceRevision(before, sourceRevisionFromStats(metadata))) {
+      return undefined;
+    }
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (offset < before.size) {
+      if (signal?.aborted) throw abortError();
+      // oxlint-disable-next-line no-await-in-loop -- one bounded file stream owns the hash.
+      const read = await handle.read(
+        buffer,
+        0,
+        Math.min(buffer.length, before.size - offset),
+        offset,
+      );
+      if (read.bytesRead === 0) return undefined;
+      hash.update(buffer.subarray(0, read.bytesRead));
+      offset += read.bytesRead;
+    }
+    const after = await getSourceRevision(path);
+    if (!after || !sameSourceRevision(before, after)) return undefined;
+    return {
+      path,
+      origin: { kind: "worktree", revision: after, contentHash: hash.digest("hex") },
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Capture content identities for retained matches without buffering whole files in memory. */
+export async function captureStableSourceReferences(
+  paths: ReadonlySet<string>,
+  before: ReadonlyMap<string, SourceRevision>,
+  signal?: AbortSignal,
+): Promise<Map<string, SourceReference>> {
+  const candidates = [...paths].filter((path) => before.has(path));
+  const references = new Map<string, SourceReference>();
+  for (let offset = 0; offset < candidates.length; offset += SOURCE_HASH_CONCURRENCY) {
+    if (signal?.aborted) throw abortError();
+    const batch = candidates.slice(offset, offset + SOURCE_HASH_CONCURRENCY);
+    // oxlint-disable-next-line no-await-in-loop -- bounded content hashing avoids unbounded I/O.
+    const captured = await Promise.all(
+      batch.map(async (path) => {
+        const expected = before.get(path);
+        if (!expected) return undefined;
+        try {
+          return await captureStableSourceReference(path, expected, signal);
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          return undefined;
+        }
+      }),
+    );
+    for (const reference of captured) {
+      if (reference) references.set(reference.path, reference);
+    }
+  }
+  return references;
 }

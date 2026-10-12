@@ -334,7 +334,7 @@ class OperationLifecycle {
 }
 
 // src/media-search.ts
-import { createHash, randomUUID as randomUUID4 } from "node:crypto";
+import { createHash as createHash2, randomUUID as randomUUID4 } from "node:crypto";
 import { mkdtemp, mkdir, readFile as readFile3, realpath as realpath3, rm, stat as stat5, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename as basename2, dirname as dirname2, extname as extname2, join as join2, resolve as resolve7 } from "node:path";
@@ -1842,7 +1842,10 @@ function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLin
 }
 
 // src/scan-revisions.ts
+import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import { resolve as resolve4 } from "node:path";
+var SOURCE_HASH_CONCURRENCY = 4;
 async function captureRevision(path, revisions, onRevisionError) {
   let failed = false;
   let failure;
@@ -1937,6 +1940,67 @@ async function retainStableSourceRevisions(paths, before, signal) {
     const initial = before.get(path);
     return initial !== undefined && sameSourceRevision(initial, revision);
   }));
+}
+async function captureStableSourceReference(path, expected, signal) {
+  if (signal?.aborted)
+    throw abortError();
+  const before = await getSourceRevision(path);
+  if (!before || !sameSourceRevision(expected, before))
+    return;
+  const handle = await open(path, "r");
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || !sameSourceRevision(before, sourceRevisionFromStats(metadata))) {
+      return;
+    }
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    while (offset < before.size) {
+      if (signal?.aborted)
+        throw abortError();
+      const read = await handle.read(buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+      if (read.bytesRead === 0)
+        return;
+      hash.update(buffer.subarray(0, read.bytesRead));
+      offset += read.bytesRead;
+    }
+    const after = await getSourceRevision(path);
+    if (!after || !sameSourceRevision(before, after))
+      return;
+    return {
+      path,
+      origin: { kind: "worktree", revision: after, contentHash: hash.digest("hex") }
+    };
+  } finally {
+    await handle.close();
+  }
+}
+async function captureStableSourceReferences(paths, before, signal) {
+  const candidates = [...paths].filter((path) => before.has(path));
+  const references = new Map;
+  for (let offset = 0;offset < candidates.length; offset += SOURCE_HASH_CONCURRENCY) {
+    if (signal?.aborted)
+      throw abortError();
+    const batch = candidates.slice(offset, offset + SOURCE_HASH_CONCURRENCY);
+    const captured = await Promise.all(batch.map(async (path) => {
+      const expected = before.get(path);
+      if (!expected)
+        return;
+      try {
+        return await captureStableSourceReference(path, expected, signal);
+      } catch (error) {
+        if (signal?.aborted)
+          throw error;
+        return;
+      }
+    }));
+    for (const reference of captured) {
+      if (reference)
+        references.set(reference.path, reference);
+    }
+  }
+  return references;
 }
 
 // src/rg.ts
@@ -2339,6 +2403,7 @@ function createRipgrepRunner(options = {}) {
       const retainedPaths = new Set(matches.map((match) => match.absolutePath).filter((path) => !lossyPaths.has(path)));
       await assertRetainedPathsAllowed(policy, [...retainedPaths], signal);
       const sourceRevisions = await retainStableSourceRevisions(retainedPaths, before.revisions, signal);
+      const sourceReferences = await captureStableSourceReferences(retainedPaths, sourceRevisions, signal);
       if (signal?.aborted)
         throw abortError();
       return {
@@ -2347,6 +2412,7 @@ function createRipgrepRunner(options = {}) {
         totalMatches,
         fileCounts,
         sourceRevisions,
+        sourceReferences,
         snapshotComplete: matches.length === totalMatches && !modificationTimeFilterIncomplete && retention.details.reasons.length === 0,
         filesystemCoverage,
         filesystemErrorSamples: [...filesystemErrorSamples],
@@ -2520,7 +2586,7 @@ var extensions = new Set([
 var maxFileBytes = 20 * 1024 * 1024;
 var maxCorpusBytes = 256 * 1024 * 1024;
 function hash(bytes) {
-  return createHash("sha256").update(bytes).digest("hex");
+  return createHash2("sha256").update(bytes).digest("hex");
 }
 async function sourceBytes(cwd, path, signal) {
   const policy = new SearchPathPolicy(cwd);
@@ -2665,7 +2731,7 @@ class MediaSearch {
       } else if (this.#remoteConfig) {
         this.#remote ??= new RemoteMediaClient(this.#remoteConfig);
         const remoteFiles = [...admitted.values()].map((entry) => ({
-          id: createHash("sha256").update(entry.staged).digest("hex").slice(0, 32),
+          id: createHash2("sha256").update(entry.staged).digest("hex").slice(0, 32),
           path: entry.staged
         }));
         response = await this.#remote.search({
@@ -2837,7 +2903,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.0",
+  version: "1.1.1-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -4434,7 +4500,7 @@ function parseDataSources(value) {
 }
 
 // src/data-source-http.ts
-import { open } from "node:fs/promises";
+import { open as open2 } from "node:fs/promises";
 class DataSourceError extends Error {
   code;
   constructor(code) {
@@ -4449,7 +4515,7 @@ async function credential(config) {
     value = process.env[config.tokenEnv];
   if (config.tokenFile) {
     try {
-      const handle = await open(config.tokenFile, "r");
+      const handle = await open2(config.tokenFile, "r");
       try {
         const info = await handle.stat();
         if (!info.isFile() || info.size > 16384)
@@ -4744,7 +4810,7 @@ class DataSources {
 }
 
 // src/service.ts
-import { createHash as createHash7 } from "node:crypto";
+import { createHash as createHash8 } from "node:crypto";
 
 // src/concept-worker-client.ts
 import { randomUUID as randomUUID5 } from "node:crypto";
@@ -5288,7 +5354,7 @@ function rangeEvidence(document, range) {
 
 // src/concept-search.ts
 import { resolve as resolve14 } from "node:path";
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 
 // src/request.ts
 function list(value) {
@@ -5962,13 +6028,13 @@ async function parseSyntax(path, text, signal, pattern) {
 }
 
 // src/concept-source-generation.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 
 // src/source-access.ts
 import { extname as extname4, resolve as resolve13 } from "node:path";
 
 // src/historical-paths.ts
-import { lstat, mkdir as mkdir3, mkdtemp as mkdtemp2, open as open2, rm as rm3, writeFile as writeFile2 } from "node:fs/promises";
+import { lstat, mkdir as mkdir3, mkdtemp as mkdtemp2, open as open3, rm as rm3, writeFile as writeFile2 } from "node:fs/promises";
 import { constants as constants2 } from "node:fs";
 import { tmpdir as tmpdir2 } from "node:os";
 import { dirname as dirname5, join as join5, parse, relative as relative4, resolve as resolve10 } from "node:path";
@@ -6030,7 +6096,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
             throw new SiftLightError("Current ignore rules are not regular files; historical path filtering is unavailable");
           if (before.size > MAX_SOURCE_FILE_BYTES || ignoreBytesRead + before.size > MAX_STRUCTURE_BYTES)
             throw new SiftLightError("Current ignore rules exceed the source read budget");
-          const handle = await open2(path, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0));
+          const handle = await open3(path, constants2.O_RDONLY | (constants2.O_NOFOLLOW ?? 0));
           let bytes;
           try {
             if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
@@ -6267,9 +6333,9 @@ async function sourceSimilarity(oldContent, newContent, budget) {
 }
 
 // src/git-repository.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import { constants as constants3 } from "node:fs";
-import { lstat as lstat2, open as open3 } from "node:fs/promises";
+import { lstat as lstat2, open as open4 } from "node:fs/promises";
 import { isAbsolute as isAbsolute6, relative as relative5, resolve as resolve11, sep as sep3 } from "node:path";
 
 // src/git-process.ts
@@ -6537,7 +6603,7 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
   budget.bytes += output.length;
   if (output.length !== size)
     throw new SiftLightError("Git blob size does not match its immutable tree entry");
-  const verifiedBlob = createHash2(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
+  const verifiedBlob = createHash3(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
   if (verifiedBlob !== blob)
     throw new SiftLightError("Git blob bytes do not match their immutable object identity");
   return {
@@ -6546,7 +6612,7 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
     sourceStatus: output.includes(0) ? "binary" : "available",
     ...output.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content: output },
     origin: { kind: "git", commit, blob },
-    contentHash: createHash2("sha256").update(output).digest("hex")
+    contentHash: createHash3("sha256").update(output).digest("hex")
   };
 }
 async function readWorktreeSource(cwd, path, budget, signal) {
@@ -6577,7 +6643,7 @@ async function readWorktreeSource(cwd, path, budget, signal) {
     if (budget.bytes + before.size > budget.maxBytes)
       return limitedSource(path, mode, `Source reads exceed the ${String(budget.maxBytes)} byte request limit`);
     await assertExistingPathInsideCwd(absolute, cwd);
-    const handle = await open3(absolute, constants3.O_RDONLY | (constants3.O_NOFOLLOW ?? 0));
+    const handle = await open4(absolute, constants3.O_RDONLY | (constants3.O_NOFOLLOW ?? 0));
     try {
       if (!sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(await handle.stat())))
         throw new SiftLightError("Working source changed before reading");
@@ -6606,9 +6672,9 @@ async function readWorktreeSource(cwd, path, budget, signal) {
         origin: {
           kind: "worktree",
           revision: sourceRevisionFromStats(after),
-          contentHash: createHash2("sha256").update(content).digest("hex")
+          contentHash: createHash3("sha256").update(content).digest("hex")
         },
-        contentHash: createHash2("sha256").update(content).digest("hex")
+        contentHash: createHash3("sha256").update(content).digest("hex")
       };
     } finally {
       await handle.close();
@@ -6853,8 +6919,8 @@ async function readGitSource(cwd, identity, signal, options = {}) {
 
 // src/source-document.ts
 import { isUtf8 } from "node:buffer";
-import { createHash as createHash3 } from "node:crypto";
-import { open as open4, realpath as realpath4 } from "node:fs/promises";
+import { createHash as createHash4 } from "node:crypto";
+import { open as open5, realpath as realpath4 } from "node:fs/promises";
 import { relative as relative6, resolve as resolve12 } from "node:path";
 class SourceDocumentError extends SiftLightError {
   reason;
@@ -6865,7 +6931,7 @@ class SourceDocumentError extends SiftLightError {
   }
 }
 function contentHash(bytes) {
-  return createHash3("sha256").update(bytes).digest("hex");
+  return createHash4("sha256").update(bytes).digest("hex");
 }
 
 class SourceDocument {
@@ -7020,14 +7086,14 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
   if (!before)
     throw new SourceDocumentError("source-unavailable", "Source is unavailable");
   if (expected && !sameSourceRevision(before, expected.revision)) {
-    throw new SourceDocumentError("source-changed", "Source changed; start a new inspection");
+    throw new SourceDocumentError("source-changed", "Source changed; refresh the search");
   }
   if (before.size > Math.min(MAX_SOURCE_FILE_BYTES, readBudget)) {
     throw new SourceDocumentError("file-too-large", "Source exceeds the 5 MiB file limit");
   }
   if (signal?.aborted)
     throw abortError();
-  const handle = await open4(canonical, "r");
+  const handle = await open5(canonical, "r");
   let bytes;
   try {
     const metadata = await handle.stat();
@@ -7062,7 +7128,7 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
     throw abortError();
   const hash = contentHash(bytes);
   if (expected && expected.contentHash !== hash) {
-    throw new SourceDocumentError("source-changed", "Source content changed; start a new inspection");
+    throw new SourceDocumentError("source-changed", "Source content changed; refresh the search");
   }
   return new SourceDocument({
     path: isPathInsideCwd(canonical, canonicalCwd) ? relative6(canonicalCwd, canonical).replaceAll("\\", "/") : canonical.replaceAll("\\", "/"),
@@ -7357,7 +7423,7 @@ async function createConceptSourceGeneration(access, filters, providedFiles) {
       reasons.push(`${path}: ${error.message}`);
     }
   }
-  const inventoryHash = createHash4("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32);
+  const inventoryHash = createHash5("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32);
   return {
     cwd: access.cwd,
     filters: {
@@ -7696,7 +7762,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
     batchFileLimit: MAX_STRUCTURE_FILES,
     fileLimit: access.maxFiles,
     startedAt: generationStartedAt,
-    inventoryHash: createHash5("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32)
+    inventoryHash: createHash6("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32)
   };
   result.counts = {
     ...lexical ? { relevanceRanking: 1 } : {},
@@ -7876,7 +7942,7 @@ async function structuralSearch(input, access) {
 }
 
 // src/native-text-search.ts
-import { createHash as createHash6 } from "node:crypto";
+import { createHash as createHash7 } from "node:crypto";
 import { mkdtemp as mkdtemp3, mkdir as mkdir4, readFile as readFile4, realpath as realpath5, rm as rm4, writeFile as writeFile3 } from "node:fs/promises";
 import { tmpdir as tmpdir3 } from "node:os";
 import { basename as basename3, dirname as dirname6, isAbsolute as isAbsolute7, join as join6, resolve as resolve15 } from "node:path";
@@ -7953,11 +8019,11 @@ function createNativeTextSearch(config, search) {
           if (access.signal?.aborted)
             throw abortError();
           const path = document.path;
-          const relative = isAbsolute7(path) ? join6(createHash6("sha256").update(dirname6(path)).digest("hex"), basename3(path)) : path;
+          const relative = isAbsolute7(path) ? join6(createHash7("sha256").update(dirname6(path)).digest("hex"), basename3(path)) : path;
           const staged = resolve15(corpus, relative);
           if (!staged.startsWith(corpus + "/"))
             throw new SiftLightError("Native staging path escaped its corpus");
-          const hash = createHash6("sha256").update(document.bytes).digest("hex");
+          const hash = createHash7("sha256").update(document.bytes).digest("hex");
           const previous = known.get(path);
           if (!previous || previous.hash !== hash) {
             await mkdir4(dirname6(staged), { recursive: true });
@@ -8003,7 +8069,7 @@ function createNativeTextSearch(config, search) {
           throw new SiftLightError("Native text returned an unknown or duplicate source");
         seen.add(entry.staged);
         const content = await readFile4(entry.staged);
-        if (createHash6("sha256").update(content).digest("hex") !== entry.hash)
+        if (createHash7("sha256").update(content).digest("hex") !== entry.hash)
           throw new SiftLightError("Native staged source changed");
         const document = new SourceDocument(entry.source, content);
         const range = document.lineRange(hit.line);
@@ -8714,6 +8780,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   const absolutePath = retainedMatch?.absolutePath ?? resolve16(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
+  let expectedReference;
   if (input.cursor) {
     const { snapshot } = snapshots.resolve(input.cursor);
     retainedMatch ??= snapshot.matches.find((match) => match.absolutePath === absolutePath && match.lineNumber === line);
@@ -8721,13 +8788,15 @@ function resolveInspectionTarget(input, cwd, snapshots) {
       throw new CursorError("The requested line is not a retained match in this snapshot.");
     }
     expectedRevision = snapshot.sourceRevisions.get(absolutePath);
+    expectedReference = snapshot.sourceReferences?.get(absolutePath);
   }
   return {
     path,
     absolutePath,
     line,
-    unverified: input.cursor !== undefined && expectedRevision === undefined,
+    unverified: input.cursor !== undefined && (expectedReference === undefined || expectedRevision === undefined),
     ...retainedMatch ? { retainedMatch } : {},
+    ...expectedReference ? { expectedReference } : {},
     ...expectedRevision ? { expectedRevision } : {}
   };
 }
@@ -10825,6 +10894,7 @@ function matchInspectionTarget(target) {
     path: target.path,
     line: target.line,
     unverified: target.unverified,
+    ...target.expectedReference ? { reference: target.expectedReference } : {},
     ...target.expectedRevision ? { expectedRevision: target.expectedRevision } : {},
     ...target.retainedMatch?.occurrences[0] ? { focus: target.retainedMatch.occurrences[0].byteStart } : {}
   };
@@ -11410,9 +11480,6 @@ async function failure(error, expected, path, cwd, signal) {
 function sourceKey(reference) {
   return JSON.stringify([reference.path, reference.origin]);
 }
-function revisionKey(path, revision) {
-  return JSON.stringify([path, revision]);
-}
 function selectedIndex(index, count, label) {
   if (index === undefined)
     return;
@@ -11463,8 +11530,8 @@ function snapshotTargets(snapshot, matchIndex) {
   const missing = [];
   const seen = new Set;
   for (const path of selectedPaths) {
-    const revision = snapshot.sourceRevisions.get(path);
-    if (!revision) {
+    const reference = snapshot.sourceReferences?.get(path);
+    if (!reference) {
       const key = JSON.stringify(["missing", path]);
       if (!seen.has(key)) {
         seen.add(key);
@@ -11472,73 +11539,18 @@ function snapshotTargets(snapshot, matchIndex) {
           path,
           role: "source",
           status: "unknown",
-          reason: "Saved search has no source revision"
+          reason: "Saved search has no verified source content identity"
         });
       }
       continue;
     }
     addUniqueTarget(targets, seen, {
-      key: revisionKey(path, revision),
+      key: sourceKey(reference),
       path,
-      revision
+      expected: reference
     });
   }
   return { targets, missing };
-}
-async function validateSnapshotTarget(target, cwd, policy, signal) {
-  if (!target.revision)
-    throw new Error("Snapshot validation target omitted its revision");
-  try {
-    const absolute = resolve22(cwd, target.path);
-    const canonical = await policy.resolveExistingPath(absolute);
-    if (!canonical) {
-      const result = await confirmWorktreeState(target.path, cwd, signal);
-      return { path: target.path, role: "source", ...result };
-    }
-    const before = await stat7(absolute);
-    const beforeCanonical = canonical;
-    const after = await stat7(absolute);
-    const afterCanonical = await realpath7(absolute);
-    if (!before.isFile() || !after.isFile()) {
-      return {
-        path: target.path,
-        role: "source",
-        status: "stale",
-        reason: "Source is no longer a regular file"
-      };
-    }
-    if (beforeCanonical !== afterCanonical || !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after))) {
-      return {
-        path: target.path,
-        role: "source",
-        status: "stale",
-        reason: "Source changed while checking its revision"
-      };
-    }
-    const current = sourceRevisionFromStats(after);
-    const unchanged = sameSourceRevision(target.revision, current);
-    return {
-      path: target.path,
-      role: "source",
-      status: unchanged ? "current" : "stale",
-      ...unchanged ? {} : { reason: "Source revision changed" }
-    };
-  } catch (error) {
-    if (isAbort(error, signal))
-      throw error;
-    const code = systemErrorCode(error);
-    if (code === "ENOENT") {
-      const classified = await confirmWorktreeState(target.path, cwd, signal);
-      return { path: target.path, role: "source", ...classified };
-    }
-    const classified = await failure(error, undefined, target.path, cwd, signal);
-    return {
-      path: target.path,
-      role: "source",
-      status: classified.status,
-      reason: classified.reason
-    };
-  }
 }
 async function validateAnalysisTarget(target, access, cwd, signal) {
   if (!target.expected)
@@ -11637,14 +11649,17 @@ async function validateSavedEvidence(options) {
     const selected = snapshotTargets(snapshot, options.matchIndex);
     targets = selected.targets;
     missing.push(...selected.missing);
-    const policy = new SearchPathPolicy(options.cwd);
     sources = [...missing];
-    let checked = 0;
     const maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
+    const access = new SourceAccess(options.cwd, options.queue, options.signal, {
+      maxFiles
+    });
+    let checked = 0;
+    let budgetExhausted = false;
     for (const target of targets) {
       if (options.signal?.aborted)
         throw abortError();
-      if (checked >= maxFiles) {
+      if (budgetExhausted || checked >= maxFiles) {
         sources.push({
           path: target.path,
           role: "source",
@@ -11654,7 +11669,11 @@ async function validateSavedEvidence(options) {
         continue;
       }
       checked += 1;
-      sources.push(await validateSnapshotTarget(target, options.cwd, policy, options.signal));
+      const status = await validateAnalysisTarget(target, access, options.cwd, options.signal);
+      const { budgetReached, ...sourceStatus } = status;
+      sources.push(sourceStatus);
+      if (budgetReached)
+        budgetExhausted = true;
     }
   }
   if (sources.length === 0)
@@ -14146,7 +14165,7 @@ class EvidenceService {
       if (selected.unverified)
         throw new SiftLightError("Snapshot source revision is unverified; refresh the search");
       if (selected.expectedRevision) {
-        const doc = await access.load(path);
+        const doc = await access.load(path, selected.reference);
         if (doc.reference.origin.kind !== "worktree" || !sameSourceRevision(selected.expectedRevision, doc.reference.origin.revision))
           throw new SiftLightError("Source changed; refresh the search");
         reference = doc.reference;
@@ -14931,7 +14950,8 @@ class SnapshotStore {
     return scan.retention?.accountedBytes ?? Buffer.byteLength(JSON.stringify({
       matches: scan.matches,
       fileCounts: [...scan.fileCounts],
-      sourceRevisions: [...scan.sourceRevisions]
+      sourceRevisions: [...scan.sourceRevisions],
+      sourceReferences: scan.sourceReferences ? [...scan.sourceReferences] : []
     }));
   }
   #scanOccurrences(scan) {
@@ -15460,11 +15480,11 @@ function cursorPathSelection(input, cwd) {
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash7("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash8("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails2(snapshot, mode) {
-  const sourceUnverifiedFileCount = new Set(snapshot.matches.filter((match) => !snapshot.sourceRevisions.has(match.absolutePath)).map((match) => match.absolutePath)).size;
+  const sourceUnverifiedFileCount = new Set(snapshot.matches.filter((match) => !snapshot.sourceReferences?.has(match.absolutePath)).map((match) => match.absolutePath)).size;
   return {
     version: 1,
     mode,

@@ -7,10 +7,12 @@ import {
   getSourceRevision,
   readSourceRange,
   sameSourceRevision,
+  sourceRangeFromBytes,
   SourceBudgetTooSmallError,
   SourceTooLargeError,
   type SourceRangeRead,
 } from "./source.js";
+import { readWorkspaceDocument, type SourceReference } from "./source-document.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import {
   MAX_LINE_CHARACTERS,
@@ -40,6 +42,7 @@ export interface InspectionTarget {
   absolutePath: string;
   line: number;
   retainedMatch?: MatchRecord;
+  expectedReference?: SourceReference;
   expectedRevision?: SourceRevision;
   unverified: boolean;
 }
@@ -87,6 +90,7 @@ export function resolveInspectionTarget(
   const absolutePath = retainedMatch?.absolutePath ?? resolve(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision: SourceRevision | undefined;
+  let expectedReference: SourceReference | undefined;
   if (input.cursor) {
     const { snapshot } = snapshots.resolve(input.cursor);
     retainedMatch ??= snapshot.matches.find(
@@ -96,13 +100,17 @@ export function resolveInspectionTarget(
       throw new CursorError("The requested line is not a retained match in this snapshot.");
     }
     expectedRevision = snapshot.sourceRevisions.get(absolutePath);
+    expectedReference = snapshot.sourceReferences?.get(absolutePath);
   }
   return {
     path,
     absolutePath,
     line,
-    unverified: input.cursor !== undefined && expectedRevision === undefined,
+    unverified:
+      input.cursor !== undefined &&
+      (expectedReference === undefined || expectedRevision === undefined),
     ...(retainedMatch ? { retainedMatch } : {}),
+    ...(expectedReference ? { expectedReference } : {}),
     ...(expectedRevision ? { expectedRevision } : {}),
   };
 }
@@ -209,19 +217,40 @@ export async function inspectSourceEvidence(
     endLine: target.line + 10,
   };
   try {
-    evidence.source = await readSourceRange(
-      target.absolutePath,
-      range.startLine,
-      range.endLine,
-      signal,
-      target.line,
-      {
-        maxBytes,
-        ...(target.retainedMatch?.occurrences[0]
-          ? { focus: target.retainedMatch.occurrences[0] }
-          : {}),
-      },
-    );
+    if (target.expectedReference) {
+      const document = await readWorkspaceDocument(
+        target.path,
+        cwd,
+        signal,
+        target.expectedReference.origin,
+      );
+      evidence.source = sourceRangeFromBytes(
+        document.bytes,
+        range.startLine,
+        range.endLine,
+        target.line,
+        {
+          maxBytes,
+          ...(target.retainedMatch?.occurrences[0]
+            ? { focus: target.retainedMatch.occurrences[0] }
+            : {}),
+        },
+      );
+    } else {
+      evidence.source = await readSourceRange(
+        target.absolutePath,
+        range.startLine,
+        range.endLine,
+        signal,
+        target.line,
+        {
+          maxBytes,
+          ...(target.retainedMatch?.occurrences[0]
+            ? { focus: target.retainedMatch.occurrences[0] }
+            : {}),
+        },
+      );
+    }
   } catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === "AbortError"))
       throw abortError();

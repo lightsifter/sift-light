@@ -231,6 +231,8 @@ export interface SearchScan {
   totalMatches: number;
   fileCounts: Map<string, number>;
   sourceRevisions: Map<string, SourceRevision>;
+  /** Full content identities for retained worktree matches; missing entries are unverified. */
+  sourceReferences?: Map<string, SourceReference>;
   snapshotComplete: boolean;
   filesystemCoverage?: "complete" | "policy-filtered" | "partial";
   filesystemCoverageReasons?: string[];

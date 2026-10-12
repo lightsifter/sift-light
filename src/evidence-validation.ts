@@ -9,7 +9,7 @@ import { SourceAccess, SourceBudgetError, SyntaxQueue } from "./source-access.js
 import { SourceDocumentError, type SourceReference } from "./source-document.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import type { AnalysisItem } from "./analysis-types.js";
-import type { SearchRequest, SearchScopeDetails, SearchSnapshot, SourceRevision } from "./types.js";
+import type { SearchRequest, SearchScopeDetails, SearchSnapshot } from "./types.js";
 import type {
   EvidenceCoverageStatus,
   EvidenceComparisonTarget,
@@ -46,7 +46,6 @@ interface ValidationTarget {
   key: string;
   path: string;
   expected?: SourceReference;
-  revision?: SourceRevision;
 }
 
 interface ClassifiedFailure {
@@ -156,10 +155,6 @@ function sourceKey(reference: SourceReference): string {
   return JSON.stringify([reference.path, reference.origin]);
 }
 
-function revisionKey(path: string, revision: SourceRevision): string {
-  return JSON.stringify([path, revision]);
-}
-
 function selectedIndex(
   index: number | undefined,
   count: number,
@@ -231,8 +226,8 @@ function snapshotTargets(
   const missing: EvidenceSourceStatus[] = [];
   const seen = new Set<string>();
   for (const path of selectedPaths) {
-    const revision = snapshot.sourceRevisions.get(path);
-    if (!revision) {
+    const reference = snapshot.sourceReferences?.get(path);
+    if (!reference) {
       const key = JSON.stringify(["missing", path]);
       if (!seen.has(key)) {
         seen.add(key);
@@ -240,80 +235,18 @@ function snapshotTargets(
           path,
           role: "source",
           status: "unknown",
-          reason: "Saved search has no source revision",
+          reason: "Saved search has no verified source content identity",
         });
       }
       continue;
     }
     addUniqueTarget(targets, seen, {
-      key: revisionKey(path, revision),
+      key: sourceKey(reference),
       path,
-      revision,
+      expected: reference,
     });
   }
   return { targets, missing };
-}
-
-async function validateSnapshotTarget(
-  target: ValidationTarget,
-  cwd: string,
-  policy: SearchPathPolicy,
-  signal?: AbortSignal,
-): Promise<EvidenceSourceStatus> {
-  if (!target.revision) throw new Error("Snapshot validation target omitted its revision");
-  try {
-    const absolute = resolve(cwd, target.path);
-    const canonical = await policy.resolveExistingPath(absolute);
-    if (!canonical) {
-      const result = await confirmWorktreeState(target.path, cwd, signal);
-      return { path: target.path, role: "source", ...result };
-    }
-    const before = await stat(absolute);
-    const beforeCanonical = canonical;
-    const after = await stat(absolute);
-    const afterCanonical = await realpath(absolute);
-    if (!before.isFile() || !after.isFile()) {
-      return {
-        path: target.path,
-        role: "source",
-        status: "stale",
-        reason: "Source is no longer a regular file",
-      };
-    }
-    if (
-      beforeCanonical !== afterCanonical ||
-      !sameSourceRevision(sourceRevisionFromStats(before), sourceRevisionFromStats(after))
-    ) {
-      return {
-        path: target.path,
-        role: "source",
-        status: "stale",
-        reason: "Source changed while checking its revision",
-      };
-    }
-    const current = sourceRevisionFromStats(after);
-    const unchanged = sameSourceRevision(target.revision, current);
-    return {
-      path: target.path,
-      role: "source",
-      status: unchanged ? "current" : "stale",
-      ...(unchanged ? {} : { reason: "Source revision changed" }),
-    };
-  } catch (error) {
-    if (isAbort(error, signal)) throw error;
-    const code = systemErrorCode(error);
-    if (code === "ENOENT") {
-      const classified = await confirmWorktreeState(target.path, cwd, signal);
-      return { path: target.path, role: "source", ...classified };
-    }
-    const classified = await failure(error, undefined, target.path, cwd, signal);
-    return {
-      path: target.path,
-      role: "source",
-      status: classified.status,
-      reason: classified.reason,
-    };
-  }
 }
 
 async function validateAnalysisTarget(
@@ -426,13 +359,16 @@ export async function validateSavedEvidence(
     const selected = snapshotTargets(snapshot, options.matchIndex);
     targets = selected.targets;
     missing.push(...selected.missing);
-    const policy = new SearchPathPolicy(options.cwd);
     sources = [...missing];
-    let checked = 0;
     const maxFiles = options.maxFiles ?? MAX_STRUCTURE_FILES;
+    const access = new SourceAccess(options.cwd, options.queue, options.signal, {
+      maxFiles,
+    });
+    let checked = 0;
+    let budgetExhausted = false;
     for (const target of targets) {
       if (options.signal?.aborted) throw abortError();
-      if (checked >= maxFiles) {
+      if (budgetExhausted || checked >= maxFiles) {
         sources.push({
           path: target.path,
           role: "source",
@@ -442,7 +378,10 @@ export async function validateSavedEvidence(
         continue;
       }
       checked += 1;
-      sources.push(await validateSnapshotTarget(target, options.cwd, policy, options.signal));
+      const status = await validateAnalysisTarget(target, access, options.cwd, options.signal);
+      const { budgetReached, ...sourceStatus } = status;
+      sources.push(sourceStatus);
+      if (budgetReached) budgetExhausted = true;
     }
   }
 

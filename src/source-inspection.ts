@@ -74,6 +74,7 @@ export function matchInspectionTarget(target: InspectionTarget): SourceInspectio
     path: target.path,
     line: target.line,
     unverified: target.unverified,
+    ...(target.expectedReference ? { reference: target.expectedReference } : {}),
     ...(target.expectedRevision ? { expectedRevision: target.expectedRevision } : {}),
     ...(target.retainedMatch?.occurrences[0]
       ? { focus: target.retainedMatch.occurrences[0].byteStart }
