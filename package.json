@@ -1,6 +1,6 @@
 {
   "name": "sift-light",
-  "version": "1.0.5-6",
+  "version": "1.1.0-1",
   "description": "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   "keywords": [
     "ai-agent",
@@ -46,7 +46,13 @@
     "CHANGELOG.md",
     "SECURITY.md",
     "src/concept-worker.mjs",
-    "plugins/sift-light/**"
+    "plugins/sift-light/**",
+    "native/text-search/Worker.swift",
+    "native/WorkerMemory.swift",
+    "scripts/build-native-text.ts",
+    "native/media-search/Worker.swift",
+    "scripts/build-native-media.ts",
+    "scripts/build-native-worker.ts"
   ],
   "type": "module",
   "publishConfig": {
@@ -82,7 +88,9 @@
     "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
     "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
     "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
-    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark"
+    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark",
+    "build:native-text": "bun run scripts/build-native-text.ts",
+    "build:native-media": "bun run scripts/build-native-media.ts"
   },
   "dependencies": {
     "@ast-grep/lang-go": "0.0.6",

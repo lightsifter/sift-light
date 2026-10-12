@@ -1,4 +1,5 @@
 import type { DataSourceConfig } from "./data-source-config.js";
+import type { NativeTextConfig } from "./native-text-config.js";
 import {
   DEFAULT_SIFT_LIGHT_CONFIG,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
@@ -27,6 +28,8 @@ export async function createMcpSearchFeatures(
   semanticJudge: SemanticJudgeIntegration;
   vectorSearchEnabled: boolean;
   dataSources: DataSourceConfig[];
+  nativeText?: NativeTextConfig;
+  nativeMedia?: NativeTextConfig;
 }> {
   const path = configuredPath(environment);
   if (!path)
@@ -41,6 +44,8 @@ export async function createMcpSearchFeatures(
     semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
     vectorSearchEnabled: config.vectorSearchEnabled === true,
     dataSources: config.dataSources ?? [],
+    ...(config.nativeText ? { nativeText: config.nativeText } : {}),
+    ...(config.nativeMedia ? { nativeMedia: config.nativeMedia } : {}),
   };
 }
 

@@ -34,7 +34,7 @@ Concept ranking covers every UTF-8 passage admitted by the request's documented 
 
 Slow Concept and hybrid requests return within the default five-second wait window with `status: "waiting"` or `"running"`, an `operationId`, progress and an exact `nextRequest` such as `{ "mode": "await", "operationId": "..." }`. Copy that request unchanged: it resumes the same computation and never restarts the query or downgrades to a literal-only result. A final result remains available for stable re-fetch for 10 minutes, with up to 32 terminal results retained per service session, and `mode: "cancel"` stops the owned work and waits for cleanup. Each service session admits at most eight pending operations; an operation has one total deadline controlled by `SIFT_LIGHT_CONCEPT_TIMEOUT_MS` (integer milliseconds from 1000 through 3600000; default 600000) and a 120-second idle continuation lease. A real model, source or resource failure is returned as a failure with its diagnostic. Source generation is re-enumerated and re-verified before publication, so changes refresh the operation and mixed versions are never marked complete. Admission planning counts (`filesEnumerated`, `filesAdmitted`, `filesSkippedEmpty`, `filesUnavailable`, `passagesQueued`, `batchesPlanned`, `batchesCompleted`) stay visible. Empty files are a normal skip and do not mark the result partial.
 
-The first uncached Concept or hybrid search loads the local model and may take tens of seconds and more than 1 GiB of inference-worker memory, depending on the machine and search scope. Later searches reuse cached passage embeddings even when the query wording changes, although a new query still loads the model briefly to embed that query. Changed passages are recomputed; cache eviction, deletion or broad source changes can cause another cold run. Exact search modes do not load the model. These are workload-dependent observations, not a latency or memory guarantee. If the result is waiting during `model-loading`, follow its `nextRequest` to continue the same operation.
+The first uncached Concept or hybrid search loads the local model and may take tens of seconds and more than 1 GiB of inference-worker memory, depending on the machine and search scope. Later searches reuse cached passage embeddings even when the query wording changes, and an active service reuses its loaded model. The E5 worker is released after 30 seconds of inactivity; the next query then loads it again. Changed passages are recomputed; cache eviction, deletion or broad source changes can cause another cold run. Exact search modes do not load the model. These are workload-dependent observations, not a latency or memory guarantee. If the result is waiting during `model-loading`, follow its `nextRequest` to continue the same operation.
 
 ### Give several search conditions together
 
@@ -72,6 +72,30 @@ Worktree searches can use `modifiedAfter` and `modifiedBefore` as Unix milliseco
 Use `mode: "outline"` with a concrete JS/TS/TSX or Python file to see bounded symbol ranges. JS/TS/TSX use ast-grep; Python uses indentation-based class, function and method evidence. Inspecting an outline item returns that symbol's version-checked source. These ranges do not prove compiler bindings, runtime calls or test coverage. `mode: "tests"` provides JS/TS/TSX related-test candidates; unsupported language operations fail explicitly. Use ordinary search and `inspect` for Swift source.
 
 The readable result keeps the main evidence compact. Per-item ranges, counts, coverage and continuation requests remain in structured `details`, so a client can use the structured fields without requiring a second search.
+
+### Independent text retrieval on Apple Silicon
+
+Optional `nativeText` configuration makes `concept` and `hybrid` return two local retrieval lanes. Each keeps its own ranking; `details.analysis.retrievalLanes.current` and `.native` contain executable continuation requests. For `hybrid` with `ranking: "relevance"`, the default view ranks at most ten distinct files using weighted reciprocal file ranks (native 1, current 0.1). Raw scores across lanes are not comparable. Other dual-lane views interleave candidates. The default view and both lanes support `inspect` and `validate`, including source-change reporting.
+
+On Apple Silicon macOS, prepare Xcode, Metal Toolchain, a local SDK checkout and model directory, then run from this project's checkout:
+
+```sh
+bun run build:native-text -- /absolute/sdk-checkout /absolute/native-text-output
+```
+
+The builder selects a fixed revision and installs the executable and required resource bundles. The model directory must contain `model.safetensors`, `config.json`, `tokenizer.json` and `tokenizer_config.json`. Keep the complete output directory and add this to the host's active `sift-light.json`:
+
+```json
+{
+  "vectorSearchEnabled": true,
+  "nativeText": {
+    "executable": "/absolute/native-text-output/native-text",
+    "modelDirectory": "/absolute/model-directory"
+  }
+}
+```
+
+The existing E5 model is still required. The native process reads only private staged text admitted by the existing source policy. The service reuses its incremental index and removes it on shutdown; consecutive requests reuse the same loaded native model. After 60 seconds of inactivity the native worker exits and releases its memory; the next request starts a fresh worker. Cancellation, shutdown and protocol failures reap the owned worker before further work begins. `details.analysis.stats` reports `nativeModelLoads`, `nativeModelReused` and `nativeProcessId`. Existing admission controls hidden files, globs, exclusions and read budgets. Unknown text suffixes are normalized from verified UTF-8 bytes into plain text copies. Executable, model and protocol failures are explicit errors. Omit `nativeText` to retain existing behavior. This option enables text only, without image, audio or video retrieval.
 
 ## Common uses
 
@@ -184,3 +208,33 @@ In hard mode, a direct search such as `grep warning report.txt` is denied. A rec
 Local searches stay on your machine. Only grant access to files your agent is allowed to read. HTTP deployments need an authenticated gateway before public exposure; see [Security](SECURITY.md).
 
 [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [AGPL-3.0-only license](LICENSE)
+
+### Visual search (MCP)
+
+Configure `nativeMedia` with absolute `executable` and `modelDirectory` paths, then restart the MCP host. Build the Apple Silicon worker with `bun run build:native-media <sdk-checkout> <output-directory>`. The worker uses the local model weights with vision enabled and audio disabled.
+
+The additional `sift-light-media` tool accepts `mode: "search"`, an exact local `path`, and exactly one `query` (text description) or `image` (local image path). `kind` is `all`, `image`, or `scan`. File filters `glob`, `exclude`, `hidden`, and `ignorePolicy` use the same admission policy as workspace search. Text and source navigation continue through `sift-light`.
+
+```json
+{
+  "mode": "search",
+  "path": "/absolute/project/assets",
+  "query": "a dog running on grass",
+  "kind": "image"
+}
+```
+
+```json
+{
+  "mode": "search",
+  "path": "/absolute/project/assets",
+  "image": "/absolute/query.jpg",
+  "kind": "all"
+}
+```
+
+Results retain up to ten distinct files, content hashes, original PDF page numbers, and exact `inspect`/`validate` requests for this tool. `inspect` returns actual PNG pixels at a maximum dimension of 1024; scan results render the corresponding original PDF page. Changed sources reject inspection and validation reports stale evidence. Scanned pages in mixed PDFs retain their original page numbers. Visual similarity remains candidate evidence; small print recognition and region-level text location are not guaranteed.
+
+Cold indexing returns `nextRequest` with `mode: "await"`; copy it to the same tool. `mode: "cancel"` and its `operationId` stop that work. The service reuses one resident visual model for consecutive requests, releases it after 60 seconds idle, and owns shutdown and cancellation. Each request admits at most 512 media files, 20 MiB per file and 256 MiB total; corpus limits and enumeration limits are explicit partial coverage. Request deadline is five minutes. Results expire after ten minutes and are scoped to the originating workspace. Office documents, audio and video are outside this tool's current contract.
+
+Native text and visual workers reserve 1 GB of inference headroom above the loaded model and its working space, and return unused compute cache after each query. This is not a hard limit on total process memory. The model still uses several GB, with additional allocations during indexing and inference. Each MCP service session owns its models; multiple connections and simultaneous text/visual workers add their memory use. Ordinary exact search does not load these models. Measure memory and latency for the actual model, machine and file scope.

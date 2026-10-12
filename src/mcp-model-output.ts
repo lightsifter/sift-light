@@ -41,6 +41,11 @@ function compactSemanticMetadata(details: SiftLightDetails, analysis: AnalysisDe
     ...(details.operation
       ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`]
       : []),
+    ...(analysis.retrievalLanes
+      ? [
+          `Independent retrieval lanes (copy the exact request): ${JSON.stringify(analysis.retrievalLanes)}`,
+        ]
+      : []),
     ...analysis.reasons.map((reason) => `[${reason}]`),
     ...(details.redactionApplied ? ["[Display redaction applied.]"] : []),
   ];
@@ -99,7 +104,12 @@ function compactRows(analysis: AnalysisDetails): string[] {
       typeof semanticJudge.model === "string"
         ? ` Jev: ${semanticJudge.classification}; probability=${String(semanticJudge.probability)};${typeof semanticJudge.confidence === "number" ? ` confidence=${String(semanticJudge.confidence)};` : ""} model=${JSON.stringify(semanticJudge.model)}.`
         : "";
-    rows.push(`#${String(item.index)} L${String(item.line)} ${label}${judgment}`);
+    const lane = item.details?.retrievalLane;
+    const retrieval =
+      lane === "current" || lane === "native"
+        ? ` [${lane} #${String(item.details?.laneRank)}]`
+        : "";
+    rows.push(`#${String(item.index)} L${String(item.line)} ${label}${retrieval}${judgment}`);
   }
   return rows;
 }

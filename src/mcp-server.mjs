@@ -1,13 +1,2535 @@
 #!/usr/bin/env node
 
 // src/mcp.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
+import { z as z3 } from "zod";
+
+// src/operation-lifecycle.ts
+import { randomUUID } from "node:crypto";
+var OPERATION_INITIAL_WAIT_MS = 5000;
+var OPERATION_DEFAULT_DEADLINE_MS = 10 * 60000;
+var OPERATION_DEFAULT_LEASE_MS = 2 * 60000;
+var OPERATION_RESULT_TTL_MS = 10 * 60000;
+var MAX_ACTIVE_OPERATIONS = 8;
+var MAX_RETAINED_OPERATIONS = 32;
+function abortReason(signal) {
+  return signal?.reason instanceof Error ? signal.reason : new Error("Operation was cancelled");
+}
+function snapshot(entry) {
+  return {
+    id: entry.id,
+    state: entry.state,
+    startedAt: entry.startedAt,
+    deadlineAt: entry.deadlineAt,
+    leaseExpiresAt: entry.leaseExpiresAt,
+    metadata: entry.metadata,
+    ...entry.progress ? { progress: { ...entry.progress } } : {},
+    ...entry.result === undefined ? {} : { result: entry.result },
+    ...entry.error === undefined ? {} : { error: entry.error }
+  };
+}
+
+class OperationLifecycle {
+  #operations = new Map;
+  #pending = new Set;
+  #now;
+  #maxOperations;
+  #deadlineMs;
+  #leaseMs;
+  #resultTtlMs;
+  #maxRetainedOperations;
+  #closed = false;
+  constructor(options = {}) {
+    this.#now = options.now ?? Date.now;
+    this.#maxOperations = options.maxOperations ?? MAX_ACTIVE_OPERATIONS;
+    this.#deadlineMs = options.deadlineMs ?? OPERATION_DEFAULT_DEADLINE_MS;
+    this.#leaseMs = options.leaseMs ?? OPERATION_DEFAULT_LEASE_MS;
+    this.#resultTtlMs = options.resultTtlMs ?? OPERATION_RESULT_TTL_MS;
+    this.#maxRetainedOperations = options.maxRetainedOperations ?? MAX_RETAINED_OPERATIONS;
+    if (!Number.isSafeInteger(this.#maxOperations) || this.#maxOperations < 1)
+      throw new Error("maxOperations must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#deadlineMs) || this.#deadlineMs < 1)
+      throw new Error("deadlineMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#leaseMs) || this.#leaseMs < 1)
+      throw new Error("leaseMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#resultTtlMs) || this.#resultTtlMs < 1)
+      throw new Error("resultTtlMs must be a positive safe integer");
+    if (!Number.isSafeInteger(this.#maxRetainedOperations) || this.#maxRetainedOperations < 1)
+      throw new Error("maxRetainedOperations must be a positive safe integer");
+  }
+  get size() {
+    this.#expireRetained();
+    return this.#operations.size;
+  }
+  start(run, metadata) {
+    this.#expireRetained();
+    if (this.#closed)
+      throw new Error("Operation lifecycle is closed");
+    if (this.#pending.size >= this.#maxOperations)
+      throw new Error(`Operation resource limit reached (${String(this.#maxOperations)} pending operations)`);
+    const id = randomUUID();
+    const startedAt = this.#now();
+    const controller = new AbortController;
+    const promise = Promise.resolve().then(() => run(controller.signal, id));
+    const entry = {
+      id,
+      startedAt,
+      deadlineAt: startedAt + this.#deadlineMs,
+      leaseExpiresAt: startedAt + this.#leaseMs,
+      metadata,
+      controller,
+      promise,
+      state: "running",
+      settled: false,
+      retainedAt: undefined,
+      waiters: new Set,
+      timer: undefined,
+      leaseTimer: undefined
+    };
+    this.#operations.set(id, entry);
+    this.#pending.add(promise);
+    promise.finally(() => this.#pending.delete(promise)).catch(() => {
+      return;
+    });
+    entry.timer = setTimeout(() => {
+      this.#finishFailure(entry, "Operation deadline exceeded");
+      controller.abort(new Error("Operation deadline exceeded"));
+    }, this.#deadlineMs);
+    entry.timer.unref?.();
+    this.#armLease(entry);
+    entry.promise.then((result) => {
+      entry.settled = true;
+      if (entry.timer)
+        clearTimeout(entry.timer);
+      entry.timer = undefined;
+      if (entry.state === "running") {
+        entry.state = "complete";
+        entry.result = result;
+        this.#retainResult(entry);
+        this.#notify(entry);
+      }
+      return;
+    }, (error) => {
+      entry.settled = true;
+      if (entry.timer)
+        clearTimeout(entry.timer);
+      entry.timer = undefined;
+      if (entry.state === "running") {
+        entry.state = controller.signal.aborted ? "cancelled" : "failed";
+        entry.error = error;
+        this.#retainResult(entry);
+        this.#notify(entry);
+      }
+      return;
+    });
+    return { ...snapshot(entry), promise: entry.promise };
+  }
+  get(operationId) {
+    this.#expireRetained();
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    return snapshot(entry);
+  }
+  updateProgress(operationId, progress) {
+    const entry = this.#operations.get(operationId);
+    if (!entry || entry.state !== "running")
+      return;
+    entry.progress = { ...progress };
+  }
+  touch(operationId) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state === "running")
+      this.#touch(entry);
+    return snapshot(entry);
+  }
+  async wait(operationId, timeoutMs = OPERATION_INITIAL_WAIT_MS, signal) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
+      throw new Error("timeoutMs must be a non-negative safe integer");
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state !== "running")
+      return this.#settled(entry);
+    this.#touch(entry);
+    return new Promise((resolve, reject) => {
+      let timer;
+      let finished = false;
+      let aborting = false;
+      const onSettled = () => finish(this.#settled(entry));
+      const finish = (result) => {
+        if (finished || aborting)
+          return;
+        finished = true;
+        if (timer)
+          clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        entry.waiters.delete(onSettled);
+        resolve(result);
+      };
+      const onAbort = () => {
+        if (finished || aborting)
+          return;
+        aborting = true;
+        if (timer)
+          clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        entry.waiters.delete(onSettled);
+        const reason = abortReason(signal);
+        this.cancelAndWait(operationId, reason).then(() => {
+          if (!finished) {
+            finished = true;
+            reject(reason);
+          }
+          return;
+        }, (error) => {
+          if (!finished) {
+            finished = true;
+            reject(error);
+          }
+          return;
+        });
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => finish({ state: "running", operation: snapshot(entry) }), timeoutMs);
+      timer.unref?.();
+      entry.waiters.add(onSettled);
+    });
+  }
+  cancel(operationId, reason = new Error("Operation cancelled")) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    if (entry.state === "running") {
+      entry.state = "cancelled";
+      entry.error = reason;
+      entry.controller.abort(reason);
+      this.#retainResult(entry);
+      this.#notify(entry);
+    }
+    return snapshot(entry);
+  }
+  async cancelAndWait(operationId, reason = new Error("Operation cancelled")) {
+    const entry = this.#operations.get(operationId);
+    if (!entry)
+      throw new Error("Operation was not found or has expired; start the query again");
+    this.cancel(operationId, reason);
+    await Promise.allSettled([entry.promise]);
+    return snapshot(entry);
+  }
+  clear(reason = new Error("Operation session closed")) {
+    this.#closed = true;
+    for (const entry of this.#operations.values()) {
+      if (entry.state === "running")
+        this.cancel(entry.id, reason);
+      this.#clearTimers(entry);
+    }
+    this.#operations.clear();
+  }
+  reset(reason = new Error("Operation session reset")) {
+    this.clear(reason);
+    this.#closed = false;
+  }
+  async shutdown(reason = new Error("Operation session closed")) {
+    this.clear(reason);
+    await Promise.allSettled(this.#pending);
+  }
+  #settled(entry) {
+    const current = snapshot(entry);
+    if (entry.state === "complete" && entry.result !== undefined)
+      return { state: "complete", operation: current, result: entry.result };
+    if (entry.state === "failed")
+      return { state: "failed", operation: current, error: entry.error };
+    if (entry.state === "cancelled" || entry.state === "expired")
+      return { state: entry.state, operation: current, error: entry.error };
+    return { state: "running", operation: current };
+  }
+  #finishFailure(entry, message) {
+    if (entry.state !== "running")
+      return;
+    entry.state = "failed";
+    entry.error = new Error(message);
+    this.#retainResult(entry);
+    this.#notify(entry);
+  }
+  #retainResult(entry) {
+    if (entry.settled && entry.timer)
+      clearTimeout(entry.timer);
+    if (entry.settled)
+      entry.timer = undefined;
+    if (entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.leaseTimer = undefined;
+    entry.retainedAt = this.#now();
+    entry.leaseExpiresAt = this.#now() + this.#resultTtlMs;
+    entry.leaseTimer = setTimeout(() => this.#evict(entry), this.#resultTtlMs);
+    entry.leaseTimer.unref?.();
+    this.#evictRetainedOverflow();
+  }
+  #notify(entry) {
+    const waiters = [...entry.waiters];
+    entry.waiters.clear();
+    for (const waiter of waiters)
+      waiter();
+  }
+  #touch(entry) {
+    entry.leaseExpiresAt = this.#now() + this.#leaseMs;
+    this.#armLease(entry);
+  }
+  #armLease(entry) {
+    if (entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.leaseTimer = setTimeout(() => {
+      if (entry.state === "running") {
+        entry.state = "expired";
+        entry.error = new Error("Operation lease expired without a continuation");
+        entry.controller.abort(entry.error);
+      }
+      this.#evict(entry);
+    }, Math.max(1, entry.leaseExpiresAt - this.#now()));
+    entry.leaseTimer.unref?.();
+  }
+  #evict(entry) {
+    if (this.#operations.get(entry.id) !== entry)
+      return;
+    if (entry.state === "running") {
+      entry.state = "expired";
+      entry.error = new Error("Operation lease expired without a continuation");
+      entry.controller.abort(entry.error);
+    }
+    this.#notify(entry);
+    this.#clearTimers(entry);
+    this.#operations.delete(entry.id);
+  }
+  #evictRetainedOverflow() {
+    const retained = [...this.#operations.values()].filter((entry) => entry.state !== "running" && entry.retainedAt !== undefined).toSorted((left, right) => (left.retainedAt ?? left.startedAt) - (right.retainedAt ?? right.startedAt));
+    while (retained.length > this.#maxRetainedOperations) {
+      const candidate = retained.shift();
+      if (!candidate || candidate.waiters.size > 0)
+        continue;
+      this.#evict(candidate);
+    }
+  }
+  #clearTimers(entry, includeLease = true) {
+    if (entry.timer)
+      clearTimeout(entry.timer);
+    if (includeLease && entry.leaseTimer)
+      clearTimeout(entry.leaseTimer);
+    entry.timer = undefined;
+    if (includeLease)
+      entry.leaseTimer = undefined;
+  }
+  #expireRetained() {
+    const now = this.#now();
+    for (const entry of this.#operations.values()) {
+      if (entry.leaseExpiresAt <= now)
+        this.#evict(entry);
+    }
+  }
+}
+
+// src/media-search.ts
+import { createHash, randomUUID as randomUUID3 } from "node:crypto";
+import { mkdtemp, mkdir, readFile as readFile2, realpath as realpath3, rm, stat as stat4, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename as basename2, dirname as dirname2, extname, join as join2, resolve as resolve7 } from "node:path";
+import { z } from "zod";
+
+// src/resident-worker-client.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+
+// src/owned-process.ts
+import { spawn } from "node:child_process";
+
+// src/errors.ts
+class SiftLightError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "SiftLightError";
+  }
+}
+
+class ConceptUnavailableError extends SiftLightError {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "ConceptUnavailableError";
+  }
+}
+
+class RipgrepInputError extends SiftLightError {
+  code;
+  guidance;
+  details;
+  constructor(code, message, guidance, repairExamples = []) {
+    super(`${message} ${guidance}`);
+    this.name = "RipgrepInputError";
+    this.code = code;
+    this.guidance = guidance;
+    this.details = {
+      code,
+      issues: [
+        {
+          field: code === "E_REGEX_INVALID" ? "pattern" : "path",
+          reason: guidance
+        }
+      ],
+      recovery: { action: "manual", reason: guidance },
+      ...repairExamples.length > 0 ? { repairExamples } : {}
+    };
+  }
+}
+
+class CursorError extends SiftLightError {
+  code;
+  constructor(message, code = "E_CURSOR_MALFORMED") {
+    super(`${code}: ${message}`);
+    this.name = "CursorError";
+    this.code = code;
+  }
+}
+function abortError() {
+  const error = new Error("Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+// src/owned-process.ts
+var MAX_STDERR_BYTES = 16 * 1024;
+var TERMINATE_GRACE_MS = 250;
+var TERMINATE_DEADLINE_MS = 2000;
+async function runOwnedProcess(options, consumeOutput) {
+  const { executable, args, cwd, signal, env, input } = options;
+  if (signal?.aborted)
+    throw abortError();
+  const spawnOptions = { cwd, windowsHide: true, ...env ? { env } : {} };
+  const child = input === undefined && !options.interactive ? spawn(executable, args, { ...spawnOptions, stdio: ["ignore", "pipe", "pipe"] }) : spawn(executable, args, { ...spawnOptions, stdio: ["pipe", "pipe", "pipe"] });
+  if (options.interactive)
+    child.stdin?.on("error", () => {
+      return;
+    });
+  const spawned = new Promise((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
+  });
+  const inputComplete = new Promise((resolveInput, rejectInput) => {
+    if (input === undefined || child.stdin === null) {
+      resolveInput();
+      return;
+    }
+    child.stdin.on("error", rejectInput);
+    child.stdin.end(input, (error) => {
+      if (error)
+        rejectInput(error);
+      else
+        resolveInput();
+    });
+  });
+  let closed = false;
+  let spawnError;
+  let forceTimer;
+  let deadlineTimer;
+  let rejectClose;
+  const closePromise = new Promise((resolveClose, reject) => {
+    rejectClose = reject;
+    child.once("error", (error) => {
+      spawnError = error;
+    });
+    child.once("close", (code) => {
+      closed = true;
+      resolveClose(code);
+    });
+  });
+  const stderrChunks = [];
+  let stderrBytes = 0;
+  child.stderr.on("data", (chunk) => {
+    const retained = chunk.subarray(0, MAX_STDERR_BYTES - stderrBytes);
+    if (retained.length === 0)
+      return;
+    stderrChunks.push(retained);
+    stderrBytes += retained.length;
+  });
+  const terminate = () => {
+    if (closed || forceTimer)
+      return;
+    child.stdin?.destroy();
+    child.kill("SIGTERM");
+    forceTimer = setTimeout(() => {
+      if (!closed)
+        child.kill("SIGKILL");
+    }, TERMINATE_GRACE_MS);
+    deadlineTimer = setTimeout(() => {
+      rejectClose?.(new SiftLightError("Owned search process did not close after termination"));
+    }, TERMINATE_DEADLINE_MS);
+  };
+  signal?.addEventListener("abort", terminate, { once: true });
+  if (signal?.aborted)
+    terminate();
+  try {
+    const [code] = await Promise.all([
+      closePromise,
+      spawned.then(() => consumeOutput(child.stdout, child.stdin)),
+      inputComplete
+    ]);
+    if (signal?.aborted)
+      throw abortError();
+    if (spawnError)
+      throw spawnError;
+    return { code, stderr: Buffer.concat(stderrChunks).toString("utf8") };
+  } catch (error) {
+    terminate();
+    await closePromise;
+    if (signal?.aborted)
+      throw abortError();
+    if (spawnError)
+      throw spawnError;
+    throw error;
+  } finally {
+    if (forceTimer)
+      clearTimeout(forceTimer);
+    if (deadlineTimer)
+      clearTimeout(deadlineTimer);
+    signal?.removeEventListener("abort", terminate);
+  }
+}
+
+// src/owned-task-queue.ts
+class OwnedTaskQueue {
+  #tail = Promise.resolve();
+  async acquire(signal) {
+    if (signal?.aborted)
+      throw abortError();
+    const previous = this.#tail;
+    const completed = Promise.withResolvers();
+    this.#tail = previous.then(() => completed.promise);
+    const cancelled = Promise.withResolvers();
+    const abort = () => cancelled.reject(abortError());
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted)
+      abort();
+    try {
+      await Promise.race([previous, cancelled.promise]);
+      if (signal?.aborted)
+        throw abortError();
+      let released = false;
+      return () => {
+        if (released)
+          return;
+        released = true;
+        completed.resolve();
+      };
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted)
+        completed.resolve();
+    }
+  }
+  async run(operation, signal) {
+    const release = await this.acquire(signal);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
+
+// src/resident-worker-client.ts
+class ResidentWorkerClient {
+  #protocol;
+  #queue = new OwnedTaskQueue;
+  #lifecycle = new AbortController;
+  #config;
+  #root;
+  #corpus;
+  #index;
+  #idleMs;
+  #session;
+  #timer;
+  #backgroundFailure;
+  #closed = false;
+  constructor(config, root, corpus, index, protocol, idleMs = 60000) {
+    if (!Number.isSafeInteger(idleMs) || idleMs < 1 || idleMs > 300000)
+      throw new SiftLightError("Native text idle timeout must be 1–300000 ms");
+    this.#protocol = protocol;
+    this.#config = config;
+    this.#root = root;
+    this.#corpus = corpus;
+    this.#index = index;
+    this.#idleMs = idleMs;
+  }
+  async#start() {
+    const ready = Promise.withResolvers();
+    ready.promise.catch(() => {
+      return;
+    });
+    const session = {
+      controller: new AbortController,
+      ready: ready.promise,
+      finished: Promise.resolve(),
+      pending: undefined,
+      failure: undefined
+    };
+    this.#session = session;
+    let exposed = false;
+    session.finished = (async () => {
+      try {
+        const result = await runOwnedProcess({
+          executable: this.#config.executable,
+          args: [this.#config.modelDirectory, this.#corpus, this.#index, "--serve"],
+          cwd: this.#root,
+          interactive: true,
+          signal: session.controller.signal
+        }, async (stdout, stdin) => {
+          if (!stdin)
+            throw new SiftLightError("Native text stdin unavailable");
+          exposed = true;
+          ready.resolve(stdin);
+          const decoder = new StringDecoder("utf8");
+          let buffered = "";
+          for await (const chunk of stdout) {
+            const pending = session.pending;
+            if (!pending)
+              throw new SiftLightError("Unsolicited native text output");
+            pending.bytes += chunk.byteLength;
+            if (pending.bytes > this.#protocol.maxResponseBytes)
+              throw new SiftLightError("Native text response exceeded its protocol budget");
+            buffered += decoder.write(Buffer.from(chunk));
+            let newline = buffered.indexOf(`
+`);
+            while (newline >= 0) {
+              const frame = buffered.slice(0, newline);
+              buffered = buffered.slice(newline + 1);
+              const response = this.#protocol.parse(JSON.parse(frame));
+              if (!session.pending || response.id !== session.pending.id)
+                throw new SiftLightError("Native text response identity mismatch");
+              session.pending.resolve(response);
+              session.pending = undefined;
+              newline = buffered.indexOf(`
+`);
+            }
+          }
+          buffered += decoder.end();
+          if (buffered.trim())
+            throw new SiftLightError("Incomplete native text response frame");
+        });
+        if (session.pending || result.code !== 0)
+          throw new SiftLightError(`Native text worker closed (exit ${String(result.code)}): ${result.stderr}`);
+      } catch (error) {
+        session.failure = error;
+        ready.reject(error);
+        session.pending?.reject(error);
+        if (exposed && !session.controller.signal.aborted && !session.pending)
+          throw error;
+      } finally {
+        session.pending = undefined;
+        if (this.#session === session)
+          this.#session = undefined;
+      }
+    })();
+    session.finished.catch((error) => {
+      this.#backgroundFailure = error;
+    });
+    return session;
+  }
+  #clearTimer() {
+    if (this.#timer)
+      clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+  async#stop() {
+    this.#clearTimer();
+    const session = this.#session;
+    if (!session)
+      return;
+    session.controller.abort();
+    await session.finished;
+  }
+  #reportBackgroundFailure() {
+    if (this.#backgroundFailure === undefined)
+      return;
+    const error = this.#backgroundFailure;
+    this.#backgroundFailure = undefined;
+    throw new SiftLightError("Native text background process or cleanup failed", { cause: error });
+  }
+  async search(request, signal) {
+    if (this.#closed)
+      throw new SiftLightError("Native text worker owner is closed");
+    this.#reportBackgroundFailure();
+    const combined = signal ? AbortSignal.any([signal, this.#lifecycle.signal]) : this.#lifecycle.signal;
+    return this.#queue.run(async () => {
+      this.#clearTimer();
+      if (combined.aborted)
+        throw abortError();
+      const session = this.#session ?? await this.#start();
+      const abort = () => session.controller.abort();
+      combined.addEventListener("abort", abort, { once: true });
+      if (combined.aborted)
+        abort();
+      try {
+        const stdin = await session.ready;
+        if (combined.aborted)
+          throw abortError();
+        const response = Promise.withResolvers();
+        response.promise.catch(() => {
+          return;
+        });
+        const id = randomUUID2();
+        session.pending = { id, bytes: 0, resolve: response.resolve, reject: response.reject };
+        const body = JSON.stringify({ ...request, id }) + `
+`;
+        if (Buffer.byteLength(body) > 4096)
+          throw new SiftLightError("Native text request exceeded its protocol budget");
+        await new Promise((done, reject) => stdin.write(body, (error) => error ? reject(error) : done()));
+        const result = await response.promise;
+        if (combined.aborted)
+          throw abortError();
+        this.#timer = setTimeout(() => {
+          this.#timer = undefined;
+          this.#queue.run(() => this.#stop()).catch((error) => {
+            this.#backgroundFailure = error;
+          });
+        }, this.#idleMs);
+        this.#timer.unref();
+        return result;
+      } catch (error) {
+        await this.#stop();
+        if (combined.aborted)
+          throw abortError();
+        throw session.failure ?? error;
+      } finally {
+        combined.removeEventListener("abort", abort);
+      }
+    }, combined);
+  }
+  async close() {
+    this.#closed = true;
+    this.#lifecycle.abort();
+    await this.#queue.run(() => this.#stop());
+    this.#reportBackgroundFailure();
+  }
+}
+
+// src/workspace-files.ts
+import { relative as relative3, resolve as resolve6, sep as sep2 } from "node:path";
+
+// src/path-policy.ts
+import { realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+var POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"];
+var PORTABLE_CREDENTIAL_DIRECTORY_NAMES = [
+  ".ssh",
+  ".gnupg",
+  ".aws",
+  ".azure",
+  ".kube",
+  ".docker",
+  ".password-store"
+];
+var HOME_CREDENTIAL_DIRECTORIES = [
+  [".ssh"],
+  [".gnupg"],
+  [".aws"],
+  [".azure"],
+  [".kube"],
+  [".docker"],
+  [".password-store"],
+  [".config", "gcloud"],
+  [".config", "gh"],
+  [".local", "share", "keyrings"]
+];
+var HOME_CREDENTIAL_FILES = [[".netrc"], [".npmrc"], [".pypirc"], [".git-credentials"]];
+var DARWIN_CREDENTIAL_DIRECTORIES = [
+  ["Library", "Keychains"],
+  ["Library", "Application Support", "Google", "Chrome"],
+  ["Library", "Application Support", "Chromium"],
+  ["Library", "Application Support", "Firefox"],
+  ["Library", "Application Support", "Microsoft Edge"],
+  ["Library", "Application Support", "BraveSoftware", "Brave-Browser"]
+];
+var LINUX_CREDENTIAL_DIRECTORIES = [
+  [".mozilla", "firefox"],
+  [".config", "google-chrome"],
+  [".config", "chromium"],
+  [".config", "microsoft-edge"],
+  [".config", "BraveSoftware", "Brave-Browser"]
+];
+function pathKey(path) {
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+function directoryNameKey(name) {
+  return process.platform === "win32" || process.platform === "darwin" ? name.toLowerCase() : name;
+}
+var PORTABLE_CREDENTIAL_DIRECTORY_KEYS = new Set(PORTABLE_CREDENTIAL_DIRECTORY_NAMES.map(directoryNameKey));
+function isGitInternal(path) {
+  return resolve(path).split(sep).some((part) => part.toLowerCase() === ".git");
+}
+function isPathInsideRoot(path, root) {
+  const local = relative(pathKey(root), pathKey(path));
+  return local !== ".." && !local.startsWith(`..${sep}`) && !isAbsolute(local);
+}
+function isPathInsideCwd(path, cwd) {
+  return isPathInsideRoot(resolve(cwd, path), resolve(cwd));
+}
+function defaultSensitiveRoots() {
+  const home = homedir();
+  const roots = [...HOME_CREDENTIAL_DIRECTORIES, ...HOME_CREDENTIAL_FILES].map((parts) => join(home, ...parts));
+  if (process.platform !== "win32")
+    roots.push(...POSIX_SPECIAL_ROOTS);
+  if (process.platform === "darwin") {
+    roots.push(...DARWIN_CREDENTIAL_DIRECTORIES.map((parts) => join(home, ...parts)));
+  } else if (process.platform === "linux") {
+    roots.push(...LINUX_CREDENTIAL_DIRECTORIES.map((parts) => join(home, ...parts)));
+  } else if (process.platform === "win32") {
+    const { APPDATA, LOCALAPPDATA, ProgramData, SystemRoot } = process.env;
+    if (APPDATA) {
+      roots.push(join(APPDATA, "Microsoft", "Credentials"), join(APPDATA, "Microsoft", "Protect"), join(APPDATA, "gnupg"));
+    }
+    if (LOCALAPPDATA) {
+      roots.push(join(LOCALAPPDATA, "Google", "Chrome", "User Data"), join(LOCALAPPDATA, "Chromium", "User Data"), join(LOCALAPPDATA, "Microsoft", "Edge", "User Data"), join(LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"));
+    }
+    if (ProgramData)
+      roots.push(join(ProgramData, "Microsoft", "Crypto", "RSA", "MachineKeys"));
+    if (SystemRoot)
+      roots.push(join(SystemRoot, "System32", "config"));
+  }
+  return [...new Set(roots.map((root) => resolve(root)))];
+}
+var DEFAULT_SENSITIVE_ROOTS = defaultSensitiveRoots();
+function escapeGlobPath(path) {
+  const normalized = path.split(sep).join("/");
+  return normalized.replaceAll(/([\\*?[\]{}])/g, "\\$1");
+}
+function blockedPathMessage(path) {
+  return `Path is inside a protected credential or system area: ${path}`;
+}
+
+class SearchPathPolicy {
+  cwd;
+  protectedRoots;
+  constructor(cwd, protectedRoots = DEFAULT_SENSITIVE_ROOTS) {
+    this.cwd = resolve(cwd);
+    this.protectedRoots = [...new Set(protectedRoots.map((root) => resolve(root)))];
+  }
+  isProtected(path) {
+    const absolute = resolve(this.cwd, path);
+    if (isPathInsideRoot(absolute, this.cwd))
+      return false;
+    return absolute.split(sep).some((part) => PORTABLE_CREDENTIAL_DIRECTORY_KEYS.has(directoryNameKey(part))) || this.protectedRoots.some((root) => isPathInsideRoot(absolute, root));
+  }
+  assertPath(path) {
+    const absolute = resolve(this.cwd, path);
+    if (isGitInternal(absolute))
+      throw new SiftLightError("Git internals are excluded from search");
+    if (this.isProtected(absolute))
+      throw new SiftLightError(blockedPathMessage(absolute));
+  }
+  async resolveExistingPath(path) {
+    const absolute = resolve(this.cwd, path);
+    this.assertPath(absolute);
+    let canonical;
+    try {
+      canonical = await realpath(absolute);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return;
+      throw error;
+    }
+    this.assertPath(canonical);
+    return canonical;
+  }
+  async assertExistingPath(path) {
+    await this.resolveExistingPath(path);
+  }
+  async resolveSearchTarget(path) {
+    const absolute = resolve(this.cwd, path);
+    const [canonical, canonicalCwd] = await Promise.all([
+      this.resolveExistingPath(absolute),
+      realpath(this.cwd)
+    ]);
+    return canonical && (!isPathInsideRoot(absolute, this.cwd) || !isPathInsideRoot(canonical, canonicalCwd)) ? canonical : absolute;
+  }
+  async allowsScopeExpansion(path, scope) {
+    if (scope === "strict")
+      return false;
+    if (scope === "expand")
+      return true;
+    const searchTarget = await this.resolveSearchTarget(path);
+    return isPathInsideRoot(searchTarget, this.cwd);
+  }
+  async ripgrepWorkingDirectory(searchPath) {
+    const absolute = resolve(this.cwd, searchPath);
+    if (isPathInsideRoot(absolute, this.cwd))
+      return this.cwd;
+    let isDirectory;
+    try {
+      isDirectory = (await stat(absolute)).isDirectory();
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return this.cwd;
+      throw error;
+    }
+    return isDirectory ? absolute : dirname(absolute);
+  }
+  ripgrepGlobArguments(searchPath) {
+    const absolute = resolve(this.cwd, searchPath);
+    if (isPathInsideRoot(absolute, this.cwd))
+      return [];
+    const args = [];
+    const globFlag = process.platform === "win32" || process.platform === "darwin" ? "--iglob" : "--glob";
+    for (const name of PORTABLE_CREDENTIAL_DIRECTORY_NAMES) {
+      args.push(globFlag, `!${name}`, globFlag, `!${name}/**`, globFlag, `!**/${name}`, globFlag, `!**/${name}/**`);
+    }
+    for (const root of this.protectedRoots) {
+      if (!isPathInsideRoot(root, absolute))
+        continue;
+      const local = relative(absolute, root);
+      if (!local || local === ".")
+        continue;
+      const escaped = escapeGlobPath(local);
+      args.push(globFlag, `!${escaped}`, globFlag, `!${escaped}/**`);
+    }
+    return args;
+  }
+}
+
+// src/rg.ts
+import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve5 } from "node:path";
+
+// src/types.ts
+var DEFAULT_PAGE_SIZE = 100;
+var MAX_PAGE_SIZE = 100;
+var DEFAULT_RESULT_TOKEN_BUDGET = 2000;
+var ESTIMATED_CHARACTERS_PER_TOKEN = 4;
+var DEFAULT_SUMMARY_FILE_LIMIT = 30;
+var MAX_SELECTED_PATHS = 20;
+var MAX_INSPECT_TARGETS = 5;
+var MAX_INSPECT_REQUEST_TARGETS = 20;
+var MAX_DISPLAYED_OCCURRENCES = 20;
+var MAX_STORED_MATCHES = 50000;
+var MAX_STORED_OCCURRENCES = 200000;
+var MAX_SEARCH_STORAGE_BYTES = 32 * 1024 * 1024;
+var MAX_LINE_CHARACTERS = 500;
+var MAX_RESULT_BYTES = 16 * 1024;
+var MAX_CONTEXT_LINES = 20;
+var MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
+var MAX_SOURCE_FILE_BYTES = 5 * 1024 * 1024;
+var MAX_PATH_CHARACTERS = 4096;
+var MAX_PATTERN_CHARACTERS = 64 * 1024;
+var MAX_AUDIT_LITERAL_CHARACTERS = 256;
+var MAX_FILE_FILTER_ITEMS = 64;
+var MAX_SOURCE_REVISION_CONCURRENCY = 16;
+var MAX_SOURCE_REVISION_FILES = 50000;
+
+// src/excerpt.ts
+function boundedCharacter(value, maximum) {
+  if (!Number.isFinite(value))
+    return 0;
+  return Math.min(maximum, Math.max(0, Math.floor(value)));
+}
+function excerptText(text, focusStart = 0, focusEnd = focusStart, maximumCharacters = MAX_LINE_CHARACTERS) {
+  if (!Number.isSafeInteger(maximumCharacters) || maximumCharacters <= 0) {
+    throw new Error("Excerpt size must be a positive safe integer");
+  }
+  if (text.length <= maximumCharacters) {
+    return {
+      text,
+      truncated: false,
+      startCharacter: 0,
+      endCharacter: text.length
+    };
+  }
+  const boundedStart = boundedCharacter(focusStart, text.length);
+  const boundedEnd = Math.max(boundedStart, boundedCharacter(focusEnd, text.length));
+  const focusLength = boundedEnd - boundedStart;
+  const startCharacter = focusLength >= maximumCharacters ? Math.min(boundedStart, text.length - maximumCharacters) : Math.min(Math.max(0, boundedStart - Math.floor((maximumCharacters - focusLength) / 2)), text.length - maximumCharacters);
+  const endCharacter = startCharacter + maximumCharacters;
+  const prefix = startCharacter > 0 ? "…" : "";
+  const suffix = endCharacter < text.length ? "…" : "";
+  return {
+    text: `${prefix}${text.slice(startCharacter, endCharacter)}${suffix}`,
+    truncated: true,
+    startCharacter,
+    endCharacter
+  };
+}
+
+// src/search-retention.ts
+class SearchRetention {
+  #bytes = 0;
+  #metadataBytes = 0;
+  #metadataLimitReached = false;
+  #occurrences = 0;
+  #reasons = new Set;
+  maxBytes;
+  maxOccurrences;
+  constructor(maxBytes = MAX_SEARCH_STORAGE_BYTES, maxOccurrences = MAX_STORED_OCCURRENCES) {
+    this.maxBytes = maxBytes;
+    this.maxOccurrences = maxOccurrences;
+    for (const value of [maxBytes, maxOccurrences]) {
+      if (!Number.isSafeInteger(value) || value < 1)
+        throw new SiftLightError("Search retention limits must be positive safe integers");
+    }
+  }
+  file(displayPath, absolutePath) {
+    if (this.#metadataLimitReached)
+      return false;
+    const bytes = Buffer.byteLength(JSON.stringify([displayPath, absolutePath])) + 512;
+    const metadataLimit = Math.floor(this.maxBytes / 4);
+    if (this.#metadataBytes + bytes > metadataLimit) {
+      this.#metadataLimitReached = true;
+      this.#reasons.add(`File-summary retention reached its ${String(metadataLimit)}-byte share of the search budget; file summaries are partial; narrow the path or filters`);
+      return false;
+    }
+    this.#bytes += bytes;
+    this.#metadataBytes += bytes;
+    return true;
+  }
+  canRetainOccurrences(count) {
+    if (this.#occurrences + count <= this.maxOccurrences)
+      return true;
+    this.#reasons.add(`Occurrence retention reached the ${String(this.maxOccurrences)} limit`);
+    return false;
+  }
+  retain(match) {
+    if (!this.canRetainOccurrences(match.occurrences.length))
+      return false;
+    const bytes = Buffer.byteLength(JSON.stringify(match)) + 1;
+    if (this.#bytes - this.#metadataBytes + bytes > this.maxBytes - Math.floor(this.maxBytes / 4)) {
+      this.#reasons.add(`Search evidence retention reached the ${String(this.maxBytes)}-byte limit`);
+      return false;
+    }
+    this.#bytes += bytes;
+    this.#occurrences += match.occurrences.length;
+    return true;
+  }
+  noteLimit(reason) {
+    this.#reasons.add(reason);
+  }
+  get details() {
+    return {
+      accountedBytes: this.#bytes,
+      retainedOccurrences: this.#occurrences,
+      maxBytes: this.maxBytes,
+      maxOccurrences: this.maxOccurrences,
+      reasons: [...this.#reasons]
+    };
+  }
+}
+
+// src/capped-lines.ts
+var MAX_DIAGNOSTIC_PREFIX_BYTES = 8 * 1024;
+async function consumeCappedLines(stream, onLine, options = {}) {
+  const maxLineBytes = options.maxLineBytes ?? MAX_PROTOCOL_LINE_BYTES;
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1)
+    throw new Error("Capped line byte limit must be a positive safe integer");
+  let lineChunks = [];
+  let lineBytes = 0;
+  let discarding = false;
+  const resetLine = () => {
+    lineChunks = [];
+    lineBytes = 0;
+  };
+  const lastLineByte = () => {
+    const chunk = lineChunks.at(-1);
+    return chunk && chunk.length > 0 ? chunk[chunk.length - 1] : undefined;
+  };
+  const prefixFor = (segment, totalBytes) => {
+    const prefixBytes = Math.min(MAX_DIAGNOSTIC_PREFIX_BYTES, totalBytes);
+    const prefix = Buffer.allocUnsafe(prefixBytes);
+    let copied = 0;
+    for (const chunk of lineChunks) {
+      if (copied === prefixBytes)
+        break;
+      const length = Math.min(chunk.length, prefixBytes - copied);
+      prefix.set(chunk.subarray(0, length), copied);
+      copied += length;
+    }
+    if (copied < prefixBytes) {
+      const length = Math.min(segment.length, prefixBytes - copied);
+      prefix.set(segment.subarray(0, length), copied);
+    }
+    return prefix.toString("utf8");
+  };
+  const lineText = (withoutTrailingCarriageReturn) => {
+    const contentBytes = lineBytes - (withoutTrailingCarriageReturn && lineBytes > 0 ? 1 : 0);
+    const bytes = Buffer.concat(lineChunks, lineBytes);
+    return bytes.toString("utf8", 0, contentBytes);
+  };
+  const reportOverflow = (segment, observedBytes, final) => {
+    if (!options.onLineTooLong)
+      throw new Error(`Input line exceeds the ${String(maxLineBytes)}-byte limit${final ? " at end of stream" : ""}`);
+    options.onLineTooLong({
+      prefix: prefixFor(segment, observedBytes),
+      observedBytes
+    });
+  };
+  const consumeChunk = (chunk, final) => {
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline >= 0 ? newline : chunk.length;
+      const segment = chunk.subarray(offset, end);
+      if (discarding) {
+        if (newline < 0)
+          return;
+        discarding = false;
+        resetLine();
+        offset = newline + 1;
+        continue;
+      }
+      const observedBytes = lineBytes + segment.length;
+      const hasTrailingCarriageReturn = newline >= 0 && observedBytes > 0 && (segment.at(-1) ?? lastLineByte()) === 13;
+      const contentBytes = observedBytes - (hasTrailingCarriageReturn ? 1 : 0);
+      if (contentBytes > maxLineBytes) {
+        reportOverflow(segment, observedBytes, final && newline < 0);
+        resetLine();
+        if (newline < 0)
+          discarding = true;
+        else
+          offset = newline + 1;
+        continue;
+      }
+      if (segment.length > 0)
+        lineChunks.push(segment);
+      lineBytes = observedBytes;
+      if (newline < 0)
+        return;
+      onLine(lineText(hasTrailingCarriageReturn));
+      resetLine();
+      offset = newline + 1;
+    }
+  };
+  for await (const chunk of stream)
+    consumeChunk(chunk, false);
+  if (discarding)
+    return;
+  consumeChunk(new Uint8Array, true);
+  if (lineBytes > 0)
+    onLine(lineText(false));
+}
+
+// src/ripgrep-executable.ts
+import { constants } from "node:fs";
+import { access, stat as stat2 } from "node:fs/promises";
+import { delimiter, isAbsolute as isAbsolute2, resolve as resolve2 } from "node:path";
+var OVERRIDE_ENV = "SIFT_LIGHT_RG_PATH";
+var PATH_RIPGREP_NAME = process.platform === "win32" ? "rg.exe" : "rg";
+var BUNDLED_REPAIR = `Reinstall sift-light with optional dependencies enabled for this platform, set ${OVERRIDE_ENV} to an absolute ripgrep executable path, or ensure ${PATH_RIPGREP_NAME} is available on PATH.`;
+async function findExecutableOnPath() {
+  const pathValue = process.env.PATH;
+  if (!pathValue)
+    return;
+  const candidates = pathValue.split(delimiter).map((directory) => resolve2(directory || ".", PATH_RIPGREP_NAME));
+  const available = await Promise.all(candidates.map(async (candidate) => {
+    try {
+      if (!(await stat2(candidate)).isFile())
+        return;
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      return;
+    }
+  }));
+  return available.find((candidate) => candidate !== undefined);
+}
+async function resolveRipgrepExecutable() {
+  const configured = process.env[OVERRIDE_ENV];
+  if (configured !== undefined && !isAbsolute2(configured))
+    throw new SiftLightError(`${OVERRIDE_ENV} must be an absolute executable file path; shell functions, aliases and relative paths are not supported.`);
+  let executable;
+  if (configured !== undefined) {
+    executable = configured;
+  } else {
+    try {
+      executable = (await import("@vscode/ripgrep")).rgPath;
+    } catch (cause) {
+      const pathExecutable = await findExecutableOnPath();
+      if (pathExecutable === undefined)
+        throw new SiftLightError(`Bundled ripgrep is unavailable. ${BUNDLED_REPAIR}`, { cause });
+      executable = pathExecutable;
+    }
+  }
+  try {
+    if (!(await stat2(executable)).isFile())
+      throw new Error("Expected an executable file");
+    await access(executable, constants.X_OK);
+  } catch (cause) {
+    const repair = configured === undefined ? BUNDLED_REPAIR : `Fix ${OVERRIDE_ENV} or unset it to use bundled ripgrep. No fallback was attempted.`;
+    throw new SiftLightError(`ripgrep executable is unavailable: ${executable}. ${repair}`, {
+      cause
+    });
+  }
+  return executable;
+}
+
+// src/ripgrep-diagnostics.ts
+import { basename, resolve as resolve3 } from "node:path";
+
+// src/redaction.ts
+var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
+var SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
+var SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`, "gi");
+var SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
+var CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*[([]/u;
+var TYPE_ONLY_VALUES = new Set([
+  "boolean",
+  "number",
+  "string",
+  "unknown",
+  "never",
+  "undefined",
+  "null"
+]);
+function redactString(value) {
+  let count = 0;
+  let redacted = value.replace(PRIVATE_KEY, (_match, kind) => {
+    count += 1;
+    return `-----BEGIN ${kind}-----
+[REDACTED]
+-----END ${kind}-----`;
+  });
+  redacted = redacted.replace(SENSITIVE_ASSIGNMENT, (match, prefix, rawValue) => {
+    const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
+    if (TYPE_ONLY_VALUES.has(unquoted) || CODE_EXPRESSION.test(rawValue))
+      return match;
+    count += 1;
+    const quote = rawValue.startsWith('"') || rawValue.startsWith("'") ? rawValue[0] : "";
+    return `${prefix}${quote}[REDACTED]${quote}`;
+  });
+  redacted = redacted.replace(SENSITIVE_TOKEN, () => {
+    count += 1;
+    return "[REDACTED]";
+  });
+  return { value: redacted, count };
+}
+function redactDiagnosticText(value) {
+  return redactString(value).value;
+}
+function containsSensitiveText(value) {
+  if (typeof value === "string")
+    return redactString(value).count > 0;
+  if (Array.isArray(value))
+    return value.some((item) => containsSensitiveText(item));
+  if (typeof value !== "object" || value === null)
+    return false;
+  return Object.values(value).some((item) => containsSensitiveText(item));
+}
+function redactInPlace(value, seen) {
+  if (typeof value !== "object" || value === null)
+    return 0;
+  if (seen.has(value))
+    return 0;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    let count = 0;
+    for (let index = 0;index < value.length; index += 1) {
+      const item = value[index];
+      if (typeof item === "string") {
+        const redacted = redactString(item);
+        value[index] = redacted.value;
+        count += redacted.count;
+      } else
+        count += redactInPlace(item, seen);
+    }
+    return count;
+  }
+  let count = 0;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") {
+      const redacted = redactString(item);
+      Reflect.set(value, key, redacted.value);
+      count += redacted.count;
+    } else
+      count += redactInPlace(item, seen);
+  }
+  return count;
+}
+function redactSiftLightResult(result) {
+  const text = redactString(result.text);
+  const details = structuredClone(result.details);
+  const redactedCount = text.count + redactInPlace(details, new WeakSet);
+  return {
+    text: text.value,
+    details: {
+      ...details,
+      redactedCount,
+      redactionApplied: true
+    }
+  };
+}
+
+// src/ripgrep-diagnostics.ts
+var UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
+var UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
+var RECOVERABLE_FILESYSTEM_CODE = /\(os error (?:4|5|22)\)\s*$/iu;
+var RECOVERABLE_FILESYSTEM_SUFFIXES = [
+  /:\s+Invalid argument(?:\s+\(os error 22\))?\s*$/iu,
+  /:\s+Interrupted system call\s*$/iu,
+  /:\s+Input\/output error(?:\s+\(os error 5\))?\s*$/iu,
+  /:\s+No message available on STREAM\s*$/iu
+];
+var INVALID_REGEX_DIAGNOSTIC = /(?:^|\n)\s*(?:rg:\s*)?regex parse error:/iu;
+var MISSING_PATH_DIAGNOSTIC = /(?:IO error for operation on .+?:\s*)?No such file or directory \(os error 2\)\s*$/iu;
+var MAX_RIPGREP_DIAGNOSTIC_CHARACTERS = 4096;
+function diagnosticLines(stderr) {
+  return stderr.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+}
+function boundedRipgrepDiagnostic(value, redact = false) {
+  const safe = redact ? redactDiagnosticText(value) : value;
+  const normalized = safe.toWellFormed();
+  return normalized.length <= MAX_RIPGREP_DIAGNOSTIC_CHARACTERS ? normalized : `${normalized.slice(0, MAX_RIPGREP_DIAGNOSTIC_CHARACTERS - 1)}…`;
+}
+function classifyRipgrepInputFailure(stderr) {
+  if (INVALID_REGEX_DIAGNOSTIC.test(stderr))
+    return "E_REGEX_INVALID";
+  if (diagnosticLines(stderr).some((line) => MISSING_PATH_DIAGNOSTIC.test(line)))
+    return "E_SEARCH_PATH_NOT_FOUND";
+  return;
+}
+function missingPathFromDiagnostics(stderr) {
+  for (const line of diagnosticLines(stderr)) {
+    const operation = /IO error for operation on (.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
+    if (operation?.[1])
+      return operation[1].trim();
+    const direct = /^rg:\s*(.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
+    if (direct?.[1])
+      return direct[1].trim();
+  }
+  return;
+}
+var RIPGREP_RECOVERY_FIELDS = [
+  "path",
+  "glob",
+  "exclude",
+  "literal",
+  "ignoreCase",
+  "hidden",
+  "ignorePolicy",
+  "wholeWord",
+  "context",
+  "scope",
+  "redact"
+];
+function copyRipgrepRecoveryFields(request) {
+  const result = {};
+  for (const field of RIPGREP_RECOVERY_FIELDS) {
+    const value = request[field];
+    if (value !== undefined)
+      result[field] = value;
+  }
+  return result;
+}
+function ripgrepRepairExamples(code, request, redact) {
+  if (request === undefined || redact && containsSensitiveText(request))
+    return [];
+  if (code === "E_REGEX_INVALID") {
+    return [
+      {
+        label: "按原文查找",
+        request: {
+          mode: "matches",
+          ...copyRipgrepRecoveryFields(request),
+          pattern: request.pattern,
+          literal: true
+        }
+      }
+    ];
+  }
+  if (code === "E_SEARCH_PATH_NOT_FOUND" && request.path !== undefined) {
+    const fileName = basename(request.path.replaceAll("\\", "/"));
+    if (fileName === "." || fileName === "/" || fileName.length === 0)
+      return [];
+    return [
+      {
+        label: "按文件名查找",
+        request: {
+          mode: "files",
+          query: fileName,
+          ...request.redact === true ? { redact: true } : {}
+        }
+      }
+    ];
+  }
+  return [];
+}
+function createRipgrepInputError(stderr, redact = false, request) {
+  const code = classifyRipgrepInputFailure(stderr);
+  if (code === "E_REGEX_INVALID") {
+    return new RipgrepInputError(code, "ripgrep regex parse error: pattern is not a valid regular expression.", "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.", ripgrepRepairExamples(code, request, redact));
+  }
+  if (code === "E_SEARCH_PATH_NOT_FOUND") {
+    const path = missingPathFromDiagnostics(stderr);
+    const location = path ? ` (${JSON.stringify(boundedRipgrepDiagnostic(path, redact))})` : "";
+    return new RipgrepInputError(code, `A searched path${location} does not exist or became unavailable.`, "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.", ripgrepRepairExamples(code, request, redact));
+  }
+  return;
+}
+function unreadablePath(line, suffix) {
+  const match = suffix.exec(line);
+  if (!match || match.index === undefined)
+    return;
+  const prefix = line.slice(0, match.index).trim();
+  if (prefix === "rg")
+    return;
+  const separator = prefix.indexOf(": ");
+  const path = (separator < 0 ? prefix : prefix.slice(separator + 2)).trim();
+  return path.replace(/^['"]|['"]$/gu, "") || undefined;
+}
+function classifyRipgrepDiagnostics(stderr) {
+  const unreadable = [];
+  const recoverable = [];
+  const other = [];
+  for (const line of diagnosticLines(stderr)) {
+    const path = unreadablePath(line, UNREADABLE_SUFFIX);
+    if (path !== undefined || UNREADABLE_CODE.test(line)) {
+      unreadable.push({ message: line, ...path ? { path } : {} });
+      continue;
+    }
+    const recoverableSuffix = RECOVERABLE_FILESYSTEM_SUFFIXES.find((suffix) => suffix.test(line));
+    if (recoverableSuffix || RECOVERABLE_FILESYSTEM_CODE.test(line)) {
+      const recoverablePath = recoverableSuffix ? unreadablePath(line, recoverableSuffix) : undefined;
+      recoverable.push({ message: line, ...recoverablePath ? { path: recoverablePath } : {} });
+      continue;
+    }
+    other.push(line);
+  }
+  return { unreadable, recoverable, other };
+}
+function hasRequestedRootUnreadable(diagnostics, cwd, searchPath) {
+  const expected = resolve3(cwd, searchPath);
+  return diagnostics.some((diagnostic) => diagnostic.path === undefined || resolve3(cwd, diagnostic.path) === expected);
+}
+function describeUnreadableDiagnostics(diagnostics) {
+  const messages = [...new Set(diagnostics.map((diagnostic) => diagnostic.message))];
+  return `Ripgrep skipped ${String(messages.length)} unreadable path(s); search coverage is partial: ${messages.join("; ")}`;
+}
+
+// src/source.ts
+import { readFile, realpath as realpath2, stat as stat3 } from "node:fs/promises";
+var SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
+var MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
+async function getSourceRevision(path, onError) {
+  try {
+    const metadata = await stat3(path);
+    return sourceRevisionFromStats(metadata);
+  } catch (error) {
+    onError?.(error);
+    return;
+  }
+}
+function sourceRevisionFromStats(metadata) {
+  return {
+    size: metadata.size,
+    mtimeMs: metadata.mtimeMs,
+    ctimeMs: metadata.ctimeMs,
+    ...metadata.ino !== 0 ? { inode: metadata.ino } : {},
+    ...metadata.dev !== 0 ? { device: metadata.dev } : {}
+  };
+}
+function sameSourceRevision(left, right) {
+  return left.size === right.size && left.mtimeMs === right.mtimeMs && (left.ctimeMs === undefined || right.ctimeMs === undefined || left.ctimeMs === right.ctimeMs) && left.inode === right.inode && left.device === right.device;
+}
+function matchesModificationTime(revision, modifiedAfterMs, modifiedBeforeMs) {
+  return (modifiedAfterMs === undefined || revision.mtimeMs >= modifiedAfterMs) && (modifiedBeforeMs === undefined || revision.mtimeMs < modifiedBeforeMs);
+}
+function modificationTimeDisplay(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? `${String(value)} Unix ms` : JSON.stringify(date.toISOString());
+}
+function modificationTimeBoundsText(modifiedAfterMs, modifiedBeforeMs) {
+  if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
+    return "";
+  const bounds = [
+    modifiedAfterMs === undefined ? undefined : `mtime >= ${modificationTimeDisplay(modifiedAfterMs)}`,
+    modifiedBeforeMs === undefined ? undefined : `mtime < ${modificationTimeDisplay(modifiedBeforeMs)}`
+  ].filter((value) => value !== undefined);
+  return ` [Modification-time filter: ${bounds.join("; ")}.]`;
+}
+async function assertExistingPathInsideCwd(path, cwd) {
+  if (!isPathInsideCwd(path, cwd)) {
+    throw new SiftLightError("Path must stay within the working directory");
+  }
+  const canonical = await new SearchPathPolicy(cwd).resolveExistingPath(path);
+  if (canonical && !isPathInsideCwd(canonical, await realpath2(cwd))) {
+    throw new SiftLightError("Path must stay within the working directory");
+  }
+}
+class SourceBudgetTooSmallError extends SiftLightError {
+  constructor() {
+    super("Source target line exceeds the available byte budget");
+    this.name = "SourceBudgetTooSmallError";
+  }
+}
+
+class SourceLineUnavailableError extends SiftLightError {
+  constructor(line) {
+    super(`Source line ${String(line)} is beyond the end of the file`);
+    this.name = "SourceLineUnavailableError";
+  }
+}
+function sourceLineBytes(line) {
+  return Buffer.byteLength(`${String(line.line)}: ${line.text}`, "utf8");
+}
+function selectSourceWindow(rendered, targetIndex, maxBytes) {
+  let startIndex = targetIndex;
+  let endIndex = targetIndex;
+  const target = rendered[targetIndex];
+  if (!target)
+    throw new Error("Source target line is unavailable");
+  let bytes = sourceLineBytes(target);
+  if (bytes > maxBytes)
+    throw new SourceBudgetTooSmallError;
+  let canGrowBefore = true;
+  let canGrowAfter = true;
+  while (canGrowBefore || canGrowAfter) {
+    let grew = false;
+    if (canGrowBefore) {
+      const candidate = rendered[startIndex - 1];
+      if (candidate === undefined) {
+        canGrowBefore = false;
+      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
+        startIndex -= 1;
+        bytes += 1 + sourceLineBytes(candidate);
+        grew = true;
+      } else {
+        canGrowBefore = false;
+      }
+    }
+    if (canGrowAfter) {
+      const candidate = rendered[endIndex + 1];
+      if (candidate === undefined) {
+        canGrowAfter = false;
+      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
+        endIndex += 1;
+        bytes += 1 + sourceLineBytes(candidate);
+        grew = true;
+      } else {
+        canGrowAfter = false;
+      }
+    }
+    if (!grew && !canGrowBefore && !canGrowAfter)
+      break;
+  }
+  return { lines: rendered.slice(startIndex, endIndex + 1), startIndex, endIndex };
+}
+function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLine, options = {}) {
+  const maxBytes = options.maxBytes ?? MAX_SOURCE_RANGE_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_SOURCE_RANGE_BYTES)
+    throw new Error("Source range byte budget must be within the result body limit");
+  const lines = [];
+  let lineStart = 0;
+  for (let newline = content.indexOf(10);newline >= 0; newline = content.indexOf(10, lineStart)) {
+    lines.push(content.subarray(lineStart, newline));
+    lineStart = newline + 1;
+  }
+  lines.push(content.subarray(lineStart));
+  const boundedStart = Math.max(1, startLine);
+  if (boundedStart > lines.length) {
+    throw new SourceLineUnavailableError(targetLine);
+  }
+  const boundedEnd = Math.min(lines.length, Math.max(boundedStart, endLine));
+  if (targetLine < 1 || targetLine > lines.length) {
+    throw new SourceLineUnavailableError(targetLine);
+  }
+  const boundedTarget = Math.min(boundedEnd, Math.max(boundedStart, targetLine));
+  const rendered = Array.from({ length: boundedEnd - boundedStart + 1 }, (_, index) => {
+    const lineNumber = boundedStart + index;
+    const raw = lines[lineNumber - 1];
+    if (!raw)
+      throw new Error("Source line is unavailable");
+    const focus = lineNumber === targetLine ? options.focus : undefined;
+    const start = focus?.range.start.character ?? 0;
+    const end = focus?.range.end.character ?? start;
+    const bytes = focus?.range.encoding === "utf-8" ? raw : undefined;
+    const excerpt = excerptText(raw.toString("utf8").replaceAll("\r", ""), bytes ? bytes.subarray(0, start).toString("utf8").replaceAll("\r", "").length : start, bytes ? bytes.subarray(0, end).toString("utf8").replaceAll("\r", "").length : end);
+    return { line: lineNumber, text: excerpt.text, truncated: excerpt.truncated };
+  });
+  const selected = selectSourceWindow(rendered, boundedTarget - boundedStart, maxBytes);
+  const omittedBefore = selected.startIndex;
+  const omittedAfter = rendered.length - selected.endIndex - 1;
+  return {
+    text: selected.lines.map((line) => `${String(line.line)}: ${line.text}`).join(`
+`),
+    lines: selected.lines,
+    startLine: boundedStart + selected.startIndex,
+    endLine: boundedStart + selected.endIndex,
+    truncated: omittedBefore > 0 || omittedAfter > 0,
+    omittedBefore,
+    omittedAfter,
+    truncatedLines: selected.lines.filter((line) => line.truncated).map((line) => line.line)
+  };
+}
+
+// src/scan-revisions.ts
+import { resolve as resolve4 } from "node:path";
+async function captureRevision(path, revisions, onRevisionError) {
+  let failed = false;
+  let failure;
+  const revision = await getSourceRevision(path, (error) => {
+    failed = true;
+    failure = error;
+  });
+  if (revision)
+    revisions.set(path, revision);
+  if (failed)
+    onRevisionError?.(path, failure);
+}
+async function captureBatch(paths, revisions, signal, onRevisionError) {
+  if (signal?.aborted)
+    throw abortError();
+  await Promise.all(paths.map((path) => captureRevision(path, revisions, onRevisionError)));
+  if (signal?.aborted)
+    throw abortError();
+}
+async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal, redact = false, request) {
+  const revisions = new Map;
+  let candidateCount = 0;
+  let enumerationTruncated = false;
+  let invalidPathCount = 0;
+  const metadataFailures = [];
+  const recordMetadataFailure = (path, error) => {
+    const reason = error instanceof Error ? error.message : String(error);
+    metadataFailures.push({
+      path,
+      message: `Source metadata unavailable: ${boundedRipgrepDiagnostic(reason, redact)}`
+    });
+  };
+  const result = await runOwnedProcess({ executable, args, cwd, ...signal ? { signal } : {} }, async (stdout) => {
+    let pending = Buffer.alloc(0);
+    let batch = [];
+    for await (const chunk of stdout) {
+      if (signal?.aborted)
+        throw abortError();
+      pending = Buffer.concat([pending, chunk]);
+      let delimiter = pending.indexOf(0);
+      while (delimiter >= 0) {
+        const rawPath = pending.subarray(0, delimiter);
+        if (rawPath.length > MAX_PROTOCOL_LINE_BYTES) {
+          throw new SiftLightError("ripgrep file path exceeds the protocol byte limit");
+        }
+        const path = rawPath.toString("utf8");
+        if (Buffer.from(path, "utf8").equals(rawPath)) {
+          if (candidateCount < maxFiles) {
+            candidateCount += 1;
+            batch.push(resolve4(cwd, path));
+          } else {
+            enumerationTruncated = true;
+          }
+          if (batch.length === MAX_SOURCE_REVISION_CONCURRENCY) {
+            await captureBatch(batch, revisions, signal, recordMetadataFailure);
+            batch = [];
+          }
+        } else {
+          invalidPathCount += 1;
+        }
+        pending = pending.subarray(delimiter + 1);
+        delimiter = pending.indexOf(0);
+      }
+      if (pending.length > MAX_PROTOCOL_LINE_BYTES) {
+        throw new SiftLightError("ripgrep file path exceeds the protocol byte limit");
+      }
+    }
+    if (pending.length > 0) {
+      throw new SiftLightError("ripgrep file enumeration ended without a NUL delimiter");
+    }
+    await captureBatch(batch, revisions, signal, recordMetadataFailure);
+  });
+  const diagnostics = classifyRipgrepDiagnostics(result.stderr);
+  const inputError = createRipgrepInputError(result.stderr, redact, request);
+  const unreadable = [...diagnostics.unreadable, ...diagnostics.recoverable, ...metadataFailures];
+  if (inputError)
+    throw inputError;
+  if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
+    return { revisions, unreadable, enumerationTruncated, invalidPathCount };
+  if (result.code !== 0 && result.code !== 1) {
+    throw new SiftLightError(result.stderr.trim() || `ripgrep file enumeration exited with status ${String(result.code)}`);
+  }
+  return { revisions, unreadable, enumerationTruncated, invalidPathCount };
+}
+async function retainStableSourceRevisions(paths, before, signal) {
+  const after = new Map;
+  const candidates = [...paths].filter((path) => before.has(path));
+  for (let offset = 0;offset < candidates.length; offset += MAX_SOURCE_REVISION_CONCURRENCY) {
+    await captureBatch(candidates.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY), after, signal);
+  }
+  return new Map([...after].filter(([path, revision]) => {
+    const initial = before.get(path);
+    return initial !== undefined && sameSourceRevision(initial, revision);
+  }));
+}
+
+// src/rg.ts
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+function isRgText(value) {
+  return isRecord(value) && (typeof value.text === "string" || typeof value.bytes === "string");
+}
+function isRgSubmatch(value) {
+  if (!isRecord(value))
+    return false;
+  return isRgText(value.match) && typeof value.start === "number" && Number.isSafeInteger(value.start) && typeof value.end === "number" && Number.isSafeInteger(value.end) && value.start >= 0 && value.end >= value.start;
+}
+function isRgMatchEvent(value) {
+  if (!isRecord(value) || value.type !== "match" || !isRecord(value.data))
+    return false;
+  const submatches = value.data.submatches;
+  return isRgText(value.data.path) && isRgText(value.data.lines) && typeof value.data.line_number === "number" && Number.isSafeInteger(value.data.line_number) && value.data.line_number > 0 && (submatches === undefined || Array.isArray(submatches) && submatches.every(isRgSubmatch));
+}
+function decodeRgText(value, field) {
+  if (typeof value.text === "string") {
+    return { text: value.text, bytes: Buffer.from(value.text, "utf8"), encoding: "utf-16" };
+  }
+  if (typeof value.bytes === "string") {
+    const bytes = Buffer.from(value.bytes, "base64");
+    return { text: bytes.toString("utf8"), bytes, encoding: "utf-8" };
+  }
+  throw new SiftLightError(`ripgrep JSON event omitted ${field}`);
+}
+function displayPath(rawPath, cwd) {
+  const absolutePath = isAbsolute3(rawPath) ? rawPath : resolve5(cwd, rawPath);
+  const localPath = relative2(cwd, absolutePath).replaceAll("\\", "/");
+  const isInsideCwd = localPath !== ".." && !localPath.startsWith("../") && !isAbsolute3(localPath);
+  return {
+    absolutePath,
+    displayPath: isInsideCwd && localPath.length > 0 ? localPath : absolutePath
+  };
+}
+function jsonObjectEnd(value, start, end) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start;index < end; index += 1) {
+    const character = value[index];
+    if (inString) {
+      if (escaped)
+        escaped = false;
+      else if (character === "\\")
+        escaped = true;
+      else if (character === '"')
+        inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === "{") {
+      depth += 1;
+      continue;
+    }
+    if (character !== "}")
+      continue;
+    depth -= 1;
+    if (depth === 0)
+      return index + 1;
+  }
+  return;
+}
+function jsonObjectStringProperty(value, property, pathStart) {
+  let offset = pathStart + '"path"'.length;
+  while (/\s/.test(value[offset] ?? ""))
+    offset += 1;
+  if (value[offset] !== ":")
+    return;
+  offset += 1;
+  while (/\s/.test(value[offset] ?? ""))
+    offset += 1;
+  if (value[offset] !== "{")
+    return;
+  const objectEnd = jsonObjectEnd(value, offset, value.length);
+  if (objectEnd === undefined)
+    return;
+  try {
+    const parsed = JSON.parse(value.slice(offset, objectEnd));
+    if (!isRecord(parsed))
+      return;
+    const candidate = parsed[property];
+    return typeof candidate === "string" ? candidate : undefined;
+  } catch {
+    return;
+  }
+}
+function oversizedMatchPath(prefix, cwd) {
+  const pathStart = prefix.indexOf('"path"');
+  if (pathStart < 0)
+    return;
+  const text = jsonObjectStringProperty(prefix, "text", pathStart);
+  if (text !== undefined)
+    return displayPath(text, cwd);
+  const encoded = jsonObjectStringProperty(prefix, "bytes", pathStart);
+  if (encoded === undefined)
+    return;
+  const bytes = Buffer.from(encoded, "base64");
+  const decoded = bytes.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(bytes) ? displayPath(decoded, cwd) : undefined;
+}
+async function assertSearchTargetIdentity(policy, path, expectedCanonical) {
+  const currentCanonical = await policy.resolveExistingPath(path);
+  if (currentCanonical !== expectedCanonical) {
+    throw new SiftLightError("Search target changed during validation; retry the search");
+  }
+}
+async function assertRetainedPathsAllowed(policy, paths, signal) {
+  for (let offset = 0;offset < paths.length; offset += MAX_SOURCE_REVISION_CONCURRENCY) {
+    if (signal?.aborted)
+      throw abortError();
+    const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
+    await Promise.all(batch.map((path) => policy.resolveExistingPath(path)));
+  }
+}
+function utf16Length(value) {
+  return value.length;
+}
+function byteOffsetToCharacter(bytes, byteOffset, encoding) {
+  if (byteOffset < 0 || byteOffset > bytes.length) {
+    throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
+  }
+  if (encoding === "utf-8")
+    return byteOffset;
+  const prefix = bytes.subarray(0, byteOffset).toString("utf8").replaceAll("\r", "");
+  return utf16Length(prefix);
+}
+function createOccurrences(lineNumber, decodedLine, submatches) {
+  const range = {
+    start: { line: lineNumber - 1, character: 0 },
+    end: { line: lineNumber - 1, character: 0 },
+    encoding: decodedLine.encoding
+  };
+  const occurrences = [];
+  for (const submatch of submatches) {
+    if (submatch.end > decodedLine.bytes.length) {
+      throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
+    }
+    occurrences.push({
+      byteStart: submatch.start,
+      byteEnd: submatch.end,
+      range: {
+        start: {
+          ...range.start,
+          character: byteOffsetToCharacter(decodedLine.bytes, submatch.start, range.encoding)
+        },
+        end: {
+          ...range.end,
+          character: byteOffsetToCharacter(decodedLine.bytes, submatch.end, range.encoding)
+        },
+        encoding: range.encoding
+      }
+    });
+  }
+  return occurrences;
+}
+function fileScopeArguments(request) {
+  const args = [];
+  if (request.ignorePolicy === "include")
+    args.push("--no-ignore", "--no-ignore-parent");
+  if (request.hidden)
+    args.push("--hidden");
+  for (const glob of request.glob)
+    args.push("--glob", glob);
+  for (const excluded of request.exclude) {
+    const normalized = excluded.startsWith("!") ? excluded : `!${excluded}`;
+    args.push("--glob", normalized);
+  }
+  args.push("--iglob", "!.git", "--iglob", "!.git/**", "--iglob", "!**/.git/**");
+  return args;
+}
+function buildRipgrepArguments(request, cwd, validatedSearchPath) {
+  const searchPath = validatedSearchPath ?? resolve5(cwd, request.path ?? ".");
+  const policy = new SearchPathPolicy(cwd);
+  policy.assertPath(searchPath);
+  const args = [
+    "--no-config",
+    "--json",
+    "--line-number",
+    "--color=never",
+    "--no-heading",
+    ...request.binaryAsText ? ["--text"] : [],
+    ...fileScopeArguments(request),
+    ...policy.ripgrepGlobArguments(searchPath)
+  ];
+  args.push(...patternArguments(request));
+  const searchTarget = isPathInsideCwd(searchPath, cwd) ? relative2(resolve5(cwd), searchPath) || "." : searchPath;
+  args.push("--", request.pattern, searchTarget);
+  return args;
+}
+function patternArguments(request) {
+  return [
+    ...request.wholeWord ? ["--word-regexp"] : [],
+    ...request.literal ? ["--fixed-strings"] : [],
+    request.ignoreCase === true ? "--ignore-case" : request.ignoreCase === false ? "--case-sensitive" : "--smart-case"
+  ];
+}
+function createRipgrepRunner(options = {}) {
+  const maxStoredMatches = options.maxStoredMatches ?? MAX_STORED_MATCHES;
+  const maxEventBytes = options.maxEventBytes ?? MAX_PROTOCOL_LINE_BYTES;
+  const maxSourceRevisionFiles = options.maxSourceRevisionFiles ?? MAX_SOURCE_REVISION_FILES;
+  return async function runRipgrep(request, cwd, signal) {
+    if (signal?.aborted)
+      throw abortError();
+    const executable = options.executable ?? await resolveRipgrepExecutable();
+    const searchPath = resolve5(cwd, request.path ?? ".");
+    const policy = new SearchPathPolicy(cwd);
+    const validatedSearchPath = await policy.resolveSearchTarget(searchPath);
+    const ripgrepCwd = await policy.ripgrepWorkingDirectory(validatedSearchPath);
+    const expectedSearchTarget = await policy.resolveExistingPath(validatedSearchPath);
+    const searchTarget = isPathInsideCwd(validatedSearchPath, cwd) ? relative2(resolve5(cwd), validatedSearchPath) || "." : validatedSearchPath;
+    const args = buildRipgrepArguments(request, cwd, validatedSearchPath);
+    if (signal?.aborted)
+      throw abortError();
+    const matches = [];
+    const retention = new SearchRetention(options.maxStoredBytes, options.maxStoredOccurrences);
+    const fileCounts = new Map;
+    const lossyPaths = new Set;
+    const oversizedPathReasons = new Set;
+    let totalMatches = 0;
+    let truncatedLines = 0;
+    let modificationTimeFilterIncomplete = false;
+    let candidateRevisions = new Map;
+    const onLine = (line) => {
+      if (line.length === 0)
+        return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch (error) {
+        throw new SiftLightError("Failed to parse ripgrep JSON output", { cause: error });
+      }
+      if (!isRecord(event))
+        return;
+      if (event.type !== "match")
+        return;
+      if (!isRgMatchEvent(event)) {
+        throw new SiftLightError("ripgrep emitted an invalid match event");
+      }
+      const rawPath = decodeRgText(event.data.path, "path");
+      const rawContent = decodeRgText(event.data.lines, "line content");
+      const normalizedContent = rawContent.text.replaceAll("\r", "").replace(/\n$/, "");
+      const path = displayPath(rawPath.text, cwd);
+      if (request.modifiedAfterMs !== undefined || request.modifiedBeforeMs !== undefined) {
+        const revision = candidateRevisions.get(path.absolutePath);
+        if (!revision) {
+          modificationTimeFilterIncomplete = true;
+          retention.noteLimit(`Modification time could not be verified for ${path.displayPath}; matching evidence was retained`);
+        } else if (!matchesModificationTime(revision, request.modifiedAfterMs, request.modifiedBeforeMs)) {
+          return;
+        }
+      }
+      if (rawPath.encoding === "utf-8")
+        lossyPaths.add(path.absolutePath);
+      const submatches = event.data.submatches ?? [];
+      if (submatches.some((match) => match.end > rawContent.bytes.length))
+        throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
+      const primaryOccurrence = submatches[0];
+      let focusStart = 0;
+      let focusEnd = 0;
+      if (primaryOccurrence) {
+        focusStart = byteOffsetToCharacter(rawContent.bytes, primaryOccurrence.start, "utf-16");
+        focusEnd = byteOffsetToCharacter(rawContent.bytes, primaryOccurrence.end, "utf-16");
+      }
+      const excerpt = excerptText(normalizedContent, focusStart, focusEnd);
+      const { text: lineContent, truncated: lineTruncated } = excerpt;
+      totalMatches += 1;
+      if (!fileCounts.has(path.displayPath)) {
+        if (retention.file(path.displayPath, path.absolutePath))
+          fileCounts.set(path.displayPath, 0);
+      }
+      if (fileCounts.has(path.displayPath))
+        fileCounts.set(path.displayPath, (fileCounts.get(path.displayPath) ?? 0) + 1);
+      if (lineTruncated)
+        truncatedLines += 1;
+      if (matches.length >= maxStoredMatches)
+        retention.noteLimit(`Matching-line retention reached the ${String(maxStoredMatches)} limit`);
+      if (matches.length < maxStoredMatches && retention.canRetainOccurrences(submatches.length)) {
+        const match = {
+          ...path,
+          lineNumber: event.data.line_number,
+          lineContent,
+          lineTruncated,
+          occurrences: createOccurrences(event.data.line_number, rawContent, submatches)
+        };
+        if (retention.retain(match))
+          matches.push(match);
+      }
+    };
+    try {
+      const before = await captureCandidateRevisions(executable, [
+        "--no-config",
+        "--files",
+        "--null",
+        ...fileScopeArguments(request),
+        ...policy.ripgrepGlobArguments(validatedSearchPath),
+        "--",
+        searchTarget
+      ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
+      let ignoredFileCount = 0;
+      let ignoredFileSamples = [];
+      let filesystemCoverage = "complete";
+      const filesystemCoverageReasons = new Set;
+      const filesystemErrorSamples = new Set;
+      const noteFilesystemDiagnostics = (diagnostics) => {
+        for (const diagnostic of diagnostics) {
+          if (filesystemErrorSamples.size >= 20)
+            break;
+          filesystemErrorSamples.add(boundedRipgrepDiagnostic(diagnostic.message, request.redact));
+        }
+      };
+      if (before.enumerationTruncated) {
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(`Filesystem coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`);
+      }
+      if (before.invalidPathCount > 0) {
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(`${String(before.invalidPathCount)} candidate path(s) were not valid UTF-8`);
+      }
+      if (request.ignorePolicy !== "include") {
+        const allCandidates = await captureCandidateRevisions(executable, [
+          "--no-config",
+          "--files",
+          "--null",
+          ...fileScopeArguments({ ...request, ignorePolicy: "include" }),
+          ...policy.ripgrepGlobArguments(validatedSearchPath),
+          "--",
+          searchTarget
+        ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
+        const ignored = [...allCandidates.revisions.keys()].filter((path) => !before.revisions.has(path));
+        ignoredFileCount = ignored.length;
+        ignoredFileSamples = ignored.slice(0, 20).map((path) => displayPath(path, cwd).displayPath);
+        if (ignoredFileCount > 0)
+          filesystemCoverage = "policy-filtered";
+        if (allCandidates.unreadable.length > 0) {
+          filesystemCoverage = "partial";
+          retention.noteLimit(describeUnreadableDiagnostics(allCandidates.unreadable));
+          noteFilesystemDiagnostics(allCandidates.unreadable);
+        }
+        if (allCandidates.enumerationTruncated) {
+          filesystemCoverage = "partial";
+          filesystemCoverageReasons.add(`Include-ignored coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`);
+        }
+        if (allCandidates.invalidPathCount > 0) {
+          filesystemCoverage = "partial";
+          filesystemCoverageReasons.add(`${String(allCandidates.invalidPathCount)} include-ignored candidate path(s) were not valid UTF-8`);
+        }
+      }
+      if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
+        throw new SiftLightError(describeUnreadableDiagnostics(before.unreadable));
+      candidateRevisions = before.revisions;
+      if (before.unreadable.length > 0) {
+        retention.noteLimit(describeUnreadableDiagnostics(before.unreadable));
+        noteFilesystemDiagnostics(before.unreadable);
+      }
+      if (before.unreadable.length > 0)
+        filesystemCoverage = "partial";
+      if (before.unreadable.length > 0)
+        filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
+      await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
+      const { code, stderr } = await runOwnedProcess({ executable, args, cwd: ripgrepCwd, ...signal ? { signal } : {} }, (stdout) => consumeCappedLines(stdout, onLine, {
+        maxLineBytes: maxEventBytes,
+        onLineTooLong: ({ prefix, observedBytes }) => {
+          const source = oversizedMatchPath(prefix, cwd);
+          const label = source?.displayPath ?? "unknown source";
+          if (oversizedPathReasons.has(label))
+            return;
+          oversizedPathReasons.add(label);
+          retention.noteLimit(`Skipped oversized ripgrep match line in ${JSON.stringify(label)}; observed at least ${String(observedBytes)} bytes, limit is ${String(maxEventBytes)} bytes`);
+        }
+      }));
+      const diagnostics = classifyRipgrepDiagnostics(stderr);
+      const inputError = createRipgrepInputError(stderr, request.redact, request);
+      if (inputError)
+        throw inputError;
+      const filesystemDiagnostics = [...diagnostics.unreadable, ...diagnostics.recoverable];
+      if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
+        throw new SiftLightError(describeUnreadableDiagnostics(diagnostics.unreadable));
+      if (filesystemDiagnostics.length > 0) {
+        retention.noteLimit(describeUnreadableDiagnostics(filesystemDiagnostics));
+        filesystemCoverage = "partial";
+        filesystemCoverageReasons.add(describeUnreadableDiagnostics(filesystemDiagnostics));
+        noteFilesystemDiagnostics(filesystemDiagnostics);
+      }
+      if (code === 2 && (diagnostics.other.length > 0 || filesystemDiagnostics.length === 0)) {
+        throw new SiftLightError(stderr.trim() || `ripgrep exited with status ${String(code)}`);
+      }
+      if ((before.unreadable.length > 0 || filesystemDiagnostics.length > 0) && totalMatches === 0 && before.revisions.size === 0) {
+        const diagnosticsForFailure = [...before.unreadable, ...filesystemDiagnostics];
+        throw new SiftLightError(`ripgrep traversal was incomplete and produced no reliable match result; ${describeUnreadableDiagnostics(diagnosticsForFailure)}`);
+      }
+      await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
+      const retainedPaths = new Set(matches.map((match) => match.absolutePath).filter((path) => !lossyPaths.has(path)));
+      await assertRetainedPathsAllowed(policy, [...retainedPaths], signal);
+      const sourceRevisions = await retainStableSourceRevisions(retainedPaths, before.revisions, signal);
+      if (signal?.aborted)
+        throw abortError();
+      return {
+        request,
+        matches,
+        totalMatches,
+        fileCounts,
+        sourceRevisions,
+        snapshotComplete: matches.length === totalMatches && !modificationTimeFilterIncomplete && retention.details.reasons.length === 0,
+        filesystemCoverage,
+        filesystemErrorSamples: [...filesystemErrorSamples],
+        filesystemCoverageReasons: [...filesystemCoverageReasons],
+        ignoredFileCount,
+        ignoredFileSamples,
+        searchedFileCount: before.revisions.size,
+        truncatedLines,
+        retention: retention.details
+      };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError")
+        throw abortError();
+      if (error instanceof RipgrepInputError)
+        throw error;
+      const cause = error instanceof Error ? error : new Error(String(error));
+      const executableMissing = "code" in cause && cause.code === "ENOENT";
+      const message = executableMissing ? `ripgrep executable not found: ${boundedRipgrepDiagnostic(executable, request.redact)}` : boundedRipgrepDiagnostic(cause.message, request.redact);
+      throw new SiftLightError(message, { cause });
+    }
+  };
+}
+
+// src/workspace-files.ts
+class EnumerationLimit extends Error {
+}
+function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
+  const absolute = resolve6(cwd, path);
+  policy.assertPath(absolute);
+  const local = relative3(resolve6(cwd), absolute);
+  if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
+    throw new SiftLightError("Git internals are excluded from source candidates");
+  return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
+}
+async function listWorkspaceFiles(cwd, signal, options = {}) {
+  const absolutePath = resolve6(cwd, options.path ?? ".");
+  const policy = new SearchPathPolicy(cwd);
+  const searchPath = await policy.resolveSearchTarget(absolutePath);
+  const ripgrepCwd = await policy.ripgrepWorkingDirectory(searchPath);
+  const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
+  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
+    throw new SiftLightError("Candidate file limit must be a positive integer");
+  const paths = new Set;
+  const reasons = new Set;
+  let coverageIssue;
+  let bytes = 0;
+  try {
+    const result = await runOwnedProcess({
+      executable: await resolveRipgrepExecutable(),
+      args: [
+        "--no-config",
+        "--files",
+        "--sort",
+        "path",
+        "--null",
+        ...options.ignore === false ? ["--no-ignore"] : [],
+        ...options.ignoreParents === false ? ["--no-ignore-parent"] : [],
+        ...fileScopeArguments({
+          hidden: options.hidden ?? true,
+          glob: options.glob ?? [],
+          exclude: options.exclude ?? []
+        }),
+        ...policy.ripgrepGlobArguments(searchPath),
+        "--",
+        searchPath
+      ],
+      cwd: ripgrepCwd,
+      ...signal ? { signal } : {}
+    }, async (stdout) => {
+      let pending = Buffer.alloc(0);
+      for await (const chunk of stdout) {
+        if (signal?.aborted)
+          throw abortError();
+        bytes += chunk.byteLength;
+        if (bytes > MAX_PROTOCOL_LINE_BYTES)
+          throw new EnumerationLimit(`Candidate enumeration exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
+        pending = Buffer.concat([pending, chunk]);
+        let delimiter = pending.indexOf(0);
+        while (delimiter >= 0) {
+          const raw = pending.subarray(0, delimiter);
+          const decoded = raw.toString("utf8");
+          if (!Buffer.from(decoded).equals(raw)) {
+            reasons.add("Some candidate paths are not valid UTF-8");
+            coverageIssue ??= "invalid-path";
+          } else {
+            const local = workspaceRelativePath(cwd, decoded, policy);
+            if (!paths.has(local) && paths.size >= maxFiles)
+              throw new EnumerationLimit(`Candidate enumeration reached the ${String(maxFiles)} file limit`);
+            paths.add(local);
+          }
+          pending = pending.subarray(delimiter + 1);
+          delimiter = pending.indexOf(0);
+        }
+      }
+      if (pending.length > 0)
+        throw new SiftLightError("Candidate enumeration ended without a NUL delimiter");
+    });
+    const diagnostics = classifyRipgrepDiagnostics(result.stderr);
+    if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
+      throw new SiftLightError(describeUnreadableDiagnostics(diagnostics.unreadable));
+    if (diagnostics.unreadable.length > 0) {
+      reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
+      coverageIssue = "unreadable";
+    }
+    if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
+      throw new SiftLightError(result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`);
+  } catch (error) {
+    if (!(error instanceof EnumerationLimit))
+      throw error;
+    reasons.add(error.message);
+    coverageIssue = "enumeration-limit";
+  }
+  return {
+    paths: [...paths].toSorted(),
+    partial: reasons.size > 0,
+    reasons: [...reasons],
+    ...coverageIssue ? { coverageIssue } : {}
+  };
+}
+
+// src/media-search.ts
+var mediaRequestSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.enum(["await", "cancel"]), operationId: z.string().uuid() }).strict(),
+  z.object({
+    mode: z.literal("search"),
+    path: z.string().min(1).max(4096),
+    query: z.string().min(1).max(256).optional(),
+    image: z.string().min(1).max(4096).optional(),
+    kind: z.enum(["all", "image", "scan"]).default("all"),
+    glob: z.array(z.string().max(4096)).max(64).optional(),
+    exclude: z.array(z.string().max(4096)).max(64).optional(),
+    hidden: z.boolean().default(true),
+    ignorePolicy: z.enum(["respect", "include"]).default("respect")
+  }).strict().refine((r) => r.query === undefined !== (r.image === undefined), "Supply exactly one query or image"),
+  z.object({
+    mode: z.enum(["inspect", "validate"]),
+    cursor: z.string().uuid(),
+    matchIndex: z.number().int().min(1).max(10)
+  }).strict()
+]);
+var responseSchema = z.object({
+  version: z.literal(1),
+  id: z.string(),
+  indexedFiles: z.number().int().nonnegative(),
+  modelLoads: z.literal(1),
+  modelReused: z.boolean(),
+  processId: z.number().int().positive(),
+  hits: z.array(z.object({
+    path: z.string(),
+    score: z.number().finite(),
+    kind: z.enum(["image", "scan"]),
+    page: z.number().int().positive().nullish().transform((value) => value ?? null),
+    chunkCount: z.number().int().positive(),
+    width: z.number().int().nonnegative(),
+    height: z.number().int().nonnegative()
+  })).max(10)
+});
+var extensions = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".tiff",
+  ".tif",
+  ".heic",
+  ".heif",
+  ".webp",
+  ".pdf"
+]);
+var maxFileBytes = 20 * 1024 * 1024;
+var maxCorpusBytes = 256 * 1024 * 1024;
+function hash(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+async function sourceBytes(cwd, path, signal) {
+  const policy = new SearchPathPolicy(cwd);
+  const canonical = await policy.resolveExistingPath(path);
+  if (!canonical)
+    throw new SiftLightError(`Media source unavailable: ${path}`);
+  const before = await stat4(canonical);
+  if (!before.isFile() || before.size > maxFileBytes)
+    throw new SiftLightError(`Media source must be a regular file at most ${String(maxFileBytes)} bytes: ${path}`);
+  const bytes = await readFile2(canonical, { signal });
+  const after = await stat4(canonical);
+  if (bytes.length > maxFileBytes || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || await policy.resolveExistingPath(path) !== canonical)
+    throw new SiftLightError(`Media source changed during read: ${path}`);
+  return { canonical, bytes };
+}
+
+class MediaSearch {
+  #config;
+  #operations = new OperationLifecycle({ deadlineMs: 300000 });
+  #queue = new OwnedTaskQueue;
+  #lifecycle = new AbortController;
+  #snapshots = new Map;
+  #known = new Map;
+  #directory;
+  #worker;
+  #closed = false;
+  constructor(config) {
+    this.#config = config;
+  }
+  async search(value, cwd, signal) {
+    const request = mediaRequestSchema.parse(value);
+    if (this.#closed)
+      throw new SiftLightError("Media search is closed");
+    const combined = signal ? AbortSignal.any([signal, this.#lifecycle.signal]) : this.#lifecycle.signal;
+    if (request.mode === "await" || request.mode === "cancel") {
+      const operation = this.#operations.get(request.operationId);
+      if (operation.metadata.cwd !== resolve7(cwd))
+        throw new SiftLightError("Media operation belongs to another workspace");
+      if (request.mode === "cancel") {
+        await this.#operations.cancelAndWait(request.operationId);
+      }
+      return this.#operationResult(await this.#operations.wait(request.operationId, 5000, combined));
+    }
+    if (request.mode === "search") {
+      const operation = this.#operations.start((operationSignal) => this.#queue.run(() => this.#search(request, cwd, AbortSignal.any([operationSignal, this.#lifecycle.signal])), operationSignal), { mode: "media", cwd: resolve7(cwd), redact: false });
+      return this.#operationResult(await this.#operations.wait(operation.id, 5000, combined));
+    }
+    if (request.mode === "inspect" || request.mode === "validate")
+      return this.#queue.run(() => this.#inspect(request, cwd, combined), combined);
+    throw new SiftLightError("Unsupported visual request");
+  }
+  #operationResult(result) {
+    if (result.state === "complete")
+      return result.result;
+    if (result.state === "failed")
+      throw result.error;
+    const details = {
+      status: result.state,
+      operationId: result.operation.id,
+      ...result.state === "running" ? { nextRequest: { mode: "await", operationId: result.operation.id } } : {}
+    };
+    return { text: JSON.stringify(details), details };
+  }
+  async#root() {
+    this.#directory ??= mkdtemp(join2(tmpdir(), "sift-media-")).then((path) => realpath3(path));
+    return this.#directory;
+  }
+  async#search(r, cwd, signal) {
+    const root = await this.#root();
+    const corpus = join2(root, "corpus");
+    await mkdir(corpus, { recursive: true, mode: 448 });
+    const options = {
+      path: r.path,
+      ...r.glob ? { glob: r.glob } : {},
+      ...r.exclude ? { exclude: r.exclude } : {},
+      hidden: r.hidden,
+      ignore: r.ignorePolicy === "respect"
+    };
+    const inventory = await listWorkspaceFiles(cwd, signal, options);
+    const admitted = new Map;
+    const reasons = [...inventory.reasons];
+    let total = 0;
+    for (const path of inventory.paths) {
+      if (!extensions.has(extname(path).toLowerCase()))
+        continue;
+      if (signal.aborted)
+        throw abortError();
+      if (admitted.size >= 512) {
+        reasons.push("Media file admission reached 512 files");
+        break;
+      }
+      const source = await sourceBytes(cwd, path, signal);
+      if (total + source.bytes.length > maxCorpusBytes) {
+        reasons.push("Media corpus exceeded 256 MiB");
+        break;
+      }
+      total += source.bytes.length;
+      const staged = join2(corpus, hash(Buffer.from(dirname2(resolve7(cwd, path)))), basename2(path));
+      const entry = {
+        path,
+        canonical: source.canonical,
+        staged,
+        hash: hash(source.bytes),
+        bytes: source.bytes.length
+      };
+      if (this.#known.get(staged)?.hash !== entry.hash) {
+        await mkdir(dirname2(staged), { recursive: true, mode: 448 });
+        await writeFile(staged, source.bytes, { mode: 384 });
+      }
+      admitted.set(staged, entry);
+    }
+    for (const entry of this.#known.values())
+      if (!admitted.has(entry.staged)) {
+        await rm(entry.staged, { force: true });
+      }
+    this.#known.clear();
+    for (const [path, entry] of admitted)
+      this.#known.set(path, entry);
+    let imageSource;
+    let queryImage;
+    if (r.image) {
+      if (!extensions.has(extname(r.image).toLowerCase()) || extname(r.image).toLowerCase() === ".pdf")
+        throw new SiftLightError("image must be a supported local image file");
+      imageSource = await sourceBytes(cwd, r.image, signal);
+      queryImage = join2(root, "query" + extname(r.image).toLowerCase());
+      await writeFile(queryImage, imageSource.bytes, { mode: 384 });
+    }
+    let response;
+    if (admitted.size) {
+      this.#worker ??= new ResidentWorkerClient(this.#config, root, corpus, join2(root, "index.sqlite"), { parse: (value) => responseSchema.parse(value), maxResponseBytes: 128 * 1024 });
+      response = await this.#worker.search({
+        ...queryImage ? { image: queryImage } : { query: r.query },
+        kind: r.kind,
+        expectedFiles: admitted.size
+      }, signal);
+      if (response.indexedFiles !== admitted.size)
+        throw new SiftLightError("Media index inventory mismatch");
+    }
+    const saved = [];
+    const seen = new Set;
+    for (const hit of response?.hits ?? []) {
+      const source = admitted.get(resolve7(hit.path));
+      if (!source || hit.kind === "scan" !== (extname(source.path).toLowerCase() === ".pdf") || seen.has(hit.path) || hit.kind === "scan" !== (hit.page !== null) || hit.page !== null && hit.page > hit.chunkCount)
+        throw new SiftLightError("Media result source or page is inconsistent");
+      seen.add(hit.path);
+      saved.push({ hit, source });
+    }
+    for (const source of admitted.values()) {
+      const current = await sourceBytes(cwd, source.path, signal);
+      if (current.canonical !== source.canonical || hash(current.bytes) !== source.hash)
+        throw new SiftLightError(`Media source changed: ${source.path}`);
+    }
+    const after = await listWorkspaceFiles(cwd, signal, options);
+    if (JSON.stringify(after) !== JSON.stringify(inventory))
+      throw new SiftLightError("Media file inventory changed during search");
+    if (imageSource && r.image) {
+      const afterImage = await sourceBytes(cwd, r.image, signal);
+      if (afterImage.canonical !== imageSource.canonical || !afterImage.bytes.equals(imageSource.bytes))
+        throw new SiftLightError("Query image changed during search");
+    }
+    if (signal.aborted)
+      throw abortError();
+    const cursor = randomUUID3();
+    for (const [id, snapshot] of this.#snapshots)
+      if (Date.now() - snapshot.createdAt > 600000)
+        this.#snapshots.delete(id);
+    if (this.#snapshots.size >= 32) {
+      const oldest = this.#snapshots.keys().next().value;
+      if (oldest)
+        this.#snapshots.delete(oldest);
+    }
+    this.#snapshots.set(cursor, { cwd: resolve7(cwd), createdAt: Date.now(), hits: saved });
+    const items = saved.map(({ hit, source }, index) => ({
+      index: index + 1,
+      path: source.path,
+      kind: hit.kind,
+      page: hit.page,
+      score: hit.score,
+      pages: hit.kind === "scan" ? hit.chunkCount : undefined,
+      width: hit.width,
+      height: hit.height,
+      sourceHash: source.hash,
+      inspect: { mode: "inspect", cursor, matchIndex: index + 1 },
+      validate: { mode: "validate", cursor, matchIndex: index + 1 }
+    }));
+    const status = reasons.length ? "partial" : "complete";
+    const details = {
+      status,
+      cursor,
+      indexedFiles: admitted.size,
+      admittedBytes: total,
+      reasons,
+      coverage: r.ignorePolicy === "respect" ? "policy-filtered" : "included",
+      modelLoads: response ? response.modelReused ? 0 : 1 : 0,
+      modelReused: response?.modelReused ?? false,
+      processId: response?.processId,
+      items
+    };
+    return {
+      text: `Visual search (${status}): ${String(items.length)} candidates. Similarity is a candidate, inspect original evidence before conclusions.
+${JSON.stringify(details)}`,
+      details
+    };
+  }
+  async#inspect(r, cwd, signal) {
+    const snapshot = this.#snapshots.get(r.cursor);
+    if (!snapshot || Date.now() - snapshot.createdAt > 600000 || snapshot.cwd !== resolve7(cwd))
+      throw new SiftLightError("Media cursor expired or belongs to another workspace");
+    const item = snapshot.hits[r.matchIndex - 1];
+    if (!item)
+      throw new SiftLightError("Media matchIndex is not retained");
+    const current = await sourceBytes(cwd, item.source.path, signal);
+    const fresh = current.canonical === item.source.canonical && hash(current.bytes) === item.source.hash;
+    const details = {
+      path: item.source.path,
+      page: item.hit.page,
+      sourceHash: item.source.hash,
+      freshness: fresh ? "current" : "stale"
+    };
+    if (r.mode === "validate")
+      return { text: JSON.stringify(details), details };
+    if (!fresh)
+      throw new SiftLightError("Media source changed; search again before inspection");
+    const folder = await mkdtemp(join2(await this.#root(), "inspect-"));
+    try {
+      const input = join2(folder, "source" + extname(item.source.path));
+      const output = join2(folder, "preview.png");
+      await writeFile(input, current.bytes, { mode: 384 });
+      const result = await runOwnedProcess({
+        executable: this.#config.executable,
+        args: ["--render", input, String(item.hit.page ?? 0), output],
+        cwd: folder,
+        signal
+      }, async (stdout) => {
+        for await (const chunk of stdout)
+          if (chunk.length)
+            throw new SiftLightError("Unexpected media renderer output");
+      });
+      if (result.code !== 0)
+        throw new SiftLightError(`Media preview failed: ${result.stderr}`);
+      const preview = await readFile2(output);
+      if (preview.length > 4 * 1024 * 1024)
+        throw new SiftLightError("Media preview exceeds 4 MiB");
+      return {
+        text: JSON.stringify(details),
+        details,
+        image: { data: preview.toString("base64"), mimeType: "image/png" }
+      };
+    } finally {
+      await rm(folder, { recursive: true, force: true });
+    }
+  }
+  clear() {
+    this.#lifecycle.abort();
+    this.#lifecycle = new AbortController;
+    this.#operations.reset();
+    this.#snapshots.clear();
+  }
+  async close() {
+    this.#closed = true;
+    this.#lifecycle.abort();
+    await this.#operations.shutdown();
+    await this.#queue.run(async () => {
+      try {
+        await this.#worker?.close();
+      } finally {
+        this.#snapshots.clear();
+        if (this.#directory)
+          await rm(await this.#directory, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+// src/mcp.ts
+import { randomUUID as randomUUID8 } from "node:crypto";
 import { createServer } from "node:http";
 import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.0.5-6",
+  version: "1.1.0-1",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -53,7 +2575,13 @@ var package_default = {
     "CHANGELOG.md",
     "SECURITY.md",
     "src/concept-worker.mjs",
-    "plugins/sift-light/**"
+    "plugins/sift-light/**",
+    "native/text-search/Worker.swift",
+    "native/WorkerMemory.swift",
+    "scripts/build-native-text.ts",
+    "native/media-search/Worker.swift",
+    "scripts/build-native-media.ts",
+    "scripts/build-native-worker.ts"
   ],
   type: "module",
   publishConfig: {
@@ -89,7 +2617,9 @@ var package_default = {
     "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
     "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
     "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
-    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark"
+    "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark",
+    "build:native-text": "bun run scripts/build-native-text.ts",
+    "build:native-media": "bun run scripts/build-native-media.ts"
   },
   dependencies: {
     "@ast-grep/lang-go": "0.0.6",
@@ -293,7 +2823,7 @@ function analysisExtraGroups(counts, termCounts, items) {
 }
 
 // src/mcp-model-output.ts
-function isRecord(value) {
+function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function compactSemanticMetadata(details, analysis) {
@@ -316,6 +2846,9 @@ function compactSemanticMetadata(details, analysis) {
       `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`
     ] : [],
     ...details.operation ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`] : [],
+    ...analysis.retrievalLanes ? [
+      `Independent retrieval lanes (copy the exact request): ${JSON.stringify(analysis.retrievalLanes)}`
+    ] : [],
     ...analysis.reasons.map((reason) => `[${reason}]`),
     ...details.redactionApplied ? ["[Display redaction applied.]"] : []
   ];
@@ -352,8 +2885,10 @@ function compactRows(analysis) {
     }
     const label = analysis.kind === "outline" && analysis.modelOutput || analysis.kind === "files" ? item.label : "metadata";
     const semanticJudge = item.details?.semanticJudge;
-    const judgment = isRecord(semanticJudge) && typeof semanticJudge.classification === "string" && typeof semanticJudge.probability === "number" && typeof semanticJudge.model === "string" ? ` Jev: ${semanticJudge.classification}; probability=${String(semanticJudge.probability)};${typeof semanticJudge.confidence === "number" ? ` confidence=${String(semanticJudge.confidence)};` : ""} model=${JSON.stringify(semanticJudge.model)}.` : "";
-    rows.push(`#${String(item.index)} L${String(item.line)} ${label}${judgment}`);
+    const judgment = isRecord2(semanticJudge) && typeof semanticJudge.classification === "string" && typeof semanticJudge.probability === "number" && typeof semanticJudge.model === "string" ? ` Jev: ${semanticJudge.classification}; probability=${String(semanticJudge.probability)};${typeof semanticJudge.confidence === "number" ? ` confidence=${String(semanticJudge.confidence)};` : ""} model=${JSON.stringify(semanticJudge.model)}.` : "";
+    const lane = item.details?.retrievalLane;
+    const retrieval = lane === "current" || lane === "native" ? ` [${lane} #${String(item.details?.laneRank)}]` : "";
+    rows.push(`#${String(item.index)} L${String(item.line)} ${label}${retrieval}${judgment}`);
   }
   return rows;
 }
@@ -434,176 +2969,6 @@ var MAX_IMPORT_FILES = 20;
 var DEFAULT_HYBRID_CONCEPT_LIMIT = 3;
 var MAX_HYBRID_CONCEPT_LIMIT = 20;
 
-// src/types.ts
-var DEFAULT_PAGE_SIZE = 100;
-var MAX_PAGE_SIZE = 100;
-var DEFAULT_RESULT_TOKEN_BUDGET = 2000;
-var ESTIMATED_CHARACTERS_PER_TOKEN = 4;
-var DEFAULT_SUMMARY_FILE_LIMIT = 30;
-var MAX_SELECTED_PATHS = 20;
-var MAX_INSPECT_TARGETS = 5;
-var MAX_INSPECT_REQUEST_TARGETS = 20;
-var MAX_DISPLAYED_OCCURRENCES = 20;
-var MAX_STORED_MATCHES = 50000;
-var MAX_STORED_OCCURRENCES = 200000;
-var MAX_SEARCH_STORAGE_BYTES = 32 * 1024 * 1024;
-var MAX_LINE_CHARACTERS = 500;
-var MAX_RESULT_BYTES = 16 * 1024;
-var MAX_CONTEXT_LINES = 20;
-var MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
-var MAX_SOURCE_FILE_BYTES = 5 * 1024 * 1024;
-var MAX_PATH_CHARACTERS = 4096;
-var MAX_PATTERN_CHARACTERS = 64 * 1024;
-var MAX_AUDIT_LITERAL_CHARACTERS = 256;
-var MAX_FILE_FILTER_ITEMS = 64;
-var MAX_SOURCE_REVISION_CONCURRENCY = 16;
-var MAX_SOURCE_REVISION_FILES = 50000;
-
-// src/redaction.ts
-var PRIVATE_KEY = /-----BEGIN ([^-\r\n]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
-var SENSITIVE_NAME = String.raw`(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?(?:key|token)|secret[_-]?access[_-]?key|private[_-]?key|service[_-]?key)(?:[_-][A-Za-z0-9]+)*)`;
-var SENSITIVE_ASSIGNMENT = new RegExp(String.raw`((?<![A-Za-z0-9_-])(?:["']?${SENSITIVE_NAME}["']?)\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)`, "gi");
-var SENSITIVE_TOKEN = /\b(?:sk|ghp|xox[baprs])[-_][A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g;
-var CODE_EXPRESSION = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*[([]/u;
-var TYPE_ONLY_VALUES = new Set([
-  "boolean",
-  "number",
-  "string",
-  "unknown",
-  "never",
-  "undefined",
-  "null"
-]);
-function redactString(value) {
-  let count = 0;
-  let redacted = value.replace(PRIVATE_KEY, (_match, kind) => {
-    count += 1;
-    return `-----BEGIN ${kind}-----
-[REDACTED]
------END ${kind}-----`;
-  });
-  redacted = redacted.replace(SENSITIVE_ASSIGNMENT, (match, prefix, rawValue) => {
-    const unquoted = rawValue.replace(/^["']|["']$/g, "").toLowerCase();
-    if (TYPE_ONLY_VALUES.has(unquoted) || CODE_EXPRESSION.test(rawValue))
-      return match;
-    count += 1;
-    const quote = rawValue.startsWith('"') || rawValue.startsWith("'") ? rawValue[0] : "";
-    return `${prefix}${quote}[REDACTED]${quote}`;
-  });
-  redacted = redacted.replace(SENSITIVE_TOKEN, () => {
-    count += 1;
-    return "[REDACTED]";
-  });
-  return { value: redacted, count };
-}
-function redactDiagnosticText(value) {
-  return redactString(value).value;
-}
-function containsSensitiveText(value) {
-  if (typeof value === "string")
-    return redactString(value).count > 0;
-  if (Array.isArray(value))
-    return value.some((item) => containsSensitiveText(item));
-  if (typeof value !== "object" || value === null)
-    return false;
-  return Object.values(value).some((item) => containsSensitiveText(item));
-}
-function redactInPlace(value, seen) {
-  if (typeof value !== "object" || value === null)
-    return 0;
-  if (seen.has(value))
-    return 0;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    let count = 0;
-    for (let index = 0;index < value.length; index += 1) {
-      const item = value[index];
-      if (typeof item === "string") {
-        const redacted = redactString(item);
-        value[index] = redacted.value;
-        count += redacted.count;
-      } else
-        count += redactInPlace(item, seen);
-    }
-    return count;
-  }
-  let count = 0;
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") {
-      const redacted = redactString(item);
-      Reflect.set(value, key, redacted.value);
-      count += redacted.count;
-    } else
-      count += redactInPlace(item, seen);
-  }
-  return count;
-}
-function redactSiftLightResult(result) {
-  const text = redactString(result.text);
-  const details = structuredClone(result.details);
-  const redactedCount = text.count + redactInPlace(details, new WeakSet);
-  return {
-    text: text.value,
-    details: {
-      ...details,
-      redactedCount,
-      redactionApplied: true
-    }
-  };
-}
-
-// src/errors.ts
-class SiftLightError extends Error {
-  constructor(message, options) {
-    super(message, options);
-    this.name = "SiftLightError";
-  }
-}
-
-class ConceptUnavailableError extends SiftLightError {
-  constructor(message, options) {
-    super(message, options);
-    this.name = "ConceptUnavailableError";
-  }
-}
-
-class RipgrepInputError extends SiftLightError {
-  code;
-  guidance;
-  details;
-  constructor(code, message, guidance, repairExamples = []) {
-    super(`${message} ${guidance}`);
-    this.name = "RipgrepInputError";
-    this.code = code;
-    this.guidance = guidance;
-    this.details = {
-      code,
-      issues: [
-        {
-          field: code === "E_REGEX_INVALID" ? "pattern" : "path",
-          reason: guidance
-        }
-      ],
-      recovery: { action: "manual", reason: guidance },
-      ...repairExamples.length > 0 ? { repairExamples } : {}
-    };
-  }
-}
-
-class CursorError extends SiftLightError {
-  code;
-  constructor(message, code = "E_CURSOR_MALFORMED") {
-    super(`${code}: ${message}`);
-    this.name = "CursorError";
-    this.code = code;
-  }
-}
-function abortError() {
-  const error = new Error("Operation aborted");
-  error.name = "AbortError";
-  return error;
-}
-
 // src/request-contract-error.ts
 var MAX_REQUEST_RECOVERY_BYTES = 64 * 1024;
 var MAX_REQUEST_DISPLAY_CHARACTERS = 256;
@@ -670,7 +3035,7 @@ function boundedRequestContractDetails(details) {
 }
 
 // src/language-capability-definitions.ts
-import { extname } from "node:path";
+import { extname as extname2 } from "node:path";
 var TYPESCRIPT_LANGUAGE_CAPABILITIES = [
   {
     id: "ast-grep.outline",
@@ -819,14 +3184,14 @@ var DEFAULT_NEUTRAL_CAPABILITIES = [
   }
 ];
 function descriptorForPath(descriptors, path) {
-  const extension = extname(path).toLowerCase();
+  const extension = extname2(path).toLowerCase();
   return descriptors.find((item) => item.extensions.includes(extension));
 }
 function languageForPath(descriptors, path) {
   return descriptorForPath(descriptors, path)?.language;
 }
 function outlineExtension(path) {
-  const extension = extname(path).toLowerCase();
+  const extension = extname2(path).toLowerCase();
   return extension || undefined;
 }
 
@@ -1510,1363 +3875,8 @@ function requestContractProjection(error) {
   return { details: compact, text: compactText };
 }
 
-// src/rg.ts
-import { isAbsolute as isAbsolute3, relative as relative2, resolve as resolve5 } from "node:path";
-
-// src/excerpt.ts
-function boundedCharacter(value, maximum) {
-  if (!Number.isFinite(value))
-    return 0;
-  return Math.min(maximum, Math.max(0, Math.floor(value)));
-}
-function excerptText(text, focusStart = 0, focusEnd = focusStart, maximumCharacters = MAX_LINE_CHARACTERS) {
-  if (!Number.isSafeInteger(maximumCharacters) || maximumCharacters <= 0) {
-    throw new Error("Excerpt size must be a positive safe integer");
-  }
-  if (text.length <= maximumCharacters) {
-    return {
-      text,
-      truncated: false,
-      startCharacter: 0,
-      endCharacter: text.length
-    };
-  }
-  const boundedStart = boundedCharacter(focusStart, text.length);
-  const boundedEnd = Math.max(boundedStart, boundedCharacter(focusEnd, text.length));
-  const focusLength = boundedEnd - boundedStart;
-  const startCharacter = focusLength >= maximumCharacters ? Math.min(boundedStart, text.length - maximumCharacters) : Math.min(Math.max(0, boundedStart - Math.floor((maximumCharacters - focusLength) / 2)), text.length - maximumCharacters);
-  const endCharacter = startCharacter + maximumCharacters;
-  const prefix = startCharacter > 0 ? "…" : "";
-  const suffix = endCharacter < text.length ? "…" : "";
-  return {
-    text: `${prefix}${text.slice(startCharacter, endCharacter)}${suffix}`,
-    truncated: true,
-    startCharacter,
-    endCharacter
-  };
-}
-
-// src/search-retention.ts
-class SearchRetention {
-  #bytes = 0;
-  #metadataBytes = 0;
-  #metadataLimitReached = false;
-  #occurrences = 0;
-  #reasons = new Set;
-  maxBytes;
-  maxOccurrences;
-  constructor(maxBytes = MAX_SEARCH_STORAGE_BYTES, maxOccurrences = MAX_STORED_OCCURRENCES) {
-    this.maxBytes = maxBytes;
-    this.maxOccurrences = maxOccurrences;
-    for (const value of [maxBytes, maxOccurrences]) {
-      if (!Number.isSafeInteger(value) || value < 1)
-        throw new SiftLightError("Search retention limits must be positive safe integers");
-    }
-  }
-  file(displayPath, absolutePath) {
-    if (this.#metadataLimitReached)
-      return false;
-    const bytes = Buffer.byteLength(JSON.stringify([displayPath, absolutePath])) + 512;
-    const metadataLimit = Math.floor(this.maxBytes / 4);
-    if (this.#metadataBytes + bytes > metadataLimit) {
-      this.#metadataLimitReached = true;
-      this.#reasons.add(`File-summary retention reached its ${String(metadataLimit)}-byte share of the search budget; file summaries are partial; narrow the path or filters`);
-      return false;
-    }
-    this.#bytes += bytes;
-    this.#metadataBytes += bytes;
-    return true;
-  }
-  canRetainOccurrences(count) {
-    if (this.#occurrences + count <= this.maxOccurrences)
-      return true;
-    this.#reasons.add(`Occurrence retention reached the ${String(this.maxOccurrences)} limit`);
-    return false;
-  }
-  retain(match) {
-    if (!this.canRetainOccurrences(match.occurrences.length))
-      return false;
-    const bytes = Buffer.byteLength(JSON.stringify(match)) + 1;
-    if (this.#bytes - this.#metadataBytes + bytes > this.maxBytes - Math.floor(this.maxBytes / 4)) {
-      this.#reasons.add(`Search evidence retention reached the ${String(this.maxBytes)}-byte limit`);
-      return false;
-    }
-    this.#bytes += bytes;
-    this.#occurrences += match.occurrences.length;
-    return true;
-  }
-  noteLimit(reason) {
-    this.#reasons.add(reason);
-  }
-  get details() {
-    return {
-      accountedBytes: this.#bytes,
-      retainedOccurrences: this.#occurrences,
-      maxBytes: this.maxBytes,
-      maxOccurrences: this.maxOccurrences,
-      reasons: [...this.#reasons]
-    };
-  }
-}
-
-// src/capped-lines.ts
-var MAX_DIAGNOSTIC_PREFIX_BYTES = 8 * 1024;
-async function consumeCappedLines(stream, onLine, options = {}) {
-  const maxLineBytes = options.maxLineBytes ?? MAX_PROTOCOL_LINE_BYTES;
-  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1)
-    throw new Error("Capped line byte limit must be a positive safe integer");
-  let lineChunks = [];
-  let lineBytes = 0;
-  let discarding = false;
-  const resetLine = () => {
-    lineChunks = [];
-    lineBytes = 0;
-  };
-  const lastLineByte = () => {
-    const chunk = lineChunks.at(-1);
-    return chunk && chunk.length > 0 ? chunk[chunk.length - 1] : undefined;
-  };
-  const prefixFor = (segment, totalBytes) => {
-    const prefixBytes = Math.min(MAX_DIAGNOSTIC_PREFIX_BYTES, totalBytes);
-    const prefix = Buffer.allocUnsafe(prefixBytes);
-    let copied = 0;
-    for (const chunk of lineChunks) {
-      if (copied === prefixBytes)
-        break;
-      const length = Math.min(chunk.length, prefixBytes - copied);
-      prefix.set(chunk.subarray(0, length), copied);
-      copied += length;
-    }
-    if (copied < prefixBytes) {
-      const length = Math.min(segment.length, prefixBytes - copied);
-      prefix.set(segment.subarray(0, length), copied);
-    }
-    return prefix.toString("utf8");
-  };
-  const lineText = (withoutTrailingCarriageReturn) => {
-    const contentBytes = lineBytes - (withoutTrailingCarriageReturn && lineBytes > 0 ? 1 : 0);
-    const bytes = Buffer.concat(lineChunks, lineBytes);
-    return bytes.toString("utf8", 0, contentBytes);
-  };
-  const reportOverflow = (segment, observedBytes, final) => {
-    if (!options.onLineTooLong)
-      throw new Error(`Input line exceeds the ${String(maxLineBytes)}-byte limit${final ? " at end of stream" : ""}`);
-    options.onLineTooLong({
-      prefix: prefixFor(segment, observedBytes),
-      observedBytes
-    });
-  };
-  const consumeChunk = (chunk, final) => {
-    let offset = 0;
-    while (offset < chunk.length) {
-      const newline = chunk.indexOf(10, offset);
-      const end = newline >= 0 ? newline : chunk.length;
-      const segment = chunk.subarray(offset, end);
-      if (discarding) {
-        if (newline < 0)
-          return;
-        discarding = false;
-        resetLine();
-        offset = newline + 1;
-        continue;
-      }
-      const observedBytes = lineBytes + segment.length;
-      const hasTrailingCarriageReturn = newline >= 0 && observedBytes > 0 && (segment.at(-1) ?? lastLineByte()) === 13;
-      const contentBytes = observedBytes - (hasTrailingCarriageReturn ? 1 : 0);
-      if (contentBytes > maxLineBytes) {
-        reportOverflow(segment, observedBytes, final && newline < 0);
-        resetLine();
-        if (newline < 0)
-          discarding = true;
-        else
-          offset = newline + 1;
-        continue;
-      }
-      if (segment.length > 0)
-        lineChunks.push(segment);
-      lineBytes = observedBytes;
-      if (newline < 0)
-        return;
-      onLine(lineText(hasTrailingCarriageReturn));
-      resetLine();
-      offset = newline + 1;
-    }
-  };
-  for await (const chunk of stream)
-    consumeChunk(chunk, false);
-  if (discarding)
-    return;
-  consumeChunk(new Uint8Array, true);
-  if (lineBytes > 0)
-    onLine(lineText(false));
-}
-
-// src/path-policy.ts
-import { realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-var POSIX_SPECIAL_ROOTS = ["/dev", "/proc", "/sys"];
-var PORTABLE_CREDENTIAL_DIRECTORY_NAMES = [
-  ".ssh",
-  ".gnupg",
-  ".aws",
-  ".azure",
-  ".kube",
-  ".docker",
-  ".password-store"
-];
-var HOME_CREDENTIAL_DIRECTORIES = [
-  [".ssh"],
-  [".gnupg"],
-  [".aws"],
-  [".azure"],
-  [".kube"],
-  [".docker"],
-  [".password-store"],
-  [".config", "gcloud"],
-  [".config", "gh"],
-  [".local", "share", "keyrings"]
-];
-var HOME_CREDENTIAL_FILES = [[".netrc"], [".npmrc"], [".pypirc"], [".git-credentials"]];
-var DARWIN_CREDENTIAL_DIRECTORIES = [
-  ["Library", "Keychains"],
-  ["Library", "Application Support", "Google", "Chrome"],
-  ["Library", "Application Support", "Chromium"],
-  ["Library", "Application Support", "Firefox"],
-  ["Library", "Application Support", "Microsoft Edge"],
-  ["Library", "Application Support", "BraveSoftware", "Brave-Browser"]
-];
-var LINUX_CREDENTIAL_DIRECTORIES = [
-  [".mozilla", "firefox"],
-  [".config", "google-chrome"],
-  [".config", "chromium"],
-  [".config", "microsoft-edge"],
-  [".config", "BraveSoftware", "Brave-Browser"]
-];
-function pathKey(path) {
-  const absolute = resolve(path);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
-}
-function directoryNameKey(name) {
-  return process.platform === "win32" || process.platform === "darwin" ? name.toLowerCase() : name;
-}
-var PORTABLE_CREDENTIAL_DIRECTORY_KEYS = new Set(PORTABLE_CREDENTIAL_DIRECTORY_NAMES.map(directoryNameKey));
-function isGitInternal(path) {
-  return resolve(path).split(sep).some((part) => part.toLowerCase() === ".git");
-}
-function isPathInsideRoot(path, root) {
-  const local = relative(pathKey(root), pathKey(path));
-  return local !== ".." && !local.startsWith(`..${sep}`) && !isAbsolute(local);
-}
-function isPathInsideCwd(path, cwd) {
-  return isPathInsideRoot(resolve(cwd, path), resolve(cwd));
-}
-function defaultSensitiveRoots() {
-  const home = homedir();
-  const roots = [...HOME_CREDENTIAL_DIRECTORIES, ...HOME_CREDENTIAL_FILES].map((parts) => join(home, ...parts));
-  if (process.platform !== "win32")
-    roots.push(...POSIX_SPECIAL_ROOTS);
-  if (process.platform === "darwin") {
-    roots.push(...DARWIN_CREDENTIAL_DIRECTORIES.map((parts) => join(home, ...parts)));
-  } else if (process.platform === "linux") {
-    roots.push(...LINUX_CREDENTIAL_DIRECTORIES.map((parts) => join(home, ...parts)));
-  } else if (process.platform === "win32") {
-    const { APPDATA, LOCALAPPDATA, ProgramData, SystemRoot } = process.env;
-    if (APPDATA) {
-      roots.push(join(APPDATA, "Microsoft", "Credentials"), join(APPDATA, "Microsoft", "Protect"), join(APPDATA, "gnupg"));
-    }
-    if (LOCALAPPDATA) {
-      roots.push(join(LOCALAPPDATA, "Google", "Chrome", "User Data"), join(LOCALAPPDATA, "Chromium", "User Data"), join(LOCALAPPDATA, "Microsoft", "Edge", "User Data"), join(LOCALAPPDATA, "BraveSoftware", "Brave-Browser", "User Data"));
-    }
-    if (ProgramData)
-      roots.push(join(ProgramData, "Microsoft", "Crypto", "RSA", "MachineKeys"));
-    if (SystemRoot)
-      roots.push(join(SystemRoot, "System32", "config"));
-  }
-  return [...new Set(roots.map((root) => resolve(root)))];
-}
-var DEFAULT_SENSITIVE_ROOTS = defaultSensitiveRoots();
-function escapeGlobPath(path) {
-  const normalized = path.split(sep).join("/");
-  return normalized.replaceAll(/([\\*?[\]{}])/g, "\\$1");
-}
-function blockedPathMessage(path) {
-  return `Path is inside a protected credential or system area: ${path}`;
-}
-
-class SearchPathPolicy {
-  cwd;
-  protectedRoots;
-  constructor(cwd, protectedRoots = DEFAULT_SENSITIVE_ROOTS) {
-    this.cwd = resolve(cwd);
-    this.protectedRoots = [...new Set(protectedRoots.map((root) => resolve(root)))];
-  }
-  isProtected(path) {
-    const absolute = resolve(this.cwd, path);
-    if (isPathInsideRoot(absolute, this.cwd))
-      return false;
-    return absolute.split(sep).some((part) => PORTABLE_CREDENTIAL_DIRECTORY_KEYS.has(directoryNameKey(part))) || this.protectedRoots.some((root) => isPathInsideRoot(absolute, root));
-  }
-  assertPath(path) {
-    const absolute = resolve(this.cwd, path);
-    if (isGitInternal(absolute))
-      throw new SiftLightError("Git internals are excluded from search");
-    if (this.isProtected(absolute))
-      throw new SiftLightError(blockedPathMessage(absolute));
-  }
-  async resolveExistingPath(path) {
-    const absolute = resolve(this.cwd, path);
-    this.assertPath(absolute);
-    let canonical;
-    try {
-      canonical = await realpath(absolute);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT")
-        return;
-      throw error;
-    }
-    this.assertPath(canonical);
-    return canonical;
-  }
-  async assertExistingPath(path) {
-    await this.resolveExistingPath(path);
-  }
-  async resolveSearchTarget(path) {
-    const absolute = resolve(this.cwd, path);
-    const [canonical, canonicalCwd] = await Promise.all([
-      this.resolveExistingPath(absolute),
-      realpath(this.cwd)
-    ]);
-    return canonical && (!isPathInsideRoot(absolute, this.cwd) || !isPathInsideRoot(canonical, canonicalCwd)) ? canonical : absolute;
-  }
-  async allowsScopeExpansion(path, scope) {
-    if (scope === "strict")
-      return false;
-    if (scope === "expand")
-      return true;
-    const searchTarget = await this.resolveSearchTarget(path);
-    return isPathInsideRoot(searchTarget, this.cwd);
-  }
-  async ripgrepWorkingDirectory(searchPath) {
-    const absolute = resolve(this.cwd, searchPath);
-    if (isPathInsideRoot(absolute, this.cwd))
-      return this.cwd;
-    let isDirectory;
-    try {
-      isDirectory = (await stat(absolute)).isDirectory();
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT")
-        return this.cwd;
-      throw error;
-    }
-    return isDirectory ? absolute : dirname(absolute);
-  }
-  ripgrepGlobArguments(searchPath) {
-    const absolute = resolve(this.cwd, searchPath);
-    if (isPathInsideRoot(absolute, this.cwd))
-      return [];
-    const args = [];
-    const globFlag = process.platform === "win32" || process.platform === "darwin" ? "--iglob" : "--glob";
-    for (const name of PORTABLE_CREDENTIAL_DIRECTORY_NAMES) {
-      args.push(globFlag, `!${name}`, globFlag, `!${name}/**`, globFlag, `!**/${name}`, globFlag, `!**/${name}/**`);
-    }
-    for (const root of this.protectedRoots) {
-      if (!isPathInsideRoot(root, absolute))
-        continue;
-      const local = relative(absolute, root);
-      if (!local || local === ".")
-        continue;
-      const escaped = escapeGlobPath(local);
-      args.push(globFlag, `!${escaped}`, globFlag, `!${escaped}/**`);
-    }
-    return args;
-  }
-}
-
-// src/owned-process.ts
-import { spawn } from "node:child_process";
-var MAX_STDERR_BYTES = 16 * 1024;
-var TERMINATE_GRACE_MS = 250;
-var TERMINATE_DEADLINE_MS = 2000;
-async function runOwnedProcess(options, consumeOutput) {
-  const { executable, args, cwd, signal, env, input } = options;
-  if (signal?.aborted)
-    throw abortError();
-  const spawnOptions = { cwd, windowsHide: true, ...env ? { env } : {} };
-  const child = input === undefined && !options.interactive ? spawn(executable, args, { ...spawnOptions, stdio: ["ignore", "pipe", "pipe"] }) : spawn(executable, args, { ...spawnOptions, stdio: ["pipe", "pipe", "pipe"] });
-  if (options.interactive)
-    child.stdin?.on("error", () => {
-      return;
-    });
-  const inputComplete = new Promise((resolveInput, rejectInput) => {
-    if (input === undefined || child.stdin === null) {
-      resolveInput();
-      return;
-    }
-    child.stdin.on("error", rejectInput);
-    child.stdin.end(input, (error) => {
-      if (error)
-        rejectInput(error);
-      else
-        resolveInput();
-    });
-  });
-  let closed = false;
-  let spawnError;
-  let forceTimer;
-  let deadlineTimer;
-  let rejectClose;
-  const closePromise = new Promise((resolveClose, reject) => {
-    rejectClose = reject;
-    child.once("error", (error) => {
-      spawnError = error;
-    });
-    child.once("close", (code) => {
-      closed = true;
-      resolveClose(code);
-    });
-  });
-  const stderrChunks = [];
-  let stderrBytes = 0;
-  child.stderr.on("data", (chunk) => {
-    const retained = chunk.subarray(0, MAX_STDERR_BYTES - stderrBytes);
-    if (retained.length === 0)
-      return;
-    stderrChunks.push(retained);
-    stderrBytes += retained.length;
-  });
-  const terminate = () => {
-    if (closed || forceTimer)
-      return;
-    child.stdin?.destroy();
-    child.kill("SIGTERM");
-    forceTimer = setTimeout(() => {
-      if (!closed)
-        child.kill("SIGKILL");
-    }, TERMINATE_GRACE_MS);
-    deadlineTimer = setTimeout(() => {
-      rejectClose?.(new SiftLightError("Owned search process did not close after termination"));
-    }, TERMINATE_DEADLINE_MS);
-  };
-  signal?.addEventListener("abort", terminate, { once: true });
-  if (signal?.aborted)
-    terminate();
-  try {
-    const [code] = await Promise.all([
-      closePromise,
-      consumeOutput(child.stdout, child.stdin),
-      inputComplete
-    ]);
-    if (signal?.aborted)
-      throw abortError();
-    if (spawnError)
-      throw spawnError;
-    return { code, stderr: Buffer.concat(stderrChunks).toString("utf8") };
-  } catch (error) {
-    terminate();
-    await closePromise;
-    if (signal?.aborted)
-      throw abortError();
-    if (spawnError)
-      throw spawnError;
-    throw error;
-  } finally {
-    if (forceTimer)
-      clearTimeout(forceTimer);
-    if (deadlineTimer)
-      clearTimeout(deadlineTimer);
-    signal?.removeEventListener("abort", terminate);
-  }
-}
-
-// src/ripgrep-executable.ts
-import { constants } from "node:fs";
-import { access, stat as stat2 } from "node:fs/promises";
-import { delimiter, isAbsolute as isAbsolute2, resolve as resolve2 } from "node:path";
-var OVERRIDE_ENV = "SIFT_LIGHT_RG_PATH";
-var PATH_RIPGREP_NAME = process.platform === "win32" ? "rg.exe" : "rg";
-var BUNDLED_REPAIR = `Reinstall sift-light with optional dependencies enabled for this platform, set ${OVERRIDE_ENV} to an absolute ripgrep executable path, or ensure ${PATH_RIPGREP_NAME} is available on PATH.`;
-async function findExecutableOnPath() {
-  const pathValue = process.env.PATH;
-  if (!pathValue)
-    return;
-  const candidates = pathValue.split(delimiter).map((directory) => resolve2(directory || ".", PATH_RIPGREP_NAME));
-  const available = await Promise.all(candidates.map(async (candidate) => {
-    try {
-      if (!(await stat2(candidate)).isFile())
-        return;
-      await access(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      return;
-    }
-  }));
-  return available.find((candidate) => candidate !== undefined);
-}
-async function resolveRipgrepExecutable() {
-  const configured = process.env[OVERRIDE_ENV];
-  if (configured !== undefined && !isAbsolute2(configured))
-    throw new SiftLightError(`${OVERRIDE_ENV} must be an absolute executable file path; shell functions, aliases and relative paths are not supported.`);
-  let executable;
-  if (configured !== undefined) {
-    executable = configured;
-  } else {
-    try {
-      executable = (await import("@vscode/ripgrep")).rgPath;
-    } catch (cause) {
-      const pathExecutable = await findExecutableOnPath();
-      if (pathExecutable === undefined)
-        throw new SiftLightError(`Bundled ripgrep is unavailable. ${BUNDLED_REPAIR}`, { cause });
-      executable = pathExecutable;
-    }
-  }
-  try {
-    if (!(await stat2(executable)).isFile())
-      throw new Error("Expected an executable file");
-    await access(executable, constants.X_OK);
-  } catch (cause) {
-    const repair = configured === undefined ? BUNDLED_REPAIR : `Fix ${OVERRIDE_ENV} or unset it to use bundled ripgrep. No fallback was attempted.`;
-    throw new SiftLightError(`ripgrep executable is unavailable: ${executable}. ${repair}`, {
-      cause
-    });
-  }
-  return executable;
-}
-
-// src/ripgrep-diagnostics.ts
-import { basename, resolve as resolve3 } from "node:path";
-var UNREADABLE_SUFFIX = /:\s+Permission denied(?:\s+\(os error 13\))?\s*$/iu;
-var UNREADABLE_CODE = /\(os error 13\)\s*$/iu;
-var RECOVERABLE_FILESYSTEM_CODE = /\(os error (?:4|5|22)\)\s*$/iu;
-var RECOVERABLE_FILESYSTEM_SUFFIXES = [
-  /:\s+Invalid argument(?:\s+\(os error 22\))?\s*$/iu,
-  /:\s+Interrupted system call\s*$/iu,
-  /:\s+Input\/output error(?:\s+\(os error 5\))?\s*$/iu,
-  /:\s+No message available on STREAM\s*$/iu
-];
-var INVALID_REGEX_DIAGNOSTIC = /(?:^|\n)\s*(?:rg:\s*)?regex parse error:/iu;
-var MISSING_PATH_DIAGNOSTIC = /(?:IO error for operation on .+?:\s*)?No such file or directory \(os error 2\)\s*$/iu;
-var MAX_RIPGREP_DIAGNOSTIC_CHARACTERS = 4096;
-function diagnosticLines(stderr) {
-  return stderr.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
-}
-function boundedRipgrepDiagnostic(value, redact = false) {
-  const safe = redact ? redactDiagnosticText(value) : value;
-  const normalized = safe.toWellFormed();
-  return normalized.length <= MAX_RIPGREP_DIAGNOSTIC_CHARACTERS ? normalized : `${normalized.slice(0, MAX_RIPGREP_DIAGNOSTIC_CHARACTERS - 1)}…`;
-}
-function classifyRipgrepInputFailure(stderr) {
-  if (INVALID_REGEX_DIAGNOSTIC.test(stderr))
-    return "E_REGEX_INVALID";
-  if (diagnosticLines(stderr).some((line) => MISSING_PATH_DIAGNOSTIC.test(line)))
-    return "E_SEARCH_PATH_NOT_FOUND";
-  return;
-}
-function missingPathFromDiagnostics(stderr) {
-  for (const line of diagnosticLines(stderr)) {
-    const operation = /IO error for operation on (.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
-    if (operation?.[1])
-      return operation[1].trim();
-    const direct = /^rg:\s*(.+?):\s*No such file or directory \(os error 2\)\s*$/iu.exec(line);
-    if (direct?.[1])
-      return direct[1].trim();
-  }
-  return;
-}
-var RIPGREP_RECOVERY_FIELDS = [
-  "path",
-  "glob",
-  "exclude",
-  "literal",
-  "ignoreCase",
-  "hidden",
-  "ignorePolicy",
-  "wholeWord",
-  "context",
-  "scope",
-  "redact"
-];
-function copyRipgrepRecoveryFields(request) {
-  const result = {};
-  for (const field of RIPGREP_RECOVERY_FIELDS) {
-    const value = request[field];
-    if (value !== undefined)
-      result[field] = value;
-  }
-  return result;
-}
-function ripgrepRepairExamples(code, request, redact) {
-  if (request === undefined || redact && containsSensitiveText(request))
-    return [];
-  if (code === "E_REGEX_INVALID") {
-    return [
-      {
-        label: "按原文查找",
-        request: {
-          mode: "matches",
-          ...copyRipgrepRecoveryFields(request),
-          pattern: request.pattern,
-          literal: true
-        }
-      }
-    ];
-  }
-  if (code === "E_SEARCH_PATH_NOT_FOUND" && request.path !== undefined) {
-    const fileName = basename(request.path.replaceAll("\\", "/"));
-    if (fileName === "." || fileName === "/" || fileName.length === 0)
-      return [];
-    return [
-      {
-        label: "按文件名查找",
-        request: {
-          mode: "files",
-          query: fileName,
-          ...request.redact === true ? { redact: true } : {}
-        }
-      }
-    ];
-  }
-  return [];
-}
-function createRipgrepInputError(stderr, redact = false, request) {
-  const code = classifyRipgrepInputFailure(stderr);
-  if (code === "E_REGEX_INVALID") {
-    return new RipgrepInputError(code, "ripgrep regex parse error: pattern is not a valid regular expression.", "Correct pattern or set literal=true for source text; no automatic literal conversion was attempted.", ripgrepRepairExamples(code, request, redact));
-  }
-  if (code === "E_SEARCH_PATH_NOT_FOUND") {
-    const path = missingPathFromDiagnostics(stderr);
-    const location = path ? ` (${JSON.stringify(boundedRipgrepDiagnostic(path, redact))})` : "";
-    return new RipgrepInputError(code, `A searched path${location} does not exist or became unavailable.`, "Provide an existing exact path, or use mode=files with query to discover an unknown filename; no retry or scope expansion was attempted.", ripgrepRepairExamples(code, request, redact));
-  }
-  return;
-}
-function unreadablePath(line, suffix) {
-  const match = suffix.exec(line);
-  if (!match || match.index === undefined)
-    return;
-  const prefix = line.slice(0, match.index).trim();
-  if (prefix === "rg")
-    return;
-  const separator = prefix.indexOf(": ");
-  const path = (separator < 0 ? prefix : prefix.slice(separator + 2)).trim();
-  return path.replace(/^['"]|['"]$/gu, "") || undefined;
-}
-function classifyRipgrepDiagnostics(stderr) {
-  const unreadable = [];
-  const recoverable = [];
-  const other = [];
-  for (const line of diagnosticLines(stderr)) {
-    const path = unreadablePath(line, UNREADABLE_SUFFIX);
-    if (path !== undefined || UNREADABLE_CODE.test(line)) {
-      unreadable.push({ message: line, ...path ? { path } : {} });
-      continue;
-    }
-    const recoverableSuffix = RECOVERABLE_FILESYSTEM_SUFFIXES.find((suffix) => suffix.test(line));
-    if (recoverableSuffix || RECOVERABLE_FILESYSTEM_CODE.test(line)) {
-      const recoverablePath = recoverableSuffix ? unreadablePath(line, recoverableSuffix) : undefined;
-      recoverable.push({ message: line, ...recoverablePath ? { path: recoverablePath } : {} });
-      continue;
-    }
-    other.push(line);
-  }
-  return { unreadable, recoverable, other };
-}
-function hasRequestedRootUnreadable(diagnostics, cwd, searchPath) {
-  const expected = resolve3(cwd, searchPath);
-  return diagnostics.some((diagnostic) => diagnostic.path === undefined || resolve3(cwd, diagnostic.path) === expected);
-}
-function describeUnreadableDiagnostics(diagnostics) {
-  const messages = [...new Set(diagnostics.map((diagnostic) => diagnostic.message))];
-  return `Ripgrep skipped ${String(messages.length)} unreadable path(s); search coverage is partial: ${messages.join("; ")}`;
-}
-
-// src/source.ts
-import { readFile, realpath as realpath2, stat as stat3 } from "node:fs/promises";
-var SOURCE_RANGE_METADATA_RESERVE_BYTES = 1024;
-var MAX_SOURCE_RANGE_BYTES = MAX_RESULT_BYTES - SOURCE_RANGE_METADATA_RESERVE_BYTES;
-async function getSourceRevision(path, onError) {
-  try {
-    const metadata = await stat3(path);
-    return sourceRevisionFromStats(metadata);
-  } catch (error) {
-    onError?.(error);
-    return;
-  }
-}
-function sourceRevisionFromStats(metadata) {
-  return {
-    size: metadata.size,
-    mtimeMs: metadata.mtimeMs,
-    ctimeMs: metadata.ctimeMs,
-    ...metadata.ino !== 0 ? { inode: metadata.ino } : {},
-    ...metadata.dev !== 0 ? { device: metadata.dev } : {}
-  };
-}
-function sameSourceRevision(left, right) {
-  return left.size === right.size && left.mtimeMs === right.mtimeMs && (left.ctimeMs === undefined || right.ctimeMs === undefined || left.ctimeMs === right.ctimeMs) && left.inode === right.inode && left.device === right.device;
-}
-function matchesModificationTime(revision, modifiedAfterMs, modifiedBeforeMs) {
-  return (modifiedAfterMs === undefined || revision.mtimeMs >= modifiedAfterMs) && (modifiedBeforeMs === undefined || revision.mtimeMs < modifiedBeforeMs);
-}
-function modificationTimeDisplay(value) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? `${String(value)} Unix ms` : JSON.stringify(date.toISOString());
-}
-function modificationTimeBoundsText(modifiedAfterMs, modifiedBeforeMs) {
-  if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
-    return "";
-  const bounds = [
-    modifiedAfterMs === undefined ? undefined : `mtime >= ${modificationTimeDisplay(modifiedAfterMs)}`,
-    modifiedBeforeMs === undefined ? undefined : `mtime < ${modificationTimeDisplay(modifiedBeforeMs)}`
-  ].filter((value) => value !== undefined);
-  return ` [Modification-time filter: ${bounds.join("; ")}.]`;
-}
-async function assertExistingPathInsideCwd(path, cwd) {
-  if (!isPathInsideCwd(path, cwd)) {
-    throw new SiftLightError("Path must stay within the working directory");
-  }
-  const canonical = await new SearchPathPolicy(cwd).resolveExistingPath(path);
-  if (canonical && !isPathInsideCwd(canonical, await realpath2(cwd))) {
-    throw new SiftLightError("Path must stay within the working directory");
-  }
-}
-class SourceBudgetTooSmallError extends SiftLightError {
-  constructor() {
-    super("Source target line exceeds the available byte budget");
-    this.name = "SourceBudgetTooSmallError";
-  }
-}
-
-class SourceLineUnavailableError extends SiftLightError {
-  constructor(line) {
-    super(`Source line ${String(line)} is beyond the end of the file`);
-    this.name = "SourceLineUnavailableError";
-  }
-}
-function sourceLineBytes(line) {
-  return Buffer.byteLength(`${String(line.line)}: ${line.text}`, "utf8");
-}
-function selectSourceWindow(rendered, targetIndex, maxBytes) {
-  let startIndex = targetIndex;
-  let endIndex = targetIndex;
-  const target = rendered[targetIndex];
-  if (!target)
-    throw new Error("Source target line is unavailable");
-  let bytes = sourceLineBytes(target);
-  if (bytes > maxBytes)
-    throw new SourceBudgetTooSmallError;
-  let canGrowBefore = true;
-  let canGrowAfter = true;
-  while (canGrowBefore || canGrowAfter) {
-    let grew = false;
-    if (canGrowBefore) {
-      const candidate = rendered[startIndex - 1];
-      if (candidate === undefined) {
-        canGrowBefore = false;
-      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
-        startIndex -= 1;
-        bytes += 1 + sourceLineBytes(candidate);
-        grew = true;
-      } else {
-        canGrowBefore = false;
-      }
-    }
-    if (canGrowAfter) {
-      const candidate = rendered[endIndex + 1];
-      if (candidate === undefined) {
-        canGrowAfter = false;
-      } else if (bytes + 1 + sourceLineBytes(candidate) <= maxBytes) {
-        endIndex += 1;
-        bytes += 1 + sourceLineBytes(candidate);
-        grew = true;
-      } else {
-        canGrowAfter = false;
-      }
-    }
-    if (!grew && !canGrowBefore && !canGrowAfter)
-      break;
-  }
-  return { lines: rendered.slice(startIndex, endIndex + 1), startIndex, endIndex };
-}
-function sourceRangeFromBytes(content, startLine, endLine, targetLine = startLine, options = {}) {
-  const maxBytes = options.maxBytes ?? MAX_SOURCE_RANGE_BYTES;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_SOURCE_RANGE_BYTES)
-    throw new Error("Source range byte budget must be within the result body limit");
-  const lines = [];
-  let lineStart = 0;
-  for (let newline = content.indexOf(10);newline >= 0; newline = content.indexOf(10, lineStart)) {
-    lines.push(content.subarray(lineStart, newline));
-    lineStart = newline + 1;
-  }
-  lines.push(content.subarray(lineStart));
-  const boundedStart = Math.max(1, startLine);
-  if (boundedStart > lines.length) {
-    throw new SourceLineUnavailableError(targetLine);
-  }
-  const boundedEnd = Math.min(lines.length, Math.max(boundedStart, endLine));
-  if (targetLine < 1 || targetLine > lines.length) {
-    throw new SourceLineUnavailableError(targetLine);
-  }
-  const boundedTarget = Math.min(boundedEnd, Math.max(boundedStart, targetLine));
-  const rendered = Array.from({ length: boundedEnd - boundedStart + 1 }, (_, index) => {
-    const lineNumber = boundedStart + index;
-    const raw = lines[lineNumber - 1];
-    if (!raw)
-      throw new Error("Source line is unavailable");
-    const focus = lineNumber === targetLine ? options.focus : undefined;
-    const start = focus?.range.start.character ?? 0;
-    const end = focus?.range.end.character ?? start;
-    const bytes = focus?.range.encoding === "utf-8" ? raw : undefined;
-    const excerpt = excerptText(raw.toString("utf8").replaceAll("\r", ""), bytes ? bytes.subarray(0, start).toString("utf8").replaceAll("\r", "").length : start, bytes ? bytes.subarray(0, end).toString("utf8").replaceAll("\r", "").length : end);
-    return { line: lineNumber, text: excerpt.text, truncated: excerpt.truncated };
-  });
-  const selected = selectSourceWindow(rendered, boundedTarget - boundedStart, maxBytes);
-  const omittedBefore = selected.startIndex;
-  const omittedAfter = rendered.length - selected.endIndex - 1;
-  return {
-    text: selected.lines.map((line) => `${String(line.line)}: ${line.text}`).join(`
-`),
-    lines: selected.lines,
-    startLine: boundedStart + selected.startIndex,
-    endLine: boundedStart + selected.endIndex,
-    truncated: omittedBefore > 0 || omittedAfter > 0,
-    omittedBefore,
-    omittedAfter,
-    truncatedLines: selected.lines.filter((line) => line.truncated).map((line) => line.line)
-  };
-}
-
-// src/scan-revisions.ts
-import { resolve as resolve4 } from "node:path";
-async function captureRevision(path, revisions, onRevisionError) {
-  let failed = false;
-  let failure;
-  const revision = await getSourceRevision(path, (error) => {
-    failed = true;
-    failure = error;
-  });
-  if (revision)
-    revisions.set(path, revision);
-  if (failed)
-    onRevisionError?.(path, failure);
-}
-async function captureBatch(paths, revisions, signal, onRevisionError) {
-  if (signal?.aborted)
-    throw abortError();
-  await Promise.all(paths.map((path) => captureRevision(path, revisions, onRevisionError)));
-  if (signal?.aborted)
-    throw abortError();
-}
-async function captureCandidateRevisions(executable, args, cwd, maxFiles, signal, redact = false, request) {
-  const revisions = new Map;
-  let candidateCount = 0;
-  let enumerationTruncated = false;
-  let invalidPathCount = 0;
-  const metadataFailures = [];
-  const recordMetadataFailure = (path, error) => {
-    const reason = error instanceof Error ? error.message : String(error);
-    metadataFailures.push({
-      path,
-      message: `Source metadata unavailable: ${boundedRipgrepDiagnostic(reason, redact)}`
-    });
-  };
-  const result = await runOwnedProcess({ executable, args, cwd, ...signal ? { signal } : {} }, async (stdout) => {
-    let pending = Buffer.alloc(0);
-    let batch = [];
-    for await (const chunk of stdout) {
-      if (signal?.aborted)
-        throw abortError();
-      pending = Buffer.concat([pending, chunk]);
-      let delimiter = pending.indexOf(0);
-      while (delimiter >= 0) {
-        const rawPath = pending.subarray(0, delimiter);
-        if (rawPath.length > MAX_PROTOCOL_LINE_BYTES) {
-          throw new SiftLightError("ripgrep file path exceeds the protocol byte limit");
-        }
-        const path = rawPath.toString("utf8");
-        if (Buffer.from(path, "utf8").equals(rawPath)) {
-          if (candidateCount < maxFiles) {
-            candidateCount += 1;
-            batch.push(resolve4(cwd, path));
-          } else {
-            enumerationTruncated = true;
-          }
-          if (batch.length === MAX_SOURCE_REVISION_CONCURRENCY) {
-            await captureBatch(batch, revisions, signal, recordMetadataFailure);
-            batch = [];
-          }
-        } else {
-          invalidPathCount += 1;
-        }
-        pending = pending.subarray(delimiter + 1);
-        delimiter = pending.indexOf(0);
-      }
-      if (pending.length > MAX_PROTOCOL_LINE_BYTES) {
-        throw new SiftLightError("ripgrep file path exceeds the protocol byte limit");
-      }
-    }
-    if (pending.length > 0) {
-      throw new SiftLightError("ripgrep file enumeration ended without a NUL delimiter");
-    }
-    await captureBatch(batch, revisions, signal, recordMetadataFailure);
-  });
-  const diagnostics = classifyRipgrepDiagnostics(result.stderr);
-  const inputError = createRipgrepInputError(result.stderr, redact, request);
-  const unreadable = [...diagnostics.unreadable, ...diagnostics.recoverable, ...metadataFailures];
-  if (inputError)
-    throw inputError;
-  if (result.code === 2 && diagnostics.other.length === 0 && unreadable.length > 0)
-    return { revisions, unreadable, enumerationTruncated, invalidPathCount };
-  if (result.code !== 0 && result.code !== 1) {
-    throw new SiftLightError(result.stderr.trim() || `ripgrep file enumeration exited with status ${String(result.code)}`);
-  }
-  return { revisions, unreadable, enumerationTruncated, invalidPathCount };
-}
-async function retainStableSourceRevisions(paths, before, signal) {
-  const after = new Map;
-  const candidates = [...paths].filter((path) => before.has(path));
-  for (let offset = 0;offset < candidates.length; offset += MAX_SOURCE_REVISION_CONCURRENCY) {
-    await captureBatch(candidates.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY), after, signal);
-  }
-  return new Map([...after].filter(([path, revision]) => {
-    const initial = before.get(path);
-    return initial !== undefined && sameSourceRevision(initial, revision);
-  }));
-}
-
-// src/rg.ts
-function isRecord2(value) {
-  return typeof value === "object" && value !== null;
-}
-function isRgText(value) {
-  return isRecord2(value) && (typeof value.text === "string" || typeof value.bytes === "string");
-}
-function isRgSubmatch(value) {
-  if (!isRecord2(value))
-    return false;
-  return isRgText(value.match) && typeof value.start === "number" && Number.isSafeInteger(value.start) && typeof value.end === "number" && Number.isSafeInteger(value.end) && value.start >= 0 && value.end >= value.start;
-}
-function isRgMatchEvent(value) {
-  if (!isRecord2(value) || value.type !== "match" || !isRecord2(value.data))
-    return false;
-  const submatches = value.data.submatches;
-  return isRgText(value.data.path) && isRgText(value.data.lines) && typeof value.data.line_number === "number" && Number.isSafeInteger(value.data.line_number) && value.data.line_number > 0 && (submatches === undefined || Array.isArray(submatches) && submatches.every(isRgSubmatch));
-}
-function decodeRgText(value, field) {
-  if (typeof value.text === "string") {
-    return { text: value.text, bytes: Buffer.from(value.text, "utf8"), encoding: "utf-16" };
-  }
-  if (typeof value.bytes === "string") {
-    const bytes = Buffer.from(value.bytes, "base64");
-    return { text: bytes.toString("utf8"), bytes, encoding: "utf-8" };
-  }
-  throw new SiftLightError(`ripgrep JSON event omitted ${field}`);
-}
-function displayPath(rawPath, cwd) {
-  const absolutePath = isAbsolute3(rawPath) ? rawPath : resolve5(cwd, rawPath);
-  const localPath = relative2(cwd, absolutePath).replaceAll("\\", "/");
-  const isInsideCwd = localPath !== ".." && !localPath.startsWith("../") && !isAbsolute3(localPath);
-  return {
-    absolutePath,
-    displayPath: isInsideCwd && localPath.length > 0 ? localPath : absolutePath
-  };
-}
-function jsonObjectEnd(value, start, end) {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start;index < end; index += 1) {
-    const character = value[index];
-    if (inString) {
-      if (escaped)
-        escaped = false;
-      else if (character === "\\")
-        escaped = true;
-      else if (character === '"')
-        inString = false;
-      continue;
-    }
-    if (character === '"') {
-      inString = true;
-      continue;
-    }
-    if (character === "{") {
-      depth += 1;
-      continue;
-    }
-    if (character !== "}")
-      continue;
-    depth -= 1;
-    if (depth === 0)
-      return index + 1;
-  }
-  return;
-}
-function jsonObjectStringProperty(value, property, pathStart) {
-  let offset = pathStart + '"path"'.length;
-  while (/\s/.test(value[offset] ?? ""))
-    offset += 1;
-  if (value[offset] !== ":")
-    return;
-  offset += 1;
-  while (/\s/.test(value[offset] ?? ""))
-    offset += 1;
-  if (value[offset] !== "{")
-    return;
-  const objectEnd = jsonObjectEnd(value, offset, value.length);
-  if (objectEnd === undefined)
-    return;
-  try {
-    const parsed = JSON.parse(value.slice(offset, objectEnd));
-    if (!isRecord2(parsed))
-      return;
-    const candidate = parsed[property];
-    return typeof candidate === "string" ? candidate : undefined;
-  } catch {
-    return;
-  }
-}
-function oversizedMatchPath(prefix, cwd) {
-  const pathStart = prefix.indexOf('"path"');
-  if (pathStart < 0)
-    return;
-  const text = jsonObjectStringProperty(prefix, "text", pathStart);
-  if (text !== undefined)
-    return displayPath(text, cwd);
-  const encoded = jsonObjectStringProperty(prefix, "bytes", pathStart);
-  if (encoded === undefined)
-    return;
-  const bytes = Buffer.from(encoded, "base64");
-  const decoded = bytes.toString("utf8");
-  return Buffer.from(decoded, "utf8").equals(bytes) ? displayPath(decoded, cwd) : undefined;
-}
-async function assertSearchTargetIdentity(policy, path, expectedCanonical) {
-  const currentCanonical = await policy.resolveExistingPath(path);
-  if (currentCanonical !== expectedCanonical) {
-    throw new SiftLightError("Search target changed during validation; retry the search");
-  }
-}
-async function assertRetainedPathsAllowed(policy, paths, signal) {
-  for (let offset = 0;offset < paths.length; offset += MAX_SOURCE_REVISION_CONCURRENCY) {
-    if (signal?.aborted)
-      throw abortError();
-    const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
-    await Promise.all(batch.map((path) => policy.resolveExistingPath(path)));
-  }
-}
-function utf16Length(value) {
-  return value.length;
-}
-function byteOffsetToCharacter(bytes, byteOffset, encoding) {
-  if (byteOffset < 0 || byteOffset > bytes.length) {
-    throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
-  }
-  if (encoding === "utf-8")
-    return byteOffset;
-  const prefix = bytes.subarray(0, byteOffset).toString("utf8").replaceAll("\r", "");
-  return utf16Length(prefix);
-}
-function createOccurrences(lineNumber, decodedLine, submatches) {
-  const range = {
-    start: { line: lineNumber - 1, character: 0 },
-    end: { line: lineNumber - 1, character: 0 },
-    encoding: decodedLine.encoding
-  };
-  const occurrences = [];
-  for (const submatch of submatches) {
-    if (submatch.end > decodedLine.bytes.length) {
-      throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
-    }
-    occurrences.push({
-      byteStart: submatch.start,
-      byteEnd: submatch.end,
-      range: {
-        start: {
-          ...range.start,
-          character: byteOffsetToCharacter(decodedLine.bytes, submatch.start, range.encoding)
-        },
-        end: {
-          ...range.end,
-          character: byteOffsetToCharacter(decodedLine.bytes, submatch.end, range.encoding)
-        },
-        encoding: range.encoding
-      }
-    });
-  }
-  return occurrences;
-}
-function fileScopeArguments(request) {
-  const args = [];
-  if (request.ignorePolicy === "include")
-    args.push("--no-ignore", "--no-ignore-parent");
-  if (request.hidden)
-    args.push("--hidden");
-  for (const glob of request.glob)
-    args.push("--glob", glob);
-  for (const excluded of request.exclude) {
-    const normalized = excluded.startsWith("!") ? excluded : `!${excluded}`;
-    args.push("--glob", normalized);
-  }
-  args.push("--iglob", "!.git", "--iglob", "!.git/**", "--iglob", "!**/.git/**");
-  return args;
-}
-function buildRipgrepArguments(request, cwd, validatedSearchPath) {
-  const searchPath = validatedSearchPath ?? resolve5(cwd, request.path ?? ".");
-  const policy = new SearchPathPolicy(cwd);
-  policy.assertPath(searchPath);
-  const args = [
-    "--no-config",
-    "--json",
-    "--line-number",
-    "--color=never",
-    "--no-heading",
-    ...request.binaryAsText ? ["--text"] : [],
-    ...fileScopeArguments(request),
-    ...policy.ripgrepGlobArguments(searchPath)
-  ];
-  args.push(...patternArguments(request));
-  const searchTarget = isPathInsideCwd(searchPath, cwd) ? relative2(resolve5(cwd), searchPath) || "." : searchPath;
-  args.push("--", request.pattern, searchTarget);
-  return args;
-}
-function patternArguments(request) {
-  return [
-    ...request.wholeWord ? ["--word-regexp"] : [],
-    ...request.literal ? ["--fixed-strings"] : [],
-    request.ignoreCase === true ? "--ignore-case" : request.ignoreCase === false ? "--case-sensitive" : "--smart-case"
-  ];
-}
-function createRipgrepRunner(options = {}) {
-  const maxStoredMatches = options.maxStoredMatches ?? MAX_STORED_MATCHES;
-  const maxEventBytes = options.maxEventBytes ?? MAX_PROTOCOL_LINE_BYTES;
-  const maxSourceRevisionFiles = options.maxSourceRevisionFiles ?? MAX_SOURCE_REVISION_FILES;
-  return async function runRipgrep(request, cwd, signal) {
-    if (signal?.aborted)
-      throw abortError();
-    const executable = options.executable ?? await resolveRipgrepExecutable();
-    const searchPath = resolve5(cwd, request.path ?? ".");
-    const policy = new SearchPathPolicy(cwd);
-    const validatedSearchPath = await policy.resolveSearchTarget(searchPath);
-    const ripgrepCwd = await policy.ripgrepWorkingDirectory(validatedSearchPath);
-    const expectedSearchTarget = await policy.resolveExistingPath(validatedSearchPath);
-    const searchTarget = isPathInsideCwd(validatedSearchPath, cwd) ? relative2(resolve5(cwd), validatedSearchPath) || "." : validatedSearchPath;
-    const args = buildRipgrepArguments(request, cwd, validatedSearchPath);
-    if (signal?.aborted)
-      throw abortError();
-    const matches = [];
-    const retention = new SearchRetention(options.maxStoredBytes, options.maxStoredOccurrences);
-    const fileCounts = new Map;
-    const lossyPaths = new Set;
-    const oversizedPathReasons = new Set;
-    let totalMatches = 0;
-    let truncatedLines = 0;
-    let modificationTimeFilterIncomplete = false;
-    let candidateRevisions = new Map;
-    const onLine = (line) => {
-      if (line.length === 0)
-        return;
-      let event;
-      try {
-        event = JSON.parse(line);
-      } catch (error) {
-        throw new SiftLightError("Failed to parse ripgrep JSON output", { cause: error });
-      }
-      if (!isRecord2(event))
-        return;
-      if (event.type !== "match")
-        return;
-      if (!isRgMatchEvent(event)) {
-        throw new SiftLightError("ripgrep emitted an invalid match event");
-      }
-      const rawPath = decodeRgText(event.data.path, "path");
-      const rawContent = decodeRgText(event.data.lines, "line content");
-      const normalizedContent = rawContent.text.replaceAll("\r", "").replace(/\n$/, "");
-      const path = displayPath(rawPath.text, cwd);
-      if (request.modifiedAfterMs !== undefined || request.modifiedBeforeMs !== undefined) {
-        const revision = candidateRevisions.get(path.absolutePath);
-        if (!revision) {
-          modificationTimeFilterIncomplete = true;
-          retention.noteLimit(`Modification time could not be verified for ${path.displayPath}; matching evidence was retained`);
-        } else if (!matchesModificationTime(revision, request.modifiedAfterMs, request.modifiedBeforeMs)) {
-          return;
-        }
-      }
-      if (rawPath.encoding === "utf-8")
-        lossyPaths.add(path.absolutePath);
-      const submatches = event.data.submatches ?? [];
-      if (submatches.some((match) => match.end > rawContent.bytes.length))
-        throw new SiftLightError("ripgrep emitted a submatch outside its matching line");
-      const primaryOccurrence = submatches[0];
-      let focusStart = 0;
-      let focusEnd = 0;
-      if (primaryOccurrence) {
-        focusStart = byteOffsetToCharacter(rawContent.bytes, primaryOccurrence.start, "utf-16");
-        focusEnd = byteOffsetToCharacter(rawContent.bytes, primaryOccurrence.end, "utf-16");
-      }
-      const excerpt = excerptText(normalizedContent, focusStart, focusEnd);
-      const { text: lineContent, truncated: lineTruncated } = excerpt;
-      totalMatches += 1;
-      if (!fileCounts.has(path.displayPath)) {
-        if (retention.file(path.displayPath, path.absolutePath))
-          fileCounts.set(path.displayPath, 0);
-      }
-      if (fileCounts.has(path.displayPath))
-        fileCounts.set(path.displayPath, (fileCounts.get(path.displayPath) ?? 0) + 1);
-      if (lineTruncated)
-        truncatedLines += 1;
-      if (matches.length >= maxStoredMatches)
-        retention.noteLimit(`Matching-line retention reached the ${String(maxStoredMatches)} limit`);
-      if (matches.length < maxStoredMatches && retention.canRetainOccurrences(submatches.length)) {
-        const match = {
-          ...path,
-          lineNumber: event.data.line_number,
-          lineContent,
-          lineTruncated,
-          occurrences: createOccurrences(event.data.line_number, rawContent, submatches)
-        };
-        if (retention.retain(match))
-          matches.push(match);
-      }
-    };
-    try {
-      const before = await captureCandidateRevisions(executable, [
-        "--no-config",
-        "--files",
-        "--null",
-        ...fileScopeArguments(request),
-        ...policy.ripgrepGlobArguments(validatedSearchPath),
-        "--",
-        searchTarget
-      ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
-      let ignoredFileCount = 0;
-      let ignoredFileSamples = [];
-      let filesystemCoverage = "complete";
-      const filesystemCoverageReasons = new Set;
-      const filesystemErrorSamples = new Set;
-      const noteFilesystemDiagnostics = (diagnostics) => {
-        for (const diagnostic of diagnostics) {
-          if (filesystemErrorSamples.size >= 20)
-            break;
-          filesystemErrorSamples.add(boundedRipgrepDiagnostic(diagnostic.message, request.redact));
-        }
-      };
-      if (before.enumerationTruncated) {
-        filesystemCoverage = "partial";
-        filesystemCoverageReasons.add(`Filesystem coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`);
-      }
-      if (before.invalidPathCount > 0) {
-        filesystemCoverage = "partial";
-        filesystemCoverageReasons.add(`${String(before.invalidPathCount)} candidate path(s) were not valid UTF-8`);
-      }
-      if (request.ignorePolicy !== "include") {
-        const allCandidates = await captureCandidateRevisions(executable, [
-          "--no-config",
-          "--files",
-          "--null",
-          ...fileScopeArguments({ ...request, ignorePolicy: "include" }),
-          ...policy.ripgrepGlobArguments(validatedSearchPath),
-          "--",
-          searchTarget
-        ], ripgrepCwd, maxSourceRevisionFiles, signal, request.redact, request);
-        const ignored = [...allCandidates.revisions.keys()].filter((path) => !before.revisions.has(path));
-        ignoredFileCount = ignored.length;
-        ignoredFileSamples = ignored.slice(0, 20).map((path) => displayPath(path, cwd).displayPath);
-        if (ignoredFileCount > 0)
-          filesystemCoverage = "policy-filtered";
-        if (allCandidates.unreadable.length > 0) {
-          filesystemCoverage = "partial";
-          retention.noteLimit(describeUnreadableDiagnostics(allCandidates.unreadable));
-          noteFilesystemDiagnostics(allCandidates.unreadable);
-        }
-        if (allCandidates.enumerationTruncated) {
-          filesystemCoverage = "partial";
-          filesystemCoverageReasons.add(`Include-ignored coverage comparison reached the ${String(maxSourceRevisionFiles)} file metadata limit`);
-        }
-        if (allCandidates.invalidPathCount > 0) {
-          filesystemCoverage = "partial";
-          filesystemCoverageReasons.add(`${String(allCandidates.invalidPathCount)} include-ignored candidate path(s) were not valid UTF-8`);
-        }
-      }
-      if (hasRequestedRootUnreadable(before.unreadable, cwd, validatedSearchPath))
-        throw new SiftLightError(describeUnreadableDiagnostics(before.unreadable));
-      candidateRevisions = before.revisions;
-      if (before.unreadable.length > 0) {
-        retention.noteLimit(describeUnreadableDiagnostics(before.unreadable));
-        noteFilesystemDiagnostics(before.unreadable);
-      }
-      if (before.unreadable.length > 0)
-        filesystemCoverage = "partial";
-      if (before.unreadable.length > 0)
-        filesystemCoverageReasons.add(describeUnreadableDiagnostics(before.unreadable));
-      await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
-      const { code, stderr } = await runOwnedProcess({ executable, args, cwd: ripgrepCwd, ...signal ? { signal } : {} }, (stdout) => consumeCappedLines(stdout, onLine, {
-        maxLineBytes: maxEventBytes,
-        onLineTooLong: ({ prefix, observedBytes }) => {
-          const source = oversizedMatchPath(prefix, cwd);
-          const label = source?.displayPath ?? "unknown source";
-          if (oversizedPathReasons.has(label))
-            return;
-          oversizedPathReasons.add(label);
-          retention.noteLimit(`Skipped oversized ripgrep match line in ${JSON.stringify(label)}; observed at least ${String(observedBytes)} bytes, limit is ${String(maxEventBytes)} bytes`);
-        }
-      }));
-      const diagnostics = classifyRipgrepDiagnostics(stderr);
-      const inputError = createRipgrepInputError(stderr, request.redact, request);
-      if (inputError)
-        throw inputError;
-      const filesystemDiagnostics = [...diagnostics.unreadable, ...diagnostics.recoverable];
-      if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, validatedSearchPath))
-        throw new SiftLightError(describeUnreadableDiagnostics(diagnostics.unreadable));
-      if (filesystemDiagnostics.length > 0) {
-        retention.noteLimit(describeUnreadableDiagnostics(filesystemDiagnostics));
-        filesystemCoverage = "partial";
-        filesystemCoverageReasons.add(describeUnreadableDiagnostics(filesystemDiagnostics));
-        noteFilesystemDiagnostics(filesystemDiagnostics);
-      }
-      if (code === 2 && (diagnostics.other.length > 0 || filesystemDiagnostics.length === 0)) {
-        throw new SiftLightError(stderr.trim() || `ripgrep exited with status ${String(code)}`);
-      }
-      if ((before.unreadable.length > 0 || filesystemDiagnostics.length > 0) && totalMatches === 0 && before.revisions.size === 0) {
-        const diagnosticsForFailure = [...before.unreadable, ...filesystemDiagnostics];
-        throw new SiftLightError(`ripgrep traversal was incomplete and produced no reliable match result; ${describeUnreadableDiagnostics(diagnosticsForFailure)}`);
-      }
-      await assertSearchTargetIdentity(policy, validatedSearchPath, expectedSearchTarget);
-      const retainedPaths = new Set(matches.map((match) => match.absolutePath).filter((path) => !lossyPaths.has(path)));
-      await assertRetainedPathsAllowed(policy, [...retainedPaths], signal);
-      const sourceRevisions = await retainStableSourceRevisions(retainedPaths, before.revisions, signal);
-      if (signal?.aborted)
-        throw abortError();
-      return {
-        request,
-        matches,
-        totalMatches,
-        fileCounts,
-        sourceRevisions,
-        snapshotComplete: matches.length === totalMatches && !modificationTimeFilterIncomplete && retention.details.reasons.length === 0,
-        filesystemCoverage,
-        filesystemErrorSamples: [...filesystemErrorSamples],
-        filesystemCoverageReasons: [...filesystemCoverageReasons],
-        ignoredFileCount,
-        ignoredFileSamples,
-        searchedFileCount: before.revisions.size,
-        truncatedLines,
-        retention: retention.details
-      };
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError")
-        throw abortError();
-      if (error instanceof RipgrepInputError)
-        throw error;
-      const cause = error instanceof Error ? error : new Error(String(error));
-      const executableMissing = "code" in cause && cause.code === "ENOENT";
-      const message = executableMissing ? `ripgrep executable not found: ${boundedRipgrepDiagnostic(executable, request.redact)}` : boundedRipgrepDiagnostic(cause.message, request.redact);
-      throw new SiftLightError(message, { cause });
-    }
-  };
-}
-
 // src/structure.ts
-import { isAbsolute as isAbsolute4, resolve as resolve6 } from "node:path";
+import { isAbsolute as isAbsolute4, resolve as resolve8 } from "node:path";
 var CTAGS_CAPABILITY_ARGUMENTS = [
   "--output-format=json",
   "--fields=+ne",
@@ -2956,7 +3966,7 @@ async function runCtagsCommand(executable, absolutePath, cwd, signal) {
   return tags;
 }
 function pathMatches(tagPath, absolutePath, cwd) {
-  return resolve6(isAbsolute4(tagPath) ? tagPath : resolve6(cwd, tagPath)) === resolve6(absolutePath);
+  return resolve8(isAbsolute4(tagPath) ? tagPath : resolve8(cwd, tagPath)) === resolve8(absolutePath);
 }
 function symbolFromTag(tag) {
   if (tag.line === undefined || tag.end === undefined || tag.end < tag.line)
@@ -3426,19 +4436,19 @@ class DataSources {
 }
 
 // src/service.ts
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash7 } from "node:crypto";
 
 // src/concept-worker-client.ts
-import { randomUUID } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
-import { dirname as dirname2, join as join3 } from "node:path";
+import { randomUUID as randomUUID4 } from "node:crypto";
+import { mkdir as mkdir2, rm as rm2 } from "node:fs/promises";
+import { dirname as dirname3, join as join4 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { StringDecoder } from "node:string_decoder";
+import { StringDecoder as StringDecoder2 } from "node:string_decoder";
 
 // src/concept-model.ts
-import { stat as stat4 } from "node:fs/promises";
+import { stat as stat5 } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
-import { join as join2, resolve as resolve7 } from "node:path";
+import { join as join3, resolve as resolve9 } from "node:path";
 var CONCEPT_MODEL = "Xenova/multilingual-e5-small";
 var CONCEPT_REVISION = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
 var MAX_CONCEPT_CHARS = 1000;
@@ -3474,12 +4484,12 @@ var CONCEPT_ASSETS = [
   }
 ];
 function conceptModelDirectory() {
-  return resolve7(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), CONCEPT_REVISION);
+  return resolve9(process.env.SIFT_LIGHT_MODEL_DIR ?? join3(homedir2(), ".cache", "sift-light", "models"), CONCEPT_REVISION);
 }
 async function inspectConceptModel(directory = conceptModelDirectory()) {
   for (const asset of CONCEPT_ASSETS) {
     try {
-      const information = await stat4(join2(directory, asset.path));
+      const information = await stat5(join3(directory, asset.path));
       if (!information.isFile() || information.size !== asset.bytes)
         return {
           installed: false,
@@ -3498,7 +4508,7 @@ async function inspectConceptModel(directory = conceptModelDirectory()) {
   };
 }
 function conceptCacheDirectory() {
-  return resolve7(process.env.SIFT_LIGHT_MODEL_DIR ?? join2(homedir2(), ".cache", "sift-light", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
+  return resolve9(process.env.SIFT_LIGHT_MODEL_DIR ?? join3(homedir2(), ".cache", "sift-light", "models"), "concept-cache", `${CONCEPT_REVISION}-v${String(CONCEPT_CACHE_VERSION)}`);
 }
 function resolveConceptTimeoutMs(environment = process.env) {
   const raw = environment[CONCEPT_TIMEOUT_ENV];
@@ -3509,47 +4519,6 @@ function resolveConceptTimeoutMs(environment = process.env) {
     throw new SiftLightError(`${CONCEPT_TIMEOUT_ENV} must be an integer from ${String(MIN_CONCEPT_TIMEOUT_MS)} through ${String(MAX_CONCEPT_TIMEOUT_MS)}`);
   }
   return value;
-}
-
-// src/owned-task-queue.ts
-class OwnedTaskQueue {
-  #tail = Promise.resolve();
-  async acquire(signal) {
-    if (signal?.aborted)
-      throw abortError();
-    const previous = this.#tail;
-    const completed = Promise.withResolvers();
-    this.#tail = previous.then(() => completed.promise);
-    const cancelled = Promise.withResolvers();
-    const abort = () => cancelled.reject(abortError());
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted)
-      abort();
-    try {
-      await Promise.race([previous, cancelled.promise]);
-      if (signal?.aborted)
-        throw abortError();
-      let released = false;
-      return () => {
-        if (released)
-          return;
-        released = true;
-        completed.resolve();
-      };
-    } finally {
-      signal?.removeEventListener("abort", abort);
-      if (signal?.aborted)
-        completed.resolve();
-    }
-  }
-  async run(operation, signal) {
-    const release = await this.acquire(signal);
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
 }
 
 // src/script-runtime.ts
@@ -3616,8 +4585,8 @@ class ConceptWorkerClient {
       throw new SiftLightError("Concept worker idle timeout must be 1–300000 ms");
   }
   async#start() {
-    const stagingRoot = join3(conceptCacheDirectory(), ".staging", randomUUID());
-    await mkdir(stagingRoot, { recursive: true });
+    const stagingRoot = join4(conceptCacheDirectory(), ".staging", randomUUID4());
+    await mkdir2(stagingRoot, { recursive: true });
     const ready = Promise.withResolvers();
     ready.promise.catch(() => {
       return;
@@ -3645,7 +4614,7 @@ class ConceptWorkerClient {
         const result = await runOwnedProcess({
           executable: process.execPath,
           args,
-          cwd: dirname2(this.#worker),
+          cwd: dirname3(this.#worker),
           env: {
             ...scriptRuntimeEnvironment(),
             SIFT_LIGHT_CONCEPT_CACHE_STAGING_DIR: stagingRoot
@@ -3656,7 +4625,7 @@ class ConceptWorkerClient {
           if (!stdin)
             throw new SiftLightError("Concept worker stdin unavailable");
           ready.resolve(stdin);
-          const decoder = new StringDecoder("utf8");
+          const decoder = new StringDecoder2("utf8");
           let buffered = "";
           for await (const chunk of stdout) {
             const pending = session.pending;
@@ -3693,7 +4662,7 @@ class ConceptWorkerClient {
         session.pending = undefined;
         if (this.#session === session)
           this.#session = undefined;
-        await rm(stagingRoot, { recursive: true, force: true });
+        await rm2(stagingRoot, { recursive: true, force: true });
       }
     })();
     session.finished.catch((error) => {
@@ -3750,7 +4719,7 @@ class ConceptWorkerClient {
         const input = await session.ready;
         if (combined.aborted)
           throw abortError();
-        const id = randomUUID();
+        const id = randomUUID4();
         const body = JSON.stringify({
           id,
           query,
@@ -4010,8 +4979,8 @@ function rangeEvidence(document, range) {
 }
 
 // src/concept-search.ts
-import { resolve as resolve13 } from "node:path";
-import { createHash as createHash4 } from "node:crypto";
+import { resolve as resolve14 } from "node:path";
+import { createHash as createHash5 } from "node:crypto";
 
 // src/request.ts
 function list(value) {
@@ -4091,7 +5060,7 @@ function normalizeRequest(input) {
 }
 
 // src/syntax.ts
-import { dirname as dirname3 } from "node:path";
+import { dirname as dirname4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/syntax-tree.ts
@@ -4632,7 +5601,7 @@ async function parseSyntax(path, text, signal, pattern) {
     const result = await runOwnedProcess({
       executable: process.execPath,
       args,
-      cwd: dirname3(worker),
+      cwd: dirname4(worker),
       env,
       signal: controller.signal,
       input: Buffer.from(JSON.stringify({ language, text, pattern }))
@@ -4685,116 +5654,16 @@ async function parseSyntax(path, text, signal, pattern) {
 }
 
 // src/concept-source-generation.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 
 // src/source-access.ts
-import { extname as extname2, resolve as resolve12 } from "node:path";
+import { extname as extname3, resolve as resolve13 } from "node:path";
 
 // src/historical-paths.ts
-import { lstat, mkdir as mkdir2, mkdtemp, open as open2, rm as rm2, writeFile } from "node:fs/promises";
+import { lstat, mkdir as mkdir3, mkdtemp as mkdtemp2, open as open2, rm as rm3, writeFile as writeFile2 } from "node:fs/promises";
 import { constants as constants2 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname as dirname4, join as join4, parse, relative as relative4, resolve as resolve9 } from "node:path";
-
-// src/workspace-files.ts
-import { relative as relative3, resolve as resolve8, sep as sep2 } from "node:path";
-class EnumerationLimit extends Error {
-}
-function workspaceRelativePath(cwd, path, policy = new SearchPathPolicy(cwd)) {
-  const absolute = resolve8(cwd, path);
-  policy.assertPath(absolute);
-  const local = relative3(resolve8(cwd), absolute);
-  if (local.split(sep2).some((part) => part.toLowerCase() === ".git"))
-    throw new SiftLightError("Git internals are excluded from source candidates");
-  return isPathInsideCwd(absolute, cwd) ? local.split(sep2).join("/") : absolute.replaceAll("\\", "/");
-}
-async function listWorkspaceFiles(cwd, signal, options = {}) {
-  const absolutePath = resolve8(cwd, options.path ?? ".");
-  const policy = new SearchPathPolicy(cwd);
-  const searchPath = await policy.resolveSearchTarget(absolutePath);
-  const ripgrepCwd = await policy.ripgrepWorkingDirectory(searchPath);
-  const maxFiles = options.maxFiles ?? MAX_SOURCE_REVISION_FILES;
-  if (!Number.isSafeInteger(maxFiles) || maxFiles < 1)
-    throw new SiftLightError("Candidate file limit must be a positive integer");
-  const paths = new Set;
-  const reasons = new Set;
-  let coverageIssue;
-  let bytes = 0;
-  try {
-    const result = await runOwnedProcess({
-      executable: await resolveRipgrepExecutable(),
-      args: [
-        "--no-config",
-        "--files",
-        "--sort",
-        "path",
-        "--null",
-        ...options.ignore === false ? ["--no-ignore"] : [],
-        ...options.ignoreParents === false ? ["--no-ignore-parent"] : [],
-        ...fileScopeArguments({
-          hidden: options.hidden ?? true,
-          glob: options.glob ?? [],
-          exclude: options.exclude ?? []
-        }),
-        ...policy.ripgrepGlobArguments(searchPath),
-        "--",
-        searchPath
-      ],
-      cwd: ripgrepCwd,
-      ...signal ? { signal } : {}
-    }, async (stdout) => {
-      let pending = Buffer.alloc(0);
-      for await (const chunk of stdout) {
-        if (signal?.aborted)
-          throw abortError();
-        bytes += chunk.byteLength;
-        if (bytes > MAX_PROTOCOL_LINE_BYTES)
-          throw new EnumerationLimit(`Candidate enumeration exceeds the ${String(MAX_PROTOCOL_LINE_BYTES)} byte protocol limit`);
-        pending = Buffer.concat([pending, chunk]);
-        let delimiter = pending.indexOf(0);
-        while (delimiter >= 0) {
-          const raw = pending.subarray(0, delimiter);
-          const decoded = raw.toString("utf8");
-          if (!Buffer.from(decoded).equals(raw)) {
-            reasons.add("Some candidate paths are not valid UTF-8");
-            coverageIssue ??= "invalid-path";
-          } else {
-            const local = workspaceRelativePath(cwd, decoded, policy);
-            if (!paths.has(local) && paths.size >= maxFiles)
-              throw new EnumerationLimit(`Candidate enumeration reached the ${String(maxFiles)} file limit`);
-            paths.add(local);
-          }
-          pending = pending.subarray(delimiter + 1);
-          delimiter = pending.indexOf(0);
-        }
-      }
-      if (pending.length > 0)
-        throw new SiftLightError("Candidate enumeration ended without a NUL delimiter");
-    });
-    const diagnostics = classifyRipgrepDiagnostics(result.stderr);
-    if (hasRequestedRootUnreadable(diagnostics.unreadable, cwd, searchPath))
-      throw new SiftLightError(describeUnreadableDiagnostics(diagnostics.unreadable));
-    if (diagnostics.unreadable.length > 0) {
-      reasons.add(describeUnreadableDiagnostics(diagnostics.unreadable));
-      coverageIssue = "unreadable";
-    }
-    if (result.code === 2 && (diagnostics.other.length > 0 || diagnostics.unreadable.length === 0))
-      throw new SiftLightError(result.stderr.trim() || `Candidate enumeration exited ${String(result.code)}`);
-  } catch (error) {
-    if (!(error instanceof EnumerationLimit))
-      throw error;
-    reasons.add(error.message);
-    coverageIssue = "enumeration-limit";
-  }
-  return {
-    paths: [...paths].toSorted(),
-    partial: reasons.size > 0,
-    reasons: [...reasons],
-    ...coverageIssue ? { coverageIssue } : {}
-  };
-}
-
-// src/historical-paths.ts
+import { tmpdir as tmpdir2 } from "node:os";
+import { dirname as dirname5, join as join5, parse, relative as relative4, resolve as resolve10 } from "node:path";
 function partitionPaths(paths) {
   const groups = [];
   for (const path of paths) {
@@ -4808,11 +5677,11 @@ function partitionPaths(paths) {
 }
 function relevantDirectories(cwd, paths) {
   const directories = new Set;
-  for (const path of [cwd, ...paths.map((sourcePath) => dirname4(resolve9(cwd, sourcePath)))]) {
+  for (const path of [cwd, ...paths.map((sourcePath) => dirname5(resolve10(cwd, sourcePath)))]) {
     let current = path;
     for (;; ) {
       directories.add(current);
-      const parent = dirname4(current);
+      const parent = dirname5(current);
       if (current === parent)
         break;
       current = parent;
@@ -4821,7 +5690,7 @@ function relevantDirectories(cwd, paths) {
   return [...directories];
 }
 async function filterHistoricalPaths(cwd, paths, request, signal) {
-  if (!isPathInsideCwd(resolve9(cwd, request.path ?? "."), cwd)) {
+  if (!isPathInsideCwd(resolve10(cwd, request.path ?? "."), cwd)) {
     throw new SiftLightError("Historical path filtering requires a path inside cwd");
   }
   const selectedPath = workspaceRelativePath(cwd, request.path ?? ".");
@@ -4832,8 +5701,8 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
   const bounded = candidates.slice(0, MAX_STRUCTURE_FILES);
   if (bounded.length === 0)
     return { paths: [], partial: reasons.size > 0, reasons: [...reasons], ignoreBytesRead: 0 };
-  const root = await mkdtemp(join4(tmpdir(), "sift-light-paths-"));
-  const absoluteCwd = resolve9(cwd);
+  const root = await mkdtemp2(join5(tmpdir2(), "sift-light-paths-"));
+  const absoluteCwd = resolve10(cwd);
   const volumeRoot = parse(absoluteCwd).root;
   const ignoreFiles = [];
   let ignoreBytesRead = 0;
@@ -4844,7 +5713,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       for (const name of [".ignore", ".rgignore"]) {
         if (signal?.aborted)
           throw abortError();
-        const path = join4(directory, name);
+        const path = join5(directory, name);
         let discovered = false;
         try {
           const before = await lstat(path);
@@ -4890,19 +5759,19 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
     }
     const visible = new Set;
     for (const [index, group] of partitionPaths(bounded).entries()) {
-      const tree = join4(root, String(index));
-      const target = join4(tree, relative4(volumeRoot, absoluteCwd));
-      await mkdir2(target, { recursive: true });
+      const tree = join5(root, String(index));
+      const target = join5(tree, relative4(volumeRoot, absoluteCwd));
+      await mkdir3(target, { recursive: true });
       for (const path of group) {
         const safe = workspaceRelativePath(absoluteCwd, path);
-        const placeholder = resolve9(target, safe);
-        await mkdir2(dirname4(placeholder), { recursive: true });
-        await writeFile(placeholder, "");
+        const placeholder = resolve10(target, safe);
+        await mkdir3(dirname5(placeholder), { recursive: true });
+        await writeFile2(placeholder, "");
       }
       for (const ignore of ignoreFiles) {
-        const destination = join4(tree, ignore.local);
-        await mkdir2(dirname4(destination), { recursive: true });
-        await writeFile(destination, ignore.bytes);
+        const destination = join5(tree, ignore.local);
+        await mkdir3(dirname5(destination), { recursive: true });
+        await writeFile2(destination, ignore.bytes);
       }
       const privacy = await listWorkspaceFiles(tree, signal, { ignoreParents: false });
       const prefix = `${relative4(tree, target).split("\\").join("/")}/`;
@@ -4927,7 +5796,7 @@ async function filterHistoricalPaths(cwd, paths, request, signal) {
       ignoreBytesRead
     };
   } finally {
-    await rm2(root, { recursive: true, force: true });
+    await rm3(root, { recursive: true, force: true });
   }
 }
 
@@ -5090,10 +5959,10 @@ async function sourceSimilarity(oldContent, newContent, budget) {
 }
 
 // src/git-repository.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 import { constants as constants3 } from "node:fs";
 import { lstat as lstat2, open as open3 } from "node:fs/promises";
-import { isAbsolute as isAbsolute6, relative as relative5, resolve as resolve10, sep as sep3 } from "node:path";
+import { isAbsolute as isAbsolute6, relative as relative5, resolve as resolve11, sep as sep3 } from "node:path";
 
 // src/git-process.ts
 var GIT_READ_ARGUMENTS = [
@@ -5237,8 +6106,8 @@ function splitGitRecords(output) {
 // src/git-repository.ts
 async function verifyWorktreeRevision(cwd, path, expected) {
   try {
-    const current = await lstat2(resolve10(cwd, path));
-    await assertExistingPathInsideCwd(resolve10(cwd, path), cwd);
+    const current = await lstat2(resolve11(cwd, path));
+    await assertExistingPathInsideCwd(resolve11(cwd, path), cwd);
     if (current.isFile() && sameSourceRevision(sourceRevisionFromStats(current), expected))
       return;
   } catch (error) {
@@ -5250,8 +6119,8 @@ async function verifyWorktreeRevision(cwd, path, expected) {
 function gitPath(cwd, path) {
   if (path.length === 0 || path.includes("\x00"))
     throw new SiftLightError("Git source path is invalid");
-  const absolute = resolve10(cwd, path);
-  const local = relative5(resolve10(cwd), absolute).split(sep3).join("/");
+  const absolute = resolve11(cwd, path);
+  const local = relative5(resolve11(cwd), absolute).split(sep3).join("/");
   if (!isPathInsideCwd(absolute, cwd) || local.split("/").some((part) => part.toLowerCase() === ".git")) {
     throw new SiftLightError("Git source path must stay within the working directory and outside .git");
   }
@@ -5275,7 +6144,7 @@ async function resolveGitRepository(cwd, signal) {
   const root = decodeGitPath(output).replace(/\r?\n$/, "");
   if (!isAbsolute6(root))
     throw new SiftLightError("Git returned an invalid repository root");
-  return resolve10(root);
+  return resolve11(root);
 }
 async function findGitRepository(cwd, signal) {
   try {
@@ -5360,7 +6229,7 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
   budget.bytes += output.length;
   if (output.length !== size)
     throw new SiftLightError("Git blob size does not match its immutable tree entry");
-  const verifiedBlob = createHash(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
+  const verifiedBlob = createHash2(blob.length === 40 ? "sha1" : "sha256").update(`blob ${String(output.length)}\x00`).update(output).digest("hex");
   if (verifiedBlob !== blob)
     throw new SiftLightError("Git blob bytes do not match their immutable object identity");
   return {
@@ -5369,11 +6238,11 @@ async function readGitBlob(cwd, commit, entry, budget, signal) {
     sourceStatus: output.includes(0) ? "binary" : "available",
     ...output.includes(0) ? { reason: "Binary source contains NUL bytes" } : { content: output },
     origin: { kind: "git", commit, blob },
-    contentHash: createHash("sha256").update(output).digest("hex")
+    contentHash: createHash2("sha256").update(output).digest("hex")
   };
 }
 async function readWorktreeSource(cwd, path, budget, signal) {
-  const absolute = resolve10(cwd, path);
+  const absolute = resolve11(cwd, path);
   if (signal?.aborted)
     throw abortError();
   let discovered = false;
@@ -5429,9 +6298,9 @@ async function readWorktreeSource(cwd, path, budget, signal) {
         origin: {
           kind: "worktree",
           revision: sourceRevisionFromStats(after),
-          contentHash: createHash("sha256").update(content).digest("hex")
+          contentHash: createHash2("sha256").update(content).digest("hex")
         },
-        contentHash: createHash("sha256").update(content).digest("hex")
+        contentHash: createHash2("sha256").update(content).digest("hex")
       };
     } finally {
       await handle.close();
@@ -5676,9 +6545,9 @@ async function readGitSource(cwd, identity, signal, options = {}) {
 
 // src/source-document.ts
 import { isUtf8 } from "node:buffer";
-import { createHash as createHash2 } from "node:crypto";
-import { open as open4, realpath as realpath3 } from "node:fs/promises";
-import { relative as relative6, resolve as resolve11 } from "node:path";
+import { createHash as createHash3 } from "node:crypto";
+import { open as open4, realpath as realpath4 } from "node:fs/promises";
+import { relative as relative6, resolve as resolve12 } from "node:path";
 class SourceDocumentError extends SiftLightError {
   reason;
   constructor(reason, message) {
@@ -5688,7 +6557,7 @@ class SourceDocumentError extends SiftLightError {
   }
 }
 function contentHash(bytes) {
-  return createHash2("sha256").update(bytes).digest("hex");
+  return createHash3("sha256").update(bytes).digest("hex");
 }
 
 class SourceDocument {
@@ -5830,10 +6699,10 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
   if (expected?.kind === "git") {
     throw new SiftLightError("A Git source reference cannot be read from the worktree");
   }
-  const absolute = resolve11(cwd, path);
+  const absolute = resolve12(cwd, path);
   const [canonical, canonicalCwd] = await Promise.all([
     new SearchPathPolicy(cwd).resolveExistingPath(absolute),
-    realpath3(cwd)
+    realpath4(cwd)
   ]);
   if (!canonical)
     throw new SourceDocumentError("source-unavailable", `Path not found: ${path}`);
@@ -5877,7 +6746,7 @@ async function readWorkspaceDocument(path, cwd, signal, expected, readBudget = M
   } finally {
     await handle.close();
   }
-  const [after, finalPath] = await Promise.all([getSourceRevision(absolute), realpath3(absolute)]);
+  const [after, finalPath] = await Promise.all([getSourceRevision(absolute), realpath4(absolute)]);
   if (!after || canonical !== finalPath || !sameSourceRevision(before, after)) {
     throw new SourceDocumentError("source-changed", "Source changed during reading");
   }
@@ -5921,7 +6790,7 @@ class SyntaxQueue {
         throw new SourceDocumentError("encoding", "Syntax requires lossless UTF-8 source");
       const origin = document.reference.origin;
       const revision = origin.kind === "worktree" ? origin.contentHash : origin.blob;
-      const key = `${extname2(document.path).toLowerCase()}\x00${revision}\x00${pattern ?? ""}`;
+      const key = `${extname3(document.path).toLowerCase()}\x00${revision}\x00${pattern ?? ""}`;
       const cached = this.#cache.get(key);
       if (cached) {
         this.#cache.delete(key);
@@ -6012,10 +6881,10 @@ class SourceAccess {
   async load(path, expected) {
     if (this.signal?.aborted)
       throw abortError();
-    if (expected && resolve12(this.cwd, expected.path) !== resolve12(this.cwd, path)) {
+    if (expected && resolve13(this.cwd, expected.path) !== resolve13(this.cwd, path)) {
       throw new SiftLightError("Source reference path does not match the requested file");
     }
-    const key = JSON.stringify([resolve12(this.cwd, path), expected?.origin]);
+    const key = JSON.stringify([resolve13(this.cwd, path), expected?.origin]);
     const existing = this.#documents.get(key);
     if (existing)
       return existing;
@@ -6047,7 +6916,7 @@ class SourceAccess {
     if (remaining <= 0)
       throw new SourceBudgetError("Structural scan reached the 32 MiB read limit");
     if (expected?.origin.kind !== "git") {
-      const metadata = await getSourceRevision(resolve12(this.cwd, path));
+      const metadata = await getSourceRevision(resolve13(this.cwd, path));
       if (metadata && metadata.size > remaining)
         throw new SourceBudgetError("Next source exceeds the remaining 32 MiB structural read budget");
     }
@@ -6180,7 +7049,7 @@ async function createConceptSourceGeneration(access, filters, providedFiles) {
       reasons.push(`${path}: ${error.message}`);
     }
   }
-  const inventoryHash = createHash3("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32);
+  const inventoryHash = createHash4("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32);
   return {
     cwd: access.cwd,
     filters: {
@@ -6381,6 +7250,8 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
       reasons: []
     });
     inventory.push(...generation.inventory);
+    if (options.onSourceBatch)
+      await options.onSourceBatch(generation.documents);
     filesAdmitted += generation.filesAdmitted;
     filesSkippedEmpty += generation.filesSkippedEmpty;
     filesSkippedBinary += generation.filesSkippedBinary;
@@ -6444,7 +7315,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
     const inferred = await infer(query, passages, access.signal, onProgress);
     const retainedPathSet = retainPaths === undefined ? undefined : await retainPaths;
     for (const document of generation.documents) {
-      if (retainedPathSet?.has(resolve13(access.cwd, document.path))) {
+      if (retainedPathSet?.has(resolve14(access.cwd, document.path))) {
         retainedDocuments.push(document);
       }
     }
@@ -6517,7 +7388,7 @@ async function runConceptSearch(input, access, infer, onProgress, options = {}) 
     batchFileLimit: MAX_STRUCTURE_FILES,
     fileLimit: access.maxFiles,
     startedAt: generationStartedAt,
-    inventoryHash: createHash4("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32)
+    inventoryHash: createHash5("sha256").update(JSON.stringify(inventory)).digest("hex").slice(0, 32)
   };
   result.counts = {
     ...lexical ? { relevanceRanking: 1 } : {},
@@ -6696,11 +7567,218 @@ async function structuralSearch(input, access) {
   return result;
 }
 
+// src/native-text-search.ts
+import { createHash as createHash6 } from "node:crypto";
+import { mkdtemp as mkdtemp3, mkdir as mkdir4, readFile as readFile3, realpath as realpath5, rm as rm4, writeFile as writeFile3 } from "node:fs/promises";
+import { tmpdir as tmpdir3 } from "node:os";
+import { basename as basename3, dirname as dirname6, isAbsolute as isAbsolute7, join as join6, resolve as resolve15 } from "node:path";
+
+// src/native-text-worker-client.ts
+import { z as z2 } from "zod";
+var responseSchema2 = z2.object({
+  version: z2.literal(2),
+  id: z2.string(),
+  indexedFiles: z2.number().int().nonnegative(),
+  modelLoads: z2.literal(1),
+  modelReused: z2.boolean(),
+  processId: z2.number().int().positive(),
+  hits: z2.array(z2.object({
+    path: z2.string(),
+    score: z2.number().finite(),
+    line: z2.number().int().positive(),
+    chunkIndex: z2.number().int().nonnegative(),
+    locator: z2.string()
+  })).max(10)
+});
+
+class NativeTextWorkerClient {
+  #worker;
+  constructor(config, root, corpus, index, idleMs = 60000) {
+    this.#worker = new ResidentWorkerClient(config, root, corpus, index, { parse: (value) => responseSchema2.parse(value), maxResponseBytes: 128 * 1024 }, idleMs);
+  }
+  search(query, expectedFiles, signal) {
+    return this.#worker.search({ query, expectedFiles }, signal);
+  }
+  close() {
+    return this.#worker.close();
+  }
+}
+
+// src/native-text-search.ts
+function withLane(items, lane) {
+  return items.map((item, index) => ({
+    ...item,
+    label: `${lane} #${String(index + 1)}: ${item.label}`,
+    details: { ...item.details, retrievalLane: lane, laneRank: index + 1 }
+  }));
+}
+function interleaveRetrievalLanes(current, native) {
+  const result = [];
+  for (let i = 0;i < Math.max(current.length, native.length); i++) {
+    if (current[i])
+      result.push(current[i]);
+    if (native[i])
+      result.push(native[i]);
+  }
+  return result;
+}
+function createNativeTextSearch(config, search) {
+  const queue = new OwnedTaskQueue;
+  let directory;
+  const known = new Map;
+  let closed = false;
+  let worker;
+  const run = (input, access, progress, options) => queue.run(async () => {
+    if (closed)
+      throw new SiftLightError("Native text search is closed");
+    directory ??= mkdtemp3(join6(tmpdir3(), "sift-native-text-")).then((path) => realpath5(path));
+    const root = await directory;
+    const corpus = join6(root, "corpus");
+    await mkdir4(corpus, { recursive: true });
+    const admitted = new Map;
+    const execution = await search(input, access, progress, {
+      ...options,
+      verifySourceGeneration: false,
+      onSourceBatch: async (documents) => {
+        await options?.onSourceBatch?.(documents);
+        for (const document of documents) {
+          if (access.signal?.aborted)
+            throw abortError();
+          const path = document.path;
+          const relative = isAbsolute7(path) ? join6(createHash6("sha256").update(dirname6(path)).digest("hex"), basename3(path)) : path;
+          const staged = resolve15(corpus, relative);
+          if (!staged.startsWith(corpus + "/"))
+            throw new SiftLightError("Native staging path escaped its corpus");
+          const hash = createHash6("sha256").update(document.bytes).digest("hex");
+          const previous = known.get(path);
+          if (!previous || previous.hash !== hash) {
+            await mkdir4(dirname6(staged), { recursive: true });
+            await writeFile3(staged, document.bytes, { mode: 384 });
+          }
+          const entry = { source: document.reference, staged, hash };
+          admitted.set(path, entry);
+          known.set(path, entry);
+        }
+      }
+    });
+    for (const [path, entry] of known) {
+      if (!admitted.has(path)) {
+        await rm4(entry.staged, { force: true });
+      }
+    }
+    known.clear();
+    for (const [path, entry] of admitted)
+      known.set(path, entry);
+    let nativeItems = [];
+    if (admitted.size) {
+      progress?.({
+        phase: "native-text-search",
+        detail: `${String(admitted.size)} admitted files`
+      });
+      worker ??= new NativeTextWorkerClient(config, root, corpus, join6(root, "index.sqlite"));
+      const response = await worker.search(input.query, admitted.size, access.signal);
+      execution.analysis.stats = {
+        ...execution.analysis.stats,
+        nativeModelLoads: response.modelReused ? 0 : response.modelLoads,
+        nativeModelReused: response.modelReused,
+        nativeProcessId: response.processId
+      };
+      if (response.indexedFiles !== admitted.size)
+        throw new SiftLightError("Native text index did not admit the complete source inventory");
+      const byStaged = new Map([...admitted.values()].map((entry) => [entry.staged, entry]));
+      const seen = new Set;
+      for (const hit of response.hits) {
+        if (hit.locator !== `Line ${String(hit.line)}`)
+          throw new SiftLightError("Native text returned an inconsistent source locator");
+        const entry = byStaged.get(resolve15(hit.path));
+        if (!entry || seen.has(entry.staged))
+          throw new SiftLightError("Native text returned an unknown or duplicate source");
+        seen.add(entry.staged);
+        const content = await readFile3(entry.staged);
+        if (createHash6("sha256").update(content).digest("hex") !== entry.hash)
+          throw new SiftLightError("Native staged source changed");
+        const document = new SourceDocument(entry.source, content);
+        const range = document.lineRange(hit.line);
+        nativeItems.push({
+          path: document.path,
+          line: hit.line,
+          source: document.reference,
+          range,
+          label: `Text retrieval candidate (score ${hit.score.toFixed(4)})`,
+          ...rangeEvidence(document, range),
+          details: {
+            source: "concept",
+            kind: "concept-candidate",
+            certainty: "candidate",
+            score: hit.score,
+            nativeLocator: hit.locator,
+            nativeChunkIndex: hit.chunkIndex,
+            sourceVerified: true
+          }
+        });
+      }
+    }
+    if (options?.verifySourceGeneration !== false)
+      await verifyConceptSourceGeneration(execution.sourceGeneration, access);
+    const current = withLane(execution.analysis.items, "current");
+    nativeItems = withLane(nativeItems, "native");
+    execution.analysis = {
+      ...execution.analysis,
+      items: interleaveRetrievalLanes(current, nativeItems),
+      lanes: { current, native: nativeItems },
+      sourceGeneration: conceptSourceSummary(execution.sourceGeneration),
+      reasons: [
+        ...execution.analysis.reasons,
+        "Independent current and native text rankings are retained. Follow retrievalLanes requests to read each complete lane."
+      ],
+      counts: {
+        ...execution.analysis.counts,
+        nativeFilesIndexed: admitted.size,
+        nativeCandidatesRetained: nativeItems.length
+      }
+    };
+    return execution;
+  }, access.signal);
+  return {
+    search: run,
+    close: async () => {
+      closed = true;
+      await queue.run(async () => {
+        try {
+          await worker?.close();
+        } finally {
+          if (directory)
+            await rm4(await directory, { recursive: true, force: true });
+        }
+      });
+    }
+  };
+}
+
+// src/retrieval-ranking.ts
+function ranks(items) {
+  const result = new Map;
+  for (const item of items) {
+    if (!result.has(item.path))
+      result.set(item.path, result.size + 1);
+    if (result.size === 10)
+      break;
+  }
+  return result;
+}
+function rankRetrievalFiles(current, native) {
+  const c = ranks(current);
+  const n = ranks(native);
+  const paths = [...new Set([...n.keys(), ...c.keys()])];
+  const score = (path) => (n.has(path) ? 1 / n.get(path) : 0) + (c.has(path) ? 0.1 / c.get(path) : 0);
+  return paths.toSorted((a, b) => score(b) - score(a)).slice(0, 10);
+}
+
 // src/evidence-service.ts
-import { dirname as dirname5, extname as extname3, resolve as resolve22 } from "node:path";
+import { dirname as dirname7, extname as extname4, resolve as resolve24 } from "node:path";
 
 // src/analysis-store.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID5 } from "node:crypto";
 
 // src/analysis-types.ts
 var SEMANTIC_JUDGE_CLASSIFICATIONS = [
@@ -6913,11 +7991,22 @@ function publicItemDetails(item) {
   } : undefined;
   const semanticJudge = publicSemanticJudgeDetails(item);
   const source = item.details?.source === "literal" || item.details?.source === "concept" ? item.details.source : undefined;
-  if (!structure && !semanticJudge && !source && !relevance)
+  const lane = item.details?.retrievalLane;
+  const retrieval = lane === "current" || lane === "native" ? {
+    retrievalLane: lane,
+    laneRank: item.details?.laneRank,
+    ...lane === "native" ? {
+      score: item.details?.score,
+      certainty: "candidate",
+      nativeLocator: item.details?.nativeLocator
+    } : {}
+  } : undefined;
+  if (!structure && !semanticJudge && !source && !relevance && !retrieval)
     return;
   return {
     ...structure,
     ...relevance,
+    ...retrieval,
     ...source ? { source } : {},
     ...semanticJudge ? { semanticJudge } : {}
   };
@@ -6933,7 +8022,7 @@ function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   return {
     path: item.path,
     line: item.line,
-    label: result.kind === "outline" && modelOutput || result.kind === "files" ? item.label : publicAnalysisLabel(result),
+    label: result.kind === "outline" && modelOutput || result.kind === "files" ? item.label : `${publicAnalysisLabel(result)}${item.details?.retrievalLane === "current" || item.details?.retrievalLane === "native" ? ` [${item.details.retrievalLane} #${String(item.details.laneRank)}]` : ""}`,
     index: index + 1,
     ...inspect ? { inspect } : {},
     ...publicDetails ? { details: publicDetails } : {}
@@ -6971,8 +8060,22 @@ class AnalysisStore {
   }
   create(result, summarize) {
     this.#expire();
+    const id = randomUUID5();
     const bounded = {
       ...result,
+      ...result.retrievalLanes ? {
+        retrievalLanes: Object.fromEntries(Object.keys(result.retrievalLanes).map((lane) => {
+          if (lane !== "current" && lane !== "native")
+            throw new SiftLightError("Unknown retrieval lane");
+          return [
+            lane,
+            {
+              cursor: `${id}.analysis.0.${lane}`,
+              ...result.redact ? { redact: true } : {}
+            }
+          ];
+        }))
+      } : {},
       reasons: boundedReasons(result.reasons),
       items: [],
       coverage: {
@@ -7027,30 +8130,58 @@ class AnalysisStore {
       this.#items.delete(oldest.id);
       this.#rememberExpired(oldest.id);
     }
-    const id = randomUUID2();
     this.#items.set(id, { id, result: bounded, bytes, touched: this.#now() });
     return `${id}.${result.kind === "hybrid" && !result.counts?.relevanceRanking ? "analysis-hybrid" : "analysis"}.0`;
   }
   resolve(cursor) {
     this.#expire();
-    const match = /^([a-f0-9-]+)\.(analysis|analysis-hybrid|analysis-terms)\.([0-9a-z]+)$/.exec(cursor);
+    const match = /^([a-f0-9-]+)\.(analysis|analysis-hybrid|analysis-terms)\.([0-9a-z]+)(?:\.(current|native))?$/.exec(cursor);
     if (!match)
       throw new CursorError("Invalid analysis cursor");
     const id = match[1];
     const kind = match[2];
     const rawOffset = match[3];
+    const lane = match[4];
     if (kind !== "analysis" && kind !== "analysis-hybrid" && kind !== "analysis-terms")
       throw new CursorError("Invalid analysis cursor");
     if (!id || !rawOffset)
       throw new CursorError("Invalid analysis cursor");
     const offset = Number.parseInt(rawOffset, 36);
-    const stored = this.#items.get(id);
+    let stored = this.#items.get(id);
     if (!stored)
       throw new CursorError(this.#expired.has(id) ? "Analysis cursor expired or was evicted; run the query again" : "Analysis cursor was not found; run the query again", this.#expired.has(id) ? "E_CURSOR_EXPIRED" : "E_CURSOR_NOT_FOUND");
+    stored.touched = this.#now();
+    if (lane) {
+      if (kind !== "analysis" || !stored.result.retrievalLanes?.[lane])
+        throw new CursorError("Invalid retrieval lane");
+      stored = {
+        ...stored,
+        result: {
+          ...stored.result,
+          items: stored.result.items.filter((item) => item.details?.retrievalLane === lane)
+        }
+      };
+    } else if (stored.result.rankedFiles) {
+      const representatives = new Map;
+      for (const item of stored.result.items) {
+        if (!representatives.has(item.path) || item.details?.retrievalLane === "native")
+          representatives.set(item.path, item);
+      }
+      stored = {
+        ...stored,
+        result: {
+          ...stored.result,
+          items: stored.result.rankedFiles.flatMap((path) => {
+            const item = representatives.get(path);
+            return item ? [item] : [];
+          })
+        }
+      };
+    }
     if (!Number.isSafeInteger(offset) || offset < 0 || offset.toString(36) !== rawOffset || (kind === "analysis" ? offset > stored.result.items.length : kind === "analysis-hybrid" ? offset !== 0 || stored.result.kind !== "hybrid" : offset >= (stored.result.termCounts?.length ?? 0)))
       throw new CursorError("Invalid analysis offset", "E_CURSOR_OFFSET_INVALID");
     stored.touched = this.#now();
-    return { stored, offset, kind };
+    return { stored, offset, kind, ...lane ? { lane } : {} };
   }
   item(cursor, index) {
     const { stored, kind } = this.resolve(cursor);
@@ -7064,7 +8195,8 @@ class AnalysisStore {
     return structuredClone(item);
   }
   page(cursor, modelOutput = false, redact = false) {
-    const { stored, offset, kind } = this.resolve(cursor);
+    const { stored, offset, kind, lane } = this.resolve(cursor);
+    const suffix = lane ? `.${lane}` : "";
     const result = redact ? { ...stored.result, redact: true } : stored.result;
     if (kind === "analysis-terms")
       return analysisTermPage(result, stored.id, offset);
@@ -7077,7 +8209,7 @@ class AnalysisStore {
     const items = [];
     const sources = [];
     const sourceIds = new Map;
-    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
+    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0${suffix}` : undefined;
     const statistics = statisticsForItems(result.items, result.items.length, result.unit, analysisExtraGroups(result.counts, inlineTerms, result.items));
     const scope = result.scope ? ` Scope: ${result.scope.assertion === "project-wide" ? "project root" : "requested path"} ${JSON.stringify(result.scope.path)}${result.scope.expandedToProjectRoot ? `, expanded after ${JSON.stringify(result.scope.requestedPath)} had no matches` : ""}.${modificationTimeBoundsText(result.scope.modifiedAfterMs, result.scope.modifiedBeforeMs)}` : "";
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
@@ -7096,6 +8228,8 @@ ${result.reasons.map((reason) => `[${reason}]`).join(`
       if (!item)
         throw new Error("Analysis item unavailable");
       const publicItem = publicAnalysisItem(result, item, index, stored.id, modelOutput);
+      if (publicItem.inspect)
+        publicItem.inspect.cursor = `${stored.id}.analysis.0${suffix}`;
       const inspect = publicItem.inspect;
       const exposeExcerpt = result.kind === "concept" || result.kind === "hybrid" && item.details?.source === "concept";
       const row = `#${index + 1} ${item.path}:${item.line} ${publicItem.label}${exposeExcerpt && item.excerpt ? `
@@ -7152,12 +8286,15 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
       }
     }
     const nextRequest = hybridMatchesRequest ?? (next < result.items.length ? {
-      cursor: `${stored.id}.analysis.${next.toString(36)}`,
+      cursor: `${stored.id}.analysis.${next.toString(36)}${suffix}`,
       ...result.redact ? { redact: true } : {}
     } : undefined);
     const text = [
       header + notice,
       ...rows,
+      ...result.retrievalLanes ? [
+        `Independent retrieval lanes (copy the exact request): ${JSON.stringify(result.retrievalLanes)}`
+      ] : [],
       ...hybridInspectCursor ? [
         `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`
       ] : [],
@@ -7179,7 +8316,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
         returnedMatches: items.length,
         totalFiles: statistics.files,
         statistics,
-        cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
+        cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0${suffix}`,
         ...nextRequest ? { nextRequest } : {},
         analysis: {
           kind: result.kind,
@@ -7203,6 +8340,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...result.coverage ? { coverage: result.coverage } : {},
           ...result.stats ? { stats: result.stats } : {},
           ...result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {},
+          ...result.retrievalLanes ? { retrievalLanes: result.retrievalLanes } : {},
           ...hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {},
           ...hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}
         },
@@ -7236,7 +8374,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
 }
 
 // src/inspect.ts
-import { resolve as resolve14 } from "node:path";
+import { resolve as resolve16 } from "node:path";
 function resolveInspectionTarget(input, cwd, snapshots) {
   let path = input.path?.replace(/^@/, "");
   let line = input.line;
@@ -7265,7 +8403,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
   if (line === undefined || !Number.isSafeInteger(line) || line < 1) {
     throw new SiftLightError("line must be a positive integer when mode=inspect");
   }
-  const absolutePath = retainedMatch?.absolutePath ?? resolve14(cwd, path);
+  const absolutePath = retainedMatch?.absolutePath ?? resolve16(cwd, path);
   new SearchPathPolicy(cwd).assertPath(absolutePath);
   let expectedRevision;
   if (input.cursor) {
@@ -7287,7 +8425,7 @@ function resolveInspectionTarget(input, cwd, snapshots) {
 }
 
 // src/evidence-candidates.ts
-import { resolve as resolve15 } from "node:path";
+import { resolve as resolve17 } from "node:path";
 class CandidateLimit extends SiftLightError {
 }
 function record3(value) {
@@ -7452,7 +8590,7 @@ async function ordinaryCandidates(options) {
 async function collectEvidenceCandidates(options) {
   if (!options.changes)
     return ordinaryCandidates(options);
-  if (options.request.path && !isPathInsideCwd(resolve15(options.cwd, options.request.path), options.cwd)) {
+  if (options.request.path && !isPathInsideCwd(resolve17(options.cwd, options.request.path), options.cwd)) {
     throw new SiftLightError("Git changes for paths outside cwd are not supported; relaunch Pi from that repository or a common parent");
   }
   const reasons = new Set;
@@ -7509,8 +8647,8 @@ async function collectEvidenceCandidates(options) {
 
 // src/import-model.ts
 import { posix } from "node:path";
-import { realpath as realpath4 } from "node:fs/promises";
-import { relative as relative7, resolve as resolve16 } from "node:path";
+import { realpath as realpath6 } from "node:fs/promises";
+import { relative as relative7, resolve as resolve18 } from "node:path";
 class NavigationFailure extends Error {
   reason;
   constructor(reason) {
@@ -7884,13 +9022,13 @@ class NavigationContext {
       for (const reason of listed.reasons)
         this.reasons.add(reason);
     const paths = new Set;
-    const canonicalCwd = await realpath4(this.host.cwd).catch(() => {
+    const canonicalCwd = await realpath6(this.host.cwd).catch(() => {
       return;
     });
     const normalizedPaths = (Array.isArray(listed) ? listed : listed.paths).map((path) => this.host.normalizePath?.(path) ?? navigationPath(path));
     const canonicalPaths = await Promise.all(normalizedPaths.map(async (normalized) => {
       try {
-        const target = await realpath4(resolve16(this.host.cwd, normalized));
+        const target = await realpath6(resolve18(this.host.cwd, normalized));
         const canonical = canonicalCwd !== undefined && isPathInsideRoot(target, canonicalCwd) ? relative7(canonicalCwd, target).replaceAll("\\", "/") : target.replaceAll("\\", "/");
         return [normalized, canonical];
       } catch {
@@ -8958,10 +10096,10 @@ async function runOwnedParallel(start, parent) {
 }
 
 // src/file-discovery.ts
-import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve18, sep as sep4 } from "node:path";
+import { basename as platformBasename, posix as posix4, relative as relative8, resolve as resolve20, sep as sep4 } from "node:path";
 
 // src/file-metadata-filter.ts
-import { resolve as resolve17 } from "node:path";
+import { resolve as resolve19 } from "node:path";
 async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifiedBeforeMs, signal) {
   if (modifiedAfterMs === undefined && modifiedBeforeMs === undefined)
     return { paths: [...paths], partial: false, reasons: [] };
@@ -8972,7 +10110,7 @@ async function filterPathsByModificationTime(cwd, paths, modifiedAfterMs, modifi
       throw abortError();
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     const revisions = await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve17(cwd, path));
+      const revision = await getSourceRevision(resolve19(cwd, path));
       return revision ? { path, revision } : { path };
     }));
     for (const { path, revision } of revisions) {
@@ -9056,8 +10194,8 @@ function scoreFilePath(path, query) {
   };
 }
 function pathRelativeToDiscoveryRoot(cwd, root, path) {
-  const absoluteRoot = resolve18(cwd, root);
-  const absolutePath = resolve18(cwd, path);
+  const absoluteRoot = resolve20(cwd, root);
+  const absolutePath = resolve20(cwd, path);
   const scoped = relative8(absoluteRoot, absolutePath).split(sep4).join("/");
   return scoped || platformBasename(absolutePath);
 }
@@ -9167,7 +10305,7 @@ async function discoverFiles(input, cwd, signal) {
 }
 
 // src/source-continuations.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 
 // src/source-pages.ts
 function mergeByteRanges(ranges) {
@@ -9271,7 +10409,7 @@ class SourceContinuations {
   create(source, target, gaps, boundary) {
     this.#sweep();
     const item = {
-      id: randomUUID3(),
+      id: randomUUID6(),
       source: structuredClone(source),
       target: mergeByteRanges(target),
       gaps: mergeByteRanges(gaps),
@@ -9364,7 +10502,7 @@ class SourceContinuations {
 }
 
 // src/source-inspection.ts
-import { resolve as resolve19 } from "node:path";
+import { resolve as resolve21 } from "node:path";
 function usesDocumentLineWindow(path) {
   return /\.(?:md|markdown)$/iu.test(path);
 }
@@ -9451,7 +10589,7 @@ async function prepare(target, access, structure) {
     }
   } else if (document.utf8 && structure && document.reference.origin.kind === "worktree" && !target.range && !usesDocumentLineWindow(document.path)) {
     const result = await structure.inspect({
-      absolutePath: resolve19(access.cwd, target.path),
+      absolutePath: resolve21(access.cwd, target.path),
       cwd: access.cwd,
       line: target.line,
       expectedRevision: document.reference.origin.revision
@@ -9552,7 +10690,7 @@ function metadataStructure(details) {
 async function sourceDocumentIsCurrent(document, access) {
   if (document.reference.origin.kind !== "worktree")
     return true;
-  const current = await getSourceRevision(resolve19(access.cwd, document.path));
+  const current = await getSourceRevision(resolve21(access.cwd, document.path));
   return current !== undefined && sameSourceRevision(current, document.reference.origin.revision);
 }
 async function inspectDocumentsMetadata(targets, access, structure) {
@@ -9771,7 +10909,7 @@ ${preview.text}`);
     if (continuationGaps.length)
       block.continuation = continuations.create(block.document.reference, continuationTarget, continuationGaps, block.boundary);
     if (block.document.reference.origin.kind === "worktree") {
-      const current = await getSourceRevision(resolve19(access.cwd, block.document.path));
+      const current = await getSourceRevision(resolve21(access.cwd, block.document.path));
       if (!current || !sameSourceRevision(current, block.document.reference.origin.revision)) {
         block.text = [];
         block.fragments = [];
@@ -9828,7 +10966,7 @@ ${preview.text}`);
 }
 async function continueSource(cursor, access, continuations, expectedPath) {
   const state = continuations.resolve(cursor);
-  if (expectedPath !== undefined && resolve19(access.cwd, expectedPath.replace(/^@/, "")) !== resolve19(access.cwd, state.source.path))
+  if (expectedPath !== undefined && resolve21(access.cwd, expectedPath.replace(/^@/, "")) !== resolve21(access.cwd, state.source.path))
     throw new SiftLightError(`sourceCursor continues ${JSON.stringify(state.source.path)}, not ${JSON.stringify(expectedPath)}; copy the returned nextRequest exactly`);
   const document = await access.load(state.source.path, state.source);
   const page = sourcePage(document, state.remaining, MAX_RESULT_BYTES - 1400);
@@ -9867,8 +11005,8 @@ async function continueSource(cursor, access, continuations, expectedPath) {
 }
 
 // src/evidence-validation.ts
-import { realpath as realpath5, stat as stat5 } from "node:fs/promises";
-import { resolve as resolve20 } from "node:path";
+import { realpath as realpath7, stat as stat6 } from "node:fs/promises";
+import { resolve as resolve22 } from "node:path";
 
 // src/evidence-validity.ts
 function aggregateEvidenceValidity(sources) {
@@ -9901,14 +11039,14 @@ function policyFailure(error) {
   return error instanceof SiftLightError && (error.message.startsWith("Path is inside a protected credential or system area:") || error.message === "Git internals are excluded from search" || error.message === "Path must stay within the working directory");
 }
 async function confirmWorktreeState(path, cwd, signal) {
-  const absolute = resolve20(cwd, path);
+  const absolute = resolve22(cwd, path);
   const policy = new SearchPathPolicy(cwd);
   try {
     policy.assertPath(absolute);
-    const before = await stat5(absolute);
-    const beforeCanonical = await realpath5(absolute);
-    const after = await stat5(absolute);
-    const afterCanonical = await realpath5(absolute);
+    const before = await stat6(absolute);
+    const beforeCanonical = await realpath7(absolute);
+    const after = await stat6(absolute);
+    const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return { status: "stale", reason: "Source is no longer a regular file" };
     }
@@ -10043,16 +11181,16 @@ async function validateSnapshotTarget(target, cwd, policy, signal) {
   if (!target.revision)
     throw new Error("Snapshot validation target omitted its revision");
   try {
-    const absolute = resolve20(cwd, target.path);
+    const absolute = resolve22(cwd, target.path);
     const canonical = await policy.resolveExistingPath(absolute);
     if (!canonical) {
       const result = await confirmWorktreeState(target.path, cwd, signal);
       return { path: target.path, role: "source", ...result };
     }
-    const before = await stat5(absolute);
+    const before = await stat6(absolute);
     const beforeCanonical = canonical;
-    const after = await stat5(absolute);
-    const afterCanonical = await realpath5(absolute);
+    const after = await stat6(absolute);
+    const afterCanonical = await realpath7(absolute);
     if (!before.isFile() || !after.isFile()) {
       return {
         path: target.path,
@@ -10135,14 +11273,14 @@ function evidenceScope(cwd, scope, request) {
   const exclude = scope?.exclude ?? request?.exclude;
   const hidden = scope?.hidden ?? request?.hidden;
   return {
-    root: resolve20(cwd, path),
+    root: resolve22(cwd, path),
     ...include && include.length > 0 ? { include: [...include] } : {},
     ...exclude && exclude.length > 0 ? { exclude: [...exclude] } : {},
     ...hidden === undefined ? {} : { hidden }
   };
 }
 async function validateSavedEvidence(options) {
-  let scope = { root: resolve20(options.cwd) };
+  let scope = { root: resolve22(options.cwd) };
   const reasons = [];
   let storedPartial = false;
   let targets;
@@ -10922,10 +12060,27 @@ function pythonRoleAnalysis(document) {
 }
 
 // src/hybrid-search.ts
-import { resolve as resolve21 } from "node:path";
+import { resolve as resolve23 } from "node:path";
 
 // src/config-reader.ts
-import { readFile as readFile2 } from "node:fs/promises";
+import { readFile as readFile4 } from "node:fs/promises";
+
+// src/native-text-config.ts
+import { isAbsolute as isAbsolute8 } from "node:path";
+function parseNativeTextConfig(value, field = "nativeText") {
+  if (value === undefined)
+    return;
+  if (!isRecordValue(value) || Object.keys(value).some((key) => !["executable", "modelDirectory"].includes(key)))
+    throw new Error(`${field} must contain executable and modelDirectory only`);
+  const { executable, modelDirectory } = value;
+  for (const path of [executable, modelDirectory]) {
+    if (typeof path !== "string" || !isAbsolute8(path) || path.length > 4096 || /[\0\r\n]/u.test(path))
+      throw new Error(`${field} executable and modelDirectory must be absolute paths`);
+  }
+  return { executable: String(executable), modelDirectory: String(modelDirectory) };
+}
+
+// src/config-reader.ts
 var SIFT_LIGHT_CONFIG_ENV = "SIFT_LIGHT_CONFIG";
 var SEMANTIC_JUDGE_API_KEY_ENVS = ["TYPESAFE_API_KEY", "SIFT_LIGHT_JEV_API_KEY"];
 var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
@@ -11030,9 +12185,17 @@ function parseConfig(value, path) {
   if (!isRawSiftLightConfig(value)) {
     throw new Error(`Invalid sift-light config at ${path}: expected a JSON object`);
   }
-  const unknown = Object.keys(value).filter((key) => !["locale", "enforceSearch", "vectorSearchEnabled", "semanticJudge", "dataSources"].includes(key));
+  const unknown = Object.keys(value).filter((key) => ![
+    "locale",
+    "enforceSearch",
+    "vectorSearchEnabled",
+    "semanticJudge",
+    "dataSources",
+    "nativeText",
+    "nativeMedia"
+  ].includes(key));
   if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge and dataSources are accepted`);
+    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText and nativeMedia are accepted`);
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
@@ -11042,7 +12205,13 @@ function parseConfig(value, path) {
     throw new Error(`Invalid sift-light config at ${path}: vectorSearchEnabled must be a boolean`);
   }
   const enforcement = normalizeSearchEnforcement(enforceSearch, `config at ${path}`);
+  const nativeText = parseNativeTextConfig(value.nativeText);
+  const nativeMedia = parseNativeTextConfig(value.nativeMedia, "nativeMedia");
+  if (nativeText && vectorSearchEnabled !== true)
+    throw new Error("nativeText requires vectorSearchEnabled:true");
   return {
+    ...nativeText ? { nativeText } : {},
+    ...nativeMedia ? { nativeMedia } : {},
     locale: locale ?? DEFAULT_SIFT_LIGHT_CONFIG.locale,
     enforceSearch: enforcement,
     vectorSearchEnabled: vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
@@ -11061,7 +12230,7 @@ function normalizeSearchEnforcement(value, source) {
 }
 async function readSiftLightConfigFile(path, options = {}) {
   try {
-    const content = await readFile2(path, "utf8");
+    const content = await readFile4(path, "utf8");
     return parseConfig(JSON.parse(content), path);
   } catch (error) {
     if (isMissingFile(error)) {
@@ -11569,14 +12738,14 @@ function absoluteOccurrenceRanges(document, line, match) {
 async function literalEvidence(scan, access, generation) {
   const documents = new Map;
   const unavailable = new Map;
-  const generatedDocuments = new Map(generation.documents.map((document) => [resolve21(access.cwd, document.path), document]));
+  const generatedDocuments = new Map(generation.documents.map((document) => [resolve23(access.cwd, document.path), document]));
   let reusedDocuments = 0;
   let loadedDocuments = 0;
   for (const match of scan.matches) {
     if (documents.has(match.absolutePath) || unavailable.has(match.absolutePath))
       continue;
     try {
-      const generated = generatedDocuments.get(resolve21(access.cwd, match.absolutePath));
+      const generated = generatedDocuments.get(resolve23(access.cwd, match.absolutePath));
       const document = generated ?? await access.load(match.absolutePath);
       if (generated)
         reusedDocuments += 1;
@@ -11865,7 +13034,7 @@ ${sourceRows.join(`
 }
 
 // src/evidence-service.ts
-import { realpath as realpath6 } from "node:fs/promises";
+import { realpath as realpath8 } from "node:fs/promises";
 function isEvidenceRequest(input) {
   return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
@@ -12004,11 +13173,11 @@ function searchScope(request) {
   };
 }
 async function navigationRoot(cwd, path, signal) {
-  const absolute = resolve22(cwd, path);
-  const repository = await findGitRepository(dirname5(absolute), signal);
+  const absolute = resolve24(cwd, path);
+  const repository = await findGitRepository(dirname7(absolute), signal);
   if (repository)
     return repository;
-  return isPathInsideCwd(absolute, cwd) ? resolve22(cwd) : dirname5(absolute);
+  return isPathInsideCwd(absolute, cwd) ? resolve24(cwd) : dirname7(absolute);
 }
 function navigationFilters(input) {
   const request = normalizeRequest({
@@ -12021,8 +13190,8 @@ function navigationFilters(input) {
 }
 async function navigationScope(cwd, root, requestedPath, filters) {
   const [canonicalCwd, canonicalRoot] = await Promise.all([
-    realpath6(resolve22(cwd)).catch(() => resolve22(cwd)),
-    realpath6(root).catch(() => resolve22(root))
+    realpath8(resolve24(cwd)).catch(() => resolve24(cwd)),
+    realpath8(root).catch(() => resolve24(root))
   ]);
   const isProjectRoot = canonicalRoot === canonicalCwd;
   return {
@@ -12037,13 +13206,13 @@ async function navigationScope(cwd, root, requestedPath, filters) {
   };
 }
 async function canonicalNavigationPath(path) {
-  return realpath6(path).catch(() => resolve22(path));
+  return realpath8(path).catch(() => resolve24(path));
 }
 async function canonicalNavigationFiles(cwd, root, files, primaryPath) {
   const canonicalRoot = await canonicalNavigationPath(root);
   const [enumerated, canonicalPrimary] = await Promise.all([
-    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve22(cwd, file)))),
-    canonicalNavigationPath(resolve22(cwd, primaryPath))
+    Promise.all(files.paths.map((file) => canonicalNavigationPath(resolve24(cwd, file)))),
+    canonicalNavigationPath(resolve24(cwd, primaryPath))
   ]);
   const allowed = new Set(enumerated.filter((path) => isPathInsideRoot(path, canonicalRoot)));
   if (isPathInsideRoot(canonicalPrimary, canonicalRoot))
@@ -12061,19 +13230,43 @@ class EvidenceService {
   #queue = new SyntaxQueue;
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
-  constructor(runner, snapshots, structure, runConceptSearch, semanticJudge) {
+  constructor(runner, snapshots, structure, runConceptSearch, semanticJudge, nativeText) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     const managed = runConceptSearch ? undefined : createManagedConceptSearch();
-    this.#conceptSearch = runConceptSearch ?? managed.search;
-    this.#closeConcept = managed?.close;
+    const native = nativeText ? createNativeTextSearch(nativeText, runConceptSearch ?? managed.search) : undefined;
+    this.#conceptSearch = native?.search ?? runConceptSearch ?? managed.search;
+    this.#closeConcept = async () => {
+      const settled = await Promise.allSettled([managed?.close(), native?.close()]);
+      const errors = settled.flatMap((entry) => entry.status === "rejected" ? [entry.reason] : []);
+      if (errors.length)
+        throw new AggregateError(errors, "Text search cleanup failed");
+    };
     this.#semanticJudge = semanticJudge;
   }
   clear() {
     this.#analyses.clear();
     this.#continuations.clear();
     this.#queue.clear();
+  }
+  #createSearchAnalysis(result) {
+    if (!result.lanes)
+      return this.#analyses.create(result);
+    const { lanes, ...base } = result;
+    const retrievalLanes = Object.fromEntries(Object.keys(lanes).map((lane) => [lane, {}]));
+    const rankedFiles = result.kind === "hybrid" && result.counts?.relevanceRanking ? rankRetrievalFiles(lanes.current ?? [], lanes.native ?? []) : undefined;
+    return this.#analyses.create({
+      ...base,
+      retrievalLanes,
+      ...rankedFiles ? {
+        rankedFiles,
+        reasons: [
+          ...base.reasons,
+          "Default results use weighted reciprocal file ranks (native 1, current 0.1), capped at ten distinct files. Independent lanes retain their complete evidence and original ordering; ranking is not source proof."
+        ]
+      } : {}
+    });
   }
   async shutdown() {
     this.clear();
@@ -12160,13 +13353,13 @@ class EvidenceService {
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+      return this.#analyses.page(this.#createSearchAnalysis(execution.analysis), options.modelOutput);
     }
     if (input.mode === "hybrid" && input.ranking === "relevance") {
       if (input.conceptLimit !== undefined)
         throw new SiftLightError("conceptLimit only applies to exact-first hybrid; omit it for relevance ranking");
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+      return this.#analyses.page(this.#createSearchAnalysis(execution.analysis), options.modelOutput);
     }
     if (input.mode === "hybrid") {
       if (input.ranking !== undefined && input.ranking !== "exact-first")
@@ -12195,7 +13388,7 @@ class EvidenceService {
         conceptAccess = ownedConceptAccess;
         const literalOperation = this.#runner(literalRequest, cwd, groupSignal).then((result) => {
           literalResult = result;
-          return new Set(result.matches.map((match) => resolve22(match.absolutePath)));
+          return new Set(result.matches.map((match) => resolve24(match.absolutePath)));
         });
         return [
           literalOperation.then(() => {
@@ -12227,7 +13420,23 @@ class EvidenceService {
       if (!sameHybridLiteralScan(firstLiteralResult, verifiedLiteralResult)) {
         throw new HybridSourceChangedError("Literal source evidence changed while concept evidence was being computed");
       }
-      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult, conceptAccess, limit, query, this.#semanticJudge, signal);
+      const hybrid = await combineHybridSearch(verifiedLiteralResult, conceptResult.analysis.lanes ? {
+        ...conceptResult,
+        analysis: {
+          ...conceptResult.analysis,
+          items: conceptResult.analysis.lanes.current ?? []
+        }
+      } : conceptResult, conceptAccess, limit, query, this.#semanticJudge, signal);
+      if (conceptResult.analysis.lanes) {
+        const current = hybrid.items.map((item, index) => ({
+          ...item,
+          details: { ...item.details, retrievalLane: "current", laneRank: index + 1 }
+        }));
+        const native = conceptResult.analysis.lanes.native ?? [];
+        hybrid.lanes = { current, native };
+        hybrid.items = interleaveRetrievalLanes(current, native);
+        return this.#analyses.page(this.#createSearchAnalysis(hybrid), options.modelOutput);
+      }
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items)
@@ -12524,7 +13733,7 @@ class EvidenceService {
         throw new SiftLightError(`No outline provider is registered for ${document.path}; use mode=capabilities to inspect available language modes`);
     }
     if (!language && !isPython || language === "go") {
-      const extension = extname3(document.path) || "extensionless source";
+      const extension = extname4(document.path) || "extensionless source";
       throw new SiftLightError(`${input.mode} is unavailable for ${extension}; choose a language capability from mode=capabilities or use ordinary content search`);
     }
     if (input.mode === "outline") {
@@ -12641,7 +13850,7 @@ class EvidenceService {
       ...access.signal ? { signal: access.signal } : {},
       normalizePath: (file) => workspaceRelativePath(access.cwd, file),
       load: async (file, expected) => {
-        const absolutePath = await canonicalNavigationPath(resolve22(access.cwd, file));
+        const absolutePath = await canonicalNavigationPath(resolve24(access.cwd, file));
         if (!allowed.has(absolutePath))
           throw new SiftLightError("Navigation source is excluded by current ignore rules");
         if (absolutePath === primaryPath && expected === undefined)
@@ -12683,7 +13892,7 @@ class EvidenceService {
 }
 
 // src/service.ts
-import { resolve as resolve25 } from "node:path";
+import { resolve as resolve27 } from "node:path";
 
 // src/discovery-errors.ts
 var DISCOVERY_MODE_REQUIRED_ERROR = 'query requires an explicit discovery mode: use mode=files for filename/path discovery or mode=concept for semantic discovery; for example {"mode":"files","query":"<filename-or-path>"}';
@@ -12717,7 +13926,7 @@ function normalizeRequestAliases(request) {
 }
 
 // src/format.ts
-import { readFile as readFile3 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 var RESULT_METADATA_RESERVE_BYTES = 1024;
 var RESULT_METADATA_RESERVE_CHARACTERS = 512;
 
@@ -12851,7 +14060,7 @@ async function loadContextLines(match, expectedRevision, cache, signal) {
       cache.set(match.absolutePath, changed);
       return changed;
     }
-    const content = await readFile3(match.absolutePath, { encoding: "utf8", signal });
+    const content = await readFile5(match.absolutePath, { encoding: "utf8", signal });
     const afterRevision = await getSourceRevision(match.absolutePath);
     if (!afterRevision || !sameSourceRevision(expectedRevision, afterRevision)) {
       const changed = { status: "changed" };
@@ -13176,7 +14385,7 @@ ${lineRows.join(`
 }
 
 // src/snapshot-store.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
+import { randomUUID as randomUUID7 } from "node:crypto";
 class SnapshotStore {
   #snapshots = new Map;
   #expired = new Set;
@@ -13201,7 +14410,7 @@ class SnapshotStore {
     const now = this.#now();
     const snapshot = {
       ...scan,
-      id: randomUUID4(),
+      id: randomUUID7(),
       createdAt: now,
       lastAccessedAt: now
     };
@@ -13305,336 +14514,6 @@ class SnapshotStore {
   }
 }
 
-// src/operation-lifecycle.ts
-import { randomUUID as randomUUID5 } from "node:crypto";
-var OPERATION_INITIAL_WAIT_MS = 5000;
-var OPERATION_DEFAULT_DEADLINE_MS = 10 * 60000;
-var OPERATION_DEFAULT_LEASE_MS = 2 * 60000;
-var OPERATION_RESULT_TTL_MS = 10 * 60000;
-var MAX_ACTIVE_OPERATIONS = 8;
-var MAX_RETAINED_OPERATIONS = 32;
-function abortReason(signal) {
-  return signal?.reason instanceof Error ? signal.reason : new Error("Operation was cancelled");
-}
-function snapshot(entry) {
-  return {
-    id: entry.id,
-    state: entry.state,
-    startedAt: entry.startedAt,
-    deadlineAt: entry.deadlineAt,
-    leaseExpiresAt: entry.leaseExpiresAt,
-    metadata: entry.metadata,
-    ...entry.progress ? { progress: { ...entry.progress } } : {},
-    ...entry.result === undefined ? {} : { result: entry.result },
-    ...entry.error === undefined ? {} : { error: entry.error }
-  };
-}
-
-class OperationLifecycle {
-  #operations = new Map;
-  #pending = new Set;
-  #now;
-  #maxOperations;
-  #deadlineMs;
-  #leaseMs;
-  #resultTtlMs;
-  #maxRetainedOperations;
-  #closed = false;
-  constructor(options = {}) {
-    this.#now = options.now ?? Date.now;
-    this.#maxOperations = options.maxOperations ?? MAX_ACTIVE_OPERATIONS;
-    this.#deadlineMs = options.deadlineMs ?? OPERATION_DEFAULT_DEADLINE_MS;
-    this.#leaseMs = options.leaseMs ?? OPERATION_DEFAULT_LEASE_MS;
-    this.#resultTtlMs = options.resultTtlMs ?? OPERATION_RESULT_TTL_MS;
-    this.#maxRetainedOperations = options.maxRetainedOperations ?? MAX_RETAINED_OPERATIONS;
-    if (!Number.isSafeInteger(this.#maxOperations) || this.#maxOperations < 1)
-      throw new Error("maxOperations must be a positive safe integer");
-    if (!Number.isSafeInteger(this.#deadlineMs) || this.#deadlineMs < 1)
-      throw new Error("deadlineMs must be a positive safe integer");
-    if (!Number.isSafeInteger(this.#leaseMs) || this.#leaseMs < 1)
-      throw new Error("leaseMs must be a positive safe integer");
-    if (!Number.isSafeInteger(this.#resultTtlMs) || this.#resultTtlMs < 1)
-      throw new Error("resultTtlMs must be a positive safe integer");
-    if (!Number.isSafeInteger(this.#maxRetainedOperations) || this.#maxRetainedOperations < 1)
-      throw new Error("maxRetainedOperations must be a positive safe integer");
-  }
-  get size() {
-    this.#expireRetained();
-    return this.#operations.size;
-  }
-  start(run, metadata) {
-    this.#expireRetained();
-    if (this.#closed)
-      throw new Error("Operation lifecycle is closed");
-    if (this.#pending.size >= this.#maxOperations)
-      throw new Error(`Operation resource limit reached (${String(this.#maxOperations)} pending operations)`);
-    const id = randomUUID5();
-    const startedAt = this.#now();
-    const controller = new AbortController;
-    const promise = Promise.resolve().then(() => run(controller.signal, id));
-    const entry = {
-      id,
-      startedAt,
-      deadlineAt: startedAt + this.#deadlineMs,
-      leaseExpiresAt: startedAt + this.#leaseMs,
-      metadata,
-      controller,
-      promise,
-      state: "running",
-      settled: false,
-      retainedAt: undefined,
-      waiters: new Set,
-      timer: undefined,
-      leaseTimer: undefined
-    };
-    this.#operations.set(id, entry);
-    this.#pending.add(promise);
-    promise.finally(() => this.#pending.delete(promise)).catch(() => {
-      return;
-    });
-    entry.timer = setTimeout(() => {
-      this.#finishFailure(entry, "Operation deadline exceeded");
-      controller.abort(new Error("Operation deadline exceeded"));
-    }, this.#deadlineMs);
-    entry.timer.unref?.();
-    this.#armLease(entry);
-    entry.promise.then((result) => {
-      entry.settled = true;
-      if (entry.timer)
-        clearTimeout(entry.timer);
-      entry.timer = undefined;
-      if (entry.state === "running") {
-        entry.state = "complete";
-        entry.result = result;
-        this.#retainResult(entry);
-        this.#notify(entry);
-      }
-      return;
-    }, (error) => {
-      entry.settled = true;
-      if (entry.timer)
-        clearTimeout(entry.timer);
-      entry.timer = undefined;
-      if (entry.state === "running") {
-        entry.state = controller.signal.aborted ? "cancelled" : "failed";
-        entry.error = error;
-        this.#retainResult(entry);
-        this.#notify(entry);
-      }
-      return;
-    });
-    return { ...snapshot(entry), promise: entry.promise };
-  }
-  get(operationId) {
-    this.#expireRetained();
-    const entry = this.#operations.get(operationId);
-    if (!entry)
-      throw new Error("Operation was not found or has expired; start the query again");
-    return snapshot(entry);
-  }
-  updateProgress(operationId, progress) {
-    const entry = this.#operations.get(operationId);
-    if (!entry || entry.state !== "running")
-      return;
-    entry.progress = { ...progress };
-  }
-  touch(operationId) {
-    const entry = this.#operations.get(operationId);
-    if (!entry)
-      throw new Error("Operation was not found or has expired; start the query again");
-    if (entry.state === "running")
-      this.#touch(entry);
-    return snapshot(entry);
-  }
-  async wait(operationId, timeoutMs = OPERATION_INITIAL_WAIT_MS, signal) {
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
-      throw new Error("timeoutMs must be a non-negative safe integer");
-    const entry = this.#operations.get(operationId);
-    if (!entry)
-      throw new Error("Operation was not found or has expired; start the query again");
-    if (entry.state !== "running")
-      return this.#settled(entry);
-    this.#touch(entry);
-    return new Promise((resolve, reject) => {
-      let timer;
-      let finished = false;
-      let aborting = false;
-      const onSettled = () => finish(this.#settled(entry));
-      const finish = (result) => {
-        if (finished || aborting)
-          return;
-        finished = true;
-        if (timer)
-          clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-        entry.waiters.delete(onSettled);
-        resolve(result);
-      };
-      const onAbort = () => {
-        if (finished || aborting)
-          return;
-        aborting = true;
-        if (timer)
-          clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-        entry.waiters.delete(onSettled);
-        const reason = abortReason(signal);
-        this.cancelAndWait(operationId, reason).then(() => {
-          if (!finished) {
-            finished = true;
-            reject(reason);
-          }
-          return;
-        }, (error) => {
-          if (!finished) {
-            finished = true;
-            reject(error);
-          }
-          return;
-        });
-      };
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-      signal?.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(() => finish({ state: "running", operation: snapshot(entry) }), timeoutMs);
-      timer.unref?.();
-      entry.waiters.add(onSettled);
-    });
-  }
-  cancel(operationId, reason = new Error("Operation cancelled")) {
-    const entry = this.#operations.get(operationId);
-    if (!entry)
-      throw new Error("Operation was not found or has expired; start the query again");
-    if (entry.state === "running") {
-      entry.state = "cancelled";
-      entry.error = reason;
-      entry.controller.abort(reason);
-      this.#retainResult(entry);
-      this.#notify(entry);
-    }
-    return snapshot(entry);
-  }
-  async cancelAndWait(operationId, reason = new Error("Operation cancelled")) {
-    const entry = this.#operations.get(operationId);
-    if (!entry)
-      throw new Error("Operation was not found or has expired; start the query again");
-    this.cancel(operationId, reason);
-    await Promise.allSettled([entry.promise]);
-    return snapshot(entry);
-  }
-  clear(reason = new Error("Operation session closed")) {
-    this.#closed = true;
-    for (const entry of this.#operations.values()) {
-      if (entry.state === "running")
-        this.cancel(entry.id, reason);
-      this.#clearTimers(entry);
-    }
-    this.#operations.clear();
-  }
-  reset(reason = new Error("Operation session reset")) {
-    this.clear(reason);
-    this.#closed = false;
-  }
-  async shutdown(reason = new Error("Operation session closed")) {
-    this.clear(reason);
-    await Promise.allSettled(this.#pending);
-  }
-  #settled(entry) {
-    const current = snapshot(entry);
-    if (entry.state === "complete" && entry.result !== undefined)
-      return { state: "complete", operation: current, result: entry.result };
-    if (entry.state === "failed")
-      return { state: "failed", operation: current, error: entry.error };
-    if (entry.state === "cancelled" || entry.state === "expired")
-      return { state: entry.state, operation: current, error: entry.error };
-    return { state: "running", operation: current };
-  }
-  #finishFailure(entry, message) {
-    if (entry.state !== "running")
-      return;
-    entry.state = "failed";
-    entry.error = new Error(message);
-    this.#retainResult(entry);
-    this.#notify(entry);
-  }
-  #retainResult(entry) {
-    if (entry.settled && entry.timer)
-      clearTimeout(entry.timer);
-    if (entry.settled)
-      entry.timer = undefined;
-    if (entry.leaseTimer)
-      clearTimeout(entry.leaseTimer);
-    entry.leaseTimer = undefined;
-    entry.retainedAt = this.#now();
-    entry.leaseExpiresAt = this.#now() + this.#resultTtlMs;
-    entry.leaseTimer = setTimeout(() => this.#evict(entry), this.#resultTtlMs);
-    entry.leaseTimer.unref?.();
-    this.#evictRetainedOverflow();
-  }
-  #notify(entry) {
-    const waiters = [...entry.waiters];
-    entry.waiters.clear();
-    for (const waiter of waiters)
-      waiter();
-  }
-  #touch(entry) {
-    entry.leaseExpiresAt = this.#now() + this.#leaseMs;
-    this.#armLease(entry);
-  }
-  #armLease(entry) {
-    if (entry.leaseTimer)
-      clearTimeout(entry.leaseTimer);
-    entry.leaseTimer = setTimeout(() => {
-      if (entry.state === "running") {
-        entry.state = "expired";
-        entry.error = new Error("Operation lease expired without a continuation");
-        entry.controller.abort(entry.error);
-      }
-      this.#evict(entry);
-    }, Math.max(1, entry.leaseExpiresAt - this.#now()));
-    entry.leaseTimer.unref?.();
-  }
-  #evict(entry) {
-    if (this.#operations.get(entry.id) !== entry)
-      return;
-    if (entry.state === "running") {
-      entry.state = "expired";
-      entry.error = new Error("Operation lease expired without a continuation");
-      entry.controller.abort(entry.error);
-    }
-    this.#notify(entry);
-    this.#clearTimers(entry);
-    this.#operations.delete(entry.id);
-  }
-  #evictRetainedOverflow() {
-    const retained = [...this.#operations.values()].filter((entry) => entry.state !== "running" && entry.retainedAt !== undefined).toSorted((left, right) => (left.retainedAt ?? left.startedAt) - (right.retainedAt ?? right.startedAt));
-    while (retained.length > this.#maxRetainedOperations) {
-      const candidate = retained.shift();
-      if (!candidate || candidate.waiters.size > 0)
-        continue;
-      this.#evict(candidate);
-    }
-  }
-  #clearTimers(entry, includeLease = true) {
-    if (entry.timer)
-      clearTimeout(entry.timer);
-    if (includeLease && entry.leaseTimer)
-      clearTimeout(entry.leaseTimer);
-    entry.timer = undefined;
-    if (includeLease)
-      entry.leaseTimer = undefined;
-  }
-  #expireRetained() {
-    const now = this.#now();
-    for (const entry of this.#operations.values()) {
-      if (entry.leaseExpiresAt <= now)
-        this.#evict(entry);
-    }
-  }
-}
-
 // src/operation-output.ts
 function operationRequest(operationId) {
   return { mode: "await", operationId };
@@ -13719,7 +14598,7 @@ function operationOutcome(outcome, mode) {
 }
 
 // src/audit-search.ts
-import { resolve as resolve23 } from "node:path";
+import { resolve as resolve25 } from "node:path";
 var MAX_AUDIT_PATTERNS = 32;
 var MAX_AUDIT_CHANGED_FILES = 20;
 var MAX_AUDIT_EVIDENCE = 3;
@@ -13752,7 +14631,7 @@ async function revisionsFor(cwd, paths, signal) {
       throw signal.reason;
     const batch = paths.slice(offset, offset + MAX_SOURCE_REVISION_CONCURRENCY);
     await Promise.all(batch.map(async (path) => {
-      const revision = await getSourceRevision(resolve23(cwd, path), () => unavailable.push(path));
+      const revision = await getSourceRevision(resolve25(cwd, path), () => unavailable.push(path));
       if (revision)
         revisions.set(path, revision);
     }));
@@ -13993,7 +14872,7 @@ async function runAuditSearch(input, cwd, runRipgrep, signal) {
 }
 
 // src/language-capabilities.ts
-import { resolve as resolve24 } from "node:path";
+import { resolve as resolve26 } from "node:path";
 function normalizeLists(values) {
   return values === undefined ? [] : [...values];
 }
@@ -14046,7 +14925,7 @@ class LanguageCapabilityCatalog {
       ...new Map(entries.flatMap((entry) => this.descriptor(entry.language)?.capabilities ?? []).map((capability) => [capability.id, capability])).values()
     ];
     return {
-      root: resolve24(request.cwd),
+      root: resolve26(request.cwd),
       ...path ? { path } : {},
       partial: files.partial,
       reasons: files.reasons,
@@ -14140,14 +15019,14 @@ function cursorPathSelection(input, cwd) {
     validateSearchPath(label, input.paths !== undefined ? "paths" : "path");
     if (label.length === 0)
       throw new SiftLightError("Cursor paths cannot be empty");
-    const absolutePath = resolve25(cwd, label);
+    const absolutePath = resolve27(cwd, label);
     policy.assertPath(absolutePath);
     if (absolutePaths.has(absolutePath))
       continue;
     absolutePaths.add(absolutePath);
     labels.push(label);
   }
-  const key = createHash5("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
+  const key = createHash7("sha256").update([...absolutePaths].toSorted((left, right) => left.localeCompare(right)).join("\x00")).digest("hex").slice(0, 16);
   return { labels, absolutePaths, key };
 }
 function baseDetails2(snapshot, mode) {
@@ -14295,6 +15174,15 @@ async function waitForSourceRefresh(signal, delayMs) {
 }
 
 class SiftLightService {
+  #media;
+  get mediaEnabled() {
+    return this.#media !== undefined;
+  }
+  mediaSearch(value, cwd, signal) {
+    if (!this.#media)
+      throw new SiftLightError("Visual search is disabled; configure nativeMedia and restart the host");
+    return this.#media.search(value, cwd, signal);
+  }
   #dataSources;
   #runRipgrep;
   #snapshots;
@@ -14308,6 +15196,7 @@ class SiftLightService {
   #operations;
   #reusableSummarySnapshots = new WeakSet;
   constructor(options) {
+    this.#media = options.nativeMedia ? new MediaSearch(options.nativeMedia) : undefined;
     this.#dataSources = new DataSources(options.dataSources);
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore;
@@ -14315,7 +15204,7 @@ class SiftLightService {
     this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
     this.#semanticJudge = options.semanticJudge;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
-    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge);
+    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge, options.nativeText);
   }
   async search(request, cwd, signal, options = {}) {
     const { input, notes } = normalizeRequestAliases(request);
@@ -14407,7 +15296,7 @@ class SiftLightService {
       throw new SiftLightError("mode=await and mode=cancel require operationId");
     const existing = this.#operations.get(input.operationId);
     const mode = existing.metadata.mode;
-    if (resolve25(cwd) !== resolve25(existing.metadata.cwd))
+    if (resolve27(cwd) !== resolve27(existing.metadata.cwd))
       throw new SiftLightError("Operation belongs to a different working directory");
     const forbidden = Object.keys(input).filter((key) => key !== "mode" && key !== "operationId");
     if (forbidden.length > 0)
@@ -14534,6 +15423,7 @@ class SiftLightService {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController;
     this.#operations.reset();
+    this.#media?.clear();
     this.#snapshots.clear();
     this.#evidence.clear();
   }
@@ -14545,7 +15435,7 @@ class SiftLightService {
     await this.#operations.shutdown();
     this.#snapshots.clear();
     this.#evidence.clear();
-    await this.#evidence.shutdown();
+    await Promise.all([this.#evidence.shutdown(), this.#media?.close()]);
   }
   get snapshotCount() {
     return this.#snapshots.size;
@@ -15018,14 +15908,16 @@ function siftLightTool(outputMode) {
     tool.outputSchema = SIFT_LIGHT_OUTPUT_SCHEMA;
   return tool;
 }
-function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = []) {
+function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = [], nativeText, nativeMedia) {
   const resolvedSemanticJudge = semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
     vectorSearchEnabled,
     dataSources,
-    semanticJudge: resolvedSemanticJudge
+    semanticJudge: resolvedSemanticJudge,
+    ...nativeText ? { nativeText } : {},
+    ...nativeMedia ? { nativeMedia } : {}
   });
 }
 function errorMessage2(error) {
@@ -15076,9 +15968,37 @@ function createSiftLightMcpServer(service, cwd, outputMode = DEFAULT_MCP_OUTPUT_
     instructions: siftLightMcpInstructions(resolvedOutputMode)
   });
   server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [tool]
+    tools: [
+      tool,
+      ...service.mediaEnabled ? [
+        {
+          name: "sift-light-media",
+          title: "Visual search",
+          description: "Search local image content or scanned PDF pages. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels. Local resident vision model; slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
+          inputSchema: {
+            ...z3.toJSONSchema(mediaRequestSchema, { unrepresentable: "any" }),
+            type: "object"
+          },
+          annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+        }
+      ] : []
+    ]
   }));
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (request.params.name === "sift-light-media" && service.mediaEnabled && service.mediaSearch) {
+      try {
+        const result = await service.mediaSearch(request.params.arguments ?? {}, cwd, extra.signal);
+        return {
+          content: [
+            { type: "text", text: result.text },
+            ...result.image ? [{ type: "image", ...result.image }] : []
+          ],
+          ...resolvedOutputMode === "structured" ? { structuredContent: { text: result.text, details: result.details } } : {}
+        };
+      } catch (error) {
+        return toolError(error, resolvedOutputMode);
+      }
+    }
     if (request.params.name !== tool.name) {
       return toolError(new Error(`Unknown tool: ${request.params.name}`), resolvedOutputMode);
     }
@@ -15274,7 +16194,7 @@ async function handleMcpRequest(request, response, state, createService, cwd) {
       try {
         const service = createService();
         const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID6(),
+          sessionIdGenerator: () => randomUUID8(),
           onsessioninitialized: (initializedSessionId) => {
             if (!pendingSession)
               throw new Error("MCP session initialized before registration");
@@ -15459,7 +16379,9 @@ async function createMcpSearchFeatures(environment = process.env) {
   return {
     semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
     vectorSearchEnabled: config.vectorSearchEnabled === true,
-    dataSources: config.dataSources ?? []
+    dataSources: config.dataSources ?? [],
+    ...config.nativeText ? { nativeText: config.nativeText } : {},
+    ...config.nativeMedia ? { nativeMedia: config.nativeMedia } : {}
   };
 }
 function mcpSemanticJudgeConfigSource(environment = process.env) {
@@ -15579,12 +16501,12 @@ function logSemanticJudgeStatus(integration) {
   process.stderr.write(`sift-light MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}
 `);
 }
-async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources) {
+async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia) {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65535),
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources),
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia),
     maxSessions: environmentInteger("SIFT_LIGHT_MCP_MAX_SESSIONS", DEFAULT_MCP_MAX_SESSIONS, 1, Number.MAX_SAFE_INTEGER),
     sessionIdleTimeoutMs: environmentInteger("SIFT_LIGHT_MCP_SESSION_IDLE_MS", DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS, 1, Number.MAX_SAFE_INTEGER),
     allowedOrigins: allowedOrigins(),
@@ -15618,11 +16540,11 @@ async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dat
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources) {
+async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia) {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources)
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia)
   });
   process.stderr.write(`sift-light MCP serving one local client over stdio
 `);
@@ -15651,15 +16573,15 @@ async function main() {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources } = await createMcpSearchFeatures();
+  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(`sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}
 `);
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
+    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia);
     return;
   }
-  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
+  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia);
 }
 try {
   await main();

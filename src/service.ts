@@ -1,5 +1,7 @@
+import { MediaSearch, type MediaResult } from "./media-search.js";
 import { DataSources } from "./data-sources.js";
 import type { DataSourceConfig } from "./data-source-config.js";
+import type { NativeTextConfig } from "./native-text-config.js";
 import { createHash } from "node:crypto";
 import { EvidenceService, isEvidenceRequest } from "./evidence-service.js";
 import { ConceptSourceChangedError } from "./concept-source-generation.js";
@@ -103,6 +105,8 @@ export interface SiftLightInput extends RawSearchInput {
 }
 
 export interface SiftLightServiceOptions {
+  nativeText?: NativeTextConfig;
+  nativeMedia?: NativeTextConfig;
   dataSources?: readonly DataSourceConfig[];
   runRipgrep: RipgrepRunner;
   snapshots?: SnapshotStore;
@@ -391,6 +395,17 @@ async function waitForSourceRefresh(signal: AbortSignal, delayMs: number): Promi
 }
 
 export class SiftLightService {
+  readonly #media: MediaSearch | undefined;
+  get mediaEnabled(): boolean {
+    return this.#media !== undefined;
+  }
+  mediaSearch(value: unknown, cwd: string, signal?: AbortSignal): Promise<MediaResult> {
+    if (!this.#media)
+      throw new SiftLightError(
+        "Visual search is disabled; configure nativeMedia and restart the host",
+      );
+    return this.#media.search(value, cwd, signal);
+  }
   readonly #dataSources: DataSources;
   readonly #runRipgrep: RipgrepRunner;
   readonly #snapshots: SnapshotStore;
@@ -405,6 +420,7 @@ export class SiftLightService {
   readonly #reusableSummarySnapshots = new WeakSet<SearchSnapshot>();
 
   constructor(options: SiftLightServiceOptions) {
+    this.#media = options.nativeMedia ? new MediaSearch(options.nativeMedia) : undefined;
     this.#dataSources = new DataSources(options.dataSources);
     this.#runRipgrep = options.runRipgrep;
     this.#snapshots = options.snapshots ?? new SnapshotStore();
@@ -418,6 +434,7 @@ export class SiftLightService {
       options.structure,
       options.conceptSearch,
       options.semanticJudge,
+      options.nativeText,
     );
   }
 
@@ -708,6 +725,7 @@ export class SiftLightService {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController();
     this.#operations.reset();
+    this.#media?.clear();
     this.#snapshots.clear();
     this.#evidence.clear();
   }
@@ -720,7 +738,7 @@ export class SiftLightService {
     await this.#operations.shutdown();
     this.#snapshots.clear();
     this.#evidence.clear();
-    await this.#evidence.shutdown();
+    await Promise.all([this.#evidence.shutdown(), this.#media?.close()]);
   }
 
   get snapshotCount(): number {

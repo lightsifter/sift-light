@@ -30,6 +30,8 @@ export async function registerSiftLightExtension(
       vectorSearchEnabled: config.vectorSearchEnabled === true,
       dataSources: config.dataSources ?? [],
       semanticJudge,
+      ...(config.nativeText ? { nativeText: config.nativeText } : {}),
+      ...(config.nativeMedia ? { nativeMedia: config.nativeMedia } : {}),
     }),
   );
   const { locale } = config;

@@ -5,6 +5,9 @@ import {
   validateConceptQuery,
 } from "./concept-search.js";
 import { structuralSearch } from "./structural-search.js";
+import { createNativeTextSearch, interleaveRetrievalLanes } from "./native-text-search.js";
+import { rankRetrievalFiles } from "./retrieval-ranking.js";
+import type { NativeTextConfig } from "./native-text-config.js";
 import { dirname, extname, resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
 import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
@@ -374,19 +377,51 @@ export class EvidenceService {
     structure?: CodeStructureProvider,
     runConceptSearch?: ConceptSearchRunner,
     semanticJudge?: SemanticJudgeIntegration,
+    nativeText?: NativeTextConfig,
   ) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
     const managed = runConceptSearch ? undefined : createManagedConceptSearch();
-    this.#conceptSearch = runConceptSearch ?? managed!.search;
-    this.#closeConcept = managed?.close;
+    const native = nativeText
+      ? createNativeTextSearch(nativeText, runConceptSearch ?? managed!.search)
+      : undefined;
+    this.#conceptSearch = native?.search ?? runConceptSearch ?? managed!.search;
+    this.#closeConcept = async () => {
+      const settled = await Promise.allSettled([managed?.close(), native?.close()]);
+      const errors = settled.flatMap((entry) =>
+        entry.status === "rejected" ? [entry.reason] : [],
+      );
+      if (errors.length) throw new AggregateError(errors, "Text search cleanup failed");
+    };
     this.#semanticJudge = semanticJudge;
   }
   clear(): void {
     this.#analyses.clear();
     this.#continuations.clear();
     this.#queue.clear();
+  }
+  #createSearchAnalysis(result: AnalysisResultSet): string {
+    if (!result.lanes) return this.#analyses.create(result);
+    const { lanes, ...base } = result;
+    const retrievalLanes = Object.fromEntries(Object.keys(lanes).map((lane) => [lane, {}]));
+    const rankedFiles =
+      result.kind === "hybrid" && result.counts?.relevanceRanking
+        ? rankRetrievalFiles(lanes.current ?? [], lanes.native ?? [])
+        : undefined;
+    return this.#analyses.create({
+      ...base,
+      retrievalLanes,
+      ...(rankedFiles
+        ? {
+            rankedFiles,
+            reasons: [
+              ...base.reasons,
+              "Default results use weighted reciprocal file ranks (native 1, current 0.1), capped at ten distinct files. Independent lanes retain their complete evidence and original ordering; ranking is not source proof.",
+            ],
+          }
+        : {}),
+    });
   }
   async shutdown(): Promise<void> {
     this.clear();
@@ -506,7 +541,10 @@ export class EvidenceService {
     }
     if (input.mode === "concept") {
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+      return this.#analyses.page(
+        this.#createSearchAnalysis(execution.analysis),
+        options.modelOutput,
+      );
     }
     if (input.mode === "hybrid" && input.ranking === "relevance") {
       if (input.conceptLimit !== undefined)
@@ -514,7 +552,10 @@ export class EvidenceService {
           "conceptLimit only applies to exact-first hybrid; omit it for relevance ranking",
         );
       const execution = await this.#conceptSearch(input, access, options.onProgress);
-      return this.#analyses.page(this.#analyses.create(execution.analysis), options.modelOutput);
+      return this.#analyses.page(
+        this.#createSearchAnalysis(execution.analysis),
+        options.modelOutput,
+      );
     }
     if (input.mode === "hybrid") {
       if (input.ranking !== undefined && input.ranking !== "exact-first")
@@ -577,13 +618,31 @@ export class EvidenceService {
       }
       const hybrid = await combineHybridSearch(
         verifiedLiteralResult,
-        conceptResult,
+        conceptResult.analysis.lanes
+          ? {
+              ...conceptResult,
+              analysis: {
+                ...conceptResult.analysis,
+                items: conceptResult.analysis.lanes.current ?? [],
+              },
+            }
+          : conceptResult,
         conceptAccess,
         limit,
         query,
         this.#semanticJudge,
         signal,
       );
+      if (conceptResult.analysis.lanes) {
+        const current = hybrid.items.map((item, index) => ({
+          ...item,
+          details: { ...item.details, retrievalLane: "current", laneRank: index + 1 },
+        }));
+        const native = conceptResult.analysis.lanes.native ?? [];
+        hybrid.lanes = { current, native };
+        hybrid.items = interleaveRetrievalLanes(current, native);
+        return this.#analyses.page(this.#createSearchAnalysis(hybrid), options.modelOutput);
+      }
       const originalCounts = hybrid.counts ?? {};
       const cursor = this.#analyses.create(hybrid, (items) => ({
         counts: retainedHybridCounts(originalCounts, items),

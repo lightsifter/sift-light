@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0-1 — 2026-10-12
+
+- Add an independent native text retrieval lane and bounded rank fusion while retaining exact source inspection, validation and both text result lanes.
+- Add opt-in MCP image search from text or an image, including image-only and mixed PDF scanned-page retrieval with original page numbers and rendered previews. Requires Apple Silicon and separately configured native workers and model files.
+- Share resident worker lifecycle management with cancellation, recovery and idle shutdown; bound native GPU cache and batching to reduce memory use.
+- Preserve default model-free exact search and explicit partial-coverage and stale-source diagnostics.
+
 ## 1.0.5-6 — 2026-10-10
 
 - Add structured `repairExamples` to invalid-regex and missing-path diagnostics. The examples preserve bounded search filters, never auto-convert regex input, and are omitted when redaction would make request data unsafe to echo.

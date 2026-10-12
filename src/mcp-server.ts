@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { DataSourceConfig } from "./data-source-config.js";
+import type { NativeTextConfig } from "./native-text-config.js";
 import {
   DEFAULT_MCP_HOST,
   DEFAULT_MCP_MAX_SESSIONS,
@@ -51,13 +52,21 @@ async function runHttpServer(
   semanticJudge: SemanticJudgeIntegration | undefined,
   vectorSearchEnabled: boolean,
   dataSources: DataSourceConfig[],
+  nativeText?: NativeTextConfig,
+  nativeMedia?: NativeTextConfig,
 ): Promise<void> {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65_535),
     createService: () =>
-      createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources),
+      createDefaultSiftLightMcpService(
+        semanticJudge,
+        vectorSearchEnabled,
+        dataSources,
+        nativeText,
+        nativeMedia,
+      ),
     maxSessions: environmentInteger(
       "SIFT_LIGHT_MCP_MAX_SESSIONS",
       DEFAULT_MCP_MAX_SESSIONS,
@@ -107,12 +116,20 @@ async function runStdioServer(
   semanticJudge: SemanticJudgeIntegration | undefined,
   vectorSearchEnabled: boolean,
   dataSources: DataSourceConfig[],
+  nativeText?: NativeTextConfig,
+  nativeMedia?: NativeTextConfig,
 ): Promise<void> {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
     createService: () =>
-      createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources),
+      createDefaultSiftLightMcpService(
+        semanticJudge,
+        vectorSearchEnabled,
+        dataSources,
+        nativeText,
+        nativeMedia,
+      ),
   });
   process.stderr.write("sift-light MCP serving one local client over stdio\n");
   process.stderr.write(`sift-light MCP working directory: ${running.cwd}\n`);
@@ -140,16 +157,31 @@ async function main(): Promise<void> {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources } = await createMcpSearchFeatures();
+  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia } =
+    await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(
     `sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}\n`,
   );
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
+    await runStdioServer(
+      outputMode,
+      semanticJudge,
+      vectorSearchEnabled,
+      dataSources,
+      nativeText,
+      nativeMedia,
+    );
     return;
   }
-  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources);
+  await runHttpServer(
+    outputMode,
+    semanticJudge,
+    vectorSearchEnabled,
+    dataSources,
+    nativeText,
+    nativeMedia,
+  );
 }
 
 try {

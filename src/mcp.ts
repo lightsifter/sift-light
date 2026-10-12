@@ -1,4 +1,7 @@
+import { z } from "zod";
+import { mediaRequestSchema, type MediaResult } from "./media-search.js";
 import type { DataSourceConfig } from "./data-source-config.js";
+import type { NativeTextConfig } from "./native-text-config.js";
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
@@ -83,6 +86,8 @@ function siftLightTool(outputMode: SiftLightMcpOutputMode): Tool {
 }
 
 export interface SiftLightMcpService {
+  readonly mediaEnabled?: boolean;
+  mediaSearch?(value: unknown, cwd: string, signal?: AbortSignal): Promise<MediaResult>;
   search(
     input: SiftLightInput,
     cwd: string,
@@ -96,6 +101,8 @@ export function createDefaultSiftLightMcpService(
   semanticJudge?: SemanticJudgeIntegration,
   vectorSearchEnabled = false,
   dataSources: readonly DataSourceConfig[] = [],
+  nativeText?: NativeTextConfig,
+  nativeMedia?: NativeTextConfig,
 ): SiftLightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
@@ -105,6 +112,8 @@ export function createDefaultSiftLightMcpService(
     vectorSearchEnabled,
     dataSources,
     semanticJudge: resolvedSemanticJudge,
+    ...(nativeText ? { nativeText } : {}),
+    ...(nativeMedia ? { nativeMedia } : {}),
   });
 }
 
@@ -176,10 +185,43 @@ export function createSiftLightMcpServer(
   );
 
   server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [tool],
+    tools: [
+      tool,
+      ...(service.mediaEnabled
+        ? [
+            {
+              name: "sift-light-media",
+              title: "Visual search",
+              description:
+                "Search local image content or scanned PDF pages. mode=search needs path and exactly one query (text) or image (local image path). kind=all/image/scan. Honors scope, glob, exclude, hidden and ignorePolicy. Returns up to ten candidates with source hashes and PDF page numbers. Copy inspect or validate requests to this tool; inspect returns actual image pixels. Local resident vision model; slow search returns nextRequest mode=await to this tool. mode=cancel stops an operation. Text/code search stays in sift-light.",
+              inputSchema: {
+                ...z.toJSONSchema(mediaRequestSchema, { unrepresentable: "any" }),
+                type: "object" as const,
+              },
+              annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+            },
+          ]
+        : []),
+    ],
   }));
 
   server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (request.params.name === "sift-light-media" && service.mediaEnabled && service.mediaSearch) {
+      try {
+        const result = await service.mediaSearch(request.params.arguments ?? {}, cwd, extra.signal);
+        return {
+          content: [
+            { type: "text" as const, text: result.text },
+            ...(result.image ? [{ type: "image" as const, ...result.image }] : []),
+          ],
+          ...(resolvedOutputMode === "structured"
+            ? { structuredContent: { text: result.text, details: result.details } }
+            : {}),
+        };
+      } catch (error) {
+        return toolError(error, resolvedOutputMode);
+      }
+    }
     if (request.params.name !== tool.name) {
       return toolError(new Error(`Unknown tool: ${request.params.name}`), resolvedOutputMode);
     }

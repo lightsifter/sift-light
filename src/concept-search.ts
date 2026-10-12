@@ -102,6 +102,7 @@ export interface ConceptSearchExecution {
 }
 
 export interface ConceptSearchOptions {
+  onSourceBatch?: (documents: readonly SourceDocument[]) => Promise<void>;
   retainPaths?: ReadonlySet<string> | PromiseLike<ReadonlySet<string>>;
   verifySourceGeneration?: boolean;
 }
@@ -188,6 +189,8 @@ async function runConceptSearch(
       reasons: [],
     });
     inventory.push(...generation.inventory);
+    // oxlint-disable-next-line no-await-in-loop -- consumers receive only this verified, bounded admission batch.
+    if (options.onSourceBatch) await options.onSourceBatch(generation.documents);
     filesAdmitted += generation.filesAdmitted;
     filesSkippedEmpty += generation.filesSkippedEmpty;
     filesSkippedBinary += generation.filesSkippedBinary;

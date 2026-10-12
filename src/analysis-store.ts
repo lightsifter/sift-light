@@ -199,10 +199,26 @@ function publicItemDetails(item: AnalysisItem): Record<string, unknown> | undefi
     item.details?.source === "literal" || item.details?.source === "concept"
       ? item.details.source
       : undefined;
-  if (!structure && !semanticJudge && !source && !relevance) return undefined;
+  const lane = item.details?.retrievalLane;
+  const retrieval =
+    lane === "current" || lane === "native"
+      ? {
+          retrievalLane: lane,
+          laneRank: item.details?.laneRank,
+          ...(lane === "native"
+            ? {
+                score: item.details?.score,
+                certainty: "candidate",
+                nativeLocator: item.details?.nativeLocator,
+              }
+            : {}),
+        }
+      : undefined;
+  if (!structure && !semanticJudge && !source && !relevance && !retrieval) return undefined;
   return {
     ...structure,
     ...relevance,
+    ...retrieval,
     ...(source ? { source } : {}),
     ...(semanticJudge ? { semanticJudge } : {}),
   };
@@ -231,7 +247,7 @@ function publicAnalysisItem(
     label:
       (result.kind === "outline" && modelOutput) || result.kind === "files"
         ? item.label
-        : publicAnalysisLabel(result),
+        : `${publicAnalysisLabel(result)}${item.details?.retrievalLane === "current" || item.details?.retrievalLane === "native" ? ` [${item.details.retrievalLane} #${String(item.details.laneRank)}]` : ""}`,
     index: index + 1,
     ...(inspect ? { inspect } : {}),
     ...(publicDetails ? { details: publicDetails } : {}),
@@ -273,8 +289,26 @@ export class AnalysisStore {
 
   create(result: AnalysisResultSet, summarize?: RetainedAnalysisSummary): string {
     this.#expire();
+    const id = randomUUID();
     const bounded: AnalysisResultSet = {
       ...result,
+      ...(result.retrievalLanes
+        ? {
+            retrievalLanes: Object.fromEntries(
+              Object.keys(result.retrievalLanes).map((lane) => {
+                if (lane !== "current" && lane !== "native")
+                  throw new SiftLightError("Unknown retrieval lane");
+                return [
+                  lane,
+                  {
+                    cursor: `${id}.analysis.0.${lane}`,
+                    ...(result.redact ? { redact: true } : {}),
+                  },
+                ];
+              }),
+            ),
+          }
+        : {}),
       reasons: boundedReasons(result.reasons),
       items: [],
       coverage: {
@@ -335,7 +369,6 @@ export class AnalysisStore {
       this.#items.delete(oldest.id);
       this.#rememberExpired(oldest.id);
     }
-    const id = randomUUID();
     this.#items.set(id, { id, result: bounded, bytes, touched: this.#now() });
     return `${id}.${result.kind === "hybrid" && !result.counts?.relevanceRanking ? "analysis-hybrid" : "analysis"}.0`;
   }
@@ -344,20 +377,23 @@ export class AnalysisStore {
     stored: StoredAnalysis;
     offset: number;
     kind: "analysis" | "analysis-hybrid" | "analysis-terms";
+    lane?: string;
   } {
     this.#expire();
-    const match = /^([a-f0-9-]+)\.(analysis|analysis-hybrid|analysis-terms)\.([0-9a-z]+)$/.exec(
-      cursor,
-    );
+    const match =
+      /^([a-f0-9-]+)\.(analysis|analysis-hybrid|analysis-terms)\.([0-9a-z]+)(?:\.(current|native))?$/.exec(
+        cursor,
+      );
     if (!match) throw new CursorError("Invalid analysis cursor");
     const id = match[1];
     const kind = match[2];
     const rawOffset = match[3];
+    const lane = match[4];
     if (kind !== "analysis" && kind !== "analysis-hybrid" && kind !== "analysis-terms")
       throw new CursorError("Invalid analysis cursor");
     if (!id || !rawOffset) throw new CursorError("Invalid analysis cursor");
     const offset = Number.parseInt(rawOffset, 36);
-    const stored = this.#items.get(id);
+    let stored = this.#items.get(id);
     if (!stored)
       throw new CursorError(
         this.#expired.has(id)
@@ -365,6 +401,34 @@ export class AnalysisStore {
           : "Analysis cursor was not found; run the query again",
         this.#expired.has(id) ? "E_CURSOR_EXPIRED" : "E_CURSOR_NOT_FOUND",
       );
+    stored.touched = this.#now();
+    if (lane) {
+      if (kind !== "analysis" || !stored.result.retrievalLanes?.[lane])
+        throw new CursorError("Invalid retrieval lane");
+      stored = {
+        ...stored,
+        result: {
+          ...stored.result,
+          items: stored.result.items.filter((item) => item.details?.retrievalLane === lane),
+        },
+      };
+    } else if (stored.result.rankedFiles) {
+      const representatives = new Map<string, AnalysisItem>();
+      for (const item of stored.result.items) {
+        if (!representatives.has(item.path) || item.details?.retrievalLane === "native")
+          representatives.set(item.path, item);
+      }
+      stored = {
+        ...stored,
+        result: {
+          ...stored.result,
+          items: stored.result.rankedFiles.flatMap((path) => {
+            const item = representatives.get(path);
+            return item ? [item] : [];
+          }),
+        },
+      };
+    }
     if (
       !Number.isSafeInteger(offset) ||
       offset < 0 ||
@@ -377,7 +441,7 @@ export class AnalysisStore {
     )
       throw new CursorError("Invalid analysis offset", "E_CURSOR_OFFSET_INVALID");
     stored.touched = this.#now();
-    return { stored, offset, kind };
+    return { stored, offset, kind, ...(lane ? { lane } : {}) };
   }
 
   item(cursor: string, index: number): AnalysisItem {
@@ -392,7 +456,8 @@ export class AnalysisStore {
   }
 
   page(cursor: string, modelOutput = false, redact = false): SiftLightResult {
-    const { stored, offset, kind } = this.resolve(cursor);
+    const { stored, offset, kind, lane } = this.resolve(cursor);
+    const suffix = lane ? `.${lane}` : "";
     const result = redact ? { ...stored.result, redact: true } : stored.result;
     if (kind === "analysis-terms") return analysisTermPage(result, stored.id, offset);
     const hybridPreview = kind === "analysis-hybrid";
@@ -407,7 +472,8 @@ export class AnalysisStore {
     const items: NonNullable<SiftLightResult["details"]["analysis"]>["items"] = [];
     const sources: NonNullable<SiftLightResult["details"]["analysis"]>["sources"] = [];
     const sourceIds = new Map<string, number>();
-    const hybridInspectCursor = result.kind === "hybrid" ? `${stored.id}.analysis.0` : undefined;
+    const hybridInspectCursor =
+      result.kind === "hybrid" ? `${stored.id}.analysis.0${suffix}` : undefined;
     const statistics = statisticsForItems(
       result.items,
       result.items.length,
@@ -434,6 +500,7 @@ export class AnalysisStore {
       const item = result.items[index];
       if (!item) throw new Error("Analysis item unavailable");
       const publicItem = publicAnalysisItem(result, item, index, stored.id, modelOutput);
+      if (publicItem.inspect) publicItem.inspect.cursor = `${stored.id}.analysis.0${suffix}`;
       const inspect = publicItem.inspect;
       const exposeExcerpt =
         result.kind === "concept" ||
@@ -490,13 +557,18 @@ export class AnalysisStore {
       hybridMatchesRequest ??
       (next < result.items.length
         ? {
-            cursor: `${stored.id}.analysis.${next.toString(36)}`,
+            cursor: `${stored.id}.analysis.${next.toString(36)}${suffix}`,
             ...(result.redact ? { redact: true } : {}),
           }
         : undefined);
     const text = [
       header + notice,
       ...rows,
+      ...(result.retrievalLanes
+        ? [
+            `Independent retrieval lanes (copy the exact request): ${JSON.stringify(result.retrievalLanes)}`,
+          ]
+        : []),
       ...(hybridInspectCursor
         ? [
             `Inspect item #N: ${JSON.stringify({ mode: "inspect", cursor: hybridInspectCursor, matchIndex: "N" })}`,
@@ -527,7 +599,7 @@ export class AnalysisStore {
         returnedMatches: items.length,
         totalFiles: statistics.files,
         statistics,
-        cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0`,
+        cursor: nextRequest?.cursor ?? `${stored.id}.analysis.0${suffix}`,
         ...(nextRequest ? { nextRequest } : {}),
         analysis: {
           kind: result.kind,
@@ -553,6 +625,7 @@ export class AnalysisStore {
           ...(result.coverage ? { coverage: result.coverage } : {}),
           ...(result.stats ? { stats: result.stats } : {}),
           ...(result.sourceGeneration ? { sourceGeneration: result.sourceGeneration } : {}),
+          ...(result.retrievalLanes ? { retrievalLanes: result.retrievalLanes } : {}),
           ...(hybridMatchesRequest ? { matchesRequest: hybridMatchesRequest } : {}),
           ...(hybridInspectCursor ? { inspectCursor: hybridInspectCursor } : {}),
         },

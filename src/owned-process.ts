@@ -30,6 +30,10 @@ export async function runOwnedProcess(
       : spawn(executable, args, { ...spawnOptions, stdio: ["pipe", "pipe", "pipe"] });
   // Interactive writes reject their callbacks; keep stream errors observed until child closure.
   if (options.interactive) child.stdin?.on("error", () => undefined);
+  const spawned = new Promise<void>((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
+  });
   const inputComplete = new Promise<void>((resolveInput, rejectInput) => {
     if (input === undefined || child.stdin === null) {
       resolveInput();
@@ -82,7 +86,7 @@ export async function runOwnedProcess(
   try {
     const [code] = await Promise.all([
       closePromise,
-      consumeOutput(child.stdout, child.stdin),
+      spawned.then(() => consumeOutput(child.stdout, child.stdin)),
       inputComplete,
     ]);
     if (signal?.aborted) throw abortError();

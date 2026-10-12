@@ -76,6 +76,7 @@ export interface AnalysisItem {
 }
 
 export interface AnalysisDetails {
+  retrievalLanes?: Record<string, SiftLightInput>;
   kind:
     | "concept"
     | "hybrid"
@@ -138,6 +139,9 @@ export interface AnalysisDetails {
     cacheHits?: number;
     conceptCacheHits?: number;
     conceptQueueWaitMs?: number;
+    nativeModelLoads?: number;
+    nativeModelReused?: boolean;
+    nativeProcessId?: number;
     conceptModelLoads?: number;
     conceptModelReused?: boolean;
     conceptCacheMisses?: number;
@@ -152,6 +156,10 @@ export interface AnalysisDetails {
 }
 
 export interface AnalysisResultSet {
+  /** Default file ordering; independent lanes share the full retained evidence. */
+  rankedFiles?: string[];
+  lanes?: Record<string, AnalysisItem[]>;
+  retrievalLanes?: Record<string, SiftLightInput>;
   kind: AnalysisDetails["kind"];
   unit: AnalysisDetails["unit"];
   items: AnalysisItem[];

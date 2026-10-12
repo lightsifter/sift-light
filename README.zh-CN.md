@@ -34,7 +34,7 @@ Concept 排名会覆盖请求所声明源码预算内接纳的全部 UTF-8 段�
 
 Concept 或 hybrid 较慢时，会在默认五秒等待窗口内返回 `status: "waiting"` 或 `"running"`、`operationId`、进度和精确的 `nextRequest`，例如 `{ "mode": "await", "operationId": "..." }`。请原样复制这个请求：它会续接同一个计算，不会重启查询，也不会降级成只有字面的结果。最终结果可稳定复取十分钟；每个服务会话最多保留 32 个终态结果。`mode: "cancel"` 会停止自有任务并等待清理完成。每个服务会话最多同时接纳八个 pending operation；单个 operation 使用 `SIFT_LIGHT_CONCEPT_TIMEOUT_MS` 指定一个总执行时限（整数毫秒，1000–3600000，默认 600000），另有 120 秒无人续接租期。真实模型、来源或资源故障会以明确失败返回。发布结果前会重新枚举并校验同一来源 generation；源文件变化会刷新 operation，混合版本不会被标成 complete。接纳计划计数（`filesEnumerated`、`filesAdmitted`、`filesSkippedEmpty`、`filesUnavailable`、`passagesQueued`、`batchesPlanned`、`batchesCompleted`）会在结果里明确显示。空文件属于正常跳过，不会把结果标成 partial。
 
-首次运行尚未缓存的 Concept 或 hybrid 搜索时需要加载本地模型；耗时可能达到数十秒，推理 worker 内存也可能超过 1 GiB，具体取决于机器和搜索范围。后续搜索即使换了问题，也会复用已缓存的段落向量；新问题仍会短暂加载模型来计算问题向量。修改过的段落需要重算；缓存被清理、淘汰或大量源码变化时可能再次冷运行。精确搜索模式不会加载模型。这些都是随负载变化的观察，不是延迟或内存保证。结果在 `model-loading` 阶段等待时，请按返回的 `nextRequest` 续接同一个 operation。
+首次运行尚未缓存的 Concept 或 hybrid 搜索时需要加载本地模型；耗时可能达到数十秒，推理 worker 内存也可能超过 1 GiB，具体取决于机器和搜索范围。后续搜索即使换了问题，也会复用已缓存的段落向量；活跃服务会复用已加载的模型。E5 worker 空闲 30 秒后释放，之后的查询会再次加载。修改过的段落需要重算；缓存被清理、淘汰或大量源码变化时可能再次冷运行。精确搜索模式不会加载模型。这些都是随负载变化的观察，不是延迟或内存保证。结果在 `model-loading` 阶段等待时，请按返回的 `nextRequest` 续接同一个 operation。
 
 ### 几个条件，可以一起交代
 
@@ -72,6 +72,30 @@ Pi 和 OMP 的被动 session 状态会显示当前加载的包版本，统计已
 对具体的 JS/TS/TSX 或 Python 文件使用 `mode: "outline"`，可以查看有界符号范围。JS/TS/TSX 使用 ast-grep，Python 使用基于缩进的类、函数和方法范围；对 outline 条目执行 inspect 会返回该符号经版本校验的源码。它们不证明编译器绑定、运行时调用或测试覆盖。`mode: "tests"` 提供 JS/TS/TSX 关联测试候选，不支持的语言操作会明确报错。Swift 源码可使用普通搜索和 `inspect`。
 
 可读正文会保持精简；每项证据的范围、计数、覆盖状态和继续请求仍保留在结构化 `details` 中，客户端无需为了拿到这些字段再次搜索。
+
+### Apple Silicon 独立文本检索
+
+可选的 `nativeText` 配置让 `concept` 和 `hybrid` 同时返回两路本地结果：现有检索和原生文本检索。两路各自保留排名，`details.analysis.retrievalLanes.current` 与 `.native` 给出可直接执行的读取请求。`hybrid` 配合 `ranking: "relevance"` 时，默认结果按文件倒数排名加权，原生路权重为 1、现有路为 0.1，最多返回十个不同文件；其他双路视图交错排列，两路原始分数不作直接比较。默认结果和两路结果都可继续 `inspect` 与 `validate`，源码变化会被报告。
+
+在 Apple Silicon macOS 上，准备 Xcode、Metal Toolchain、本地 SDK checkout 和模型目录，然后在项目 checkout 中运行：
+
+```sh
+bun run build:native-text -- /absolute/sdk-checkout /absolute/native-text-output
+```
+
+构建器使用固定版本，输出程序及必需的资源 bundle。模型目录应包含 `model.safetensors`、`config.json`、`tokenizer.json` 和 `tokenizer_config.json`。将完整输出目录保留在本机，并在宿主实际读取的 `sift-light.json` 中配置：
+
+```json
+{
+  "vectorSearchEnabled": true,
+  "nativeText": {
+    "executable": "/absolute/native-text-output/native-text",
+    "modelDirectory": "/absolute/model-directory"
+  }
+}
+```
+
+现有 E5 模型仍需安装。原生程序只读取现有源码准入策略允许的私有临时文本副本，索引在服务关闭时删除；同一服务内增量重用索引，连续请求复用同一个已加载的原生模型；空闲 60 秒后退出 worker 并释放内存，之后的请求会重新启动。取消、关闭和协议失败都会等待自有 worker 退出后再继续。`details.analysis.stats` 中的 `nativeModelLoads`、`nativeModelReused` 和 `nativeProcessId` 可用于核对复用状态。隐藏文件、glob、exclude 与读取预算由现有准入层决定，未识别的文本后缀从已核验的 UTF-8 字节转换为纯文本副本。程序、模型或协议失败会明确报错。省略 `nativeText` 即使用现有行为。这一配置仅启用文本，不启用图片、音频或视频检索。
 
 ## 常见用法
 
@@ -184,3 +208,28 @@ Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相
 本地搜索在你的机器上进行。请只允许 Agent 读取已获授权的文件。HTTP 服务对外开放前需要认证网关，详见[安全说明](SECURITY.md)。
 
 [更新记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [AGPL-3.0-only 许可证](LICENSE)
+
+### 图片与扫描页检索（MCP）
+
+在配置中设置 `nativeMedia.executable` 和 `nativeMedia.modelDirectory` 的绝对路径，然后重新连接 MCP。Apple Silicon 上的构建命令为 `bun run build:native-media <sdk-checkout> <output-directory>`。模型在本地运行，启用视觉编码，不启用音频编码。
+
+新增的 `sift-light-media` 工具使用 `mode: "search"`、一个明确的本地 `path`，以及二选一的 `query`（文字描述）或 `image`（本地图片路径）。`kind` 可为 `all`、`image` 或 `scan`。`glob`、`exclude`、`hidden`、`ignorePolicy` 沿用工作区文件准入规则。文字、代码和源码导航继续使用 `sift-light`。
+
+```json
+{ "mode": "search", "path": "/absolute/project/assets", "query": "草地上奔跑的狗", "kind": "image" }
+```
+
+```json
+{
+  "mode": "search",
+  "path": "/absolute/project/assets",
+  "image": "/absolute/query.jpg",
+  "kind": "all"
+}
+```
+
+结果最多保留十个不同文件，包含原文件内容哈希、原 PDF 页码和可直接执行的 `inspect`、`validate` 请求。把这些请求继续交给本工具：`inspect` 返回最长边不超过 1024 像素的真实 PNG；扫描页返回原 PDF 中对应页面。原文件发生变化时，查看会明确拒绝，校验会报告过期。混合 PDF 中的扫描页也保留原页码。相似度只是候选依据，不保证识别所有小字，也不提供文字区域坐标。
+
+首次索引较慢时，工具返回 `nextRequest` 和 `mode: "await"`；照原请求继续等待即可。使用 `mode: "cancel"` 和对应 `operationId` 可以取消。连续请求复用一个视觉模型，空闲 60 秒后释放，取消和关闭由服务回收进程。每次最多准入 512 个媒体文件，每个文件不超过 20 MiB，总量不超过 256 MiB；数量、总量和枚举限制会明确标为部分覆盖。单次任务期限为五分钟。结果保留十分钟，且只在原工作区中可用。当前入口不包含 Office、音频或视频。
+
+原生文本和视觉程序在已加载模型之外设置 1 GB 推理余量，使用计算所需的工作空间，并在每次查询后归还空闲计算缓存；这不是进程总内存的硬上限。模型本身仍会占用数 GB，索引和计算期间还有额外内存。每个 MCP 服务会话分别持有自己的模型；多个连接或文本与视觉同时工作时，占用会相加。普通精确搜索不加载这些模型。运行内存和速度必须按实际模型、机器与文件范围测量。

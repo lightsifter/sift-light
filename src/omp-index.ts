@@ -195,6 +195,8 @@ export async function registerOmpSiftLightExtension(
       vectorSearchEnabled: resolvedConfig.vectorSearchEnabled === true,
       dataSources: resolvedConfig.dataSources ?? [],
       semanticJudge,
+      ...(resolvedConfig.nativeText ? { nativeText: resolvedConfig.nativeText } : {}),
+      ...(resolvedConfig.nativeMedia ? { nativeMedia: resolvedConfig.nativeMedia } : {}),
     }),
   );
   const { locale } = resolvedConfig;

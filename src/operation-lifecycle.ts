@@ -9,8 +9,8 @@ export const MAX_RETAINED_OPERATIONS = 32;
 
 export type OperationState = "running" | "complete" | "failed" | "cancelled" | "expired";
 
-export interface OperationMetadata {
-  mode: "concept" | "hybrid";
+export interface OperationMetadata<Mode extends string = "concept" | "hybrid"> {
+  mode: Mode;
   redact: boolean;
   cwd: string;
 }
@@ -22,19 +22,19 @@ export interface OperationProgress {
   detail?: string;
 }
 
-export interface OperationSnapshot<T> {
+export interface OperationSnapshot<T, Mode extends string = "concept" | "hybrid"> {
   readonly id: string;
   readonly state: OperationState;
   readonly startedAt: number;
   readonly deadlineAt: number;
   readonly leaseExpiresAt: number;
-  readonly metadata: OperationMetadata;
+  readonly metadata: OperationMetadata<Mode>;
   readonly progress?: OperationProgress;
   readonly result?: T;
   readonly error?: unknown;
 }
 
-interface OperationEntry<T> {
+interface OperationEntry<T, Mode extends string> {
   readonly id: string;
   readonly startedAt: number;
   readonly deadlineAt: number;
@@ -42,7 +42,7 @@ interface OperationEntry<T> {
   readonly promise: Promise<T>;
   state: OperationState;
   leaseExpiresAt: number;
-  readonly metadata: OperationMetadata;
+  readonly metadata: OperationMetadata<Mode>;
   progress?: OperationProgress;
   result?: T;
   error?: unknown;
@@ -53,11 +53,11 @@ interface OperationEntry<T> {
   readonly waiters: Set<() => void>;
 }
 
-export type OperationWaitResult<T> =
-  | { state: "running"; operation: OperationSnapshot<T> }
-  | { state: "complete"; operation: OperationSnapshot<T>; result: T }
-  | { state: "failed"; operation: OperationSnapshot<T>; error: unknown }
-  | { state: "cancelled" | "expired"; operation: OperationSnapshot<T>; error: unknown };
+export type OperationWaitResult<T, Mode extends string = "concept" | "hybrid"> =
+  | { state: "running"; operation: OperationSnapshot<T, Mode> }
+  | { state: "complete"; operation: OperationSnapshot<T, Mode>; result: T }
+  | { state: "failed"; operation: OperationSnapshot<T, Mode>; error: unknown }
+  | { state: "cancelled" | "expired"; operation: OperationSnapshot<T, Mode>; error: unknown };
 
 export interface OperationLifecycleOptions {
   now?: () => number;
@@ -72,7 +72,9 @@ function abortReason(signal: AbortSignal | undefined): Error {
   return signal?.reason instanceof Error ? signal.reason : new Error("Operation was cancelled");
 }
 
-function snapshot<T>(entry: OperationEntry<T>): OperationSnapshot<T> {
+function snapshot<T, Mode extends string>(
+  entry: OperationEntry<T, Mode>,
+): OperationSnapshot<T, Mode> {
   return {
     id: entry.id,
     state: entry.state,
@@ -87,8 +89,8 @@ function snapshot<T>(entry: OperationEntry<T>): OperationSnapshot<T> {
 }
 
 /** Owns long-running work and its retained result for one service session. */
-export class OperationLifecycle<T> {
-  readonly #operations = new Map<string, OperationEntry<T>>();
+export class OperationLifecycle<T, Mode extends string = "concept" | "hybrid"> {
+  readonly #operations = new Map<string, OperationEntry<T, Mode>>();
   readonly #pending = new Set<Promise<T>>();
   readonly #now: () => number;
   readonly #maxOperations: number;
@@ -124,8 +126,8 @@ export class OperationLifecycle<T> {
 
   start(
     run: (signal: AbortSignal, operationId: string) => Promise<T>,
-    metadata: OperationMetadata,
-  ): OperationSnapshot<T> & {
+    metadata: OperationMetadata<Mode>,
+  ): OperationSnapshot<T, Mode> & {
     promise: Promise<T>;
   } {
     this.#expireRetained();
@@ -138,7 +140,7 @@ export class OperationLifecycle<T> {
     const startedAt = this.#now();
     const controller = new AbortController();
     const promise = Promise.resolve().then(() => run(controller.signal, id));
-    const entry: OperationEntry<T> = {
+    const entry: OperationEntry<T, Mode> = {
       id,
       startedAt,
       deadlineAt: startedAt + this.#deadlineMs,
@@ -191,7 +193,7 @@ export class OperationLifecycle<T> {
     return { ...snapshot(entry), promise: entry.promise };
   }
 
-  get(operationId: string): OperationSnapshot<T> {
+  get(operationId: string): OperationSnapshot<T, Mode> {
     this.#expireRetained();
     const entry = this.#operations.get(operationId);
     if (!entry) throw new Error("Operation was not found or has expired; start the query again");
@@ -204,7 +206,7 @@ export class OperationLifecycle<T> {
     entry.progress = { ...progress };
   }
 
-  touch(operationId: string): OperationSnapshot<T> {
+  touch(operationId: string): OperationSnapshot<T, Mode> {
     const entry = this.#operations.get(operationId);
     if (!entry) throw new Error("Operation was not found or has expired; start the query again");
     if (entry.state === "running") this.#touch(entry);
@@ -215,19 +217,19 @@ export class OperationLifecycle<T> {
     operationId: string,
     timeoutMs = OPERATION_INITIAL_WAIT_MS,
     signal?: AbortSignal,
-  ): Promise<OperationWaitResult<T>> {
+  ): Promise<OperationWaitResult<T, Mode>> {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
       throw new Error("timeoutMs must be a non-negative safe integer");
     const entry = this.#operations.get(operationId);
     if (!entry) throw new Error("Operation was not found or has expired; start the query again");
     if (entry.state !== "running") return this.#settled(entry);
     this.#touch(entry);
-    return new Promise<OperationWaitResult<T>>((resolve, reject) => {
+    return new Promise<OperationWaitResult<T, Mode>>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       let finished = false;
       let aborting = false;
       const onSettled = (): void => finish(this.#settled(entry));
-      const finish = (result: OperationWaitResult<T>): void => {
+      const finish = (result: OperationWaitResult<T, Mode>): void => {
         if (finished || aborting) return;
         finished = true;
         if (timer) clearTimeout(timer);
@@ -270,7 +272,10 @@ export class OperationLifecycle<T> {
     });
   }
 
-  cancel(operationId: string, reason = new Error("Operation cancelled")): OperationSnapshot<T> {
+  cancel(
+    operationId: string,
+    reason = new Error("Operation cancelled"),
+  ): OperationSnapshot<T, Mode> {
     const entry = this.#operations.get(operationId);
     if (!entry) throw new Error("Operation was not found or has expired; start the query again");
     if (entry.state === "running") {
@@ -286,7 +291,7 @@ export class OperationLifecycle<T> {
   async cancelAndWait(
     operationId: string,
     reason = new Error("Operation cancelled"),
-  ): Promise<OperationSnapshot<T>> {
+  ): Promise<OperationSnapshot<T, Mode>> {
     const entry = this.#operations.get(operationId);
     if (!entry) throw new Error("Operation was not found or has expired; start the query again");
     this.cancel(operationId, reason);
@@ -313,7 +318,7 @@ export class OperationLifecycle<T> {
     await Promise.allSettled(this.#pending);
   }
 
-  #settled(entry: OperationEntry<T>): OperationWaitResult<T> {
+  #settled(entry: OperationEntry<T, Mode>): OperationWaitResult<T, Mode> {
     const current = snapshot(entry);
     if (entry.state === "complete" && entry.result !== undefined)
       return { state: "complete", operation: current, result: entry.result };
@@ -324,7 +329,7 @@ export class OperationLifecycle<T> {
     return { state: "running", operation: current };
   }
 
-  #finishFailure(entry: OperationEntry<T>, message: string): void {
+  #finishFailure(entry: OperationEntry<T, Mode>, message: string): void {
     if (entry.state !== "running") return;
     entry.state = "failed";
     entry.error = new Error(message);
@@ -332,7 +337,7 @@ export class OperationLifecycle<T> {
     this.#notify(entry);
   }
 
-  #retainResult(entry: OperationEntry<T>): void {
+  #retainResult(entry: OperationEntry<T, Mode>): void {
     if (entry.settled && entry.timer) clearTimeout(entry.timer);
     if (entry.settled) entry.timer = undefined;
     if (entry.leaseTimer) clearTimeout(entry.leaseTimer);
@@ -344,18 +349,18 @@ export class OperationLifecycle<T> {
     this.#evictRetainedOverflow();
   }
 
-  #notify(entry: OperationEntry<T>): void {
+  #notify(entry: OperationEntry<T, Mode>): void {
     const waiters = [...entry.waiters];
     entry.waiters.clear();
     for (const waiter of waiters) waiter();
   }
 
-  #touch(entry: OperationEntry<T>): void {
+  #touch(entry: OperationEntry<T, Mode>): void {
     entry.leaseExpiresAt = this.#now() + this.#leaseMs;
     this.#armLease(entry);
   }
 
-  #armLease(entry: OperationEntry<T>): void {
+  #armLease(entry: OperationEntry<T, Mode>): void {
     if (entry.leaseTimer) clearTimeout(entry.leaseTimer);
     entry.leaseTimer = setTimeout(
       () => {
@@ -371,7 +376,7 @@ export class OperationLifecycle<T> {
     entry.leaseTimer.unref?.();
   }
 
-  #evict(entry: OperationEntry<T>): void {
+  #evict(entry: OperationEntry<T, Mode>): void {
     if (this.#operations.get(entry.id) !== entry) return;
     if (entry.state === "running") {
       entry.state = "expired";
@@ -397,7 +402,7 @@ export class OperationLifecycle<T> {
     }
   }
 
-  #clearTimers(entry: OperationEntry<T>, includeLease = true): void {
+  #clearTimers(entry: OperationEntry<T, Mode>, includeLease = true): void {
     if (entry.timer) clearTimeout(entry.timer);
     if (includeLease && entry.leaseTimer) clearTimeout(entry.leaseTimer);
     entry.timer = undefined;
