@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1-2 — 2026-10-13
+
+- Clarify the shared 32 MiB source-read budget for `inspect`, including why smaller output windows and source continuations do not admit oversized files.
+- Keep search behavior, public interfaces and default configuration unchanged; this is a documentation and maintainer-verification release.
+
 ## 1.1.1-1 — 2026-10-12
 
 - Bind retained ordinary search results to verified worktree content identities instead of relying on file metadata alone.
