@@ -109,6 +109,8 @@ function publicAnalysisLabel(result: AnalysisResultSet): string {
       return "condition match metadata";
     case "validate":
       return "validation metadata";
+    case "support":
+      return "answer support assessment";
   }
   throw new Error("Unknown analysis result kind");
 }
@@ -488,8 +490,11 @@ export class AnalysisStore {
     const semanticJudge = result.semanticJudge
       ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.`
       : "";
+    const answerSupport = result.answerSupport
+      ? ` Answer support: ${result.answerSupport.status}${result.answerSupport.assessment ? ` (${result.answerSupport.assessment})` : ""}${result.answerSupport.reason ? `; ${result.answerSupport.reason}` : ""}; source freshness and retrieval ranking are separate signals.`
+      : "";
     const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${scope}${coverage}${stats}`;
     const notice = result.reasons.length
       ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
       : "";
@@ -612,6 +617,7 @@ export class AnalysisStore {
           ...(sources.length ? { sources } : {}),
           reasons: result.reasons,
           ...(result.semanticJudge ? { semanticJudge: result.semanticJudge } : {}),
+          ...(result.answerSupport ? { answerSupport: result.answerSupport } : {}),
           ...(result.filesRead !== undefined ? { filesRead: result.filesRead } : {}),
           ...(result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {}),
           ...(result.changes ? { changes: result.changes } : {}),

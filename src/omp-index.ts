@@ -27,6 +27,7 @@ import {
 import { siftLightSchema } from "./tool-schema.js";
 import { modelErrorText } from "./model-error.js";
 import { createConfiguredSemanticJudgeIntegration } from "./semantic-judge.js";
+import { createConfiguredAnswerSupportIntegration } from "./answer-support.js";
 
 const SIFT_LIGHT_LABEL = "sift-light";
 const OMP_REPLACED_SEARCH_TOOLS = new Set(["grep", "glob"]);
@@ -188,6 +189,7 @@ export async function registerOmpSiftLightExtension(
       missing: process.env[SIFT_LIGHT_CONFIG_ENV]?.trim() ? "error" : "defaults",
     }));
   const semanticJudge = createConfiguredSemanticJudgeIntegration(resolvedConfig);
+  const answerSupport = createConfiguredAnswerSupportIntegration(resolvedConfig);
   const runtime = new SiftLightRuntime(
     new SiftLightService({
       runRipgrep: createRipgrepRunner(),
@@ -195,6 +197,7 @@ export async function registerOmpSiftLightExtension(
       vectorSearchEnabled: resolvedConfig.vectorSearchEnabled === true,
       dataSources: resolvedConfig.dataSources ?? [],
       semanticJudge,
+      answerSupport,
       ...(resolvedConfig.nativeText ? { nativeText: resolvedConfig.nativeText } : {}),
       ...(resolvedConfig.nativeMedia ? { nativeMedia: resolvedConfig.nativeMedia } : {}),
     }),

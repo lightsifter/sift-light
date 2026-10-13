@@ -43,6 +43,7 @@ import type { RipgrepRunner } from "./rg.js";
 import type { CodeStructureProvider } from "./structure.js";
 import { ConceptWorkerExitError, type ConceptSearchRunner } from "./concept-search.js";
 import type { SemanticJudgeIntegration } from "./semantic-judge.js";
+import type { AnswerSupportIntegration } from "./answer-support.js";
 import { SearchPathPolicy } from "./path-policy.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import {
@@ -117,6 +118,7 @@ export interface SiftLightServiceOptions {
   vectorSearchEnabled?: boolean;
   conceptSearch?: ConceptSearchRunner;
   semanticJudge?: SemanticJudgeIntegration;
+  answerSupport?: AnswerSupportIntegration;
 }
 
 export interface SiftLightSearchOptions {
@@ -438,6 +440,7 @@ export class SiftLightService {
       options.conceptSearch,
       options.semanticJudge,
       options.nativeText,
+      options.answerSupport,
     );
   }
 

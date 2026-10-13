@@ -142,7 +142,7 @@ export function validationResult(
       `#${String(index + 1)} ${JSON.stringify(source.path)}: ${source.status}${source.reason ? ` (${source.reason})` : ""}`,
   );
   return {
-    text: `Evidence validation is ${recheck.validity}; checked ${String(validation.checked.length)} source(s), ${String(validation.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}.${validation.sourceOmitted ? ` ${String(validation.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${sourceRows.length ? `\n${sourceRows.join("\n")}` : ""}`,
+    text: `Evidence validation is ${recheck.validity}; checked ${String(validation.checked.length)} source(s), ${String(validation.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}. Answer support is not assessed by source validation.${validation.sourceOmitted ? ` ${String(validation.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${sourceRows.length ? `\n${sourceRows.join("\n")}` : ""}`,
     details,
   };
 }

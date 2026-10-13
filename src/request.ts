@@ -25,6 +25,8 @@ export interface RawSearchInput {
   wholeWord?: boolean;
   modifiedAfter?: number;
   modifiedBefore?: number;
+  supportQuestion?: string;
+  supportClaim?: string;
 }
 
 function list(value: string | string[] | undefined): string[] {
@@ -53,6 +55,9 @@ export function validateSearchPath(value: string, field = "path"): void {
 /** Validate input before any filesystem or subprocess boundary is reached. */
 export function validateRawSearchInput(input: RawSearchInput): void {
   if (input.pattern !== undefined) validateText(input.pattern, "pattern", MAX_PATTERN_CHARACTERS);
+  if (input.supportQuestion !== undefined)
+    validateText(input.supportQuestion, "supportQuestion", 2_000);
+  if (input.supportClaim !== undefined) validateText(input.supportClaim, "supportClaim", 4_000);
   if (input.path !== undefined) {
     validateSearchPath(input.path);
   }

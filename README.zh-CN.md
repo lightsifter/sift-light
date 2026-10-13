@@ -167,6 +167,28 @@ Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保�
 
 启用后，配置的端点只会收到查询和有界的候选摘录。每个请求最多包含八个候选和 64 KiB；独立批次仍受现有最多二十个候选的总上限约束，HTTP 413 只会拆分对应批次。某个批次失败时，其中的候选保持本地顺序，成功批次仍可提供分类；结果会明确标记为部分覆盖，并报告已判断/未判断候选及批次计数。缺少密钥仍会明确报配置错误，提供方失败绝不会删除本地候选，语义分类也不等同于运行时证明。
 
+### 对已核验源码中的具体结论做支撑判断
+
+`mode: "support"` 用来判断一个明确的 `supportClaim` 是否被已选中的源码证据支持。它只能接收之前检索或分析返回的 `cursor` 和 `matchIndex`/`matchIndices`，会再次校验每个源码范围的当前版本；源码已变、无法确认或没有可用范围时返回 `unknown`，不会把旧内容交给模型。这个判断与两路检索、精确定位和 `mode: "validate"` 相互独立，不会改变原检索结果。
+
+功能默认关闭。配置文件中可以选择本机兼容 HTTP JSON 提供方，或显式配置 Jev 端点；密钥只通过进程环境变量提供：
+
+```json
+{
+  "answerSupport": {
+    "enabled": true,
+    "provider": "jev",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "timeoutMs": 120000,
+    "maxRetries": 2,
+    "maxEvidenceItems": 5
+  }
+}
+```
+
+`provider: "http-json"` 时可把 `endpoint` 指向自己的本地或远程服务，并省略 `apiKeyEnv`；服务返回 `supported`、`contradicted`、`insufficient` 或 `unknown` 之一。每次最多发送五个证据项，每项最多 4,000 个字符；请求体限制 64 KiB、响应体限制 4 MiB。结果会保留提供方、模型、概率、理由和可用的 token 用量，失败会明确显示，源码核验仍然可以单独使用。
+
 ### Claude Code 或 Codex：连接 MCP
 
 ```bash

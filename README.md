@@ -167,6 +167,28 @@ The feature is enabled only when `semanticJudge.enabled` is explicitly set to `t
 
 When enabled, the configured endpoint receives only the query and bounded candidate excerpts. Up to eight candidates and 64 KiB are sent per request. Independent batches run under the existing 20-candidate ceiling; an HTTP 413 response splits only that batch. If one batch fails, its candidates keep their local order while successful batches still contribute classifications, and the result reports partial coverage with judged/unjudged candidate and batch counts. A missing key still fails configuration explicitly, local candidates are never removed by a provider failure, and semantic classification is not runtime proof.
 
+### Assess one concrete claim against verified source ranges
+
+Use `mode: "support"` to assess whether a concrete `supportClaim` is supported by selected source evidence. The request accepts only a retained `cursor` plus `matchIndex` or `matchIndices`, and rechecks every source range against the current revision before sending it to a provider. Changed, unavailable or unversioned evidence produces `unknown` and is never sent as current proof. This assessment is independent from both retrieval lanes, precise inspection and `mode: "validate"`; it does not change the original search result.
+
+The feature is disabled by default. Configure either the local-compatible HTTP JSON provider or an explicit Jev endpoint. Keep credentials in the process environment:
+
+```json
+{
+  "answerSupport": {
+    "enabled": true,
+    "provider": "jev",
+    "apiKeyEnv": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "timeoutMs": 120000,
+    "maxRetries": 2,
+    "maxEvidenceItems": 5
+  }
+}
+```
+
+With `provider: "http-json"`, point `endpoint` at your local or remote service and omit `apiKeyEnv` when it does not require a key. The provider returns one of `supported`, `contradicted`, `insufficient` or `unknown`. Each request sends at most five evidence items, with 4,000 characters per item, a 64 KiB request cap and a 4 MiB response cap. Results retain provider, model, probability, reason and available token usage; failures stay explicit and source validation remains available on its own.
+
 ### Claude Code or Codex: MCP connection
 
 ```bash

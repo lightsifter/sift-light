@@ -58,6 +58,7 @@ export type SearchMode =
   | "imports"
   | "tests"
   | "validate"
+  | "support"
   | "capabilities"
   | "await"
   | "cancel";

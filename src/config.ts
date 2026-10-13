@@ -8,6 +8,7 @@ import {
 
 export {
   DEFAULT_SIFT_LIGHT_CONFIG,
+  DEFAULT_ANSWER_SUPPORT_CONFIG,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
   normalizeSearchEnforcement,
   resolveSiftLightConfigPath,
@@ -18,6 +19,7 @@ export {
   type SearchEnforcementMode,
   type SemanticJudgeConfig,
   type SemanticJudgeProvider,
+  type AnswerSupportConfig,
   type MediaConfig,
 } from "./config-reader.js";
 

@@ -56,6 +56,7 @@ async function runHttpServer(
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
   media?: MediaConfig,
+  answerSupport?: import("./answer-support.js").AnswerSupportIntegration,
 ): Promise<void> {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
@@ -69,6 +70,7 @@ async function runHttpServer(
         nativeText,
         nativeMedia,
         media,
+        answerSupport,
       ),
     maxSessions: environmentInteger(
       "SIFT_LIGHT_MCP_MAX_SESSIONS",
@@ -122,6 +124,7 @@ async function runStdioServer(
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
   media?: MediaConfig,
+  answerSupport?: import("./answer-support.js").AnswerSupportIntegration,
 ): Promise<void> {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
@@ -134,6 +137,7 @@ async function runStdioServer(
         nativeText,
         nativeMedia,
         media,
+        answerSupport,
       ),
   });
   process.stderr.write("sift-light MCP serving one local client over stdio\n");
@@ -162,8 +166,15 @@ async function main(): Promise<void> {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media } =
-    await createMcpSearchFeatures();
+  const {
+    semanticJudge,
+    answerSupport,
+    vectorSearchEnabled,
+    dataSources,
+    nativeText,
+    nativeMedia,
+    media,
+  } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(
     `sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}\n`,
@@ -177,6 +188,7 @@ async function main(): Promise<void> {
       nativeText,
       nativeMedia,
       media,
+      answerSupport,
     );
     return;
   }
@@ -188,6 +200,7 @@ async function main(): Promise<void> {
     nativeText,
     nativeMedia,
     media,
+    answerSupport,
   );
 }
 

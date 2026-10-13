@@ -529,6 +529,16 @@ function optionalUsageTotal(
   return total;
 }
 
+function withAnswerSupportBoundary(value: AnalysisResultSet): AnalysisResultSet {
+  return {
+    ...value,
+    answerSupport: value.answerSupport ?? {
+      status: "not-assessed",
+      reason: "No claim was supplied; semantic classification does not assess answer support.",
+    },
+  };
+}
+
 export async function applySemanticJudge(
   result: AnalysisResultSet,
   query: string,
@@ -537,7 +547,10 @@ export async function applySemanticJudge(
 ): Promise<AnalysisResultSet> {
   const config = integration?.config;
   if (!config || !config.enabled || !integration.runner) {
-    return { ...result, ...(config ? { semanticJudge: baseDetails(config) } : {}) };
+    return withAnswerSupportBoundary({
+      ...result,
+      ...(config ? { semanticJudge: baseDetails(config) } : {}),
+    });
   }
   const candidates = result.items.slice(0, config.maxCandidates).map((item, index) => ({
     id: `candidate-${String(index + 1)}`,
@@ -546,7 +559,10 @@ export async function applySemanticJudge(
   const initial = baseDetails(config);
   initial.candidatesConsidered = candidates.length;
   if (candidates.length === 0) {
-    return { ...result, semanticJudge: { ...initial, status: "complete", model: config.model } };
+    return withAnswerSupportBoundary({
+      ...result,
+      semanticJudge: { ...initial, status: "complete", model: config.model },
+    });
   }
   const startedAt = performance.now();
   const execution = await judgeSemanticCandidateBatches(
@@ -619,7 +635,7 @@ export async function applySemanticJudge(
   const model = models.length === 1 ? (models[0] ?? config.model) : config.model;
   const inputTokens = optionalUsageTotal(successfulResults, (judged) => judged.inputTokens);
   const outputTokens = optionalUsageTotal(successfulResults, (judged) => judged.outputTokens);
-  return {
+  return withAnswerSupportBoundary({
     ...result,
     partial: result.partial || execution.failures.length > 0,
     reasons: reason ? [...result.reasons, reason] : result.reasons,
@@ -640,5 +656,5 @@ export async function applySemanticJudge(
       elapsedMs: Math.round(performance.now() - startedAt),
       ...(reason ? { reason } : {}),
     },
-  };
+  });
 }

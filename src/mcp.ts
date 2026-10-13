@@ -38,6 +38,9 @@ import {
   type SemanticJudgeIntegration,
 } from "./semantic-judge.js";
 import { DEFAULT_SEMANTIC_JUDGE_CONFIG } from "./config-reader.js";
+import type { AnswerSupportIntegration } from "./answer-support.js";
+import { DEFAULT_ANSWER_SUPPORT_CONFIG } from "./config-reader.js";
+import { createDisabledAnswerSupportIntegration } from "./answer-support.js";
 import { siftLightMcpInstructions } from "./prompt-guidelines.js";
 import {
   SIFT_LIGHT_DESCRIPTION,
@@ -105,15 +108,19 @@ export function createDefaultSiftLightMcpService(
   nativeText?: NativeTextConfig,
   nativeMedia?: NativeTextConfig,
   media?: MediaConfig,
+  answerSupport?: AnswerSupportIntegration,
 ): SiftLightMcpService {
   const resolvedSemanticJudge =
     semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
+  const resolvedAnswerSupport =
+    answerSupport ?? createDisabledAnswerSupportIntegration(DEFAULT_ANSWER_SUPPORT_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
     vectorSearchEnabled,
     dataSources,
     semanticJudge: resolvedSemanticJudge,
+    answerSupport: resolvedAnswerSupport,
     ...(nativeText ? { nativeText } : {}),
     ...(nativeMedia ? { nativeMedia } : {}),
     ...(media ? { media } : {}),

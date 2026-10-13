@@ -63,6 +63,8 @@ import type { OperationProgress } from "./operation-lifecycle.js";
 import { outlineCapabilityError } from "./request-contract.js";
 import { realpath } from "node:fs/promises";
 import type { SemanticJudgeIntegration } from "./semantic-judge.js";
+import type { AnswerSupportIntegration, AnswerSupportEvidence } from "./answer-support.js";
+import type { AnswerSupportDetails } from "./analysis-types.js";
 import {
   MAX_ANY_OF_TERMS,
   MAX_CONFIGURABLE_STRUCTURE_FILES,
@@ -88,6 +90,7 @@ export function isEvidenceRequest(input: SiftLightInput): boolean {
     input.mode === "imports" ||
     input.mode === "tests" ||
     input.mode === "validate" ||
+    input.mode === "support" ||
     input.sourceCursor !== undefined ||
     input.anyOf !== undefined ||
     input.allOf !== undefined ||
@@ -368,6 +371,7 @@ export class EvidenceService {
   readonly #conceptSearch: ConceptSearchRunner;
   readonly #closeConcept: (() => Promise<void>) | undefined;
   readonly #semanticJudge: SemanticJudgeIntegration | undefined;
+  readonly #answerSupport: AnswerSupportIntegration | undefined;
   readonly #queue = new SyntaxQueue();
   readonly #analyses = new AnalysisStore();
   readonly #continuations = new SourceContinuations();
@@ -378,6 +382,7 @@ export class EvidenceService {
     runConceptSearch?: ConceptSearchRunner,
     semanticJudge?: SemanticJudgeIntegration,
     nativeText?: NativeTextConfig,
+    answerSupport?: AnswerSupportIntegration,
   ) {
     this.#runner = runner;
     this.#snapshots = snapshots;
@@ -395,6 +400,7 @@ export class EvidenceService {
       if (errors.length) throw new AggregateError(errors, "Text search cleanup failed");
     };
     this.#semanticJudge = semanticJudge;
+    this.#answerSupport = answerSupport;
   }
   clear(): void {
     this.#analyses.clear();
@@ -453,6 +459,141 @@ export class EvidenceService {
       end: finishedAt,
       ...(input.matchIndex !== undefined ? { selected: input.matchIndex } : {}),
     });
+  }
+
+  async #assessAnswerSupport(
+    input: SiftLightInput,
+    access: SourceAccess,
+    signal: AbortSignal | undefined,
+    options: EvidenceSearchOptions,
+  ): Promise<SiftLightResult> {
+    const cursor = input.cursor;
+    if (!cursor) throw new SiftLightError("mode=support requires an analysis cursor");
+    if (typeof input.supportQuestion !== "string" || input.supportQuestion.trim().length === 0)
+      throw new SiftLightError("mode=support requires a nonempty supportQuestion");
+    if (typeof input.supportClaim !== "string" || input.supportClaim.trim().length === 0)
+      throw new SiftLightError("mode=support requires a nonempty supportClaim");
+    if (input.path !== undefined || input.line !== undefined || input.targets !== undefined)
+      throw new SiftLightError("mode=support accepts only cursor and retained evidence indices");
+    const indices =
+      input.matchIndices ?? (input.matchIndex === undefined ? [] : [input.matchIndex]);
+    if (indices.length === 0)
+      throw new SiftLightError("mode=support requires matchIndex or matchIndices");
+    const config = this.#answerSupport?.config;
+    const maxEvidenceItems = config?.maxEvidenceItems ?? 5;
+    if (indices.length > maxEvidenceItems)
+      throw new SiftLightError(
+        `mode=support accepts at most ${String(maxEvidenceItems)} evidence item(s) from the active configuration`,
+      );
+
+    const evidence: AnswerSupportEvidence[] = [];
+    const items: AnalysisItem[] = [];
+    const reasons: string[] = [];
+    for (const index of new Set(indices)) {
+      const item = this.#analyses.item(cursor, index);
+      const evidenceId = `evidence-${String(evidence.length + 1)}`;
+      if (!item.source || !item.range) {
+        reasons.push(`Evidence item #${String(index)} has no versioned source range`);
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop -- source validation and refresh share a bounded queue
+      const validated = await validateSavedEvidence({
+        cursor,
+        cwd: access.cwd,
+        ...(signal ? { signal } : {}),
+        matchIndex: index,
+        analyses: this.#analyses,
+        snapshots: this.#snapshots,
+        queue: this.#queue,
+        maxFiles: MAX_STRUCTURE_FILES,
+      });
+      if (validated.recheck.validity !== "current") {
+        reasons.push(
+          `Evidence item #${String(index)} is ${validated.recheck.validity}; answer support requires current source bytes`,
+        );
+        continue;
+      }
+      try {
+        // oxlint-disable-next-line no-await-in-loop -- retain evidence order and queue limits
+        const document = await access.refresh(item.path, item.source);
+        evidence.push({ id: evidenceId, excerpt: document.slice(item.range) });
+        items.push({
+          ...item,
+          details: { ...item.details, answerSupportEvidenceId: evidenceId },
+        });
+      } catch (error) {
+        reasons.push(
+          `Evidence item #${String(index)} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    const assessmentBase: AnswerSupportDetails = {
+      status: "complete",
+      question: input.supportQuestion,
+      claim: input.supportClaim,
+      evidenceItems: [...new Set(indices)],
+      ...(config ? { provider: config.provider } : {}),
+    };
+    let answerSupport: AnswerSupportDetails;
+    if (reasons.length > 0 || evidence.length === 0) {
+      answerSupport = {
+        ...assessmentBase,
+        assessment: "unknown",
+        reason: reasons.join(" ").slice(0, 512) || "No version-checked evidence was available",
+      };
+    } else if (!config?.enabled || !this.#answerSupport?.runner) {
+      answerSupport = {
+        ...assessmentBase,
+        status: "failed",
+        assessment: "unknown",
+        reason:
+          "Answer support provider is disabled or unavailable; source validation remains independent",
+      };
+    } else {
+      try {
+        const judged = await this.#answerSupport.runner(
+          input.supportQuestion,
+          input.supportClaim,
+          evidence,
+          signal,
+        );
+        answerSupport = {
+          ...assessmentBase,
+          assessment: judged.status,
+          ...(judged.model ? { model: judged.model } : {}),
+          ...(judged.probability === undefined ? {} : { probability: judged.probability }),
+          ...(judged.reason ? { reason: judged.reason } : {}),
+          ...(judged.evidenceIds ? { evidenceIds: judged.evidenceIds } : {}),
+          ...(judged.inputTokens === undefined ? {} : { inputTokens: judged.inputTokens }),
+          ...(judged.outputTokens === undefined ? {} : { outputTokens: judged.outputTokens }),
+          elapsedMs: judged.elapsedMs,
+        };
+      } catch (error) {
+        answerSupport = {
+          ...assessmentBase,
+          status: "failed",
+          assessment: "unknown",
+          reason:
+            `Answer support provider failed: ${error instanceof Error ? error.message : String(error)}`.slice(
+              0,
+              512,
+            ),
+        };
+      }
+    }
+
+    const result: AnalysisResultSet = {
+      kind: "support",
+      unit: "evidence-items",
+      items,
+      partial: answerSupport.status !== "complete" || answerSupport.assessment === "unknown",
+      reasons,
+      answerSupport,
+      coverage: { sourceValidation: reasons.length > 0 ? "partial" : "complete" },
+      redact: input.redact ?? false,
+    };
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
   }
 
   async #testEntryPaths(
@@ -527,6 +668,7 @@ export class EvidenceService {
     const fileLimit = maxFilesToParse(input.maxFilesToParse, automaticConceptLimit);
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
     if (input.mode === "validate") return this.#validateSavedEvidence(input, cwd, signal);
+    if (input.mode === "support") return this.#assessAnswerSupport(input, access, signal, options);
     if (input.sourceCursor !== undefined) {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");

@@ -3,6 +3,7 @@ import type { SiftLightInput } from "./service.js";
 import type { SearchScopeDetails, ResultStatistics } from "./types.js";
 import type { ValidationDetails } from "./validation-types.js";
 import type { ConceptSourceSummary } from "./concept-source-generation.js";
+import type { AnswerSupportStatus } from "./answer-support.js";
 
 export type CoverageStatus =
   | "complete"
@@ -25,6 +26,22 @@ export type SemanticJudgeClassification = (typeof SEMANTIC_JUDGE_CLASSIFICATIONS
 
 export const SEMANTIC_JUDGE_NON_PROOF_CLAIM =
   "semantic classification only; local static and runtime verification is not asserted";
+
+export interface AnswerSupportDetails {
+  status: "not-assessed" | "complete" | "failed";
+  assessment?: AnswerSupportStatus;
+  question?: string;
+  claim?: string;
+  evidenceItems?: number[];
+  provider?: string;
+  model?: string;
+  probability?: number;
+  reason?: string;
+  evidenceIds?: string[];
+  inputTokens?: number;
+  outputTokens?: number;
+  elapsedMs?: number;
+}
 
 export type SemanticJudgeStatus = "disabled" | "complete" | "partial" | "failed";
 
@@ -89,6 +106,7 @@ export interface AnalysisDetails {
     | "outline"
     | "imports"
     | "tests"
+    | "support"
     | "any-of"
     | "validate";
   unit:
@@ -103,6 +121,7 @@ export interface AnalysisDetails {
   returnedItems: number;
   modelOutput?: boolean;
   semanticJudge?: SemanticJudgeDetails;
+  answerSupport?: AnswerSupportDetails;
   statistics?: ResultStatistics;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SiftLightInput })[];
   sources?: SourceReference[];
@@ -166,6 +185,7 @@ export interface AnalysisResultSet {
   partial: boolean;
   reasons: string[];
   semanticJudge?: SemanticJudgeDetails;
+  answerSupport?: AnswerSupportDetails;
   filesRead?: number;
   bytesRead?: number;
   counts?: Record<string, number>;

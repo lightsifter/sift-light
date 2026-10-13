@@ -38,6 +38,10 @@ function validateSearchPath(value, field = "path") {
 function validateRawSearchInput(input) {
   if (input.pattern !== undefined)
     validateText(input.pattern, "pattern", MAX_PATTERN_CHARACTERS);
+  if (input.supportQuestion !== undefined)
+    validateText(input.supportQuestion, "supportQuestion", 2000);
+  if (input.supportClaim !== undefined)
+    validateText(input.supportClaim, "supportClaim", 4000);
   if (input.path !== undefined) {
     validateSearchPath(input.path);
   }

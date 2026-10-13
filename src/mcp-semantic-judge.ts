@@ -3,6 +3,7 @@ import type { NativeTextConfig } from "./native-text-config.js";
 import type { MediaConfig } from "./media-config.js";
 import {
   DEFAULT_SIFT_LIGHT_CONFIG,
+  DEFAULT_ANSWER_SUPPORT_CONFIG,
   DEFAULT_SEMANTIC_JUDGE_CONFIG,
   readSiftLightConfigFile,
   SIFT_LIGHT_CONFIG_ENV,
@@ -12,6 +13,11 @@ import {
   createConfiguredSemanticJudgeIntegration,
   type SemanticJudgeIntegration,
 } from "./semantic-judge.js";
+import {
+  createAnswerSupportIntegration,
+  createDisabledAnswerSupportIntegration,
+  type AnswerSupportIntegration,
+} from "./answer-support.js";
 
 function configuredPath(environment: NodeJS.ProcessEnv): string | undefined {
   const value = environment[SIFT_LIGHT_CONFIG_ENV]?.trim();
@@ -27,6 +33,7 @@ export async function createMcpSearchFeatures(
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<{
   semanticJudge: SemanticJudgeIntegration;
+  answerSupport: AnswerSupportIntegration;
   vectorSearchEnabled: boolean;
   dataSources: DataSourceConfig[];
   nativeText?: NativeTextConfig;
@@ -37,6 +44,7 @@ export async function createMcpSearchFeatures(
   if (!path)
     return {
       semanticJudge: createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG),
+      answerSupport: createDisabledAnswerSupportIntegration(DEFAULT_ANSWER_SUPPORT_CONFIG),
       dataSources: [],
       vectorSearchEnabled: DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled === true,
     };
@@ -44,6 +52,10 @@ export async function createMcpSearchFeatures(
   const config = await readSiftLightConfigFile(path, { missing: "error" });
   return {
     semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
+    answerSupport: createAnswerSupportIntegration(
+      config.answerSupport ?? DEFAULT_ANSWER_SUPPORT_CONFIG,
+      environment,
+    ),
     vectorSearchEnabled: config.vectorSearchEnabled === true,
     dataSources: config.dataSources ?? [],
     ...(config.nativeText ? { nativeText: config.nativeText } : {}),

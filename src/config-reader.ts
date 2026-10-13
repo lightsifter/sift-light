@@ -23,6 +23,7 @@ export interface SiftLightConfig {
   enforceSearch?: SearchEnforcementMode;
   vectorSearchEnabled?: boolean;
   semanticJudge?: SemanticJudgeConfig;
+  answerSupport?: AnswerSupportConfig;
 }
 
 export type SemanticJudgeProvider = "jev" | "http-json";
@@ -40,6 +41,17 @@ export interface SemanticJudgeConfig {
   maxRetries: number;
 }
 
+export interface AnswerSupportConfig {
+  enabled: boolean;
+  provider: SemanticJudgeProvider;
+  endpoint: string;
+  apiKeyEnv?: string;
+  model: string;
+  timeoutMs: number;
+  maxRetries: number;
+  maxEvidenceItems: number;
+}
+
 export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
   enabled: false,
   provider: "jev",
@@ -49,6 +61,16 @@ export const DEFAULT_SEMANTIC_JUDGE_CONFIG: Readonly<SemanticJudgeConfig> = {
   timeoutMs: 120_000,
   maxCandidates: 20,
   maxRetries: 2,
+};
+
+export const DEFAULT_ANSWER_SUPPORT_CONFIG: Readonly<AnswerSupportConfig> = {
+  enabled: false,
+  provider: "http-json",
+  endpoint: "http://127.0.0.1:8787/answer-support",
+  model: "answer-support-local",
+  timeoutMs: 120_000,
+  maxRetries: 2,
+  maxEvidenceItems: 5,
 };
 
 export const DEFAULT_SIFT_LIGHT_CONFIG: Readonly<SiftLightConfig> = {
@@ -67,6 +89,7 @@ interface RawSiftLightConfig {
   enforceSearch?: unknown;
   vectorSearchEnabled?: unknown;
   semanticJudge?: unknown;
+  answerSupport?: unknown;
 }
 
 export interface ReadSiftLightConfigOptions {
@@ -90,6 +113,17 @@ interface RawSemanticJudgeConfig {
   timeoutMs?: unknown;
   maxCandidates?: unknown;
   maxRetries?: unknown;
+}
+
+interface RawAnswerSupportConfig {
+  enabled?: unknown;
+  provider?: unknown;
+  endpoint?: unknown;
+  apiKeyEnv?: unknown;
+  model?: unknown;
+  timeoutMs?: unknown;
+  maxRetries?: unknown;
+  maxEvidenceItems?: unknown;
 }
 
 interface RawMediaConfig {
@@ -116,6 +150,10 @@ function isRawSiftLightConfig(value: unknown): value is RawSiftLightConfig {
 }
 
 function isRawSemanticJudgeConfig(value: unknown): value is RawSemanticJudgeConfig {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRawAnswerSupportConfig(value: unknown): value is RawAnswerSupportConfig {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -270,6 +308,86 @@ function parseSemanticJudge(value: unknown, path: string): SemanticJudgeConfig {
   };
 }
 
+function parseAnswerSupport(value: unknown, path: string): AnswerSupportConfig {
+  if (value === undefined) return { ...DEFAULT_ANSWER_SUPPORT_CONFIG };
+  if (!isRawAnswerSupportConfig(value))
+    throw new Error(`Invalid sift-light config at ${path}: answerSupport must be an object`);
+  const unknown = Object.keys(value).filter(
+    (key) =>
+      ![
+        "enabled",
+        "provider",
+        "endpoint",
+        "apiKeyEnv",
+        "model",
+        "timeoutMs",
+        "maxRetries",
+        "maxEvidenceItems",
+      ].includes(key),
+  );
+  if (unknown.length > 0)
+    throw new Error(
+      `Invalid sift-light config at ${path}: unsupported answerSupport fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxRetries and maxEvidenceItems`,
+    );
+  const enabled = value.enabled ?? DEFAULT_ANSWER_SUPPORT_CONFIG.enabled;
+  if (typeof enabled !== "boolean")
+    throw new Error(
+      `Invalid sift-light config at ${path}: answerSupport.enabled must be a boolean`,
+    );
+  const provider = value.provider ?? DEFAULT_ANSWER_SUPPORT_CONFIG.provider;
+  if (provider !== "jev" && provider !== "http-json")
+    throw new Error(
+      `Invalid sift-light config at ${path}: answerSupport.provider must be "jev" or "http-json"`,
+    );
+  const endpoint = parseEndpoint(
+    value.endpoint ??
+      (provider === "jev"
+        ? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint
+        : DEFAULT_ANSWER_SUPPORT_CONFIG.endpoint),
+    path,
+    "answerSupport.endpoint",
+  );
+  const apiKeyEnv =
+    parseApiKeyEnv(value.apiKeyEnv, path, "answerSupport.apiKeyEnv") ??
+    (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv : undefined);
+  const model = parseBoundedModel(
+    value.model ??
+      (provider === "jev"
+        ? DEFAULT_SEMANTIC_JUDGE_CONFIG.model
+        : DEFAULT_ANSWER_SUPPORT_CONFIG.model),
+    path,
+    "answerSupport.model",
+  );
+  return {
+    enabled,
+    provider,
+    endpoint,
+    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
+    model,
+    timeoutMs: boundedInteger(
+      value.timeoutMs,
+      DEFAULT_ANSWER_SUPPORT_CONFIG.timeoutMs,
+      1_000,
+      1_200_000,
+      `config at ${path}: answerSupport.timeoutMs`,
+    ),
+    maxRetries: boundedInteger(
+      value.maxRetries,
+      DEFAULT_ANSWER_SUPPORT_CONFIG.maxRetries,
+      0,
+      5,
+      `config at ${path}: answerSupport.maxRetries`,
+    ),
+    maxEvidenceItems: boundedInteger(
+      value.maxEvidenceItems,
+      DEFAULT_ANSWER_SUPPORT_CONFIG.maxEvidenceItems,
+      1,
+      5,
+      `config at ${path}: answerSupport.maxEvidenceItems`,
+    ),
+  };
+}
+
 function parseMedia(value: unknown, path: string): MediaConfig | undefined {
   if (value === undefined) return undefined;
   if (!isRawMediaConfig(value)) {
@@ -336,6 +454,7 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
         "enforceSearch",
         "vectorSearchEnabled",
         "semanticJudge",
+        "answerSupport",
         "dataSources",
         "nativeText",
         "nativeMedia",
@@ -344,7 +463,7 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
   );
   if (unknown.length > 0) {
     throw new Error(
-      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText, nativeMedia and media are accepted`,
+      `Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, answerSupport, dataSources, nativeText, nativeMedia and media are accepted`,
     );
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
@@ -362,6 +481,10 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
     throw new Error(`Invalid sift-light config at ${path}: choose nativeMedia or media, not both`);
   if (nativeText && vectorSearchEnabled !== true)
     throw new Error("nativeText requires vectorSearchEnabled:true");
+  const answerSupport =
+    value.answerSupport === undefined
+      ? undefined
+      : parseAnswerSupport(value.answerSupport, `${path}: answerSupport`);
   return {
     ...(nativeText ? { nativeText } : {}),
     ...(nativeMedia ? { nativeMedia } : {}),
@@ -371,6 +494,7 @@ function parseConfig(value: unknown, path: string): SiftLightConfig {
     vectorSearchEnabled:
       vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path),
+    ...(answerSupport ? { answerSupport } : {}),
     ...(value.dataSources === undefined
       ? {}
       : { dataSources: parseDataSources(value.dataSources) }),

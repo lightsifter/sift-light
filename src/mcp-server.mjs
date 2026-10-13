@@ -2903,7 +2903,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.1-2",
+  version: "1.1.1-6",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -3217,7 +3217,11 @@ function compactSemanticMetadata(details, analysis) {
       `Source: ${analysis.sourceGeneration.verification}; ${String(analysis.sourceGeneration.filesUnavailable)} unavailable.`
     ] : [],
     ...judge ? [
-      `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`
+      `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`,
+      'Semantic classification is not source verification or answer support. Answer support is not assessed unless mode="support" is explicitly requested.'
+    ] : [],
+    ...analysis.answerSupport ? [
+      `Answer support: ${analysis.answerSupport.status}${analysis.answerSupport.assessment ? ` (${analysis.answerSupport.assessment})` : ""}${analysis.answerSupport.reason ? `; ${analysis.answerSupport.reason}` : ""}; source identity, retrieval ranking and answer support remain separate.`
     ] : [],
     ...details.operation ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`] : [],
     ...analysis.retrievalLanes ? [
@@ -3243,6 +3247,7 @@ function compactMetadata(details, analysis) {
     analysis.stats ? `Stats: ${JSON.stringify(analysis.stats)}` : undefined,
     analysis.sourceGeneration ? `Source generation: ${JSON.stringify(analysis.sourceGeneration)}` : undefined,
     analysis.semanticJudge ? `Semantic judge: ${JSON.stringify(analysis.semanticJudge)}` : undefined,
+    analysis.answerSupport ? `Answer support: ${JSON.stringify(analysis.answerSupport)}` : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline" && analysis.modelOutput ? "[Outline signatures are deferred; use version-checked inspection for source excerpts.]" : undefined,
     ...analysis.reasons.map((reason) => `[${reason}]`),
@@ -3587,6 +3592,7 @@ var SIFT_LIGHT_MODES = [
   "concept",
   "hybrid",
   "validate",
+  "support",
   "capabilities",
   "await",
   "cancel"
@@ -3679,6 +3685,14 @@ var MODE_FIELDS_BY_MODE = {
     "ranking"
   ],
   validate: [...commonFields, "cursor", "matchIndex"],
+  support: [
+    ...commonFields,
+    "cursor",
+    "matchIndex",
+    "matchIndices",
+    "supportQuestion",
+    "supportClaim"
+  ],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
   cancel: ["mode", "operationId"]
@@ -4072,6 +4086,12 @@ function validateRequired(input, mode) {
     throw capabilityError("E_AUDIT_PATTERNS_REQUIRED", mode, "patterns", "mode=audit requires one or more named literal patterns", "Provide patterns as objects with id and literal fields");
   if ((mode === "concept" || mode === "hybrid") && (typeof input.query !== "string" || !input.query.trim()))
     throw capabilityError("E_MODE_QUERY_REQUIRED", mode, "query", `mode=${mode} requires a nonempty natural-language query`, `mode=${mode} requires query; provide the natural-language question and retry`);
+  if (mode === "support") {
+    if (typeof input.supportQuestion !== "string" || !input.supportQuestion.trim())
+      throw capabilityError("E_SUPPORT_QUESTION_REQUIRED", mode, "supportQuestion", "mode=support requires a nonempty supportQuestion", "Provide the question that the selected evidence should address");
+    if (typeof input.supportClaim !== "string" || !input.supportClaim.trim())
+      throw capabilityError("E_SUPPORT_CLAIM_REQUIRED", mode, "supportClaim", "mode=support requires a nonempty supportClaim", "Provide one concrete claim to classify against the selected evidence");
+  }
   if (mode === "await" || mode === "cancel") {
     if (typeof input.operationId !== "string" || !input.operationId.trim())
       throw capabilityError("E_OPERATION_ID_REQUIRED", mode, "operationId", `${mode} requires the exact operationId returned by a prior waiting result`, `${mode} requires operationId; copy the returned nextRequest exactly`);
@@ -5374,6 +5394,10 @@ function validateSearchPath(value, field = "path") {
 function validateRawSearchInput(input) {
   if (input.pattern !== undefined)
     validateText(input.pattern, "pattern", MAX_PATTERN_CHARACTERS);
+  if (input.supportQuestion !== undefined)
+    validateText(input.supportQuestion, "supportQuestion", 2000);
+  if (input.supportClaim !== undefined)
+    validateText(input.supportClaim, "supportClaim", 4000);
   if (input.path !== undefined) {
     validateSearchPath(input.path);
   }
@@ -8303,6 +8327,8 @@ function publicAnalysisLabel(result) {
       return "condition match metadata";
     case "validate":
       return "validation metadata";
+    case "support":
+      return "answer support assessment";
   }
   throw new Error("Unknown analysis result kind");
 }
@@ -8589,8 +8615,9 @@ class AnalysisStore {
     const coverage = result.coverage ? ` Coverage: ${JSON.stringify(result.coverage)}.` : "";
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
     const semanticJudge = result.semanticJudge ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.` : "";
+    const answerSupport = result.answerSupport ? ` Answer support: ${result.answerSupport.status}${result.answerSupport.assessment ? ` (${result.answerSupport.assessment})` : ""}${result.answerSupport.reason ? `; ${result.answerSupport.reason}` : ""}; source freshness and retrieval ranking are separate signals.` : "";
     const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${scope}${coverage}${stats}`;
     const notice = result.reasons.length ? `
 ${result.reasons.map((reason) => `[${reason}]`).join(`
 `)}` : "";
@@ -8703,6 +8730,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           ...sources.length ? { sources } : {},
           reasons: result.reasons,
           ...result.semanticJudge ? { semanticJudge: result.semanticJudge } : {},
+          ...result.answerSupport ? { answerSupport: result.answerSupport } : {},
           ...result.filesRead !== undefined ? { filesRead: result.filesRead } : {},
           ...result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {},
           ...result.changes ? { changes: result.changes } : {},
@@ -12420,6 +12448,15 @@ var DEFAULT_SEMANTIC_JUDGE_CONFIG = {
   maxCandidates: 20,
   maxRetries: 2
 };
+var DEFAULT_ANSWER_SUPPORT_CONFIG = {
+  enabled: false,
+  provider: "http-json",
+  endpoint: "http://127.0.0.1:8787/answer-support",
+  model: "answer-support-local",
+  timeoutMs: 120000,
+  maxRetries: 2,
+  maxEvidenceItems: 5
+};
 var DEFAULT_SIFT_LIGHT_CONFIG = {
   locale: "en",
   enforceSearch: "hard",
@@ -12436,6 +12473,9 @@ function isRawSiftLightConfig(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isRawSemanticJudgeConfig(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isRawAnswerSupportConfig(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isRawMediaConfig(value) {
@@ -12522,6 +12562,43 @@ function parseSemanticJudge(value, path) {
     maxRetries: boundedInteger2(value.maxRetries, DEFAULT_SEMANTIC_JUDGE_CONFIG.maxRetries, 0, 5, `config at ${path}: semanticJudge.maxRetries`)
   };
 }
+function parseAnswerSupport(value, path) {
+  if (value === undefined)
+    return { ...DEFAULT_ANSWER_SUPPORT_CONFIG };
+  if (!isRawAnswerSupportConfig(value))
+    throw new Error(`Invalid sift-light config at ${path}: answerSupport must be an object`);
+  const unknown = Object.keys(value).filter((key) => ![
+    "enabled",
+    "provider",
+    "endpoint",
+    "apiKeyEnv",
+    "model",
+    "timeoutMs",
+    "maxRetries",
+    "maxEvidenceItems"
+  ].includes(key));
+  if (unknown.length > 0)
+    throw new Error(`Invalid sift-light config at ${path}: unsupported answerSupport fields; accepted fields are enabled, provider, endpoint, apiKeyEnv, model, timeoutMs, maxRetries and maxEvidenceItems`);
+  const enabled = value.enabled ?? DEFAULT_ANSWER_SUPPORT_CONFIG.enabled;
+  if (typeof enabled !== "boolean")
+    throw new Error(`Invalid sift-light config at ${path}: answerSupport.enabled must be a boolean`);
+  const provider = value.provider ?? DEFAULT_ANSWER_SUPPORT_CONFIG.provider;
+  if (provider !== "jev" && provider !== "http-json")
+    throw new Error(`Invalid sift-light config at ${path}: answerSupport.provider must be "jev" or "http-json"`);
+  const endpoint = parseEndpoint(value.endpoint ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.endpoint : DEFAULT_ANSWER_SUPPORT_CONFIG.endpoint), path, "answerSupport.endpoint");
+  const apiKeyEnv = parseApiKeyEnv(value.apiKeyEnv, path, "answerSupport.apiKeyEnv") ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.apiKeyEnv : undefined);
+  const model = parseBoundedModel(value.model ?? (provider === "jev" ? DEFAULT_SEMANTIC_JUDGE_CONFIG.model : DEFAULT_ANSWER_SUPPORT_CONFIG.model), path, "answerSupport.model");
+  return {
+    enabled,
+    provider,
+    endpoint,
+    ...apiKeyEnv === undefined ? {} : { apiKeyEnv },
+    model,
+    timeoutMs: boundedInteger2(value.timeoutMs, DEFAULT_ANSWER_SUPPORT_CONFIG.timeoutMs, 1000, 1200000, `config at ${path}: answerSupport.timeoutMs`),
+    maxRetries: boundedInteger2(value.maxRetries, DEFAULT_ANSWER_SUPPORT_CONFIG.maxRetries, 0, 5, `config at ${path}: answerSupport.maxRetries`),
+    maxEvidenceItems: boundedInteger2(value.maxEvidenceItems, DEFAULT_ANSWER_SUPPORT_CONFIG.maxEvidenceItems, 1, 5, `config at ${path}: answerSupport.maxEvidenceItems`)
+  };
+}
 function parseMedia(value, path) {
   if (value === undefined)
     return;
@@ -12569,13 +12646,14 @@ function parseConfig(value, path) {
     "enforceSearch",
     "vectorSearchEnabled",
     "semanticJudge",
+    "answerSupport",
     "dataSources",
     "nativeText",
     "nativeMedia",
     "media"
   ].includes(key));
   if (unknown.length > 0) {
-    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, dataSources, nativeText, nativeMedia and media are accepted`);
+    throw new Error(`Invalid sift-light config at ${path}: unsupported configuration fields; only locale, enforceSearch, vectorSearchEnabled, semanticJudge, answerSupport, dataSources, nativeText, nativeMedia and media are accepted`);
   }
   const { locale, enforceSearch, vectorSearchEnabled } = value;
   if (locale !== undefined && locale !== "en" && locale !== "zh-CN") {
@@ -12592,6 +12670,7 @@ function parseConfig(value, path) {
     throw new Error(`Invalid sift-light config at ${path}: choose nativeMedia or media, not both`);
   if (nativeText && vectorSearchEnabled !== true)
     throw new Error("nativeText requires vectorSearchEnabled:true");
+  const answerSupport = value.answerSupport === undefined ? undefined : parseAnswerSupport(value.answerSupport, `${path}: answerSupport`);
   return {
     ...nativeText ? { nativeText } : {},
     ...nativeMedia ? { nativeMedia } : {},
@@ -12600,6 +12679,7 @@ function parseConfig(value, path) {
     enforceSearch: enforcement,
     vectorSearchEnabled: vectorSearchEnabled ?? DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled ?? false,
     semanticJudge: parseSemanticJudge(value.semanticJudge, path),
+    ...answerSupport ? { answerSupport } : {},
     ...value.dataSources === undefined ? {} : { dataSources: parseDataSources(value.dataSources) }
   };
 }
@@ -13041,10 +13121,22 @@ function optionalUsageTotal(results, select) {
   }
   return total;
 }
+function withAnswerSupportBoundary(value) {
+  return {
+    ...value,
+    answerSupport: value.answerSupport ?? {
+      status: "not-assessed",
+      reason: "No claim was supplied; semantic classification does not assess answer support."
+    }
+  };
+}
 async function applySemanticJudge(result, query, integration, signal) {
   const config = integration?.config;
   if (!config || !config.enabled || !integration.runner) {
-    return { ...result, ...config ? { semanticJudge: baseDetails(config) } : {} };
+    return withAnswerSupportBoundary({
+      ...result,
+      ...config ? { semanticJudge: baseDetails(config) } : {}
+    });
   }
   const candidates = result.items.slice(0, config.maxCandidates).map((item, index) => ({
     id: `candidate-${String(index + 1)}`,
@@ -13053,7 +13145,10 @@ async function applySemanticJudge(result, query, integration, signal) {
   const initial = baseDetails(config);
   initial.candidatesConsidered = candidates.length;
   if (candidates.length === 0) {
-    return { ...result, semanticJudge: { ...initial, status: "complete", model: config.model } };
+    return withAnswerSupportBoundary({
+      ...result,
+      semanticJudge: { ...initial, status: "complete", model: config.model }
+    });
   }
   const startedAt = performance.now();
   const execution = await judgeSemanticCandidateBatches(integration.runner, query, createSemanticJudgeBatches(candidates, (batch) => new TextEncoder().encode(JSON.stringify(requestBody(query, batch, config.model))).byteLength), signal);
@@ -13107,7 +13202,7 @@ async function applySemanticJudge(result, query, integration, signal) {
   const model = models.length === 1 ? models[0] ?? config.model : config.model;
   const inputTokens = optionalUsageTotal(successfulResults, (judged) => judged.inputTokens);
   const outputTokens = optionalUsageTotal(successfulResults, (judged) => judged.outputTokens);
-  return {
+  return withAnswerSupportBoundary({
     ...result,
     partial: result.partial || execution.failures.length > 0,
     reasons: reason ? [...result.reasons, reason] : result.reasons,
@@ -13128,7 +13223,7 @@ async function applySemanticJudge(result, query, integration, signal) {
       elapsedMs: Math.round(performance.now() - startedAt),
       ...reason ? { reason } : {}
     }
-  };
+  });
 }
 
 // src/hybrid-search.ts
@@ -13479,7 +13574,7 @@ function validationResult(state, cursor, checkInterval) {
   };
   const sourceRows = [...validation.checked, ...validation.unchecked].map((source, index) => `#${String(index + 1)} ${JSON.stringify(source.path)}: ${source.status}${source.reason ? ` (${source.reason})` : ""}`);
   return {
-    text: `Evidence validation is ${recheck.validity}; checked ${String(validation.checked.length)} source(s), ${String(validation.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}.${validation.sourceOmitted ? ` ${String(validation.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${sourceRows.length ? `
+    text: `Evidence validation is ${recheck.validity}; checked ${String(validation.checked.length)} source(s), ${String(validation.unchecked.length)} require attention; coverage ${coverage}; target ${comparisonTarget}; check interval ${String(checkInterval.start)}-${String(checkInterval.end)}. Answer support is not assessed by source validation.${validation.sourceOmitted ? ` ${String(validation.sourceOmitted)} source(s) omitted from this page.` : ""}${reasons.length ? ` ${reasons.join(" ")}` : ""}${sourceRows.length ? `
 ${sourceRows.join(`
 `)}` : ""}`,
     details
@@ -13489,7 +13584,7 @@ ${sourceRows.join(`
 // src/evidence-service.ts
 import { realpath as realpath8 } from "node:fs/promises";
 function isEvidenceRequest(input) {
-  return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
+  return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.mode === "support" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
 function pageInspectRequest(input) {
   if (input.scope === "expand")
@@ -13680,10 +13775,11 @@ class EvidenceService {
   #conceptSearch;
   #closeConcept;
   #semanticJudge;
+  #answerSupport;
   #queue = new SyntaxQueue;
   #analyses = new AnalysisStore;
   #continuations = new SourceContinuations;
-  constructor(runner, snapshots, structure, runConceptSearch, semanticJudge, nativeText) {
+  constructor(runner, snapshots, structure, runConceptSearch, semanticJudge, nativeText, answerSupport) {
     this.#runner = runner;
     this.#snapshots = snapshots;
     this.#structure = structure;
@@ -13697,6 +13793,7 @@ class EvidenceService {
         throw new AggregateError(errors, "Text search cleanup failed");
     };
     this.#semanticJudge = semanticJudge;
+    this.#answerSupport = answerSupport;
   }
   clear() {
     this.#analyses.clear();
@@ -13748,6 +13845,114 @@ class EvidenceService {
       ...input.matchIndex !== undefined ? { selected: input.matchIndex } : {}
     });
   }
+  async#assessAnswerSupport(input, access, signal, options) {
+    const cursor = input.cursor;
+    if (!cursor)
+      throw new SiftLightError("mode=support requires an analysis cursor");
+    if (typeof input.supportQuestion !== "string" || input.supportQuestion.trim().length === 0)
+      throw new SiftLightError("mode=support requires a nonempty supportQuestion");
+    if (typeof input.supportClaim !== "string" || input.supportClaim.trim().length === 0)
+      throw new SiftLightError("mode=support requires a nonempty supportClaim");
+    if (input.path !== undefined || input.line !== undefined || input.targets !== undefined)
+      throw new SiftLightError("mode=support accepts only cursor and retained evidence indices");
+    const indices = input.matchIndices ?? (input.matchIndex === undefined ? [] : [input.matchIndex]);
+    if (indices.length === 0)
+      throw new SiftLightError("mode=support requires matchIndex or matchIndices");
+    const config = this.#answerSupport?.config;
+    const maxEvidenceItems = config?.maxEvidenceItems ?? 5;
+    if (indices.length > maxEvidenceItems)
+      throw new SiftLightError(`mode=support accepts at most ${String(maxEvidenceItems)} evidence item(s) from the active configuration`);
+    const evidence = [];
+    const items = [];
+    const reasons = [];
+    for (const index of new Set(indices)) {
+      const item = this.#analyses.item(cursor, index);
+      const evidenceId = `evidence-${String(evidence.length + 1)}`;
+      if (!item.source || !item.range) {
+        reasons.push(`Evidence item #${String(index)} has no versioned source range`);
+        continue;
+      }
+      const validated = await validateSavedEvidence({
+        cursor,
+        cwd: access.cwd,
+        ...signal ? { signal } : {},
+        matchIndex: index,
+        analyses: this.#analyses,
+        snapshots: this.#snapshots,
+        queue: this.#queue,
+        maxFiles: MAX_STRUCTURE_FILES
+      });
+      if (validated.recheck.validity !== "current") {
+        reasons.push(`Evidence item #${String(index)} is ${validated.recheck.validity}; answer support requires current source bytes`);
+        continue;
+      }
+      try {
+        const document = await access.refresh(item.path, item.source);
+        evidence.push({ id: evidenceId, excerpt: document.slice(item.range) });
+        items.push({
+          ...item,
+          details: { ...item.details, answerSupportEvidenceId: evidenceId }
+        });
+      } catch (error) {
+        reasons.push(`Evidence item #${String(index)} could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const assessmentBase = {
+      status: "complete",
+      question: input.supportQuestion,
+      claim: input.supportClaim,
+      evidenceItems: [...new Set(indices)],
+      ...config ? { provider: config.provider } : {}
+    };
+    let answerSupport;
+    if (reasons.length > 0 || evidence.length === 0) {
+      answerSupport = {
+        ...assessmentBase,
+        assessment: "unknown",
+        reason: reasons.join(" ").slice(0, 512) || "No version-checked evidence was available"
+      };
+    } else if (!config?.enabled || !this.#answerSupport?.runner) {
+      answerSupport = {
+        ...assessmentBase,
+        status: "failed",
+        assessment: "unknown",
+        reason: "Answer support provider is disabled or unavailable; source validation remains independent"
+      };
+    } else {
+      try {
+        const judged = await this.#answerSupport.runner(input.supportQuestion, input.supportClaim, evidence, signal);
+        answerSupport = {
+          ...assessmentBase,
+          assessment: judged.status,
+          ...judged.model ? { model: judged.model } : {},
+          ...judged.probability === undefined ? {} : { probability: judged.probability },
+          ...judged.reason ? { reason: judged.reason } : {},
+          ...judged.evidenceIds ? { evidenceIds: judged.evidenceIds } : {},
+          ...judged.inputTokens === undefined ? {} : { inputTokens: judged.inputTokens },
+          ...judged.outputTokens === undefined ? {} : { outputTokens: judged.outputTokens },
+          elapsedMs: judged.elapsedMs
+        };
+      } catch (error) {
+        answerSupport = {
+          ...assessmentBase,
+          status: "failed",
+          assessment: "unknown",
+          reason: `Answer support provider failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 512)
+        };
+      }
+    }
+    const result = {
+      kind: "support",
+      unit: "evidence-items",
+      items,
+      partial: answerSupport.status !== "complete" || answerSupport.assessment === "unknown",
+      reasons,
+      answerSupport,
+      coverage: { sourceValidation: reasons.length > 0 ? "partial" : "complete" },
+      redact: input.redact ?? false
+    };
+    return this.#analyses.page(this.#analyses.create(result), options.modelOutput);
+  }
   async#testEntryPaths(root, files, cwd, filters, signal) {
     const sourceGlobs = ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"];
     const request = normalizeRequest({
@@ -13791,6 +13996,8 @@ class EvidenceService {
     const access = new SourceAccess(cwd, this.#queue, signal, { maxFiles: fileLimit });
     if (input.mode === "validate")
       return this.#validateSavedEvidence(input, cwd, signal);
+    if (input.mode === "support")
+      return this.#assessAnswerSupport(input, access, signal, options);
     if (input.sourceCursor !== undefined) {
       if (typeof input.sourceCursor !== "string" || !input.sourceCursor.trim())
         throw new CursorError("A nonempty sourceCursor is required");
@@ -15659,7 +15866,7 @@ class SiftLightService {
     this.#vectorSearchEnabled = options.vectorSearchEnabled ?? options.conceptSearch !== undefined;
     this.#semanticJudge = options.semanticJudge;
     this.#operations = new OperationLifecycle({ deadlineMs: resolveConceptTimeoutMs() });
-    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge, options.nativeText);
+    this.#evidence = new EvidenceService(this.#runRipgrep, this.#snapshots, options.structure, options.conceptSearch, options.semanticJudge, options.nativeText, options.answerSupport);
   }
   async search(request, cwd, signal, options = {}) {
     const { input, notes } = normalizeRequestAliases(request);
@@ -16090,6 +16297,215 @@ ${page.body}${rangeNote}${contextNote}${missingSelectionNote}
   }
 }
 
+// src/answer-support.ts
+var MAX_EVIDENCE_CHARS = 4000;
+var MAX_REQUEST_BYTES = 64 * 1024;
+var MAX_RESPONSE_BYTES4 = 4 * 1024 * 1024;
+var MAX_REASON_CHARS = 512;
+var ANSWER_SUPPORT_STATUSES = [
+  "supported",
+  "contradicted",
+  "insufficient",
+  "unknown"
+];
+
+class AnswerSupportConfigurationError extends SiftLightError {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "AnswerSupportConfigurationError";
+  }
+}
+
+class AnswerSupportRequestError extends SiftLightError {
+  retryable;
+  constructor(message, retryable, options) {
+    super(message, options);
+    this.name = "AnswerSupportRequestError";
+    this.retryable = retryable;
+  }
+}
+function isRecord5(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedReason(value) {
+  if (typeof value !== "string" || value.length === 0)
+    return;
+  return value.replace(/[\r\n\0]/gu, " ").slice(0, MAX_REASON_CHARS);
+}
+function parseStatus(value) {
+  const status = typeof value === "string" ? ANSWER_SUPPORT_STATUSES.find((candidate) => candidate === value) : undefined;
+  if (status === undefined)
+    throw new AnswerSupportRequestError("Answer support response has an invalid status; expected supported, contradicted, insufficient or unknown", false);
+  return status;
+}
+function parseProbability(value) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)
+    throw new AnswerSupportRequestError("Answer support response has an invalid probability", false);
+  return value;
+}
+function parseEvidenceIds(value, ids) {
+  if (value === undefined)
+    return;
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !ids.has(id)))
+    throw new AnswerSupportRequestError("Answer support response contains an unknown evidence id", false);
+  return [...new Set(value)];
+}
+function parseJudgment2(raw, evidence) {
+  const value = isRecord5(raw.judgment) ? raw.judgment : isRecord5(raw.answers) && isRecord5(raw.answers.answer) ? raw.answers.answer : raw;
+  const ids = new Set(evidence.map((item) => item.id));
+  const probabilityValue = parseProbability(value.probability ?? value.confidence);
+  const reason = boundedReason(value.reason ?? value.rationale);
+  const evidenceIds = parseEvidenceIds(value.evidenceIds ?? value.supportingEvidence, ids);
+  return {
+    status: parseStatus(value.status ?? value.choice),
+    ...probabilityValue === undefined ? {} : { probability: probabilityValue },
+    ...reason === undefined ? {} : { reason },
+    ...evidenceIds === undefined ? {} : { evidenceIds }
+  };
+}
+function responseModel2(raw, config) {
+  const model = raw.model ?? config.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model))
+    throw new AnswerSupportRequestError("Answer support response model is invalid", false);
+  return model;
+}
+function responseUsage2(raw) {
+  const usage = isRecord5(raw.usage) ? raw.usage : undefined;
+  const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
+  const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
+  return {
+    ...inputTokens === undefined ? {} : { inputTokens },
+    ...outputTokens === undefined ? {} : { outputTokens }
+  };
+}
+function requestBody2(config, question, claim, evidence) {
+  const boundedEvidence = evidence.map((item) => ({
+    id: item.id,
+    excerpt: item.excerpt.slice(0, MAX_EVIDENCE_CHARS)
+  }));
+  if (config.provider === "jev") {
+    return {
+      state: { question, claim, evidence: boundedEvidence },
+      model: config.model,
+      questions: {
+        answer: {
+          type: "choice",
+          instructions: "Assess only whether the claim is supported by the supplied evidence for the supplied question. Do not treat source identity or lexical overlap as support.",
+          criteria: {
+            supported: "The evidence directly supports the complete claim.",
+            contradicted: "The evidence directly conflicts with the claim.",
+            insufficient: "The evidence is relevant but does not establish the complete claim.",
+            unknown: "The evidence is unavailable, ambiguous or cannot be assessed."
+          }
+        }
+      }
+    };
+  }
+  return { version: 1, model: config.model, question, claim, evidence: boundedEvidence };
+}
+async function responseText2(response) {
+  if (!response.body) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES4)
+      throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done)
+        break;
+      bytes += result.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES4) {
+        reader.cancel();
+        throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(all);
+}
+function retryDelay3(attempt) {
+  return Math.min(20000, 400 * 2 ** attempt);
+}
+async function fetchResponse(config, key, fetcher, body, parentSignal) {
+  if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES)
+    throw new AnswerSupportRequestError("Answer support request exceeded the 64 KiB limit", false);
+  for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
+    const controller = new AbortController;
+    const onAbort = () => controller.abort(parentSignal?.reason);
+    parentSignal?.addEventListener("abort", onAbort, { once: true });
+    const timeout = setTimeout(() => controller.abort(new Error("Answer support request timed out")), config.timeoutMs);
+    try {
+      const headers = { "content-type": "application/json" };
+      if (key)
+        headers.authorization = `Bearer ${key}`;
+      const response = await fetcher(config.endpoint, {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw new AnswerSupportRequestError(`Answer support provider returned HTTP ${String(response.status)}`, retryable);
+      }
+      const raw = JSON.parse(await responseText2(response));
+      if (!isRecord5(raw))
+        throw new AnswerSupportRequestError("Answer support response must be an object", false);
+      return raw;
+    } catch (error) {
+      if (parentSignal?.aborted)
+        throw error;
+      const retryable = error instanceof AnswerSupportRequestError ? error.retryable : true;
+      if (!retryable || attempt >= config.maxRetries)
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, retryDelay3(attempt)));
+    } finally {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", onAbort);
+    }
+  }
+  throw new AnswerSupportRequestError("Answer support request failed", false);
+}
+function createDisabledAnswerSupportIntegration(config) {
+  return { config: { ...config, enabled: false } };
+}
+function createAnswerSupportIntegration(config, environment = process.env, fetcher = fetch) {
+  if (!config.enabled)
+    return createDisabledAnswerSupportIntegration(config);
+  const key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
+  if (config.apiKeyEnv && !key)
+    throw new AnswerSupportConfigurationError(`Answer support is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`);
+  return {
+    config,
+    runner: async (question, claim, evidence, signal) => {
+      const startedAt = performance.now();
+      const raw = await fetchResponse(config, key, fetcher, JSON.stringify(requestBody2(config, question, claim, evidence)), signal);
+      const usage = responseUsage2(raw);
+      return {
+        ...parseJudgment2(raw, evidence),
+        model: responseModel2(raw, config),
+        ...usage,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      };
+    }
+  };
+}
+
 // src/prompt-guidelines.ts
 var SIFT_LIGHT_DISCOVERY_GUIDANCE = "Before reporting sift-light absent, check the complete runtime registry, including ALL_TOOLS deferred entries. Read mcp__sift_light__sift_light's declaration and call it via tools in functions.exec; use host tool search otherwise. Unexpanded does not mean absent; call failures are connection/capability failures.";
 var SOURCE_OUTPUT_GUIDANCE = "Auto/summary text may include bounded source excerpts; ordinary matches text is metadata-only. Inspect may return bounded source windows covering an entire small file. Analysis text may include semantic passages; structured details may retain excerpts, names and signatures. Follow output limits, coverage and continuations.";
@@ -16143,7 +16559,7 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but it is disabled by default and never turns classification into a runtime proof. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but classification is not source verification or answer support. mode=support evaluates one concrete claim against selected, version-checked retained evidence only when answerSupport is configured. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin and does not assess answer support. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. source-list/source-search/source-read. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var siftLightSchema = Type.Object({
   sourceId: Type.Optional(Type.String({
@@ -16158,6 +16574,16 @@ var siftLightSchema = Type.Object({
   query: Type.Optional(Type.String({
     maxLength: 256,
     description: `${fieldGuidance("query")}. Hybrid uses the same query as exact literal text and as the local concept query. Discovery modes preserve their requested path. Concept and hybrid require vectorSearchEnabled:true in sift-light.json and an explicitly installed local model. A semantic judge is optional and remains disabled unless the active configuration explicitly enables it.`
+  })),
+  supportQuestion: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 2000,
+    description: "mode=support only: the question whose answer the selected evidence should address."
+  })),
+  supportClaim: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 4000,
+    description: "mode=support only: one concrete claim to classify as supported, contradicted, insufficient or unknown."
   })),
   scope: Type.Optional(stringEnum(["strict", "expand"], {
     description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
@@ -16298,7 +16724,7 @@ var siftLightSchema = Type.Object({
     description: `${fieldGuidance("limit")}. Ordinary search: explicit detail-page match limit (max 100); mode=files: files per page (default 30). Normally omit to preserve automatic summarization; other analysis and inspect modes reject it.`
   })),
   mode: Type.Optional(stringEnum([...SIFT_LIGHT_MODES, ...MODE_ALIASES], {
-    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} anyOf/allOf are field names, not modes; as mode values they are accepted aliases for omitting mode, disclosed in a request note.`
+    description: `Ordinary search defaults to auto; summary/matches request explicit pages. capabilities returns a compact names-only project inventory and per-language supported modes without loading providers. files uses query, structure uses an AST pattern, concept uses a required natural-language query, and hybrid uses one query for exact literal plus concept evidence in a single snapshot. validate rechecks saved search or analysis sources against their recorded origin. support requires a retained cursor, one or more matchIndex values, supportQuestion and supportClaim; it never upgrades stale or unknown source bytes. await waits for an existing long-running concept or hybrid operation without restarting it; cancel explicitly cancels one and waits for owned cleanup. Copy the returned nextRequest exactly and do not repeat the original query. Waiting is an operation state, not evidence. Validation details report the requested scope, comparison target, coverage, and freshness as current, stale, or unknown; partial coverage is retained during validation. inspect/outline/imports/tests retain their documented location selectors. Syntax results are static evidence; concept and related-test results remain candidates. ${MODE_CONTRACT_DESCRIPTION} anyOf/allOf are field names, not modes; as mode values they are accepted aliases for omitting mode, disclosed in a request note.`
   })),
   line: Type.Optional(Type.Number({
     description: "1-indexed source line for path inspection/navigation; path-only inspect starts at line 1. Omit with matchIndex, matchIndices or targets."
@@ -16363,14 +16789,16 @@ function siftLightTool(outputMode) {
     tool.outputSchema = SIFT_LIGHT_OUTPUT_SCHEMA;
   return tool;
 }
-function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = [], nativeText, nativeMedia, media) {
+function createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled = false, dataSources = [], nativeText, nativeMedia, media, answerSupport) {
   const resolvedSemanticJudge = semanticJudge ?? createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG);
+  const resolvedAnswerSupport = answerSupport ?? createDisabledAnswerSupportIntegration(DEFAULT_ANSWER_SUPPORT_CONFIG);
   return new SiftLightService({
     runRipgrep: createRipgrepRunner(),
     structure: createCtagsStructureProvider(),
     vectorSearchEnabled,
     dataSources,
     semanticJudge: resolvedSemanticJudge,
+    answerSupport: resolvedAnswerSupport,
     ...nativeText ? { nativeText } : {},
     ...nativeMedia ? { nativeMedia } : {},
     ...media ? { media } : {}
@@ -16828,12 +17256,14 @@ async function createMcpSearchFeatures(environment = process.env) {
   if (!path)
     return {
       semanticJudge: createDisabledSemanticJudgeIntegration(DEFAULT_SEMANTIC_JUDGE_CONFIG),
+      answerSupport: createDisabledAnswerSupportIntegration(DEFAULT_ANSWER_SUPPORT_CONFIG),
       dataSources: [],
       vectorSearchEnabled: DEFAULT_SIFT_LIGHT_CONFIG.vectorSearchEnabled === true
     };
   const config = await readSiftLightConfigFile(path, { missing: "error" });
   return {
     semanticJudge: createConfiguredSemanticJudgeIntegration(config, environment),
+    answerSupport: createAnswerSupportIntegration(config.answerSupport ?? DEFAULT_ANSWER_SUPPORT_CONFIG, environment),
     vectorSearchEnabled: config.vectorSearchEnabled === true,
     dataSources: config.dataSources ?? [],
     ...config.nativeText ? { nativeText: config.nativeText } : {},
@@ -16958,12 +17388,12 @@ function logSemanticJudgeStatus(integration) {
   process.stderr.write(`sift-light MCP semantic judge: ${status}; source=${mcpSemanticJudgeConfigSource()}
 `);
 }
-async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media) {
+async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport) {
   const running = await startSiftLightMcpServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.cwd(),
     host: process.env.SIFT_LIGHT_MCP_HOST ?? DEFAULT_MCP_HOST,
     port: environmentInteger("SIFT_LIGHT_MCP_PORT", DEFAULT_MCP_PORT, 0, 65535),
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media),
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport),
     maxSessions: environmentInteger("SIFT_LIGHT_MCP_MAX_SESSIONS", DEFAULT_MCP_MAX_SESSIONS, 1, Number.MAX_SAFE_INTEGER),
     sessionIdleTimeoutMs: environmentInteger("SIFT_LIGHT_MCP_SESSION_IDLE_MS", DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS, 1, Number.MAX_SAFE_INTEGER),
     allowedOrigins: allowedOrigins(),
@@ -16997,11 +17427,11 @@ async function runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dat
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
-async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media) {
+async function runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport) {
   const running = await startSiftLightMcpStdioServer({
     cwd: process.env.SIFT_LIGHT_MCP_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
     outputMode,
-    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media)
+    createService: () => createDefaultSiftLightMcpService(semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport)
   });
   process.stderr.write(`sift-light MCP serving one local client over stdio
 `);
@@ -17030,15 +17460,23 @@ async function main() {
     return;
   }
   const outputMode = parseSiftLightMcpOutputMode(process.env.SIFT_LIGHT_MCP_OUTPUT_MODE);
-  const { semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media } = await createMcpSearchFeatures();
+  const {
+    semanticJudge,
+    answerSupport,
+    vectorSearchEnabled,
+    dataSources,
+    nativeText,
+    nativeMedia,
+    media
+  } = await createMcpSearchFeatures();
   logSemanticJudgeStatus(semanticJudge);
   process.stderr.write(`sift-light MCP vector search: ${vectorSearchEnabled ? "enabled" : "disabled"}
 `);
   if (transport === "stdio") {
-    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media);
+    await runStdioServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport);
     return;
   }
-  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media);
+  await runHttpServer(outputMode, semanticJudge, vectorSearchEnabled, dataSources, nativeText, nativeMedia, media, answerSupport);
 }
 try {
   await main();

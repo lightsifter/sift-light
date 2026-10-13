@@ -36,6 +36,12 @@ function compactSemanticMetadata(details: SiftLightDetails, analysis: AnalysisDe
     ...(judge
       ? [
           `Semantic judge: ${judge.status}; ${String(judge.judgedCandidates)}/${String(judge.candidatesConsidered)} judged, ${String(judge.candidatesUnjudged)} unjudged; batches ${String(judge.batchesCompleted)}/${String(judge.batchesAttempted)} completed; classes ${JSON.stringify(judge.classificationCounts)}${judge.reason ? `; ${judge.reason}` : ""}.`,
+          'Semantic classification is not source verification or answer support. Answer support is not assessed unless mode="support" is explicitly requested.',
+        ]
+      : []),
+    ...(analysis.answerSupport
+      ? [
+          `Answer support: ${analysis.answerSupport.status}${analysis.answerSupport.assessment ? ` (${analysis.answerSupport.assessment})` : ""}${analysis.answerSupport.reason ? `; ${analysis.answerSupport.reason}` : ""}; source identity, retrieval ranking and answer support remain separate.`,
         ]
       : []),
     ...(details.operation
@@ -74,6 +80,9 @@ function compactMetadata(details: SiftLightDetails, analysis: AnalysisDetails): 
       : undefined,
     analysis.semanticJudge
       ? `Semantic judge: ${JSON.stringify(analysis.semanticJudge)}`
+      : undefined,
+    analysis.answerSupport
+      ? `Answer support: ${JSON.stringify(analysis.answerSupport)}`
       : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline" && analysis.modelOutput

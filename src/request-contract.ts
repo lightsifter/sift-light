@@ -496,6 +496,24 @@ function validateRequired(input: Record<string, unknown>, mode: SiftLightMode): 
       `mode=${mode} requires a nonempty natural-language query`,
       `mode=${mode} requires query; provide the natural-language question and retry`,
     );
+  if (mode === "support") {
+    if (typeof input.supportQuestion !== "string" || !input.supportQuestion.trim())
+      throw capabilityError(
+        "E_SUPPORT_QUESTION_REQUIRED",
+        mode,
+        "supportQuestion",
+        "mode=support requires a nonempty supportQuestion",
+        "Provide the question that the selected evidence should address",
+      );
+    if (typeof input.supportClaim !== "string" || !input.supportClaim.trim())
+      throw capabilityError(
+        "E_SUPPORT_CLAIM_REQUIRED",
+        mode,
+        "supportClaim",
+        "mode=support requires a nonempty supportClaim",
+        "Provide one concrete claim to classify against the selected evidence",
+      );
+  }
   if (mode === "await" || mode === "cancel") {
     if (typeof input.operationId !== "string" || !input.operationId.trim())
       throw capabilityError(

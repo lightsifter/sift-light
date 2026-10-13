@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1-6 — 2026-10-13
+
+- Add opt-in answer support assessment over verified source ranges while retaining independent retrieval lanes, precise locations, inspection and source validation.
+- Wire bounded answer support providers through Pi, OMP and MCP with explicit unavailable and error states.
+- Align the local native text configuration with the resident worker and refresh packaged runtime metadata.
+
 ## 1.1.1-2 — 2026-10-13
 
 - Clarify the shared 32 MiB source-read budget for `inspect`, including why smaller output windows and source continuations do not admit oversized files.

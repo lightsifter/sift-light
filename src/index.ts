@@ -13,6 +13,7 @@ import { renderSiftLightCall, renderSiftLightResult } from "./tui/renderers.js";
 import { registerPiSearchPolicy } from "./pi-search-policy.js";
 import { modelErrorText } from "./model-error.js";
 import { createConfiguredSemanticJudgeIntegration } from "./semantic-judge.js";
+import { createConfiguredAnswerSupportIntegration } from "./answer-support.js";
 
 const SIFT_LIGHT_LABEL = "sift-light";
 
@@ -23,6 +24,7 @@ export async function registerSiftLightExtension(
   config: SiftLightConfig,
 ): Promise<void> {
   const semanticJudge = createConfiguredSemanticJudgeIntegration(config);
+  const answerSupport = createConfiguredAnswerSupportIntegration(config);
   const runtime = new SiftLightRuntime(
     new SiftLightService({
       runRipgrep: createRipgrepRunner(),
@@ -30,6 +32,7 @@ export async function registerSiftLightExtension(
       vectorSearchEnabled: config.vectorSearchEnabled === true,
       dataSources: config.dataSources ?? [],
       semanticJudge,
+      answerSupport,
       ...(config.nativeText ? { nativeText: config.nativeText } : {}),
       ...(config.nativeMedia ? { nativeMedia: config.nativeMedia } : {}),
     }),
