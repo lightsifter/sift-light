@@ -13,6 +13,8 @@ import {
   SEMANTIC_JUDGE_NON_PROOF_CLAIM,
   type AnalysisItem,
   type AnalysisResultSet,
+  type EvidenceScopeStatus,
+  type EvidenceScopeSummary,
 } from "./analysis-types.js";
 import { CursorError, SiftLightError } from "./errors.js";
 import type { SiftLightResult } from "./types.js";
@@ -216,14 +218,63 @@ function publicItemDetails(item: AnalysisItem): Record<string, unknown> | undefi
             : {}),
         }
       : undefined;
-  if (!structure && !semanticJudge && !source && !relevance && !retrieval) return undefined;
+  const evidenceScope: EvidenceScopeStatus | undefined =
+    item.details?.evidenceScope === "range-with-context" ||
+    item.details?.evidenceScope === "range-only"
+      ? item.details.evidenceScope
+      : item.source && item.range
+        ? "range-only"
+        : undefined;
+  const answerSupportEvidenceId =
+    typeof item.details?.answerSupportEvidenceId === "string"
+      ? item.details.answerSupportEvidenceId
+      : undefined;
+  const contextBeforeLines =
+    typeof item.details?.contextBeforeLines === "number" &&
+    Number.isSafeInteger(item.details.contextBeforeLines) &&
+    item.details.contextBeforeLines >= 0
+      ? item.details.contextBeforeLines
+      : undefined;
+  const contextAfterLines =
+    typeof item.details?.contextAfterLines === "number" &&
+    Number.isSafeInteger(item.details.contextAfterLines) &&
+    item.details.contextAfterLines >= 0
+      ? item.details.contextAfterLines
+      : undefined;
+  if (
+    !structure &&
+    !semanticJudge &&
+    !source &&
+    !relevance &&
+    !retrieval &&
+    !evidenceScope &&
+    !answerSupportEvidenceId
+  )
+    return undefined;
   return {
     ...structure,
     ...relevance,
     ...retrieval,
     ...(source ? { source } : {}),
     ...(semanticJudge ? { semanticJudge } : {}),
+    ...(evidenceScope ? { evidenceScope } : {}),
+    ...(answerSupportEvidenceId ? { answerSupportEvidenceId } : {}),
+    ...(contextBeforeLines === undefined ? {} : { contextBeforeLines }),
+    ...(contextAfterLines === undefined ? {} : { contextAfterLines }),
   };
+}
+
+function derivedEvidenceScope(result: AnalysisResultSet): EvidenceScopeSummary | undefined {
+  const exactItems = result.items.filter((item) => item.source && item.range).length;
+  return exactItems > 0
+    ? {
+        ...result.evidenceScope,
+        status: result.items.some((item) => item.details?.evidenceScope === "range-with-context")
+          ? "range-with-context"
+          : "range-only",
+        exactItems,
+      }
+    : undefined;
 }
 
 function publicAnalysisItem(
@@ -292,6 +343,7 @@ export class AnalysisStore {
   create(result: AnalysisResultSet, summarize?: RetainedAnalysisSummary): string {
     this.#expire();
     const id = randomUUID();
+    const evidenceScope = derivedEvidenceScope(result);
     const bounded: AnalysisResultSet = {
       ...result,
       ...(result.retrievalLanes
@@ -313,6 +365,7 @@ export class AnalysisStore {
         : {}),
       reasons: boundedReasons(result.reasons),
       items: [],
+      ...(evidenceScope ? { evidenceScope } : {}),
       coverage: {
         ...result.coverage,
         retention: result.coverage?.retention ?? "complete",
@@ -326,6 +379,9 @@ export class AnalysisStore {
       bounded.items = result.items
         .filter((_item, index) => retained.has(index))
         .map((item) => structuredClone(item));
+      const retainedScope = derivedEvidenceScope(bounded);
+      if (retainedScope) bounded.evidenceScope = retainedScope;
+      else delete bounded.evidenceScope;
     };
     for (const candidate of candidates) {
       const { item } = candidate;
@@ -460,7 +516,10 @@ export class AnalysisStore {
   page(cursor: string, modelOutput = false, redact = false): SiftLightResult {
     const { stored, offset, kind, lane } = this.resolve(cursor);
     const suffix = lane ? `.${lane}` : "";
-    const result = redact ? { ...stored.result, redact: true } : stored.result;
+    const result = { ...stored.result, ...(redact ? { redact: true } : {}) };
+    const pageScope = derivedEvidenceScope(result);
+    if (pageScope) result.evidenceScope = pageScope;
+    else delete result.evidenceScope;
     if (kind === "analysis-terms") return analysisTermPage(result, stored.id, offset);
     const hybridPreview = kind === "analysis-hybrid";
     const hybridMatchesRequest = hybridPreview
@@ -493,8 +552,11 @@ export class AnalysisStore {
     const answerSupport = result.answerSupport
       ? ` Answer support: ${result.answerSupport.status}${result.answerSupport.assessment ? ` (${result.answerSupport.assessment})` : ""}${result.answerSupport.reason ? `; ${result.answerSupport.reason}` : ""}; source freshness and retrieval ranking are separate signals.`
       : "";
+    const evidenceScope = result.evidenceScope
+      ? ` Evidence scope: ${result.evidenceScope.status}; ${String(result.evidenceScope.exactItems)} exact range item(s)${result.evidenceScope.contextLines === undefined ? "" : `; support context=${String(result.evidenceScope.contextLines)} line(s)`}.`
+      : "";
     const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${evidenceScope}${scope}${coverage}${stats}`;
     const notice = result.reasons.length
       ? `\n${result.reasons.map((reason) => `[${reason}]`).join("\n")}`
       : "";
@@ -541,6 +603,7 @@ export class AnalysisStore {
         items.push({
           ...item,
           label: publicItem.label,
+          ...(publicItem.details ? { details: { ...item.details, ...publicItem.details } } : {}),
           index: index + 1,
           ...(inspect ? { inspect } : {}),
         });
@@ -618,6 +681,7 @@ export class AnalysisStore {
           reasons: result.reasons,
           ...(result.semanticJudge ? { semanticJudge: result.semanticJudge } : {}),
           ...(result.answerSupport ? { answerSupport: result.answerSupport } : {}),
+          ...(result.evidenceScope ? { evidenceScope: result.evidenceScope } : {}),
           ...(result.filesRead !== undefined ? { filesRead: result.filesRead } : {}),
           ...(result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {}),
           ...(result.changes ? { changes: result.changes } : {}),

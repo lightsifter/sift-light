@@ -10,7 +10,7 @@ import { rankRetrievalFiles } from "./retrieval-ranking.js";
 import type { NativeTextConfig } from "./native-text-config.js";
 import { dirname, extname, resolve } from "node:path";
 import { AnalysisStore } from "./analysis-store.js";
-import type { AnalysisItem, AnalysisResultSet } from "./analysis-types.js";
+import type { AnalysisItem, AnalysisResultSet, EvidenceScopeSummary } from "./analysis-types.js";
 import { abortError, CursorError, SiftLightError } from "./errors.js";
 import { findGitRepository } from "./git-repository.js";
 import { isPathInsideCwd, isPathInsideRoot, SearchPathPolicy } from "./path-policy.js";
@@ -63,7 +63,12 @@ import type { OperationProgress } from "./operation-lifecycle.js";
 import { outlineCapabilityError } from "./request-contract.js";
 import { realpath } from "node:fs/promises";
 import type { SemanticJudgeIntegration } from "./semantic-judge.js";
-import type { AnswerSupportIntegration, AnswerSupportEvidence } from "./answer-support.js";
+import {
+  assertAnswerSupportEvidenceBudget,
+  type AnswerSupportIntegration,
+  type AnswerSupportEvidence,
+} from "./answer-support.js";
+import { supportExcerpt, DEFAULT_SUPPORT_CONTEXT_LINES } from "./support-excerpt.js";
 import type { AnswerSupportDetails } from "./analysis-types.js";
 import {
   MAX_ANY_OF_TERMS,
@@ -73,6 +78,7 @@ import {
 import {
   MAX_INSPECT_REQUEST_TARGETS,
   MAX_INSPECT_TARGETS,
+  MAX_CONTEXT_LINES,
   type SearchRequest,
   type SearchScopeDetails,
   type SiftLightResult,
@@ -485,10 +491,19 @@ export class EvidenceService {
       throw new SiftLightError(
         `mode=support accepts at most ${String(maxEvidenceItems)} evidence item(s) from the active configuration`,
       );
+    const contextLines = input.supportContextLines ?? DEFAULT_SUPPORT_CONTEXT_LINES;
+    if (!Number.isSafeInteger(contextLines) || contextLines < 0 || contextLines > MAX_CONTEXT_LINES)
+      throw new SiftLightError(
+        `supportContextLines must be an integer from 0 through ${String(MAX_CONTEXT_LINES)}`,
+      );
 
     const evidence: AnswerSupportEvidence[] = [];
     const items: AnalysisItem[] = [];
     const reasons: string[] = [];
+    const validationCache = new Map<string, ReturnType<typeof validateSavedEvidence>>();
+    const documentCache = new Map<string, Promise<SourceDocument>>();
+    let contextBeforeLines = 0;
+    let contextAfterLines = 0;
     for (const index of new Set(indices)) {
       const item = this.#analyses.item(cursor, index);
       const evidenceId = `evidence-${String(evidence.length + 1)}`;
@@ -496,17 +511,23 @@ export class EvidenceService {
         reasons.push(`Evidence item #${String(index)} has no versioned source range`);
         continue;
       }
+      const validationKey = JSON.stringify([item.source.path, item.source.origin]);
+      let validation = validationCache.get(validationKey);
+      if (!validation) {
+        validation = validateSavedEvidence({
+          cursor,
+          cwd: access.cwd,
+          ...(signal ? { signal } : {}),
+          matchIndex: index,
+          analyses: this.#analyses,
+          snapshots: this.#snapshots,
+          queue: this.#queue,
+          maxFiles: MAX_STRUCTURE_FILES,
+        });
+        validationCache.set(validationKey, validation);
+      }
       // oxlint-disable-next-line no-await-in-loop -- source validation and refresh share a bounded queue
-      const validated = await validateSavedEvidence({
-        cursor,
-        cwd: access.cwd,
-        ...(signal ? { signal } : {}),
-        matchIndex: index,
-        analyses: this.#analyses,
-        snapshots: this.#snapshots,
-        queue: this.#queue,
-        maxFiles: MAX_STRUCTURE_FILES,
-      });
+      const validated = await validation;
       if (validated.recheck.validity !== "current") {
         reasons.push(
           `Evidence item #${String(index)} is ${validated.recheck.validity}; answer support requires current source bytes`,
@@ -514,14 +535,38 @@ export class EvidenceService {
         continue;
       }
       try {
+        let pendingDocument = documentCache.get(validationKey);
+        if (!pendingDocument) {
+          pendingDocument = access.refresh(item.path, item.source);
+          documentCache.set(validationKey, pendingDocument);
+        }
         // oxlint-disable-next-line no-await-in-loop -- retain evidence order and queue limits
-        const document = await access.refresh(item.path, item.source);
-        evidence.push({ id: evidenceId, excerpt: document.slice(item.range) });
+        const document = await pendingDocument;
+        const excerpt = supportExcerpt(document, item.range, contextLines);
+        const supportEvidence: AnswerSupportEvidence = {
+          id: evidenceId,
+          excerpt: excerpt.excerpt,
+          ...(excerpt.hasContext ? { selectedExcerpt: excerpt.selectedExcerpt } : {}),
+          ...(excerpt.contextBefore === undefined ? {} : { contextBefore: excerpt.contextBefore }),
+          ...(excerpt.contextAfter === undefined ? {} : { contextAfter: excerpt.contextAfter }),
+        };
+        assertAnswerSupportEvidenceBudget([supportEvidence]);
+        contextBeforeLines = Math.max(contextBeforeLines, excerpt.contextBeforeLines);
+        contextAfterLines = Math.max(contextAfterLines, excerpt.contextAfterLines);
+        evidence.push(supportEvidence);
         items.push({
           ...item,
-          details: { ...item.details, answerSupportEvidenceId: evidenceId },
+          details: {
+            ...item.details,
+            answerSupportEvidenceId: evidenceId,
+            evidenceScope: excerpt.hasContext ? "range-with-context" : "range-only",
+            contextBeforeLines: excerpt.contextBeforeLines,
+            contextAfterLines: excerpt.contextAfterLines,
+          },
         });
       } catch (error) {
+        if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+        if (!(error instanceof SiftLightError)) throw error;
         reasons.push(
           `Evidence item #${String(index)} could not be read: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -533,6 +578,9 @@ export class EvidenceService {
       question: input.supportQuestion,
       claim: input.supportClaim,
       evidenceItems: [...new Set(indices)],
+      contextLines,
+      contextBeforeLines,
+      contextAfterLines,
       ...(config ? { provider: config.provider } : {}),
     };
     let answerSupport: AnswerSupportDetails;
@@ -570,6 +618,7 @@ export class EvidenceService {
           elapsedMs: judged.elapsedMs,
         };
       } catch (error) {
+        if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
         answerSupport = {
           ...assessmentBase,
           status: "failed",
@@ -590,6 +639,17 @@ export class EvidenceService {
       partial: answerSupport.status !== "complete" || answerSupport.assessment === "unknown",
       reasons,
       answerSupport,
+      ...(evidence.length > 0
+        ? {
+            evidenceScope: {
+              status: items.some((item) => item.details?.evidenceScope === "range-with-context")
+                ? "range-with-context"
+                : "range-only",
+              exactItems: evidence.length,
+              contextLines,
+            } satisfies EvidenceScopeSummary,
+          }
+        : {}),
       coverage: { sourceValidation: reasons.length > 0 ? "partial" : "complete" },
       redact: input.redact ?? false,
     };

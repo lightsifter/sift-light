@@ -455,6 +455,7 @@ function selectorError(
 function validateValueRanges(input: Record<string, unknown>): void {
   const integerRanges: readonly [RequestField, number, number][] = [
     ["context", 0, MAX_CONTEXT_LINES],
+    ["supportContextLines", 0, MAX_CONTEXT_LINES],
     ["limit", 1, MAX_PAGE_SIZE],
     ["conceptLimit", 1, MAX_HYBRID_CONCEPT_LIMIT],
     ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES],

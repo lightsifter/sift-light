@@ -21,6 +21,27 @@ export type AnswerSupportStatus = (typeof ANSWER_SUPPORT_STATUSES)[number];
 export interface AnswerSupportEvidence {
   id: string;
   excerpt: string;
+  /** The exact retained range when the excerpt also carries surrounding context. */
+  selectedExcerpt?: string;
+  contextBefore?: string;
+  contextAfter?: string;
+}
+
+/** Reject incomplete evidence instead of silently removing possible qualifiers. */
+export function assertAnswerSupportEvidenceBudget(
+  evidence: readonly AnswerSupportEvidence[],
+): void {
+  for (const item of evidence) {
+    const characters =
+      item.excerpt.length +
+      (item.selectedExcerpt?.length ?? 0) +
+      (item.contextBefore?.length ?? 0) +
+      (item.contextAfter?.length ?? 0);
+    if (characters > MAX_EVIDENCE_CHARS)
+      throw new SiftLightError(
+        "Answer support evidence exceeds the 4000-character per-item budget; select a smaller range or reduce supportContextLines",
+      );
+  }
 }
 
 export interface AnswerSupportJudgment {
@@ -176,9 +197,13 @@ function requestBody(
   claim: string,
   evidence: readonly AnswerSupportEvidence[],
 ): RawRecord {
+  assertAnswerSupportEvidenceBudget(evidence);
   const boundedEvidence = evidence.map((item) => ({
     id: item.id,
-    excerpt: item.excerpt.slice(0, MAX_EVIDENCE_CHARS),
+    excerpt: item.excerpt,
+    ...(item.selectedExcerpt === undefined ? {} : { selectedExcerpt: item.selectedExcerpt }),
+    ...(item.contextBefore === undefined ? {} : { contextBefore: item.contextBefore }),
+    ...(item.contextAfter === undefined ? {} : { contextAfter: item.contextAfter }),
   }));
   if (config.provider === "jev") {
     return {
@@ -188,7 +213,7 @@ function requestBody(
         answer: {
           type: "choice",
           instructions:
-            "Assess only whether the claim is supported by the supplied evidence for the supplied question. Do not treat source identity or lexical overlap as support.",
+            "Assess only whether the claim is supported by the supplied evidence for the supplied question. The selectedExcerpt is the exact retained range; contextBefore and contextAfter are adjacent source lines supplied to catch qualifiers. Do not treat source identity or lexical overlap as support.",
           criteria: {
             supported: "The evidence directly supports the complete claim.",
             contradicted: "The evidence directly conflicts with the claim.",

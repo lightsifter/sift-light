@@ -127,6 +127,7 @@ export const MODE_FIELDS_BY_MODE: Record<SiftLightMode, readonly RequestField[]>
     "matchIndices",
     "supportQuestion",
     "supportClaim",
+    "supportContextLines",
   ],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
@@ -188,6 +189,8 @@ export const REQUEST_FIELD_GUIDANCE: Partial<Record<RequestField, string>> = {
   allOf:
     "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
   context: "context is an output-context budget and is never silently dropped",
+  supportContextLines:
+    "supportContextLines is the bounded number of adjacent source lines included for answer-support assessment; the selected range remains exact",
   limit: "limit is an output/page budget and is never silently dropped",
   scope:
     "scope applies to ordinary content search; mode=files is always strict, so it accepts only the redundant scope=strict",
@@ -238,6 +241,7 @@ export const MODEL_USAGE_GUIDANCE = [
   "outline needs a concrete JS/TS/TSX/Python-capable source file, not a directory; structure needs a nonempty AST pattern for JS/TS/TSX/Go, no lang; use capabilities before unfamiliar language operations",
   "imports/tests are static JS/TS/TSX candidates",
   "selectors: inspect, hybrid and capabilities use their cataloged fields",
+  "support keeps exact ranges; supportContextLines=0-20 adds adjacent lines (default 2)",
   "exact, any-of and max_results are not parameters",
 ].join("; ");
 

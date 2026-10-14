@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1-7 — 2026-10-14
+
+- Assess answer support with configurable adjacent source context while preserving the exact selected range, inspection and source validation.
+- Expose the evidence scope separately from relevance and support judgments across Pi, OMP and MCP.
+- Reuse verified source reads within each support request and reject oversized evidence explicitly rather than silently truncating qualifiers.
+- Add public regression coverage for context boundaries, source changes, cancellation and provider payload budgets.
+
 ## 1.1.1-6 — 2026-10-13
 
 - Add opt-in answer support assessment over verified source ranges while retaining independent retrieval lanes, precise locations, inspection and source validation.

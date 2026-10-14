@@ -2235,7 +2235,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.1-6",
+  version: "1.1.1-7",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -2302,7 +2302,7 @@ var package_default = {
     "check:mcp": "bun run doc/testing/scripts/check-mcp-server.ts",
     format: "oxfmt --write .",
     "format:check": "oxfmt --check .",
-    lint: "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts",
+    lint: "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts validation",
     typecheck: "tsc --noEmit",
     "test:repo": "bun test ./doc/testing/test",
     test: "node src/package-smoke.mjs",
@@ -2321,11 +2321,12 @@ var package_default = {
     "test:mcp-hosts": "bun run doc/testing/scripts/mcp-host-verification.ts",
     build: "bun run build:worker && bun run build:concept-worker && bun run build:search-plugin && bun run build:mcp",
     "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
-    "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
+    "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts validation",
     "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
     "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark",
     "build:native-text": "bun run scripts/build-native-text.ts",
-    "build:native-media": "bun run scripts/build-native-media.ts"
+    "build:native-media": "bun run scripts/build-native-media.ts",
+    "test:support": "bun test ./validation"
   },
   dependencies: {
     "@ast-grep/lang-go": "0.0.6",
@@ -13375,15 +13376,31 @@ function publicItemDetails(item) {
       nativeLocator: item.details?.nativeLocator
     } : {}
   } : undefined;
-  if (!structure && !semanticJudge && !source && !relevance && !retrieval)
+  const evidenceScope = item.details?.evidenceScope === "range-with-context" || item.details?.evidenceScope === "range-only" ? item.details.evidenceScope : item.source && item.range ? "range-only" : undefined;
+  const answerSupportEvidenceId = typeof item.details?.answerSupportEvidenceId === "string" ? item.details.answerSupportEvidenceId : undefined;
+  const contextBeforeLines = typeof item.details?.contextBeforeLines === "number" && Number.isSafeInteger(item.details.contextBeforeLines) && item.details.contextBeforeLines >= 0 ? item.details.contextBeforeLines : undefined;
+  const contextAfterLines = typeof item.details?.contextAfterLines === "number" && Number.isSafeInteger(item.details.contextAfterLines) && item.details.contextAfterLines >= 0 ? item.details.contextAfterLines : undefined;
+  if (!structure && !semanticJudge && !source && !relevance && !retrieval && !evidenceScope && !answerSupportEvidenceId)
     return;
   return {
     ...structure,
     ...relevance,
     ...retrieval,
     ...source ? { source } : {},
-    ...semanticJudge ? { semanticJudge } : {}
+    ...semanticJudge ? { semanticJudge } : {},
+    ...evidenceScope ? { evidenceScope } : {},
+    ...answerSupportEvidenceId ? { answerSupportEvidenceId } : {},
+    ...contextBeforeLines === undefined ? {} : { contextBeforeLines },
+    ...contextAfterLines === undefined ? {} : { contextAfterLines }
   };
+}
+function derivedEvidenceScope(result) {
+  const exactItems = result.items.filter((item) => item.source && item.range).length;
+  return exactItems > 0 ? {
+    ...result.evidenceScope,
+    status: result.items.some((item) => item.details?.evidenceScope === "range-with-context") ? "range-with-context" : "range-only",
+    exactItems
+  } : undefined;
 }
 function publicAnalysisItem(result, item, index, storedId, modelOutput) {
   const inspect = item.source && item.range ? {
@@ -13435,6 +13452,7 @@ class AnalysisStore {
   create(result, summarize) {
     this.#expire();
     const id = randomUUID6();
+    const evidenceScope = derivedEvidenceScope(result);
     const bounded = {
       ...result,
       ...result.retrievalLanes ? {
@@ -13452,6 +13470,7 @@ class AnalysisStore {
       } : {},
       reasons: boundedReasons(result.reasons),
       items: [],
+      ...evidenceScope ? { evidenceScope } : {},
       coverage: {
         ...result.coverage,
         retention: result.coverage?.retention ?? "complete"
@@ -13463,6 +13482,11 @@ class AnalysisStore {
     const rebuildItems = () => {
       const retained = new Set(retainedIndices);
       bounded.items = result.items.filter((_item, index) => retained.has(index)).map((item) => structuredClone(item));
+      const retainedScope = derivedEvidenceScope(bounded);
+      if (retainedScope)
+        bounded.evidenceScope = retainedScope;
+      else
+        delete bounded.evidenceScope;
     };
     for (const candidate of candidates) {
       const { item } = candidate;
@@ -13571,7 +13595,12 @@ class AnalysisStore {
   page(cursor, modelOutput = false, redact = false) {
     const { stored, offset, kind, lane } = this.resolve(cursor);
     const suffix = lane ? `.${lane}` : "";
-    const result = redact ? { ...stored.result, redact: true } : stored.result;
+    const result = { ...stored.result, ...redact ? { redact: true } : {} };
+    const pageScope = derivedEvidenceScope(result);
+    if (pageScope)
+      result.evidenceScope = pageScope;
+    else
+      delete result.evidenceScope;
     if (kind === "analysis-terms")
       return analysisTermPage(result, stored.id, offset);
     const hybridPreview = kind === "analysis-hybrid";
@@ -13590,8 +13619,9 @@ class AnalysisStore {
     const stats = result.stats ? ` Stats: ${JSON.stringify(result.stats)}.` : "";
     const semanticJudge = result.semanticJudge ? ` Semantic judge: ${result.semanticJudge.status}; provider=${result.semanticJudge.provider}; judged ${String(result.semanticJudge.judgedCandidates)} of ${String(result.semanticJudge.candidatesConsidered)} candidates.` : "";
     const answerSupport = result.answerSupport ? ` Answer support: ${result.answerSupport.status}${result.answerSupport.assessment ? ` (${result.answerSupport.assessment})` : ""}${result.answerSupport.reason ? `; ${result.answerSupport.reason}` : ""}; source freshness and retrieval ranking are separate signals.` : "";
+    const evidenceScope = result.evidenceScope ? ` Evidence scope: ${result.evidenceScope.status}; ${String(result.evidenceScope.exactItems)} exact range item(s)${result.evidenceScope.contextLines === undefined ? "" : `; support context=${String(result.evidenceScope.contextLines)} line(s)`}.` : "";
     const hasItemDetails = result.items.some((item) => publicItemDetails(item) !== undefined);
-    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${scope}${coverage}${stats}`;
+    const header = `${result.kind}: ${result.items.length} retained ${result.unit} (${result.partial ? "PARTIAL" : "complete"}). ${publicAnalysisLabel(result)}. ${result.counts ? `Counts: ${JSON.stringify(result.counts)}. ` : ""}${inlineTerms ? `Term counts: ${JSON.stringify(inlineTerms)}. ` : ""}${termsRequest ? `Term counts are paginated: ${JSON.stringify(termsRequest)}. ` : ""}Counts use ${result.unit}; they are not ordinary matching-line counts.${hasItemDetails ? " Structured output retains per-item evidence details." : ""}${semanticJudge}${answerSupport}${evidenceScope}${scope}${coverage}${stats}`;
     const notice = result.reasons.length ? `
 ${result.reasons.map((reason) => `[${reason}]`).join(`
 `)}` : "";
@@ -13640,6 +13670,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
         items.push({
           ...item,
           label: publicItem.label,
+          ...publicItem.details ? { details: { ...item.details, ...publicItem.details } } : {},
           index: index + 1,
           ...inspect ? { inspect } : {}
         });
@@ -13705,6 +13736,7 @@ Inspect: ${JSON.stringify(inspect)}` : ""}`;
           reasons: result.reasons,
           ...result.semanticJudge ? { semanticJudge: result.semanticJudge } : {},
           ...result.answerSupport ? { answerSupport: result.answerSupport } : {},
+          ...result.evidenceScope ? { evidenceScope: result.evidenceScope } : {},
           ...result.filesRead !== undefined ? { filesRead: result.filesRead } : {},
           ...result.bytesRead !== undefined ? { bytesRead: result.bytesRead } : {},
           ...result.changes ? { changes: result.changes } : {},
@@ -17805,7 +17837,7 @@ function withAnswerSupportBoundary(value) {
     ...value,
     answerSupport: value.answerSupport ?? {
       status: "not-assessed",
-      reason: "No claim was supplied; semantic classification does not assess answer support."
+      reason: "No claim was supplied; semantic classification does not assess answer support. Retained items keep exact ranges; inspect adjacent source or use mode=support with its bounded context when qualifiers matter."
     }
   };
 }
@@ -18442,7 +18474,8 @@ var MODE_FIELDS_BY_MODE = {
     "matchIndex",
     "matchIndices",
     "supportQuestion",
-    "supportClaim"
+    "supportClaim",
+    "supportContextLines"
   ],
   capabilities: [...commonFields, ...sourceFilters],
   await: ["mode", "operationId"],
@@ -18477,6 +18510,7 @@ var REQUEST_FIELD_GUIDANCE = {
   anyOf: "anyOf is case-sensitive exact-literal OR; omit pattern, allOf, literal, ignoreCase, roles",
   allOf: "allOf is case-sensitive exact-literal AND; omit pattern, anyOf, literal, ignoreCase, roles",
   context: "context is an output-context budget and is never silently dropped",
+  supportContextLines: "supportContextLines is the bounded number of adjacent source lines included for answer-support assessment; the selected range remains exact",
   limit: "limit is an output/page budget and is never silently dropped",
   scope: "scope applies to ordinary content search; mode=files is always strict, so it accepts only the redundant scope=strict",
   ignorePolicy: "respect keeps repository ignore rules and discloses ignored files; include also searches or lists ignored files but always excludes .git internals and protected paths",
@@ -18517,6 +18551,7 @@ var MODEL_USAGE_GUIDANCE = [
   "outline needs a concrete JS/TS/TSX/Python-capable source file, not a directory; structure needs a nonempty AST pattern for JS/TS/TSX/Go, no lang; use capabilities before unfamiliar language operations",
   "imports/tests are static JS/TS/TSX candidates",
   "selectors: inspect, hybrid and capabilities use their cataloged fields",
+  "support keeps exact ranges; supportContextLines=0-20 adds adjacent lines (default 2)",
   "exact, any-of and max_results are not parameters"
 ].join("; ");
 var MODE_CONTRACT_DESCRIPTION = [
@@ -18822,6 +18857,7 @@ function selectorError(input, mode, issues) {
 function validateValueRanges(input) {
   const integerRanges = [
     ["context", 0, MAX_CONTEXT_LINES],
+    ["supportContextLines", 0, MAX_CONTEXT_LINES],
     ["limit", 1, MAX_PAGE_SIZE],
     ["conceptLimit", 1, MAX_HYBRID_CONCEPT_LIMIT],
     ["maxFilesToParse", 1, MAX_CONFIGURABLE_STRUCTURE_FILES]
@@ -18922,6 +18958,256 @@ function validateRequestContract(input) {
 
 // src/evidence-service.ts
 import { realpath as realpath8 } from "fs/promises";
+
+// src/answer-support.ts
+var MAX_EVIDENCE_CHARS = 4000;
+var MAX_REQUEST_BYTES = 64 * 1024;
+var MAX_RESPONSE_BYTES4 = 4 * 1024 * 1024;
+var MAX_REASON_CHARS = 512;
+var ANSWER_SUPPORT_STATUSES = [
+  "supported",
+  "contradicted",
+  "insufficient",
+  "unknown"
+];
+function assertAnswerSupportEvidenceBudget(evidence) {
+  for (const item of evidence) {
+    const characters = item.excerpt.length + (item.selectedExcerpt?.length ?? 0) + (item.contextBefore?.length ?? 0) + (item.contextAfter?.length ?? 0);
+    if (characters > MAX_EVIDENCE_CHARS)
+      throw new SiftLightError("Answer support evidence exceeds the 4000-character per-item budget; select a smaller range or reduce supportContextLines");
+  }
+}
+
+class AnswerSupportConfigurationError extends SiftLightError {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "AnswerSupportConfigurationError";
+  }
+}
+
+class AnswerSupportRequestError extends SiftLightError {
+  retryable;
+  constructor(message, retryable, options) {
+    super(message, options);
+    this.name = "AnswerSupportRequestError";
+    this.retryable = retryable;
+  }
+}
+function isRecord4(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function boundedReason(value) {
+  if (typeof value !== "string" || value.length === 0)
+    return;
+  return value.replace(/[\r\n\0]/gu, " ").slice(0, MAX_REASON_CHARS);
+}
+function parseStatus(value) {
+  const status = typeof value === "string" ? ANSWER_SUPPORT_STATUSES.find((candidate) => candidate === value) : undefined;
+  if (status === undefined)
+    throw new AnswerSupportRequestError("Answer support response has an invalid status; expected supported, contradicted, insufficient or unknown", false);
+  return status;
+}
+function parseProbability(value) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)
+    throw new AnswerSupportRequestError("Answer support response has an invalid probability", false);
+  return value;
+}
+function parseEvidenceIds(value, ids) {
+  if (value === undefined)
+    return;
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !ids.has(id)))
+    throw new AnswerSupportRequestError("Answer support response contains an unknown evidence id", false);
+  return [...new Set(value)];
+}
+function parseJudgment2(raw, evidence) {
+  const value = isRecord4(raw.judgment) ? raw.judgment : isRecord4(raw.answers) && isRecord4(raw.answers.answer) ? raw.answers.answer : raw;
+  const ids = new Set(evidence.map((item) => item.id));
+  const probabilityValue = parseProbability(value.probability ?? value.confidence);
+  const reason = boundedReason(value.reason ?? value.rationale);
+  const evidenceIds = parseEvidenceIds(value.evidenceIds ?? value.supportingEvidence, ids);
+  return {
+    status: parseStatus(value.status ?? value.choice),
+    ...probabilityValue === undefined ? {} : { probability: probabilityValue },
+    ...reason === undefined ? {} : { reason },
+    ...evidenceIds === undefined ? {} : { evidenceIds }
+  };
+}
+function responseModel2(raw, config) {
+  const model = raw.model ?? config.model;
+  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model))
+    throw new AnswerSupportRequestError("Answer support response model is invalid", false);
+  return model;
+}
+function responseUsage2(raw) {
+  const usage = isRecord4(raw.usage) ? raw.usage : undefined;
+  const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
+  const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
+  return {
+    ...inputTokens === undefined ? {} : { inputTokens },
+    ...outputTokens === undefined ? {} : { outputTokens }
+  };
+}
+function requestBody2(config, question, claim, evidence) {
+  assertAnswerSupportEvidenceBudget(evidence);
+  const boundedEvidence = evidence.map((item) => ({
+    id: item.id,
+    excerpt: item.excerpt,
+    ...item.selectedExcerpt === undefined ? {} : { selectedExcerpt: item.selectedExcerpt },
+    ...item.contextBefore === undefined ? {} : { contextBefore: item.contextBefore },
+    ...item.contextAfter === undefined ? {} : { contextAfter: item.contextAfter }
+  }));
+  if (config.provider === "jev") {
+    return {
+      state: { question, claim, evidence: boundedEvidence },
+      model: config.model,
+      questions: {
+        answer: {
+          type: "choice",
+          instructions: "Assess only whether the claim is supported by the supplied evidence for the supplied question. The selectedExcerpt is the exact retained range; contextBefore and contextAfter are adjacent source lines supplied to catch qualifiers. Do not treat source identity or lexical overlap as support.",
+          criteria: {
+            supported: "The evidence directly supports the complete claim.",
+            contradicted: "The evidence directly conflicts with the claim.",
+            insufficient: "The evidence is relevant but does not establish the complete claim.",
+            unknown: "The evidence is unavailable, ambiguous or cannot be assessed."
+          }
+        }
+      }
+    };
+  }
+  return { version: 1, model: config.model, question, claim, evidence: boundedEvidence };
+}
+async function responseText2(response) {
+  if (!response.body) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES4)
+      throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done)
+        break;
+      bytes += result.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES4) {
+        reader.cancel();
+        throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(all);
+}
+function retryDelay3(attempt) {
+  return Math.min(20000, 400 * 2 ** attempt);
+}
+async function fetchResponse(config, key, fetcher, body2, parentSignal) {
+  if (new TextEncoder().encode(body2).byteLength > MAX_REQUEST_BYTES)
+    throw new AnswerSupportRequestError("Answer support request exceeded the 64 KiB limit", false);
+  for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
+    const controller = new AbortController;
+    const onAbort = () => controller.abort(parentSignal?.reason);
+    parentSignal?.addEventListener("abort", onAbort, { once: true });
+    const timeout = setTimeout(() => controller.abort(new Error("Answer support request timed out")), config.timeoutMs);
+    try {
+      const headers = { "content-type": "application/json" };
+      if (key)
+        headers.authorization = `Bearer ${key}`;
+      const response = await fetcher(config.endpoint, {
+        method: "POST",
+        headers,
+        body: body2,
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw new AnswerSupportRequestError(`Answer support provider returned HTTP ${String(response.status)}`, retryable);
+      }
+      const raw = JSON.parse(await responseText2(response));
+      if (!isRecord4(raw))
+        throw new AnswerSupportRequestError("Answer support response must be an object", false);
+      return raw;
+    } catch (error) {
+      if (parentSignal?.aborted)
+        throw error;
+      const retryable = error instanceof AnswerSupportRequestError ? error.retryable : true;
+      if (!retryable || attempt >= config.maxRetries)
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, retryDelay3(attempt)));
+    } finally {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", onAbort);
+    }
+  }
+  throw new AnswerSupportRequestError("Answer support request failed", false);
+}
+function createDisabledAnswerSupportIntegration(config) {
+  return { config: { ...config, enabled: false } };
+}
+function createAnswerSupportIntegration(config, environment = process.env, fetcher = fetch) {
+  if (!config.enabled)
+    return createDisabledAnswerSupportIntegration(config);
+  const key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
+  if (config.apiKeyEnv && !key)
+    throw new AnswerSupportConfigurationError(`Answer support is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`);
+  return {
+    config,
+    runner: async (question, claim, evidence, signal) => {
+      const startedAt = performance.now();
+      const raw = await fetchResponse(config, key, fetcher, JSON.stringify(requestBody2(config, question, claim, evidence)), signal);
+      const usage = responseUsage2(raw);
+      return {
+        ...parseJudgment2(raw, evidence),
+        model: responseModel2(raw, config),
+        ...usage,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      };
+    }
+  };
+}
+function createConfiguredAnswerSupportIntegration(config, environment = process.env) {
+  const support = config.answerSupport ?? DEFAULT_ANSWER_SUPPORT_CONFIG;
+  return createAnswerSupportIntegration(support, environment);
+}
+
+// src/support-excerpt.ts
+var DEFAULT_SUPPORT_CONTEXT_LINES = 2;
+function supportExcerpt(document2, range, contextLines) {
+  const selectedExcerpt = document2.slice(range);
+  const selectedStartLine = document2.lineAt(range.start);
+  const selectedEndLine = document2.lineAt(Math.max(range.start, range.end - 1));
+  const startLine = Math.max(1, selectedStartLine - contextLines);
+  const totalLines = document2.text.endsWith(`
+`) ? Math.max(selectedEndLine, document2.lineStarts.length - 1) : document2.lineStarts.length;
+  const endLine = Math.min(totalLines, selectedEndLine + contextLines);
+  const contextRange = contextLines > 0 ? document2.lineRange(startLine, endLine) : range;
+  const contextBefore = document2.slice({ start: contextRange.start, end: range.start });
+  const contextAfter = document2.slice({ start: range.end, end: contextRange.end });
+  return {
+    excerpt: document2.slice(contextRange),
+    selectedExcerpt,
+    ...contextBefore.length > 0 ? { contextBefore } : {},
+    ...contextAfter.length > 0 ? { contextAfter } : {},
+    contextBeforeLines: selectedStartLine - startLine,
+    contextAfterLines: endLine - selectedEndLine,
+    hasContext: contextRange.start < range.start || contextRange.end > range.end
+  };
+}
+
+// src/evidence-service.ts
 function isEvidenceRequest(input) {
   return input.mode === "concept" || input.mode === "hybrid" || input.mode === "structure" || input.mode === "files" || input.mode === "inspect" || input.mode === "outline" || input.mode === "imports" || input.mode === "tests" || input.mode === "validate" || input.mode === "support" || input.sourceCursor !== undefined || input.anyOf !== undefined || input.allOf !== undefined || input.within !== undefined || input.roles !== undefined || input.changes !== undefined || input.symbol !== undefined || input.conceptLimit !== undefined || (input.cursor?.includes(".analysis") ?? false);
 }
@@ -19201,9 +19487,16 @@ class EvidenceService {
     const maxEvidenceItems = config?.maxEvidenceItems ?? 5;
     if (indices.length > maxEvidenceItems)
       throw new SiftLightError(`mode=support accepts at most ${String(maxEvidenceItems)} evidence item(s) from the active configuration`);
+    const contextLines = input.supportContextLines ?? DEFAULT_SUPPORT_CONTEXT_LINES;
+    if (!Number.isSafeInteger(contextLines) || contextLines < 0 || contextLines > MAX_CONTEXT_LINES)
+      throw new SiftLightError(`supportContextLines must be an integer from 0 through ${String(MAX_CONTEXT_LINES)}`);
     const evidence = [];
     const items = [];
     const reasons = [];
+    const validationCache = new Map;
+    const documentCache = new Map;
+    let contextBeforeLines = 0;
+    let contextAfterLines = 0;
     for (const index of new Set(indices)) {
       const item = this.#analyses.item(cursor, index);
       const evidenceId = `evidence-${String(evidence.length + 1)}`;
@@ -19211,28 +19504,60 @@ class EvidenceService {
         reasons.push(`Evidence item #${String(index)} has no versioned source range`);
         continue;
       }
-      const validated = await validateSavedEvidence({
-        cursor,
-        cwd: access.cwd,
-        ...signal ? { signal } : {},
-        matchIndex: index,
-        analyses: this.#analyses,
-        snapshots: this.#snapshots,
-        queue: this.#queue,
-        maxFiles: MAX_STRUCTURE_FILES
-      });
+      const validationKey = JSON.stringify([item.source.path, item.source.origin]);
+      let validation = validationCache.get(validationKey);
+      if (!validation) {
+        validation = validateSavedEvidence({
+          cursor,
+          cwd: access.cwd,
+          ...signal ? { signal } : {},
+          matchIndex: index,
+          analyses: this.#analyses,
+          snapshots: this.#snapshots,
+          queue: this.#queue,
+          maxFiles: MAX_STRUCTURE_FILES
+        });
+        validationCache.set(validationKey, validation);
+      }
+      const validated = await validation;
       if (validated.recheck.validity !== "current") {
         reasons.push(`Evidence item #${String(index)} is ${validated.recheck.validity}; answer support requires current source bytes`);
         continue;
       }
       try {
-        const document2 = await access.refresh(item.path, item.source);
-        evidence.push({ id: evidenceId, excerpt: document2.slice(item.range) });
+        let pendingDocument = documentCache.get(validationKey);
+        if (!pendingDocument) {
+          pendingDocument = access.refresh(item.path, item.source);
+          documentCache.set(validationKey, pendingDocument);
+        }
+        const document2 = await pendingDocument;
+        const excerpt = supportExcerpt(document2, item.range, contextLines);
+        const supportEvidence = {
+          id: evidenceId,
+          excerpt: excerpt.excerpt,
+          ...excerpt.hasContext ? { selectedExcerpt: excerpt.selectedExcerpt } : {},
+          ...excerpt.contextBefore === undefined ? {} : { contextBefore: excerpt.contextBefore },
+          ...excerpt.contextAfter === undefined ? {} : { contextAfter: excerpt.contextAfter }
+        };
+        assertAnswerSupportEvidenceBudget([supportEvidence]);
+        contextBeforeLines = Math.max(contextBeforeLines, excerpt.contextBeforeLines);
+        contextAfterLines = Math.max(contextAfterLines, excerpt.contextAfterLines);
+        evidence.push(supportEvidence);
         items.push({
           ...item,
-          details: { ...item.details, answerSupportEvidenceId: evidenceId }
+          details: {
+            ...item.details,
+            answerSupportEvidenceId: evidenceId,
+            evidenceScope: excerpt.hasContext ? "range-with-context" : "range-only",
+            contextBeforeLines: excerpt.contextBeforeLines,
+            contextAfterLines: excerpt.contextAfterLines
+          }
         });
       } catch (error) {
+        if (signal?.aborted || error instanceof Error && error.name === "AbortError")
+          throw error;
+        if (!(error instanceof SiftLightError))
+          throw error;
         reasons.push(`Evidence item #${String(index)} could not be read: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
@@ -19241,6 +19566,9 @@ class EvidenceService {
       question: input.supportQuestion,
       claim: input.supportClaim,
       evidenceItems: [...new Set(indices)],
+      contextLines,
+      contextBeforeLines,
+      contextAfterLines,
       ...config ? { provider: config.provider } : {}
     };
     let answerSupport;
@@ -19272,6 +19600,8 @@ class EvidenceService {
           elapsedMs: judged.elapsedMs
         };
       } catch (error) {
+        if (signal?.aborted || error instanceof Error && error.name === "AbortError")
+          throw error;
         answerSupport = {
           ...assessmentBase,
           status: "failed",
@@ -19287,6 +19617,13 @@ class EvidenceService {
       partial: answerSupport.status !== "complete" || answerSupport.assessment === "unknown",
       reasons,
       answerSupport,
+      ...evidence.length > 0 ? {
+        evidenceScope: {
+          status: items.some((item) => item.details?.evidenceScope === "range-with-context") ? "range-with-context" : "range-only",
+          exactItems: evidence.length,
+          contextLines
+        }
+      } : {},
       coverage: { sourceValidation: reasons.length > 0 ? "partial" : "complete" },
       redact: input.redact ?? false
     };
@@ -29232,7 +29569,7 @@ function stringEnum(values, options) {
     ...options?.description ? { description: options.description } : {}
   });
 }
-var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but classification is not source verification or answer support. mode=support evaluates one concrete claim against selected, version-checked retained evidence only when answerSupport is configured. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin and does not assess answer support. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
+var SIFT_LIGHT_DESCRIPTION = `Search and navigate code with bounded, verifiable evidence. Routine searches should use exact content, filenames or applicable structural modes first. Omitted mode is ordinary exact search and does not load the embedding model; concept/hybrid require vectorSearchEnabled:true in sift-light.json plus an installed model and may take tens of seconds on an uncached scope. Ordinary pattern searches use auto detail/summary; pattern is regex by default and literal=true matches source text exactly. A path selects an existing exact file or root; use mode=files with query to discover an unknown name. scope=strict prevents zero-result path expansion and wholeWord requires word boundaries. mode=capabilities returns a compact names-only project language inventory and the modes available for each detected language; capability providers are loaded only when the requested analysis runs. It never starts a parser, compiler, model or language server. mode=concept accepts a natural-language query, path and source filters; mode=hybrid uses one natural-language query for exact and local concept evidence, ranks exact evidence first, and retains a bounded semantic supplement. An explicitly enabled semantic judge may classify hybrid candidates, but classification is not source verification or answer support. mode=support evaluates one concrete claim against selected, version-checked retained evidence only when answerSupport is configured; it keeps the exact selected range and includes two adjacent source lines by default, configurable with supportContextLines=0-20. Slow concept/hybrid requests return status=waiting or running with operationId, progress, and an exact nextRequest using mode=await; copy that request unchanged to continue the same computation. Await expiry never downgrades evidence to literal-only or partial, and final results remain stable for the operation retention window. mode=cancel explicitly stops one operation. allOf and anyOf are explicit literal variants and cannot be mixed with pattern/literal; limit and context are output intent and are never silently dropped. modifiedAfter/modifiedBefore filter worktree files by inclusive/exclusive modification-time bounds in Unix milliseconds. structure requires a nonempty AST pattern and JS/TS/TSX/Go sources; lang is not a field. Outline uses a concrete source file path (not a directory) or retained cursor+matchIndex and follows declared syntax capabilities. imports/tests return bounded static module and related-test candidates without proving runtime execution. validate checks saved source evidence against its recorded origin and does not assess answer support. Partial coverage stays explicit. ${REQUEST_USAGE_GUIDANCE}`;
 var SIFT_LIGHT_MODEL_DESCRIPTION = `Bounded local evidence search. source-list/source-search/source-read. Default exact search is model-free; concept/hybrid require vectorSearchEnabled:true in sift-light.json and a model. ${MODEL_USAGE_GUIDANCE}. Copy cursors; analysis is evidence, not proof.`;
 var siftLightSchema = _Object_({
   sourceId: Optional(String2({
@@ -29257,6 +29594,11 @@ var siftLightSchema = _Object_({
     minLength: 1,
     maxLength: 4000,
     description: "mode=support only: one concrete claim to classify as supported, contradicted, insufficient or unknown."
+  })),
+  supportContextLines: Optional(Integer({
+    minimum: 0,
+    maximum: MAX_CONTEXT_LINES,
+    description: "mode=support only: adjacent source lines included around each exact retained range for qualifier checks (default 2; 0 keeps exact-range-only evidence)."
   })),
   scope: Optional(stringEnum(["strict", "expand"], {
     description: `${fieldGuidance("scope")}; expand (default) retries ordinary content search from project cwd. Applies to ordinary, multi-term and role searches.`
@@ -29509,219 +29851,6 @@ function requestContractProjection(error) {
   };
   const compactText = projectRequestContract(compact, JSON.stringify(compact));
   return { details: compact, text: compactText };
-}
-
-// src/answer-support.ts
-var MAX_EVIDENCE_CHARS = 4000;
-var MAX_REQUEST_BYTES = 64 * 1024;
-var MAX_RESPONSE_BYTES4 = 4 * 1024 * 1024;
-var MAX_REASON_CHARS = 512;
-var ANSWER_SUPPORT_STATUSES = [
-  "supported",
-  "contradicted",
-  "insufficient",
-  "unknown"
-];
-
-class AnswerSupportConfigurationError extends SiftLightError {
-  constructor(message, options) {
-    super(message, options);
-    this.name = "AnswerSupportConfigurationError";
-  }
-}
-
-class AnswerSupportRequestError extends SiftLightError {
-  retryable;
-  constructor(message, retryable, options) {
-    super(message, options);
-    this.name = "AnswerSupportRequestError";
-    this.retryable = retryable;
-  }
-}
-function isRecord4(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function boundedReason(value) {
-  if (typeof value !== "string" || value.length === 0)
-    return;
-  return value.replace(/[\r\n\0]/gu, " ").slice(0, MAX_REASON_CHARS);
-}
-function parseStatus(value) {
-  const status = typeof value === "string" ? ANSWER_SUPPORT_STATUSES.find((candidate) => candidate === value) : undefined;
-  if (status === undefined)
-    throw new AnswerSupportRequestError("Answer support response has an invalid status; expected supported, contradicted, insufficient or unknown", false);
-  return status;
-}
-function parseProbability(value) {
-  if (value === undefined)
-    return;
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1)
-    throw new AnswerSupportRequestError("Answer support response has an invalid probability", false);
-  return value;
-}
-function parseEvidenceIds(value, ids) {
-  if (value === undefined)
-    return;
-  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !ids.has(id)))
-    throw new AnswerSupportRequestError("Answer support response contains an unknown evidence id", false);
-  return [...new Set(value)];
-}
-function parseJudgment2(raw, evidence) {
-  const value = isRecord4(raw.judgment) ? raw.judgment : isRecord4(raw.answers) && isRecord4(raw.answers.answer) ? raw.answers.answer : raw;
-  const ids = new Set(evidence.map((item) => item.id));
-  const probabilityValue = parseProbability(value.probability ?? value.confidence);
-  const reason = boundedReason(value.reason ?? value.rationale);
-  const evidenceIds = parseEvidenceIds(value.evidenceIds ?? value.supportingEvidence, ids);
-  return {
-    status: parseStatus(value.status ?? value.choice),
-    ...probabilityValue === undefined ? {} : { probability: probabilityValue },
-    ...reason === undefined ? {} : { reason },
-    ...evidenceIds === undefined ? {} : { evidenceIds }
-  };
-}
-function responseModel2(raw, config) {
-  const model = raw.model ?? config.model;
-  if (typeof model !== "string" || model.length === 0 || model.length > 128 || /[\r\n\0]/u.test(model))
-    throw new AnswerSupportRequestError("Answer support response model is invalid", false);
-  return model;
-}
-function responseUsage2(raw) {
-  const usage = isRecord4(raw.usage) ? raw.usage : undefined;
-  const inputTokens = typeof usage?.input_tokens === "number" && Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0 ? usage.input_tokens : undefined;
-  const outputTokens = typeof usage?.output_tokens === "number" && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0 ? usage.output_tokens : undefined;
-  return {
-    ...inputTokens === undefined ? {} : { inputTokens },
-    ...outputTokens === undefined ? {} : { outputTokens }
-  };
-}
-function requestBody2(config, question, claim, evidence) {
-  const boundedEvidence = evidence.map((item) => ({
-    id: item.id,
-    excerpt: item.excerpt.slice(0, MAX_EVIDENCE_CHARS)
-  }));
-  if (config.provider === "jev") {
-    return {
-      state: { question, claim, evidence: boundedEvidence },
-      model: config.model,
-      questions: {
-        answer: {
-          type: "choice",
-          instructions: "Assess only whether the claim is supported by the supplied evidence for the supplied question. Do not treat source identity or lexical overlap as support.",
-          criteria: {
-            supported: "The evidence directly supports the complete claim.",
-            contradicted: "The evidence directly conflicts with the claim.",
-            insufficient: "The evidence is relevant but does not establish the complete claim.",
-            unknown: "The evidence is unavailable, ambiguous or cannot be assessed."
-          }
-        }
-      }
-    };
-  }
-  return { version: 1, model: config.model, question, claim, evidence: boundedEvidence };
-}
-async function responseText2(response) {
-  if (!response.body) {
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BYTES4)
-      throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
-    return text;
-  }
-  const reader = response.body.getReader();
-  const chunks = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done)
-        break;
-      bytes += result.value.byteLength;
-      if (bytes > MAX_RESPONSE_BYTES4) {
-        reader.cancel();
-        throw new AnswerSupportRequestError("Answer support response exceeded the 4 MiB limit", false);
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const all = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    all.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: true }).decode(all);
-}
-function retryDelay3(attempt) {
-  return Math.min(20000, 400 * 2 ** attempt);
-}
-async function fetchResponse(config, key, fetcher, body2, parentSignal) {
-  if (new TextEncoder().encode(body2).byteLength > MAX_REQUEST_BYTES)
-    throw new AnswerSupportRequestError("Answer support request exceeded the 64 KiB limit", false);
-  for (let attempt = 0;attempt <= config.maxRetries; attempt += 1) {
-    const controller = new AbortController;
-    const onAbort = () => controller.abort(parentSignal?.reason);
-    parentSignal?.addEventListener("abort", onAbort, { once: true });
-    const timeout = setTimeout(() => controller.abort(new Error("Answer support request timed out")), config.timeoutMs);
-    try {
-      const headers = { "content-type": "application/json" };
-      if (key)
-        headers.authorization = `Bearer ${key}`;
-      const response = await fetcher(config.endpoint, {
-        method: "POST",
-        headers,
-        body: body2,
-        signal: controller.signal
-      });
-      if (!response.ok) {
-        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-        throw new AnswerSupportRequestError(`Answer support provider returned HTTP ${String(response.status)}`, retryable);
-      }
-      const raw = JSON.parse(await responseText2(response));
-      if (!isRecord4(raw))
-        throw new AnswerSupportRequestError("Answer support response must be an object", false);
-      return raw;
-    } catch (error) {
-      if (parentSignal?.aborted)
-        throw error;
-      const retryable = error instanceof AnswerSupportRequestError ? error.retryable : true;
-      if (!retryable || attempt >= config.maxRetries)
-        throw error;
-      await new Promise((resolve) => setTimeout(resolve, retryDelay3(attempt)));
-    } finally {
-      clearTimeout(timeout);
-      parentSignal?.removeEventListener("abort", onAbort);
-    }
-  }
-  throw new AnswerSupportRequestError("Answer support request failed", false);
-}
-function createDisabledAnswerSupportIntegration(config) {
-  return { config: { ...config, enabled: false } };
-}
-function createAnswerSupportIntegration(config, environment = process.env, fetcher = fetch) {
-  if (!config.enabled)
-    return createDisabledAnswerSupportIntegration(config);
-  const key = config.apiKeyEnv ? environment[config.apiKeyEnv]?.trim() : undefined;
-  if (config.apiKeyEnv && !key)
-    throw new AnswerSupportConfigurationError(`Answer support is enabled, but environment variable ${config.apiKeyEnv} is missing or empty`);
-  return {
-    config,
-    runner: async (question, claim, evidence, signal) => {
-      const startedAt = performance.now();
-      const raw = await fetchResponse(config, key, fetcher, JSON.stringify(requestBody2(config, question, claim, evidence)), signal);
-      const usage = responseUsage2(raw);
-      return {
-        ...parseJudgment2(raw, evidence),
-        model: responseModel2(raw, config),
-        ...usage,
-        elapsedMs: Math.round(performance.now() - startedAt)
-      };
-    }
-  };
-}
-function createConfiguredAnswerSupportIntegration(config, environment = process.env) {
-  const support = config.answerSupport ?? DEFAULT_ANSWER_SUPPORT_CONFIG;
-  return createAnswerSupportIntegration(support, environment);
 }
 
 // src/omp-index.ts

@@ -44,6 +44,11 @@ function compactSemanticMetadata(details: SiftLightDetails, analysis: AnalysisDe
           `Answer support: ${analysis.answerSupport.status}${analysis.answerSupport.assessment ? ` (${analysis.answerSupport.assessment})` : ""}${analysis.answerSupport.reason ? `; ${analysis.answerSupport.reason}` : ""}; source identity, retrieval ranking and answer support remain separate.`,
         ]
       : []),
+    ...(analysis.evidenceScope
+      ? [
+          `Evidence scope: ${analysis.evidenceScope.status}; ${String(analysis.evidenceScope.exactItems)} exact range item(s)${analysis.evidenceScope.contextLines === undefined ? "" : `; support context=${String(analysis.evidenceScope.contextLines)} line(s)`}. Inspect surrounding source or use mode="support" when a claim depends on adjacent qualifiers.`,
+        ]
+      : []),
     ...(details.operation
       ? [`Operation: ${details.operation.state}; id=${details.operation.id}.`]
       : []),
@@ -83,6 +88,9 @@ function compactMetadata(details: SiftLightDetails, analysis: AnalysisDetails): 
       : undefined,
     analysis.answerSupport
       ? `Answer support: ${JSON.stringify(analysis.answerSupport)}`
+      : undefined,
+    analysis.evidenceScope
+      ? `Evidence scope: ${JSON.stringify(analysis.evidenceScope)}`
       : undefined,
     details.operation ? `Operation: ${JSON.stringify(details.operation)}` : undefined,
     analysis.kind === "outline" && analysis.modelOutput

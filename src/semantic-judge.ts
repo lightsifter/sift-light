@@ -534,7 +534,8 @@ function withAnswerSupportBoundary(value: AnalysisResultSet): AnalysisResultSet 
     ...value,
     answerSupport: value.answerSupport ?? {
       status: "not-assessed",
-      reason: "No claim was supplied; semantic classification does not assess answer support.",
+      reason:
+        "No claim was supplied; semantic classification does not assess answer support. Retained items keep exact ranges; inspect adjacent source or use mode=support with its bounded context when qualifiers matter.",
     },
   };
 }

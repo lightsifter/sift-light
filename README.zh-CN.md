@@ -169,7 +169,7 @@ Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保�
 
 ### 对已核验源码中的具体结论做支撑判断
 
-`mode: "support"` 用来判断一个明确的 `supportClaim` 是否被已选中的源码证据支持。它只能接收之前检索或分析返回的 `cursor` 和 `matchIndex`/`matchIndices`，会再次校验每个源码范围的当前版本；源码已变、无法确认或没有可用范围时返回 `unknown`，不会把旧内容交给模型。这个判断与两路检索、精确定位和 `mode: "validate"` 相互独立，不会改变原检索结果。
+`mode: "support"` 用来判断一个明确的 `supportClaim` 是否被已选中的源码证据支持。它只能接收之前检索或分析返回的 `cursor` 和 `matchIndex`/`matchIndices`，会再次校验每个源码范围的当前版本；源码已变、无法确认或没有可用范围时返回 `unknown`，不会把旧内容交给模型。这个判断与两路检索、精确定位和 `mode: "validate"` 相互独立，不会改变原检索结果。分析结果会公开 `evidenceScope: "range-only"`，明确保留的是精确范围，不能把它自动当成完整的结论证据；如果相邻限定条件可能影响结论，先 inspect 源码，或继续调用 `mode: "support"`。
 
 功能默认关闭。配置文件中可以选择本机兼容 HTTP JSON 提供方，或显式配置 Jev 端点；密钥只通过进程环境变量提供：
 
@@ -187,7 +187,7 @@ Hybrid 搜索默认只使用本地能力。可选的语义判断器可以对保�
 }
 ```
 
-`provider: "http-json"` 时可把 `endpoint` 指向自己的本地或远程服务，并省略 `apiKeyEnv`；服务返回 `supported`、`contradicted`、`insufficient` 或 `unknown` 之一。每次最多发送五个证据项，每项最多 4,000 个字符；请求体限制 64 KiB、响应体限制 4 MiB。结果会保留提供方、模型、概率、理由和可用的 token 用量，失败会明确显示，源码核验仍然可以单独使用。
+`provider: "http-json"` 时可把 `endpoint` 指向自己的本地或远程服务，并省略 `apiKeyEnv`；服务返回 `supported`、`contradicted`、`insufficient` 或 `unknown` 之一。每次最多发送五个证据项，每项所有证据文本字段合计最多 4,000 个字符，超出预算时明确返回 unknown，不截断内容；请求体限制 64 KiB、响应体限制 4 MiB。加入上下文时，支持判断会把精确命中的范围单独放在 `selectedExcerpt`，默认再带上前后各最多两行源码作为 `contextBefore`/`contextAfter`；传 `supportContextLines: 0` 可只使用精确范围，也可以选 1–20 行的有界上下文。结果会保留提供方、模型、概率、理由和可用的 token 用量，失败会明确显示，源码核验仍然可以单独使用。
 
 ### Claude Code 或 Codex：连接 MCP
 

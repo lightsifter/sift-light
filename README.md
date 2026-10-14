@@ -169,7 +169,7 @@ When enabled, the configured endpoint receives only the query and bounded candid
 
 ### Assess one concrete claim against verified source ranges
 
-Use `mode: "support"` to assess whether a concrete `supportClaim` is supported by selected source evidence. The request accepts only a retained `cursor` plus `matchIndex` or `matchIndices`, and rechecks every source range against the current revision before sending it to a provider. Changed, unavailable or unversioned evidence produces `unknown` and is never sent as current proof. This assessment is independent from both retrieval lanes, precise inspection and `mode: "validate"`; it does not change the original search result.
+Use `mode: "support"` to assess whether a concrete `supportClaim` is supported by selected source evidence. The request accepts only a retained `cursor` plus `matchIndex` or `matchIndices`, and rechecks every source range against the current revision before sending it to a provider. Changed, unavailable or unversioned evidence produces `unknown` and is never sent as current proof. This assessment is independent from both retrieval lanes, precise inspection and `mode: "validate"`; it does not change the original search result. Analysis pages expose `evidenceScope: "range-only"` so callers can see that the exact range is preserved while answer support is not assumed; inspect the source or continue with `mode: "support"` when nearby qualifiers may matter.
 
 The feature is disabled by default. Configure either the local-compatible HTTP JSON provider or an explicit Jev endpoint. Keep credentials in the process environment:
 
@@ -187,7 +187,7 @@ The feature is disabled by default. Configure either the local-compatible HTTP J
 }
 ```
 
-With `provider: "http-json"`, point `endpoint` at your local or remote service and omit `apiKeyEnv` when it does not require a key. The provider returns one of `supported`, `contradicted`, `insufficient` or `unknown`. Each request sends at most five evidence items, with 4,000 characters per item, a 64 KiB request cap and a 4 MiB response cap. Results retain provider, model, probability, reason and available token usage; failures stay explicit and source validation remains available on its own.
+With `provider: "http-json"`, point `endpoint` at your local or remote service and omit `apiKeyEnv` when it does not require a key. The provider returns one of `supported`, `contradicted`, `insufficient` or `unknown`. Each request sends at most five evidence items, with 4,000 characters per item across all evidence text fields; oversized evidence is rejected without truncation, a 64 KiB request cap and a 4 MiB response cap. When context is added, support keeps the exact selected range as `selectedExcerpt` and includes two adjacent source lines by default as `contextBefore`/`contextAfter`; pass `supportContextLines: 0` for exact-range-only or choose 1–20 lines for a wider bounded context. Results retain provider, model, probability, reason and available token usage; failures stay explicit and source validation remains available on its own.
 
 ### Claude Code or Codex: MCP connection
 

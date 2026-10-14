@@ -27,6 +27,7 @@ export interface RawSearchInput {
   modifiedBefore?: number;
   supportQuestion?: string;
   supportClaim?: string;
+  supportContextLines?: number;
 }
 
 function list(value: string | string[] | undefined): string[] {

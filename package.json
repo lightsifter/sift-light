@@ -1,6 +1,6 @@
 {
   "name": "sift-light",
-  "version": "1.1.1-6",
+  "version": "1.1.1-7",
   "description": "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   "keywords": [
     "ai-agent",
@@ -67,7 +67,7 @@
     "check:mcp": "bun run doc/testing/scripts/check-mcp-server.ts",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
-    "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts",
+    "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives src scripts validation",
     "typecheck": "tsc --noEmit",
     "test:repo": "bun test ./doc/testing/test",
     "test": "node src/package-smoke.mjs",
@@ -86,11 +86,12 @@
     "test:mcp-hosts": "bun run doc/testing/scripts/mcp-host-verification.ts",
     "build": "bun run build:worker && bun run build:concept-worker && bun run build:search-plugin && bun run build:mcp",
     "format:local:check": "bun run doc/testing/scripts/format-local.ts --check",
-    "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts",
+    "lint:local": "oxlint --no-ignore --type-aware --tsconfig doc/testing/tsconfig.json --deny-warnings --report-unused-disable-directives src scripts doc/testing/test doc/testing/scripts validation",
     "typecheck:local": "tsc --noEmit --project doc/testing/tsconfig.json",
     "check:local": "bun run format:check && bun run format:local:check && bun run check:search-plugin && bun run check:concept-worker && bun run check:worker && bun run check:mcp && bun run lint:local && bun run typecheck:local && bun run test:repo && bun run test:node:repo && bun run benchmark",
     "build:native-text": "bun run scripts/build-native-text.ts",
-    "build:native-media": "bun run scripts/build-native-media.ts"
+    "build:native-media": "bun run scripts/build-native-media.ts",
+    "test:support": "bun test ./validation"
   },
   "dependencies": {
     "@ast-grep/lang-go": "0.0.6",

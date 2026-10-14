@@ -33,6 +33,9 @@ export interface AnswerSupportDetails {
   question?: string;
   claim?: string;
   evidenceItems?: number[];
+  contextLines?: number;
+  contextBeforeLines?: number;
+  contextAfterLines?: number;
   provider?: string;
   model?: string;
   probability?: number;
@@ -41,6 +44,14 @@ export interface AnswerSupportDetails {
   inputTokens?: number;
   outputTokens?: number;
   elapsedMs?: number;
+}
+
+export type EvidenceScopeStatus = "range-only" | "range-with-context";
+
+export interface EvidenceScopeSummary {
+  status: EvidenceScopeStatus;
+  exactItems: number;
+  contextLines?: number;
 }
 
 export type SemanticJudgeStatus = "disabled" | "complete" | "partial" | "failed";
@@ -122,6 +133,7 @@ export interface AnalysisDetails {
   modelOutput?: boolean;
   semanticJudge?: SemanticJudgeDetails;
   answerSupport?: AnswerSupportDetails;
+  evidenceScope?: EvidenceScopeSummary;
   statistics?: ResultStatistics;
   items: (AnalysisItem & { index: number; sourceId?: number; inspect?: SiftLightInput })[];
   sources?: SourceReference[];
@@ -186,6 +198,7 @@ export interface AnalysisResultSet {
   reasons: string[];
   semanticJudge?: SemanticJudgeDetails;
   answerSupport?: AnswerSupportDetails;
+  evidenceScope?: EvidenceScopeSummary;
   filesRead?: number;
   bytesRead?: number;
   counts?: Record<string, number>;
