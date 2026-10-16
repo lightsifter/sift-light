@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Store Pi search policy guidance in a separate prompt section so tool activation can preserve cached prefixes and signed thinking blocks.
+- Require Pi 0.86.0 or newer for the structured prompt section API.
+
 ## 1.1.1-7 — 2026-10-14
 
 - Assess answer support with configurable adjacent source context while preserving the exact selected range, inspection and source validation.

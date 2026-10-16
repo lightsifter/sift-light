@@ -120,13 +120,15 @@ bun run build:native-text -- /absolute/sdk-checkout /absolute/native-text-output
 
 ## 安装
 
-MCP 需要 Node.js 22.19+。Pi 需要 Pi 0.84.3+，以及 Node.js 22.19+ 或 Bun 1.4+。搜索引擎随包提供对应平台的版本，无需系统搜索工具、Shell 函数或额外设置 `PATH`，搜索过程也不会下载任何东西。安装时请保留可选依赖。
+MCP 需要 Node.js 22.19+。Pi 需要 Pi 0.86.0+，以及 Node.js 22.19+ 或 Bun 1.4+。搜索引擎随包提供对应平台的版本，无需系统搜索工具、Shell 函数或额外设置 `PATH`，搜索过程也不会下载任何东西。安装时请保留可选依赖。
 
 如果你从更早的包身份升级，请先移除此前安装的插件和 MCP 注册，再安装 sift-light，避免同一宿主同时加载两套搜索工具或拦截钩子。
 
 如需使用自己的 ripgrep，在 MCP 服务或 Pi 进程的环境变量中设置 `SIFT_LIGHT_RG_PATH` 为可执行文件的绝对路径，然后重启宿主。该设置统一作用于内容、文件名和 Git 源文件搜索。路径中的空格可用；不支持别名、Shell 函数、相对路径或 `~` 展开。配置无效时明确报错，不会另选程序。随包引擎缺失时，sift-light 会把 `PATH` 中找到的可执行 `rg` 作为兼容性 fallback；如果 PATH 中也没有，再保留可选依赖重新安装，或把该项指向自己的二进制。
 
 ### Pi
+
+搜索策略指引使用独立的提示词 section，让支持会话中工具变更的模型能在启用工具时保留已有缓存前缀。
 
 ```bash
 pi install npm:sift-light
