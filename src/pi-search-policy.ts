@@ -26,7 +26,9 @@ export function registerPiSearchPolicy(
   pi.on("before_agent_start", (event) => {
     selectTools();
     const guidance = mode === "hard" ? SEARCH_POLICY_GUIDANCE : PREFERRED_SEARCH_GUIDANCE;
-    return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+    // Returning systemPrompt makes Pi collapse tool history into the request prefix.
+    // A section preserves the placement of later tool additions in the transcript.
+    event.systemPromptOptions.sections.sift_search_policy = guidance;
   });
   if (mode === "hard")
     pi.on("tool_call", async (event, ctx) => policy.check(event.toolName, event.input, ctx.signal));

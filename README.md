@@ -120,13 +120,15 @@ The plugin provides file locations and actual text so the agent can answer from 
 
 ## Install
 
-MCP needs Node.js 22.19+. Pi needs Pi 0.84.3+ with Node.js 22.19+ or Bun 1.4+. The search engine ships with the package for each supported platform, so no system search tool, shell function or `PATH` setup is required, and a search never downloads anything. Install with optional dependencies enabled.
+MCP needs Node.js 22.19+. Pi needs Pi 0.86.0+ with Node.js 22.19+ or Bun 1.4+. The search engine ships with the package for each supported platform, so no system search tool, shell function or `PATH` setup is required, and a search never downloads anything. Install with optional dependencies enabled.
 
 When upgrading from a release published under an earlier package identity, remove that earlier plugin and MCP registration before installing sift-light. This avoids loading two search tools or enforcement hooks in the same host.
 
 To use your own ripgrep, set `SIFT_LIGHT_RG_PATH` to the absolute path of the executable in the MCP server or Pi process environment, then restart the host. It applies to content, filename and Git-source searches. Paths containing spaces work; aliases, shell functions, relative paths and `~` are not expanded. An unusable value fails explicitly instead of silently choosing another executable. If the bundled engine is missing, sift-light uses an executable `rg` found on `PATH` as a compatibility fallback; otherwise reinstall with optional dependencies enabled or point this setting at your own binary.
 
 ### Pi
+
+Search policy guidance uses a separate prompt section, so models that support tool changes during a conversation can retain cached prefixes when tools are activated.
 
 ```bash
 pi install npm:sift-light

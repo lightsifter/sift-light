@@ -3007,7 +3007,7 @@ var package_default = {
   },
   devDependencies: {
     "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.86.0",
     "@earendil-works/pi-tui": "0.84.3",
     "@types/bun": "^1.4.0",
     oxfmt: "^0.65.0",
@@ -3020,7 +3020,7 @@ var package_default = {
   },
   peerDependencies: {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.86.0",
     "@earendil-works/pi-tui": "*",
     typebox: "*"
   },
