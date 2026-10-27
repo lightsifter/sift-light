@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.1.2-1 — 2026-10-27
 
 - Store Pi search policy guidance in a separate prompt section so tool activation can preserve cached prefixes and signed thinking blocks.
 - Require Pi 0.86.0 or newer for the structured prompt section API.
+- Add DeepSeek Harness 0.2.1-rc.3 integration with search policy and native tool support.
 
 ## 1.1.1-7 — 2026-10-14
 

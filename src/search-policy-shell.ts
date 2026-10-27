@@ -240,11 +240,13 @@ function isSafePipelineFilter(
 /** WASM grammars are shipped with the hook; parsing never reads shell scripts or executes code. */
 export class ShellSearchPolicy {
   readonly #assets: URL;
+  readonly #inspectInlinePrograms: boolean;
   #initialization: Promise<void> | undefined;
   readonly #languages = new Map<ShellLanguage, Promise<Language>>();
 
-  constructor(assets: URL) {
+  constructor(assets: URL, inspectInlinePrograms = false) {
     this.#assets = assets;
+    this.#inspectInlinePrograms = inspectInlinePrograms;
   }
 
   async inspect(command: string, language: ShellLanguage): Promise<ShellSearchMatch | undefined> {
@@ -296,7 +298,7 @@ export class ShellSearchPolicy {
           const commandIndex = state.nextCommandIndex;
           state.nextCommandIndex += 1;
           const words = commandWords(node, language);
-          const decision = classifyCommand(words, language);
+          const decision = classifyCommand(words, language, 0, this.#inspectInlinePrograms);
           if (
             decision.kind &&
             !(decision.kind === "content" && isSafePipelineFilter(node, language, words))

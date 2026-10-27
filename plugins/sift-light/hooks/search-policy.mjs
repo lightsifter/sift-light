@@ -3634,6 +3634,30 @@ var Parser = class {
   }
 };
 
+// src/search-policy-inline.ts
+function classifyInlineSearch(name2, args2) {
+  const node = /^(?:node|nodejs|bun|deno)$/u.test(name2);
+  const python = /^python(?:\d+(?:\.\d+)?)?$/u.test(name2);
+  if (!node && !python)
+    return;
+  const option = args2.findIndex((arg) => node ? arg === "-e" || arg === "--eval" : arg === "-c");
+  const program = option < 0 ? undefined : args2[option + 1];
+  if (typeof program !== "string")
+    return;
+  if (node) {
+    if (/\b(?:readdir(?:Sync)?|opendir(?:Sync)?|glob(?:Sync)?)\s*\(/u.test(program))
+      return "files";
+    const readsFile = /\b(?:readFile(?:Sync)?|createReadStream)\s*\(/u.test(program);
+    const searches = /\.(?:includes|indexOf|match|matchAll|search|test)\s*\(/u.test(program);
+    return readsFile && searches ? "content" : undefined;
+  }
+  if (/\b(?:os\.walk|os\.listdir|os\.scandir|glob\.(?:i?glob)|\w+\.(?:rglob|glob))\s*\(/u.test(program))
+    return "files";
+  const readsFile = /\b(?:open|\w+\.read_text|\w+\.read_bytes)\s*\(/u.test(program);
+  const searches = /\b(?:re\.(?:search|match|findall|finditer)|\w+\.(?:find|index|count))\s*\(|\bin\s+\w/u.test(program);
+  return readsFile && searches ? "content" : undefined;
+}
+
 // src/search-policy-commands.ts
 var contentCommands = new Set([
   "rg",
@@ -3719,7 +3743,7 @@ var wrapperValueOptions = {
   nohup: new Set,
   busybox: new Set
 };
-function classifyCommand(argv, language, depth = 0) {
+function classifyCommand(argv, language, depth = 0, inspectInlinePrograms = false) {
   if (depth > 8)
     throw new Error("Search policy wrapper nesting exceeds 8 levels; simplify the command");
   const first = argv[0];
@@ -3730,6 +3754,9 @@ function classifyCommand(argv, language, depth = 0) {
   const args2 = argv.slice(1);
   if (args2.length === 1 && (args2[0] === "--help" || args2[0] === "--version"))
     return {};
+  const inlineKind = inspectInlinePrograms ? classifyInlineSearch(name2, args2) : undefined;
+  if (inlineKind)
+    return { kind: inlineKind, command: `${name2} inline program` };
   if (contentCommands.has(name2))
     return { kind: "content", command: name2 };
   if (fileCommands.has(name2))
@@ -3780,7 +3807,7 @@ function classifyCommand(argv, language, depth = 0) {
     while (typeof args2[start2] === "string" && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(args2[start2] ?? ""))
       start2 += 1;
   }
-  return classifyCommand(args2.slice(start2), language, depth + 1);
+  return classifyCommand(args2.slice(start2), language, depth + 1, inspectInlinePrograms);
 }
 
 // src/search-policy-stdin-filter.ts
@@ -4136,10 +4163,12 @@ function isSafePipelineFilter(node, language, words) {
 
 class ShellSearchPolicy {
   #assets;
+  #inspectInlinePrograms;
   #initialization;
   #languages = new Map;
-  constructor(assets) {
+  constructor(assets, inspectInlinePrograms = false) {
     this.#assets = assets;
+    this.#inspectInlinePrograms = inspectInlinePrograms;
   }
   async inspect(command, language) {
     if (Buffer.byteLength(command, "utf8") > MAX_POLICY_COMMAND_BYTES)
@@ -4181,7 +4210,7 @@ class ShellSearchPolicy {
           const commandIndex = state.nextCommandIndex;
           state.nextCommandIndex += 1;
           const words = commandWords(node, language);
-          const decision = classifyCommand(words, language);
+          const decision = classifyCommand(words, language, 0, this.#inspectInlinePrograms);
           if (decision.kind && !(decision.kind === "content" && isSafePipelineFilter(node, language, words)))
             return {
               kind: decision.kind,
@@ -4250,8 +4279,8 @@ function blockedTool(kind, toolName) {
 
 class SearchPolicy {
   #shell;
-  constructor(assets) {
-    this.#shell = new ShellSearchPolicy(assets);
+  constructor(assets, inspectInlinePrograms = false) {
+    this.#shell = new ShellSearchPolicy(assets, inspectInlinePrograms);
   }
   async check(toolName, input, signal) {
     signal?.throwIfAborted();

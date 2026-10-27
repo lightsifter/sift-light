@@ -19,6 +19,10 @@ export const SEARCH_PLUGIN_FILES = [
   "skills/local-search/SKILL.md",
   ".claude-plugin/plugin.json",
   "mcp-server.mjs",
+  "dsh-entry.mjs",
+  "dsh-client.js",
+  "dsh.patch.yml",
+  "dsh-upstream-LICENSE",
   ".mcp.json",
   "kimi.plugin.json",
   "hooks/hooks.json",
@@ -33,6 +37,83 @@ export async function buildSearchPlugin(root: string): Promise<void> {
   const hooks = join(root, "hooks");
   await mkdir(hooks, { recursive: true });
   await copyFile(join(repository, "LICENSE"), join(root, "LICENSE"));
+  await copyFile(
+    join(repository, "scripts/dsh-upstream-LICENSE"),
+    join(root, "dsh-upstream-LICENSE"),
+  );
+  const dshResult = await Bun.build({
+    entrypoints: [join(repository, "src/dsh-plugin.ts")],
+    outdir: root,
+    naming: "dsh-entry.mjs",
+    root: repository,
+    target: "node",
+    format: "esm",
+    packages: "external",
+    sourcemap: "none",
+  });
+  if (!dshResult.success) throw new AggregateError(dshResult.logs, "DSH plugin build failed");
+  const clientResult = await Bun.build({
+    entrypoints: [join(repository, "src/dsh-client.mjs")],
+    outdir: root,
+    naming: "dsh-client.js",
+    target: "browser",
+    format: "cjs",
+    external: ["react"],
+    sourcemap: "none",
+  });
+  if (!clientResult.success) throw new AggregateError(clientResult.logs, "DSH client build failed");
+  const clientPath = join(root, "dsh-client.js");
+  const client = await readFile(clientPath, "utf8");
+  await writeFile(
+    clientPath,
+    `window.__ModuleLoader__.load({ id: "sift-light", factory: (require) => {\nvar module = { exports: {} }; var exports = module.exports;\n${client}\nreturn module.exports;\n} });\n`,
+  );
+  const ptcPreset = await readFile(join(repository, "scripts/dsh-ptc-preset.yml"), "utf8");
+  const dshPatch = `${ptcPreset}
+- id: preset-minimal
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: minimal
+    order: 3
+    plugins:
+      - id: persona
+        name: '@deepseek-ai/dsh-persona'
+        config:
+          prefix: You are a helpful software engineer assistant.
+          complete: true
+          includeRuntimeContext: false
+      - id: tool-fs
+        name: '@deepseek-ai/dsh-tool-fs'
+        config:
+          read: false
+          readImage: true
+          write: false
+          edit: false
+      - id: compaction
+        name: cordis:group
+        group: true
+        isolate:
+          compaction: true
+        config:
+          - id: compaction-basic
+            name: '@deepseek-ai/dsh-compaction-basic'
+          - id: command-compact
+            name: '@deepseek-ai/dsh-command-compact'
+      - id: tool-bash
+        name: '@deepseek-ai/dsh-tool-bash'
+        disabled: !!js process.platform === 'win32'
+        config:
+          enableRunInBackground: false
+      - id: tool-pwsh
+        name: '@deepseek-ai/dsh-tool-pwsh'
+        disabled: !!js process.platform !== 'win32'
+        config:
+          enableRunInBackground: false
+- insert:
+    - id: sift-light
+      name: sift-light
+`;
+  await writeFile(join(root, "dsh.patch.yml"), dshPatch);
   const result = await Bun.build({
     entrypoints: [join(repository, "src/search-policy-hook.ts")],
     outdir: hooks,
@@ -89,6 +170,13 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     version: packageJson.version,
     private: true,
     type: "module",
+    exports: { "./client": "./dsh-client.js" },
+    dsh: {
+      client: {
+        platform: "web",
+        inject: ["@deepseek-ai/dsh-client-ui-tool", "@deepseek-ai/dsh-client-locale"],
+      },
+    },
     omp: { extensions: ["./omp-extension.mjs"] },
   };
   const mcpEnvironment = {
