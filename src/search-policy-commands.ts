@@ -1,3 +1,5 @@
+import { classifyInlineSearch } from "./search-policy-inline.js";
+
 export type SearchKind = "content" | "files";
 export type ShellLanguage = "bash" | "powershell";
 
@@ -102,6 +104,7 @@ export function classifyCommand(
   argv: readonly (string | null)[],
   language: ShellLanguage,
   depth = 0,
+  inspectInlinePrograms = false,
 ): CommandDecision {
   if (depth > 8)
     throw new Error("Search policy wrapper nesting exceeds 8 levels; simplify the command");
@@ -111,6 +114,8 @@ export function classifyCommand(
   const name = language === "powershell" ? rawName.toLowerCase() : rawName;
   const args = argv.slice(1);
   if (args.length === 1 && (args[0] === "--help" || args[0] === "--version")) return {};
+  const inlineKind = inspectInlinePrograms ? classifyInlineSearch(name, args) : undefined;
+  if (inlineKind) return { kind: inlineKind, command: `${name} inline program` };
   if (contentCommands.has(name)) return { kind: "content", command: name };
   if (fileCommands.has(name)) return { kind: "files", command: name };
   if (language === "powershell") {
@@ -166,5 +171,5 @@ export function classifyCommand(
     while (typeof args[start] === "string" && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(args[start] ?? ""))
       start += 1;
   }
-  return classifyCommand(args.slice(start), language, depth + 1);
+  return classifyCommand(args.slice(start), language, depth + 1, inspectInlinePrograms);
 }

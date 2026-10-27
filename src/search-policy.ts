@@ -64,8 +64,8 @@ function blockedTool(kind: SearchKind, toolName: string): SearchPolicyDecision {
 
 export class SearchPolicy {
   readonly #shell: ShellSearchPolicy;
-  constructor(assets: URL) {
-    this.#shell = new ShellSearchPolicy(assets);
+  constructor(assets: URL, inspectInlinePrograms = false) {
+    this.#shell = new ShellSearchPolicy(assets, inspectInlinePrograms);
   }
 
   async check(

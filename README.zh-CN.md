@@ -224,6 +224,9 @@ Codex 插件包含 `local-search` 技能，用于发现和调用延迟加载的 
 - **Claude Code：** 先运行 `/plugin marketplace add lightsifter/sift-light`，再运行 `/plugin install sift-light@sift-light`。
 - **Codex：** 先运行 `codex plugin marketplace add lightsifter/sift-light`，再运行 `codex plugin add sift-light@sift-light`，通过 `/hooks` 查看并信任钩子。
 - **Kimi Code：** 使用本仓库或安装包中的插件目录，运行 `/plugins install /absolute/path/plugins/sift-light`，确认信任后执行 `/reload`。
+- **DeepSeek Harness 0.2.1-rc.3：** 使用已构建的包安装，例如 `dsh plugin --profile web add /absolute/path/to/sift-light`；桌面版通过插件管理器安装同一个包。新会话中可调用 `sift_light`。Minimal 使用单次 shell，PTC 改为普通工具调用，持久终端输入和 workflow 脚本编排会被拒绝；普通子代理仍可用。该适配目前固定支持此版本，升级 Harness 前需要更新并验证插件。
+
+DeepSeek Harness 插件检查内置 `grep`、`glob`、可识别的 shell 搜索命令，以及部分 `node -e`、`python -c` 内联程序中的文件读取加内容匹配或目录遍历。内联代码检查使用启发式规则，可能误拦，也不能识别所有写法。它不是操作系统级沙箱：自定义脚本、动态代码、其他插件以及宿主配置覆盖仍可能绕过检查，因此不能保证所有本地搜索都经过 sift-light。搜索在宿主进程权限下运行。`SIFT_LIGHT_ENFORCE_SEARCH` 仅控制其他宿主的钩子，不改变此适配的限制。
 
 Kimi Code 的 web 模式可能从安装目录启动插件 MCP 服务。如果相对路径搜索解析到了错误项目，请继续使用原生插件强制搜索，并在项目内的 `.kimi-code/mcp.json` 中配置同名 `sift-light` 服务，显式填写该项目的绝对 `cwd`。
 

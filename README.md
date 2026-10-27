@@ -224,6 +224,9 @@ For conventional search enforcement in other hosts:
 - **Claude Code:** `/plugin marketplace add lightsifter/sift-light`, then `/plugin install sift-light@sift-light`.
 - **Codex:** `codex plugin marketplace add lightsifter/sift-light`, then `codex plugin add sift-light@sift-light`; review and trust the hook in `/hooks`.
 - **Kimi Code:** `/plugins install /absolute/path/plugins/sift-light` using the plugin directory from this repository or installed package, then confirm trust and run `/reload`.
+- **DeepSeek Harness 0.2.1-rc.3:** Install the built package with `dsh plugin --profile web add /absolute/path/to/sift-light`, or use the desktop plugin manager. New sessions can call `sift_light`. Minimal uses a one-shot shell, PTC uses native tool calls, and persistent terminal input and scripted workflows are denied. Ordinary subagent calls remain available. This adapter is pinned to that Harness version and requires an update and verification before upgrading Harness.
+
+The DeepSeek Harness adapter checks built-in `grep`, `glob`, recognized shell search commands, and some file-reading-plus-matching or directory traversal patterns in inline programs such as `node -e` and `python -c`. Inline checks are heuristic: they can reject unrelated code and miss other forms. This is not an OS sandbox: custom scripts, dynamic code, other plugins, and host configuration overrides can bypass these checks, so it cannot guarantee that all local searches use sift-light. Search runs with the host process's permissions. `SIFT_LIGHT_ENFORCE_SEARCH` controls hooks in other hosts and does not change this adapter's restrictions.
 
 Kimi Code's web mode can start plugin MCP servers from its installation directory. If relative MCP searches resolve to the wrong project, keep the native plugin for search enforcement and add a project-local `.kimi-code/mcp.json` entry with the same `sift-light` server and an explicit absolute `cwd` for that project.
 

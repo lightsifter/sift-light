@@ -141,7 +141,7 @@ function validationError(value: unknown): RequestContractError | undefined {
   );
 }
 
-function parseSiftLightInput(value: unknown): SiftLightInput {
+export function parseSiftLightInput(value: unknown): SiftLightInput {
   const failure = validationError(value);
   if (failure) throw failure;
   // Value.Check has validated the complete public schema before this boundary.
