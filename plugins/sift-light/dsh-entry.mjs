@@ -2899,7 +2899,7 @@ ${JSON.stringify(details)}`,
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.2-1",
+  version: "1.1.2-2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -3040,7 +3040,7 @@ var package_default = {
   },
   engines: {
     bun: ">=1.4.0",
-    dsh: "=0.2.1-rc.3",
+    dsh: "=0.2.1-rc.5",
     node: ">=22.19.0"
   },
   packageManager: "bun@1.4.2",
@@ -16812,6 +16812,171 @@ async function createMcpSearchFeatures(environment = process.env) {
   };
 }
 
+// src/dsh-ptc-policy.ts
+var inheritedNames = new Set([
+  "constructor",
+  "prototype",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toLocaleString"
+]);
+function validToolName(name) {
+  return !name.startsWith("__") && !inheritedNames.has(name);
+}
+function validJsonObject(value) {
+  let normalized = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0;index < value.length; index++) {
+    const char = value[index];
+    if (quote === "`") {
+      if (escaped) {
+        if (char !== undefined)
+          normalized += JSON.stringify(char).slice(1, -1);
+        escaped = false;
+      } else if (char === "\\") {
+        normalized += "\\\\";
+        escaped = true;
+      } else if (char === "`") {
+        normalized += '"';
+        quote = "";
+      } else if (char === "$" && value[index + 1] === "{") {
+        return false;
+      } else if (char !== undefined) {
+        normalized += JSON.stringify(char).slice(1, -1);
+      }
+      continue;
+    }
+    if (quote === '"') {
+      normalized += char;
+      if (escaped)
+        escaped = false;
+      else if (char === "\\")
+        escaped = true;
+      else if (char === '"')
+        quote = "";
+      continue;
+    }
+    if (quote === "'") {
+      if (escaped) {
+        if (char === "'")
+          normalized += "'";
+        else if (char && '"\\/bfnrtu'.includes(char))
+          normalized += `\\${char}`;
+        else
+          return false;
+        escaped = false;
+      } else if (char === "\\")
+        escaped = true;
+      else if (char === "'") {
+        normalized += '"';
+        quote = "";
+      } else if (char === '"')
+        normalized += "\\\"";
+      else if (char && char.charCodeAt(0) < 32)
+        return false;
+      else
+        normalized += char;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+      normalized += '"';
+    } else {
+      normalized += char;
+      if (char === "{" || char === ",") {
+        const key = /^(\s*)([A-Za-z_$][\w$]*)(\s*:)/u.exec(value.slice(index + 1));
+        if (key?.[1] !== undefined && key[2] && key[3] !== undefined) {
+          normalized += `${key[1]}"${key[2]}"${key[3]}`;
+          index += key[0].length;
+        }
+      }
+    }
+  }
+  if (quote || escaped)
+    return false;
+  try {
+    const parsed = JSON.parse(normalized);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+function isDirectBatch(code) {
+  const forms = [
+    /^\s*return\s+await\s+Promise\.all\(\s*\[([\s\S]*)\]\s*\)\s*;?\s*$/u,
+    /^\s*console\.log\(\s*await\s+Promise\.all\(\s*\[([\s\S]*)\]\s*\)\s*\)\s*;?\s*$/u
+  ];
+  const outer = forms.map((form) => form.exec(code)).find(Boolean);
+  if (!outer?.[1])
+    return false;
+  const calls = outer[1];
+  let cursor = 0;
+  let count = 0;
+  while (cursor < calls.length) {
+    const prefix = /^\s*tools\.([A-Za-z_$][\w$]*)\s*\(\s*/u.exec(calls.slice(cursor));
+    if (!prefix?.[1] || !validToolName(prefix[1]))
+      return false;
+    cursor += prefix[0].length;
+    if (calls[cursor] !== "{")
+      return false;
+    const start = cursor;
+    let depth = 0;
+    let quote = "";
+    let escaped = false;
+    for (;cursor < calls.length; cursor++) {
+      const char = calls[cursor];
+      if (quote) {
+        if (escaped)
+          escaped = false;
+        else if (char === "\\")
+          escaped = true;
+        else if (char === quote)
+          quote = "";
+      } else if (char === '"' || char === "'" || char === "`")
+        quote = char;
+      else if (char === "{")
+        depth++;
+      else if (char === "}" && --depth === 0) {
+        cursor++;
+        break;
+      }
+    }
+    if (depth !== 0 || !validJsonObject(calls.slice(start, cursor)))
+      return false;
+    const suffix = /^\s*\)\s*(,|$)/u.exec(calls.slice(cursor));
+    if (!suffix)
+      return false;
+    cursor += suffix[0].length;
+    count++;
+    if (count > 10)
+      return false;
+    if (suffix[1] !== "," || calls.slice(cursor).trim() === "")
+      return calls.slice(cursor).trim() === "";
+  }
+  return false;
+}
+function isDirectPtcToolCall(value) {
+  if (typeof value !== "object" || value === null || !("code" in value))
+    return false;
+  const code = value.code;
+  if (typeof code !== "string" || code.length > 1e5)
+    return false;
+  const forms = [
+    /^\s*await\s+tools\.([A-Za-z_$][\w$]*)\s*\(\s*(\{[\s\S]*\})\s*\)\s*;?\s*$/u,
+    /^\s*return\s+await\s+tools\.([A-Za-z_$][\w$]*)\s*\(\s*(\{[\s\S]*\})\s*\)\s*;?\s*$/u,
+    /^\s*console\.log\(\s*await\s+tools\.([A-Za-z_$][\w$]*)\s*\(\s*(\{[\s\S]*\})\s*\)\s*\)\s*;?\s*$/u,
+    /^\s*console\.log\(\s*JSON\.stringify\(\s*await\s+tools\.([A-Za-z_$][\w$]*)\s*\(\s*(\{[\s\S]*\})\s*\)\s*\)\s*\)\s*;?\s*$/u
+  ];
+  const match = forms.map((form) => form.exec(code)).find(Boolean);
+  if (match?.[1] && match[2])
+    return validToolName(match[1]) && validJsonObject(match[2]);
+  return isDirectBatch(code);
+}
+
 // src/search-policy-recovery.ts
 import { isAbsolute as isAbsolute9, relative as relative9, resolve as resolve28, sep as sep5 } from "node:path";
 var CONTENT_MANUAL_REASON = "the command is not one standalone static rg search using the supported option and single-target subset";
@@ -17184,15 +17349,29 @@ function classifyInlineSearch(name, args) {
   if (node) {
     if (/\b(?:readdir(?:Sync)?|opendir(?:Sync)?|glob(?:Sync)?)\s*\(/u.test(program))
       return "files";
-    const readsFile = /\b(?:readFile(?:Sync)?|createReadStream)\s*\(/u.test(program);
-    const searches = /\.(?:includes|indexOf|match|matchAll|search|test)\s*\(/u.test(program);
-    return readsFile && searches ? "content" : undefined;
+    const directSearch = /\breadFile(?:Sync)?\s*\([^)]*\)\s*\.(?:includes|indexOf|match|matchAll|search)\s*\(/u;
+    if (directSearch.test(program))
+      return "content";
+    const text = /\b(?:const|let|var)\s+([\w$]+)\s*=\s*(?:(?:[\w$.]+|require\s*\([^)]*\))\.)?readFile(?:Sync)?\s*\([^)]*\)/gu;
+    for (const match of program.matchAll(text)) {
+      const variable = match[1].replace(/[$]/gu, "\\$");
+      if (new RegExp(`(?<![\\w$])${variable}\\s*\\.(?:includes|indexOf|match|matchAll|search)\\s*\\(|\\.test\\s*\\(\\s*${variable}\\s*\\)`, "u").test(program))
+        return "content";
+    }
+    return;
   }
   if (/\b(?:os\.walk|os\.listdir|os\.scandir|glob\.(?:i?glob)|\w+\.(?:rglob|glob))\s*\(/u.test(program))
     return "files";
-  const readsFile = /\b(?:open|\w+\.read_text|\w+\.read_bytes)\s*\(/u.test(program);
-  const searches = /\b(?:re\.(?:search|match|findall|finditer)|\w+\.(?:find|index|count))\s*\(|\bin\s+\w/u.test(program);
-  return readsFile && searches ? "content" : undefined;
+  const read = String.raw`(?:open\s*\([^)]*\)\s*\.read\s*\(\s*\)|\w+\.read_(?:text|bytes)\s*\([^)]*\))`;
+  if (new RegExp(String.raw`["'][^"']+["']\s+in\s+${read}|${read}\s*\.(?:find|index|count)\s*\(`, "u").test(program))
+    return "content";
+  const text = new RegExp(String.raw`\b(\w+)\s*=\s*${read}`, "gu");
+  for (const match of program.matchAll(text)) {
+    const variable = match[1];
+    if (new RegExp(String.raw`["'][^"']+["']\s+in\s+${variable}\b|\b${variable}\s*\.(?:find|index|count)\s*\(|\bre\.(?:search|match|findall|finditer)\s*\([^,]+,\s*${variable}\b`, "u").test(program))
+      return "content";
+  }
+  return new RegExp(String.raw`\bre\.(?:search|match|findall|finditer)\s*\([^,]+,\s*${read}`, "u").test(program) ? "content" : undefined;
 }
 
 // src/search-policy-commands.ts
@@ -18116,7 +18295,9 @@ async function apply(ctx) {
   const approved = new Set;
   ctx.tools.register({
     name: "sift_light",
-    description: SIFT_LIGHT_MODEL_DESCRIPTION,
+    description: `${SIFT_LIGHT_MODEL_DESCRIPTION}
+
+In DSH PTC mode, each run_code must contain either one direct tool call with literal arguments or return await Promise.all([tools.sift_light({"path":".","pattern":"one"}), tools.sift_light({"path":".","pattern":"two"})]) with up to 10 direct calls. Return the complete result, for example: return await tools.sift_light({"path":".","pattern":"needle","literal":true}) or return await tools.read({"file_path":"/absolute/path"}). Template strings without interpolation are allowed; keys may be unquoted. Do not declare variables or process results. Separate calls are allowed. Other programs are blocked by the search policy.`,
     parameters: JSON.parse(JSON.stringify(siftLightSchema)),
     output: {
       schema: {
@@ -18159,7 +18340,12 @@ async function apply(ctx) {
     return downstream;
   });
   ctx.tools.guard((exec) => {
-    if (["run_code", "workflow", "ralph"].includes(exec.name)) {
+    if (exec.name === "run_code") {
+      if (isDirectPtcToolCall(exec.arguments))
+        return;
+      return 'Each run_code must contain a direct call to an available tool with literal arguments, for example: return await tools.read({"file_path":"/absolute/path"}) or return await tools.sift_light({"path":".","pattern":"needle","literal":true}). Template strings without interpolation are allowed; keys may be unquoted. For parallel calls use return await Promise.all([tools.sift_light({"path":".","pattern":"one"}), tools.sift_light({"path":".","pattern":"two"})]) with literal arguments, up to 10 calls. Do not declare variables or transform results.';
+    }
+    if (["workflow", "ralph"].includes(exec.name)) {
       return "Programmatic execution is disabled by sift-light search policy; use native tools.";
     }
     if (terminalNames.has(exec.name))

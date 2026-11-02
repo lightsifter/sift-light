@@ -68,9 +68,7 @@ export async function buildSearchPlugin(root: string): Promise<void> {
     clientPath,
     `window.__ModuleLoader__.load({ id: "sift-light", factory: (require) => {\nvar module = { exports: {} }; var exports = module.exports;\n${client}\nreturn module.exports;\n} });\n`,
   );
-  const ptcPreset = await readFile(join(repository, "scripts/dsh-ptc-preset.yml"), "utf8");
-  const dshPatch = `${ptcPreset}
-- id: preset-minimal
+  const dshPatch = `- id: preset-minimal
   name: '@deepseek-ai/dsh-agent-preset'
   config:
     id: minimal

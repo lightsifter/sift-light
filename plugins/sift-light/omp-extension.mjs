@@ -2235,7 +2235,7 @@ function createCtagsStructureProvider(options = {}) {
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.2-1",
+  version: "1.1.2-2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -2376,7 +2376,7 @@ var package_default = {
   },
   engines: {
     bun: ">=1.4.0",
-    dsh: "=0.2.1-rc.3",
+    dsh: "=0.2.1-rc.5",
     node: ">=22.19.0"
   },
   packageManager: "bun@1.4.2",
@@ -28645,15 +28645,29 @@ function classifyInlineSearch(name2, args2) {
   if (node) {
     if (/\b(?:readdir(?:Sync)?|opendir(?:Sync)?|glob(?:Sync)?)\s*\(/u.test(program))
       return "files";
-    const readsFile = /\b(?:readFile(?:Sync)?|createReadStream)\s*\(/u.test(program);
-    const searches = /\.(?:includes|indexOf|match|matchAll|search|test)\s*\(/u.test(program);
-    return readsFile && searches ? "content" : undefined;
+    const directSearch = /\breadFile(?:Sync)?\s*\([^)]*\)\s*\.(?:includes|indexOf|match|matchAll|search)\s*\(/u;
+    if (directSearch.test(program))
+      return "content";
+    const text = /\b(?:const|let|var)\s+([\w$]+)\s*=\s*(?:(?:[\w$.]+|require\s*\([^)]*\))\.)?readFile(?:Sync)?\s*\([^)]*\)/gu;
+    for (const match of program.matchAll(text)) {
+      const variable = match[1].replace(/[$]/gu, "\\$");
+      if (new RegExp(`(?<![\\w$])${variable}\\s*\\.(?:includes|indexOf|match|matchAll|search)\\s*\\(|\\.test\\s*\\(\\s*${variable}\\s*\\)`, "u").test(program))
+        return "content";
+    }
+    return;
   }
   if (/\b(?:os\.walk|os\.listdir|os\.scandir|glob\.(?:i?glob)|\w+\.(?:rglob|glob))\s*\(/u.test(program))
     return "files";
-  const readsFile = /\b(?:open|\w+\.read_text|\w+\.read_bytes)\s*\(/u.test(program);
-  const searches = /\b(?:re\.(?:search|match|findall|finditer)|\w+\.(?:find|index|count))\s*\(|\bin\s+\w/u.test(program);
-  return readsFile && searches ? "content" : undefined;
+  const read = String.raw`(?:open\s*\([^)]*\)\s*\.read\s*\(\s*\)|\w+\.read_(?:text|bytes)\s*\([^)]*\))`;
+  if (new RegExp(String.raw`["'][^"']+["']\s+in\s+${read}|${read}\s*\.(?:find|index|count)\s*\(`, "u").test(program))
+    return "content";
+  const text = new RegExp(String.raw`\b(\w+)\s*=\s*${read}`, "gu");
+  for (const match of program.matchAll(text)) {
+    const variable = match[1];
+    if (new RegExp(String.raw`["'][^"']+["']\s+in\s+${variable}\b|\b${variable}\s*\.(?:find|index|count)\s*\(|\bre\.(?:search|match|findall|finditer)\s*\([^,]+,\s*${variable}\b`, "u").test(program))
+      return "content";
+  }
+  return new RegExp(String.raw`\bre\.(?:search|match|findall|finditer)\s*\([^,]+,\s*${read}`, "u").test(program) ? "content" : undefined;
 }
 
 // src/search-policy-commands.ts

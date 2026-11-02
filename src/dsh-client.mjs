@@ -327,24 +327,35 @@ function searchCard({ block, phase, openFile, locale }) {
               )
             : null,
         )
-      : valid && view.total === 0
+      : valid && view.total === 0 && !view.partial && !block.isError
         ? h(
             "div",
             { style: { ...styles.rows, ...styles.label } },
             chinese ? "没有找到匹配结果" : "No results found",
           )
         : null,
+    valid && view.partial
+      ? h(
+          "div",
+          { style: { ...styles.rows, ...styles.label } },
+          chinese
+            ? `搜索范围或结果不完整${view.unavailable ? `；${view.unavailable} 个位置无法读取` : ""}。请展开详情查看原因。`
+            : `Search coverage or results are incomplete${view.unavailable ? `; ${view.unavailable} locations could not be read` : ""}. Open details for the reason.`,
+        )
+      : null,
     valid && view.more
       ? h(
           "div",
           { style: { ...styles.rows, ...styles.label } },
-          chinese ? "还有后续结果" : "More results available",
+          chinese
+            ? "还有后续结果；展开详情查看继续请求。"
+            : "More results are available; open details for the continuation request.",
         )
       : null,
     text
       ? h(
           "details",
-          { style: styles.details },
+          { style: styles.details, open: block.isError || undefined },
           h(
             "summary",
             { style: { ...styles.label, cursor: "pointer" } },
