@@ -10,6 +10,7 @@ describe("DSH inline search detection", () => {
     const commands = [
       `node -e 'const f=require("fs"); console.log(f.readFileSync("sample.txt","utf8").includes("marker"))'`,
       `env node --eval 'const s = require("fs").readFileSync("sample.txt", "utf8"); console.log(/marker/.test(s))'`,
+      `node -e 'const $s = fs.readFileSync("sample.txt"); console.log($s.includes("marker"))'`,
       `bash -c 'node -e "fs.readdirSync()"'`,
       `python3 -c 'print("marker" in open("sample.txt").read())'`,
       `python3 -c 'import re; print(re.search("marker", open("sample.txt").read()))'`,
@@ -26,6 +27,7 @@ describe("DSH inline search detection", () => {
     const commands = [
       `node -e 'console.log("marker".includes("mark"))'`,
       `node -e 'console.log(require("fs").readFileSync("sample.txt", "utf8"))'`,
+      `node -e 'const s = fs.readFileSync("sample.txt"); console.log(other_s.includes("marker"))'`,
       `python3 -c 'print("marker" in "marker")'`,
       `python3 -c 'print(open("sample.txt").read())'`,
       `python3 -c "open('/tmp/sift_policy_probe.txt','w').write(chr(10).join('line %d' % i for i in range(3)))"`,

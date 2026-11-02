@@ -20,14 +20,12 @@ export function classifyInlineSearch(
     const text =
       /\b(?:const|let|var)\s+([\w$]+)\s*=\s*(?:(?:[\w$.]+|require\s*\([^)]*\))\.)?readFile(?:Sync)?\s*\([^)]*\)/gu;
     for (const match of program.matchAll(text)) {
-      const variable = match[1]!.replace(/[$]/gu, "\\$");
-      if (
-        new RegExp(
-          `(?<![\\w$])${variable}\\s*\\.(?:includes|indexOf|match|matchAll|search)\\s*\\(|\\.test\\s*\\(\\s*${variable}\\s*\\)`,
-          "u",
-        ).test(program)
-      )
-        return "content";
+      const variable = match[1];
+      const calls =
+        /(?<![\w$])([\w$]+)\s*\.(?:includes|indexOf|match|matchAll|search)\s*\(|\.test\s*\(\s*([\w$]+)\s*\)/gu;
+      for (const call of program.matchAll(calls)) {
+        if (call[1] === variable || call[2] === variable) return "content";
+      }
     }
     return undefined;
   }
