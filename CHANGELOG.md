@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2-2 — 2026-11-02
+
+- Support DeepSeek Harness 0.2.1-rc.5, including bounded direct tool calls in PTC mode.
+- Avoid blocking unrelated inline file operations while retaining detection of common inline searches.
+- Make incomplete search coverage and continuation requests clearer in the DSH result card.
+
 ## 1.1.2-1 — 2026-10-27
 
 - Store Pi search policy guidance in a separate prompt section so tool activation can preserve cached prefixes and signed thinking blocks.

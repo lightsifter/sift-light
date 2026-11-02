@@ -10,9 +10,11 @@ describe("DSH inline search detection", () => {
     const commands = [
       `node -e 'const f=require("fs"); console.log(f.readFileSync("sample.txt","utf8").includes("marker"))'`,
       `env node --eval 'const s = require("fs").readFileSync("sample.txt", "utf8"); console.log(/marker/.test(s))'`,
+      `node -e 'const $s = fs.readFileSync("sample.txt"); console.log($s.includes("marker"))'`,
       `bash -c 'node -e "fs.readdirSync()"'`,
       `python3 -c 'print("marker" in open("sample.txt").read())'`,
       `python3 -c 'import re; print(re.search("marker", open("sample.txt").read()))'`,
+      `python3 -c 's = open("sample.txt").read(); print("marker" in s)'`,
       `python3 -c 'import os; print(list(os.walk("src")))'`,
       `python3 -c 'import glob; print(glob.glob("src/*.ts"))'`,
     ];
@@ -25,8 +27,14 @@ describe("DSH inline search detection", () => {
     const commands = [
       `node -e 'console.log("marker".includes("mark"))'`,
       `node -e 'console.log(require("fs").readFileSync("sample.txt", "utf8"))'`,
+      `node -e 'const s = fs.readFileSync("sample.txt"); console.log(other_s.includes("marker"))'`,
       `python3 -c 'print("marker" in "marker")'`,
       `python3 -c 'print(open("sample.txt").read())'`,
+      `python3 -c "open('/tmp/sift_policy_probe.txt','w').write(chr(10).join('line %d' % i for i in range(3)))"`,
+      `python3 -c "import json; d=json.load(open('/tmp/items.json')); print([r['name'] for r in d if r['kind']=='y'])"`,
+      `python3 -c 's = open("sample.txt").read(); print([x for x in s])'`,
+      `python3 -c 'print([x for x in open("sample.txt").read()])'`,
+      `node -e 'const d=JSON.parse(require("fs").readFileSync("sample.json")); console.log(d.some(r => r.name.includes("x")))'`,
       "node scripts/build.js",
       "python3 scripts/check.py",
       "bun test",

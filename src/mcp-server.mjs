@@ -2903,7 +2903,7 @@ import { URL as URL2 } from "node:url";
 // package.json
 var package_default = {
   name: "sift-light",
-  version: "1.1.2-1",
+  version: "1.1.2-2",
   description: "Context-efficient local search for files, documents, notes and logs across Pi, OMP and MCP clients",
   keywords: [
     "ai-agent",
@@ -3044,7 +3044,7 @@ var package_default = {
   },
   engines: {
     bun: ">=1.4.0",
-    dsh: "=0.2.1-rc.3",
+    dsh: "=0.2.1-rc.5",
     node: ">=22.19.0"
   },
   packageManager: "bun@1.4.2",

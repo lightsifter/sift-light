@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { createDefaultSiftLightMcpService, parseSiftLightInput } from "./mcp.js";
 import { compactMcpModelText } from "./mcp-model-output.js";
 import { createMcpSearchFeatures } from "./mcp-semantic-judge.js";
+import { isDirectPtcToolCall } from "./dsh-ptc-policy.js";
 import { SearchPolicy } from "./search-policy.js";
 import { SIFT_LIGHT_MODEL_DESCRIPTION, siftLightSchema } from "./tool-schema.js";
 import { dashboard } from "./tui/dashboard.js";
@@ -72,7 +73,7 @@ export async function apply(ctx: DshContext): Promise<void> {
 
   ctx.tools.register({
     name: "sift_light",
-    description: SIFT_LIGHT_MODEL_DESCRIPTION,
+    description: `${SIFT_LIGHT_MODEL_DESCRIPTION}\n\nIn DSH PTC mode, each run_code must contain either one direct tool call with literal arguments or return await Promise.all([tools.sift_light({"path":".","pattern":"one"}), tools.sift_light({"path":".","pattern":"two"})]) with up to 10 direct calls. Return the complete result, for example: return await tools.sift_light({"path":".","pattern":"needle","literal":true}) or return await tools.read({"file_path":"/absolute/path"}). Template strings without interpolation are allowed; keys may be unquoted. Do not declare variables or process results. Separate calls are allowed. Other programs are blocked by the search policy.`,
     // TypeBox schemas carry symbols that DSH rejects in model-facing JSON schemas.
     parameters: JSON.parse(JSON.stringify(siftLightSchema)) as unknown,
     output: {
@@ -122,7 +123,11 @@ export async function apply(ctx: DshContext): Promise<void> {
     return downstream;
   });
   ctx.tools.guard((exec) => {
-    if (["run_code", "workflow", "ralph"].includes(exec.name)) {
+    if (exec.name === "run_code") {
+      if (isDirectPtcToolCall(exec.arguments)) return undefined;
+      return 'Each run_code must contain a direct call to an available tool with literal arguments, for example: return await tools.read({"file_path":"/absolute/path"}) or return await tools.sift_light({"path":".","pattern":"needle","literal":true}). Template strings without interpolation are allowed; keys may be unquoted. For parallel calls use return await Promise.all([tools.sift_light({"path":".","pattern":"one"}), tools.sift_light({"path":".","pattern":"two"})]) with literal arguments, up to 10 calls. Do not declare variables or transform results.';
+    }
+    if (["workflow", "ralph"].includes(exec.name)) {
       return "Programmatic execution is disabled by sift-light search policy; use native tools.";
     }
     if (terminalNames.has(exec.name))
