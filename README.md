@@ -1,5 +1,9 @@
 # sift-light
 
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/lightsifter/sift-light/version.svg)](https://yarkr.com/arks/lightsifter/sift-light)
+<!-- yarkr:badges:end -->
+
 English · [简体中文](README.zh-CN.md)
 
 **sift-light — Evidence-first search for AI agents.**
@@ -295,3 +299,35 @@ The remote path uses the same `sift-light-media` tool and source verification as
 Cold indexing returns `nextRequest` with `mode: "await"`; copy it to the same tool. `mode: "cancel"` and its `operationId` stop that work. The local provider reuses one resident visual model for consecutive requests and releases it after 60 seconds idle; remote provider timeouts, retries, and request limits come from its configuration. The service owns shutdown and cancellation. Each request admits at most 512 media files, 20 MiB per file and 256 MiB total; corpus limits and enumeration limits are explicit partial coverage. Request deadline is five minutes. Results expire after ten minutes and are scoped to the originating workspace. Office documents, audio and video are outside this tool's current contract.
 
 Native text and visual workers reserve 1 GB of inference headroom above the loaded model and its working space, and return unused compute cache after each query. This is not a hard limit on total process memory. The model still uses several GB, with additional allocations during indexing and inference. Each MCP service session owns its models; multiple connections and simultaneous text/visual workers add their memory use. Ordinary exact search does not load these models. Measure memory and latency for the actual model, machine and file scope.
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/lightsifter/sift-light) as the ark [lightsifter/sift-light](https://yarkr.com/arks/lightsifter/sift-light), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync lightsifter/sift-light
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:lightsifter/sift-light/local-search
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add lightsifter/sift-light
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/lightsifter/sift-light`.
+<!-- yarkr:install:end -->
